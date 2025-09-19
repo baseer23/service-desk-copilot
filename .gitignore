@@ -1,0 +1,16 @@
+# macOS artifacts
+.DS_Store
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Node dependencies
+frontend/node_modules/
+
+# Logs (keep placeholder)
+logs/*
+!logs/.gitkeep
+
+# Build outputs
+frontend/dist/
