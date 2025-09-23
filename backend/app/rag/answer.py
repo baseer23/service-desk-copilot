@@ -14,7 +14,7 @@ from backend.app.models.provider import LocalModelProvider
 
 
 logger = logging.getLogger(__name__)
-FALLBACK_PREFIX = "Local model unavailable; falling back to stub. "
+FALLBACK_PREFIX = "Model provider unavailable; falling back to stub. "
 
 
 def compose_prompt(question: str, chunks: List[Dict[str, object]]) -> str:

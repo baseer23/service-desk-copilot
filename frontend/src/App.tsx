@@ -27,6 +27,14 @@ type IngestResult = {
 type HealthResponse = {
   status: string
   provider: string
+  provider_type: string
+  model_name: string
+  provider_vendor: string | null
+  local_model_available: boolean
+  operator_message: string | null
+  hosted_reachable: boolean | null
+  hosted_model_name: string | null
+  preferred_local_models: string[]
   ollama_reachable: boolean
   llamacpp_reachable: boolean
   neo4j_reachable: boolean
@@ -82,12 +90,54 @@ export default function App() {
     return null
   }, [messages])
 
-  const providerLabel = useMemo(() => {
-    const provider = health?.provider
-    if (!provider) return 'Ollama'
-    if (provider.length === 0) return 'Ollama'
-    return provider[0].toUpperCase() + provider.slice(1)
-  }, [health?.provider])
+  const lastAnswerSummary = useMemo(() => {
+    if (!lastAssistant) return null
+    const flattened = lastAssistant.text.replace(/\s+/g, ' ').trim()
+    if (!flattened) return null
+    const sentenceMatch = flattened.match(/.*?[.!?](?:\s|$)/)
+    const candidate = sentenceMatch ? sentenceMatch[0].trim() : flattened
+    const trimmed = candidate.length > 110 ? `${candidate.slice(0, 110).trimEnd()}…` : candidate
+    return trimmed
+  }, [lastAssistant])
+
+  const lastAnswerSourceTitle = useMemo(() => {
+    if (!lastAssistant) return 'Untitled'
+    if (!lastAssistant.citations || lastAssistant.citations.length === 0) return 'Untitled'
+    const firstTitled = lastAssistant.citations.find((citation) => citation.title && citation.title.trim().length > 0)
+    const title = firstTitled?.title?.trim()
+    return title && title.length > 0 ? title : 'Untitled'
+  }, [lastAssistant])
+
+  const providerPill = useMemo(() => {
+    if (!health) return 'Provider · unknown · unknown'
+    const rawType = (health.provider_type || health.provider || 'unknown').toLowerCase()
+    const typeLabel = rawType === 'hosted' ? 'api' : rawType
+    const modelSource = health.model_name?.trim() && health.model_name.trim().length > 0 ? health.model_name : health.provider
+    const model = modelSource && modelSource.length > 0 ? modelSource : 'unknown'
+    return `Provider · ${typeLabel} · ${model}`
+  }, [health])
+
+  const providerNotes = useMemo(() => {
+    if (!health) return [] as Array<{ text: string; tone: 'default' | 'warn' }>
+    const notes: Array<{ text: string; tone: 'default' | 'warn' }> = []
+    if (health.operator_message) {
+      notes.push({ text: health.operator_message, tone: health.local_model_available ? 'default' : 'warn' })
+    }
+    if (!health.local_model_available && (health.preferred_local_models?.length ?? 0) > 0) {
+      notes.push({
+        text: `Preferred small models: ${health.preferred_local_models.join(' → ')}.`,
+        tone: 'default',
+      })
+    }
+    if (health.provider_type === 'hosted') {
+      if (health.hosted_reachable === false) {
+        notes.push({ text: 'Hosted provider unreachable – responses will fall back to stub.', tone: 'warn' })
+      } else if (health.hosted_reachable === true) {
+        notes.push({ text: 'Hosted provider reachable.', tone: 'default' })
+      }
+    }
+    return notes
+  }, [health])
 
   const scrollToBottom = () => {
     requestAnimationFrame(() => {
@@ -148,6 +198,10 @@ export default function App() {
       setLoading(false)
       scrollToBottom()
     }
+  }
+
+  const handleRecentQuestionClick = (question: string) => {
+    void handleAsk(question)
   }
 
   const resetThread = () => {
@@ -288,7 +342,14 @@ export default function App() {
             <p className="tagline">Ingest docs. Ask with citations.</p>
           </div>
           <div className="header-actions">
-            <span className="provider-pill">Provider: {providerLabel}</span>
+            <div className="provider-stack">
+              <span className="provider-pill">{providerPill}</span>
+              {providerNotes.map((note, index) => (
+                <span key={index} className={`provider-note${note.tone === 'warn' ? ' warn' : ''}`}>
+                  {note.text}
+                </span>
+              ))}
+            </div>
             <button type="button" className="ghost" onClick={resetThread} disabled={loading}>
               New thread
             </button>
@@ -322,10 +383,18 @@ export default function App() {
 
           {indexStatus && indexedSource && (
             <div className="inline-banner success" role="status">
-              <span>
-                Indexed "{indexedSource.title}" • {indexedSource.tokens} tokens • {indexedSource.chunks} chunks
-              </span>
-              <button type="button" className="link-button" onClick={viewIndexedSource}>
+              <p className="banner-text">
+                <span className="banner-segment">Indexed “{indexedSource.title}”</span>
+                <span className="banner-separator" aria-hidden="true">
+                  •
+                </span>
+                <span className="banner-segment">{indexStatus.vector_count} vectors stored locally</span>
+                <span className="banner-separator" aria-hidden="true">
+                  •
+                </span>
+                <span className="banner-segment">{indexStatus.chunks} chunks</span>
+              </p>
+              <button type="button" className="link-button banner-link" onClick={viewIndexedSource}>
                 View source
               </button>
             </div>
@@ -403,16 +472,25 @@ export default function App() {
             {recentQuestions.length === 0 ? (
               <p className="muted">Try "What is the MFA reset policy" or "How do I create a ticket".</p>
             ) : (
-              <ul>
+              <ul className="recent-question-list">
                 {recentQuestions.map((question) => (
-                  <li key={question}>{question}</li>
+                  <li key={question}>
+                    <button
+                      type="button"
+                      className="recent-question"
+                      onClick={() => handleRecentQuestionClick(question)}
+                    >
+                      {question}
+                    </button>
+                  </li>
                 ))}
               </ul>
             )}
             {lastAssistant && (
-              <div className="sidebar-card">
+              <div className="sidebar-card last-answer-card">
                 <h3>Last answer</h3>
-                <p>{lastAssistant.text}</p>
+                <p className="last-answer-summary">{lastAnswerSummary ?? 'Answer ready.'}</p>
+                <p className="last-answer-source">From: {lastAnswerSourceTitle}</p>
               </div>
             )}
             <button

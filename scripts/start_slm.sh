@@ -7,6 +7,28 @@ mkdir -p "$LOG_DIR"
 info()  { printf '[slm] %s\n' "$*"; }
 warn()  { printf '[slm][warn] %s\n' "$*"; }
 
+PREFERRED_MODELS=("phi3:mini" "tinyllama")
+MODEL_REASONS=(
+  "Phi 3 Mini chosen for Mac Air responsiveness."
+  "TinyLlama fallback when thermals climb."
+)
+
+pick_ollama_model() {
+  local output models idx=0
+  if ! output=$(ollama list 2>/dev/null); then
+    return 1
+  fi
+  models=$(printf '%s\n' "$output" | awk 'NR>1 {print $1}')
+  for candidate in "${PREFERRED_MODELS[@]}"; do
+    if printf '%s\n' "$models" | grep -q "^${candidate}$"; then
+      printf '%s\n' "$idx"
+      return 0
+    fi
+    idx=$((idx + 1))
+  done
+  return 1
+}
+
 if command -v ollama >/dev/null 2>&1; then
   info "Detected Ollama CLI." 
   if ! pgrep -f "ollama serve" >/dev/null 2>&1; then
@@ -16,7 +38,18 @@ if command -v ollama >/dev/null 2>&1; then
   else
     info "'ollama serve' already running."
   fi
-  info "You can pull a model with: ollama pull \"${MODEL_NAME:-tinyllama}\""
+  if model_index=$(pick_ollama_model); then
+    SELECTED_MODEL=${PREFERRED_MODELS[$model_index]}
+    REASON=${MODEL_REASONS[$model_index]}
+    info "Active model: ${SELECTED_MODEL} (${REASON})"
+    info "Set MODEL_PROVIDER=ollama and MODEL_NAME=${SELECTED_MODEL} for the backend."
+  else
+    primary=${PREFERRED_MODELS[0]}
+    fallback=${PREFERRED_MODELS[1]}
+    warn "No Phi 3 Mini or TinyLlama detected."
+    warn "Pull one with: ollama pull \"${primary}\" (fallback: ${fallback})."
+    warn "Backend will continue with the deterministic stub until a small model is available."
+  fi
   exit 0
 fi
 

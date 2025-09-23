@@ -21,7 +21,12 @@ from backend.app.models.dto import (
     IngestPasteResponse,
     IngestPdfResponse,
 )
-from backend.app.models.provider_factory import get_provider
+from backend.app.models.provider_factory import (
+    ProviderContext,
+    SMALL_OLLAMA_MODELS,
+    get_provider,
+    select_provider,
+)
 from backend.app.rag.answer import Responder
 from backend.app.rag.planner import Planner
 from backend.app.rag.retrieve import Retriever
@@ -58,7 +63,9 @@ app = FastAPI(title=SETTINGS.app_name)
 app.state.vector_store = InMemoryVectorStore()
 app.state.graph_repo = InMemoryGraphRepository()
 app.state.graph_driver = None
-app.state.provider = get_provider(SETTINGS)
+_initial_provider_context = select_provider(SETTINGS)
+app.state.provider = _initial_provider_context.provider
+app.state.provider_context = _initial_provider_context
 app.state.settings = SETTINGS
 
 app.add_middleware(
@@ -101,7 +108,9 @@ async def startup_event():  # pragma: no cover - exercised in integration tests
     repo, driver = _init_graph_repo(settings)
     app.state.graph_repo = repo
     app.state.graph_driver = driver
-    app.state.provider = get_provider(settings)
+    provider_context = select_provider(settings)
+    app.state.provider = provider_context.provider
+    app.state.provider_context = provider_context
 
 
 @app.on_event("shutdown")
@@ -155,12 +164,21 @@ async def log_requests(request: Request, call_next: Callable):
 @app.get("/health")
 def health() -> dict[str, object]:
     settings = getattr(app.state, "settings", SETTINGS)
-    provider = getattr(app.state, "provider", get_provider(settings))
+    provider_context = getattr(app.state, "provider_context", select_provider(settings))
+    provider = provider_context.provider
     vector_path, vector_exists = _vector_store_state(getattr(app.state, "vector_store", None), settings)
 
     return {
         "status": "ok",
         "provider": provider.name(),
+        "provider_type": provider_context.provider_type,
+        "model_name": provider_context.model_name,
+        "provider_vendor": provider_context.vendor,
+        "local_model_available": provider_context.local_model_available,
+        "operator_message": provider_context.reason,
+        "hosted_reachable": _probe_hosted(settings) if provider_context.provider_type == "hosted" else None,
+        "hosted_model_name": getattr(settings, "hosted_model_name", None),
+        "preferred_local_models": [choice for choice, _ in SMALL_OLLAMA_MODELS],
         "ollama_reachable": _probe_ollama(settings),
         "llamacpp_reachable": _probe_llamacpp(settings),
         "neo4j_reachable": _probe_neo4j(getattr(app.state, "graph_repo", None)),
@@ -234,7 +252,8 @@ def ask(payload: AskRequest) -> AskResponse:
     else:
         contexts = retriever.vector_search(payload.question, top_k)
 
-    provider = getattr(app.state, "provider", get_provider(settings))
+    context = getattr(app.state, "provider_context", select_provider(settings))
+    provider = context.provider
     responder = Responder(settings=settings, provider=provider)
     response = responder.answer(payload.question, plan, contexts)
     return response
@@ -246,6 +265,35 @@ def _safe_embedding_provider(settings):
     except Exception as exc:
         logger.warning("Falling back to stub embeddings (%s)", exc)
         return StubEmbeddingProvider()
+
+
+def _probe_hosted(settings) -> bool | None:
+    api_key = getattr(settings, "groq_api_key", None)
+    api_url = getattr(settings, "groq_api_url", "")
+    if not api_key or not api_url:
+        return False
+    url = _groq_models_url(api_url)
+    headers = {"Authorization": f"Bearer {api_key}"}
+    try:
+        response = requests.get(url, headers=headers, timeout=1)
+        response.raise_for_status()
+        return True
+    except requests.RequestException:  # pragma: no cover - network-dependent
+        return False
+
+
+def _groq_models_url(api_url: str) -> str:
+    if not api_url:
+        return ""
+    sanitized = api_url.rstrip("/")
+    suffix = "/chat/completions"
+    if sanitized.endswith(suffix):
+        sanitized = sanitized[: -len(suffix)]
+    if not sanitized.endswith("/openai/v1"):
+        parts = sanitized.split("/openai/v1", 1)
+        base = parts[0] if len(parts) > 1 else sanitized
+        return f"{base.rstrip('/')}/openai/v1/models"
+    return f"{sanitized}/models"
 
 
 def _probe_ollama(settings) -> bool:

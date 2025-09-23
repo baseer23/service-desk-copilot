@@ -19,6 +19,7 @@ def test_health_returns_status_and_provider(monkeypatch, make_client, tmp_path):
     monkeypatch.setattr(main, "_probe_ollama", lambda *_: False, raising=False)
     monkeypatch.setattr(main, "_probe_llamacpp", lambda *_: False, raising=False)
     monkeypatch.setattr(main, "_probe_neo4j", lambda *_: False, raising=False)
+    monkeypatch.setattr(main, "_probe_hosted", lambda *_: False, raising=False)
     monkeypatch.setattr(main, "_vector_store_state", lambda *_: (str(tmp_path / "chroma"), True), raising=False)
 
     try:
@@ -30,6 +31,15 @@ def test_health_returns_status_and_provider(monkeypatch, make_client, tmp_path):
     body = response.json()
     assert body["status"] == "ok"
     assert body["provider"] == "stub"
+    assert body["provider_type"] == "stub"
+    assert body["model_name"] == "stub"
+    assert body["provider_vendor"] is None
+    assert body["local_model_available"] is False
+    assert body["operator_message"].startswith("Stub provider active")
+    assert body["hosted_reachable"] is None
+    assert isinstance(body["preferred_local_models"], list)
+    assert "phi3:mini" in body["preferred_local_models"]
+    assert body["hosted_model_name"] == "llama-3.1-8b-instant"
 
 
 def test_ask_returns_stub_answer(make_client, tmp_path):

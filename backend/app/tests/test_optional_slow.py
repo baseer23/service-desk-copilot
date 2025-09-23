@@ -72,7 +72,7 @@ def test_provider_ollama_live(make_client, tmp_path):  # pragma: no cover - slow
     client = make_client(
         {
             "MODEL_PROVIDER": "ollama",
-            "MODEL_NAME": os.getenv("MODEL_NAME", "llama3:8b"),
+            "MODEL_NAME": os.getenv("MODEL_NAME", "phi3:mini"),
             "CHROMA_DIR": tmp_path / "chroma",
             "EMBED_PROVIDER": "stub",
         }

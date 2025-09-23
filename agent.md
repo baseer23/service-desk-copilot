@@ -6,20 +6,26 @@ This document is the authoritative, self-contained map of the codebase. It enume
 ```
 .
 ├─ LICENSE                                  # Proprietary notice
-├─ Makefile                                  # make dev|slm|fmt|test|compose-*|ingest-sample
+├─ Makefile                                  # make dev|slm|fmt|test|compose-*|ingest-sample|bench-air
 ├─ agent.md                                  # You are here (repo snapshot)
 ├─ docker-compose.yml                        # Neo4j (APOC-enabled) service definition
 ├─ requirements.txt                          # Backend + tooling Python deps
 ├─ docs/
 │  ├─ README.md                              # High-level project overview & setup
-│  └─ RAG.md                                 # ASCII diagram of ingestion + retrieval flow
+│  ├─ RAG.md                                 # ASCII diagram of ingestion + retrieval flow
+│  └─ mac-air-runbook.md                     # Operator guidance for MacBook Air tiers
 ├─ logs/
 │  └─ .gitkeep                               # Ensures logs/ exists in git
 ├─ scripts/
 │  ├─ dev.sh                                 # Launch uvicorn + Vite with cleanup trap
 │  ├─ start_slm.sh                           # Helper to start Ollama or llama.cpp locally
+│  ├─ mac_air_check.py                       # Mac Air latency benchmark (local vs hosted)
 │  └─ neo4j/
 │     └─ 00_constraints.cypher               # Neo4j schema bootstrap (constraints/index)
+├─ templates/
+│  ├─ tier-a-mac-air.env                     # Tier A: MacBook Air local defaults (Phi 3 Mini)
+│  ├─ tier-b-hosted-hybrid.env               # Tier B: Hosted Groq with local embeddings
+│  └─ tier-c-budget-cloud.env                # Tier C: TinyLlama on a budget cloud host
 ├─ backend/
 │  ├─ __init__.py
 │  ├─ logging.ini                            # Rotating file + console logging config
@@ -37,7 +43,7 @@ This document is the authoritative, self-contained map of the codebase. It enume
 │     │  ├─ __init__.py
 │     │  ├─ dto.py                           # Pydantic request/response models
 │     │  ├─ provider.py                      # LocalModelProvider ABC
-│     │  ├─ provider_factory.py              # get_provider() dispatcher (stub/ollama/llama.cpp)
+│     │  ├─ provider_factory.py              # select_provider(): auto/local/hosted/stub chooser
 │     │  ├─ provider_llamacpp.py             # llama.cpp REST client with fallbacks
 │     │  ├─ provider_ollama.py               # Ollama REST client with fallbacks
 │     │  └─ provider_stub.py                 # Deterministic stub provider (DEFAULT_STUB_ANSWER)
@@ -90,21 +96,22 @@ This document is the authoritative, self-contained map of the codebase. It enume
 ### Provider Matrix
 | Provider | Text Gen Endpoint | Embeddings | Default |
 | --- | --- | --- | --- |
-| stub | n/a (deterministic text) | Stub embedding provider | ✅ |
+| auto | Selects Ollama Phi 3 Mini → TinyLlama fallback | Sentence-transformers (local) | ✅ |
+| stub | n/a (deterministic text) | Stub embedding provider |  |
 | ollama | `POST {OLLAMA_HOST}/api/generate` | `POST {OLLAMA_HOST}/api/embeddings` (falls back to sentence-transformers, then stub) |  |
 | llamacpp | `POST {LLAMACPP_HOST}/completion` | Sentence-transformers (falls back to stub) |  |
 
 ### 2.1 Application entry (`backend/app/main.py`)
 - Initializes logging from `backend/logging.ini`, falls back to `logging.basicConfig` when missing.
 - Global constants: `MAX_BODY_BYTES = 1 MiB` for `/ask` and `MAX_INGEST_BYTES = 5 MiB` for ingest endpoints.
-- On import, builds the `FastAPI` instance, applies CORS (from `Settings.allowed_origins`), and seeds `app.state` with in-memory vector/graph stores plus the current provider returned by `get_provider(SETTINGS)`.
-- Startup handler refreshes settings (`get_settings()`), reinitialises the vector store (`VectorChromaStore` → `InMemoryVectorStore` fallback), graph repo (`GraphRepository` with constraint bootstrap → `InMemoryGraphRepository` fallback), and provider, storing the active Neo4j driver on `app.state.graph_driver` for shutdown.
+- On import, builds the `FastAPI` instance, applies CORS (from `Settings.allowed_origins`), and seeds `app.state` with in-memory vector/graph stores plus the provider context returned by `select_provider(SETTINGS)` (prefers Phi 3 Mini, falls back to TinyLlama, otherwise stub).
+- Startup handler refreshes settings (`get_settings()`), reinitialises the vector store (`VectorChromaStore` → `InMemoryVectorStore` fallback), graph repo (`GraphRepository` with constraint bootstrap → `InMemoryGraphRepository` fallback), and provider context, storing the active Neo4j driver on `app.state.graph_driver` for shutdown.
 - Shutdown handler closes the Neo4j driver when present.
 - Middleware:
   - `enforce_body_limit` gates POST sizes on `/ask` and `/ingest/paste`. Checks `Content-Length` if provided; otherwise buffers body once and re-attaches it (`request._body`). Returns HTTP 413 on overflow.
   - `log_requests` logs `<METHOD> <PATH> -> <status>` for every response.
 - Endpoints:
-  - `GET /health`: returns the provider reported by the active adapter plus reachability booleans (`ollama_reachable`, `llamacpp_reachable`, `neo4j_reachable`) and vector store path metadata (`vector_store_path`, `vector_store_path_exists`). Failures never raise—probes are wrapped in try/except.
+  - `GET /health`: returns the provider name, provider type (`local` / `hosted` / `stub`), active model, vendor (for hosted Groq), whether a small local model is available, the operator-facing reason string, hosted reachability flag, preferred local model list, reachability booleans (`ollama_reachable`, `llamacpp_reachable`, `neo4j_reachable`), and vector store path metadata. Failures never raise—probes are wrapped in try/except.
   - `POST /ingest/paste` (response model `IngestPasteResponse`): rejects payload over 5 MiB, builds `IngestService` with `_safe_embedding_provider` (falls back to `StubEmbeddingProvider` with a warning) and the live vector/graph stores. Calls `ingest_text(title, text)`.
   - `POST /ingest/pdf` (response model `IngestPdfResponse`): accepts `application/pdf` or `application/octet-stream`; size-protects; reads binary, feeds to `IngestService.ingest_pdf`. Wraps pdfminer errors in HTTP 400 with message.
   - `POST /ask` (response model `AskResponse`):
@@ -112,12 +119,12 @@ This document is the authoritative, self-contained map of the codebase. It enume
     - Chooses `top_k`: payload `top_k` > plan `top_k` > `Settings.top_k`.
     - Instantiates `Retriever` with the current stores + embedding provider.
     - Branches on plan mode: `GRAPH` -> graph search fallback to vector; `HYBRID` -> `Retriever.hybrid_search`; default -> vector search.
-    - `Responder` uses the provider stored on `app.state` (stub/Ollama/llama.cpp). When the provider raises, the response body is prefixed with `“Local model unavailable; falling back to stub. …”` and the deterministic stub answer.
+    - `Responder` uses the provider stored on `app.state` (stub/Ollama/llama.cpp/Groq). When the provider raises, the response body is prefixed with `“Model provider unavailable; falling back to stub. …”` and the deterministic stub answer.
 - SPA mounting: if `frontend/dist` exists at runtime, mounts `/` to `SpaStaticFiles`. Custom subclass returns `index.html` fallback for unknown paths, enabling client-side routing.
 
 ### 2.2 Configuration (`backend/app/core/config.py`)
 - `Settings` extends `BaseSettings` with `.env` support and default values:
-  - `app_name`, `allowed_origins` (comma string parsed to list), log directory, provider options (`model_provider`, `model_name=llama3:8b`, `model_timeout_sec`), embedding options, and host URLs (`ollama_host=http://localhost:11434`, `llamacpp_host=http://localhost:8080`).
+  - `app_name`, `allowed_origins` (comma string parsed to list), log directory, provider options (`model_provider=auto`, `model_name=phi3:mini`, `model_timeout_sec`), embedding options (`embed_provider=sentence`, `ollama_embed_model=nomic-embed-text`), hosted knobs (`hosted_model_name=llama-3.1-8b-instant`, `groq_api_url`, optional `groq_api_key`), and host URLs (`ollama_host=http://localhost:11434`, `llamacpp_host=http://localhost:8080`).
   - Graph defaults: `neo4j_uri=bolt://localhost:7687`, credentials `neo4j/neo4j` (aligns with docker-compose `neo4j:5.25.1`), `chroma_dir=store/chroma`.
   - RAG controls: `top_k=6`, `chunk_tokens=512`, `chunk_overlap=64`.
 - Validators enforce lowercase provider names and non-negative/positive numeric constraints.
@@ -184,7 +191,7 @@ This document is the authoritative, self-contained map of the codebase. It enume
 - `provider_stub.py`: returns `DEFAULT_STUB_ANSWER` for deterministic results/testing and reports `name()='stub'`.
 - `provider_ollama.py`: HTTP POST to `{OLLAMA_HOST}/api/generate`, strict JSON parsing; raises `RuntimeError` on non-200 or malformed payloads so the responder can warn and fall back.
 - `provider_llamacpp.py`: HTTP POST to `{LLAMACPP_HOST}/completion`, supports common response shapes (`content`, `text`, OpenAI-like `choices`). Raises `RuntimeError` when the request or payload fails.
-- `provider_factory.py`: `get_provider(settings: Settings)` dispatches to the correct adapter (ollama / llama.cpp / stub) honouring `settings.model_timeout_sec` and host URLs.
+- `provider_factory.py`: `select_provider(settings)` inspects the environment and available Ollama models, preferring Phi 3 Mini then TinyLlama, otherwise returning a stub fallback. Supports explicit `ollama`, `llamacpp`, or Groq hosted providers and surfaces metadata (`provider_type`, `model_name`, `vendor`, human-readable reason). A compatibility `get_provider()` still returns the underlying adapter.
 
 ### 2.8 Logging
 - `backend/logging.ini` configures root + `service-desk` logger to use rotating file handler `logs/app.log` (1 MiB, 3 backups) plus console STDOUT handler with uniform formatter `%Y-%m-%d ...`.
@@ -194,20 +201,24 @@ This document is the authoritative, self-contained map of the codebase. It enume
 - Central React component that coordinates ingest UI, chat thread, and sidebar state.
 - Constants: `API_BASE = import.meta.env.VITE_API_BASE ?? window.location.origin`.
 - Defines typed responses `AskResponse`, `IngestResult`, and `HealthResponse` to mirror backend schemas.
-- Local state slices: messages array (`Message` type with pending/error flags + citations), ingest mode toggle (`paste` or `pdf`), paste form fields, selected PDF `File`, ingest status and error, loading spinner, recent questions (last five unique), health status/error banner, and a reference to the scroll container.
-- `useEffect` issues a one-shot fetch to `/health`; on success it surfaces the provider and reachability flags, on failure it sets a banner (`Backend <API_BASE> not reachable — run make dev`). The header renders a pill summarising the provider name.
+- Local state slices: messages array (`Message` type with pending/error flags + citations), ingest mode toggle (`paste` or `pdf`), paste form fields, selected PDF `File`, index status/error records, the latest `indexedSource` metadata (title, chunk/vector counts, original payload reference), loading flag, recent questions (last five unique), health status/error banner, memoised provider pill text, derived operator notes, and a reference to the scroll container.
+- `useEffect` issues a one-shot fetch to `/health`; on success it captures provider type/model/vendor, preferred local models, and reachability probes, otherwise sets a banner instructing to run `make dev`. The header pill now reads `Provider · <type> · <model>` (hosted types collapse to `api`, unknowns fall back to `unknown`) and the stacked notes explain why that tier is active or if hosted reachability failed.
 - `postJSON` helper handles fetch, raising `Error(detail)` on non-200 responses.
 - `handleAsk` pipeline: append user message + placeholder assistant bubble, update recent questions, set loading, call `/ask` with `question`. On success patch placeholder with full answer text, citations, metadata (planner, latency, confidence). On failure, show error bubble instructing to ensure backend is running. Always scroll to bottom.
-- `handlePasteIngest` posts to `/ingest/paste` with title fallback (`Untitled Paste`), resets paste text, surfaces error messages. `handlePdfIngest` builds `FormData`, posts to `/ingest/pdf`, resets file on success.
-- Layout renders ingest panel (tabs, forms, ingest results, errors), main chat panel (thread + composer), sidebar (recent questions list and last assistant answer card). Buttons disable while `loading`.
+- `handleRecentQuestionClick` pushes the stored prompt back through `handleAsk`, so re-clicking history items replays the request without duplicating whitespace.
+- `lastAnswerSummary` condenses the most recent assistant reply to the first sentence (≤110 chars) for the sidebar card, and `lastAnswerSourceTitle` prefers the first titled citation (defaulting to `Untitled`).
+- `handlePasteIngest` trims input, falls back to the title `Untitled`, posts to `/ingest/paste`, and captures the response as both `indexStatus` and an `indexedSource` snapshot (title, chunk/vector counts, original paste) before clearing the form fields. Errors surface through `indexError` with copy “Failed to index …”.
+- `handlePdfIngest` requires a selected file, posts `FormData` to `/ingest/pdf`, records the result in `indexStatus/indexedSource`, clears the file selector, and mirrors the same error handling copy. Both ingest paths reuse `handleIngest` dispatcher.
+- Auxiliary helpers: `clearIngestForm` wipes all ingest state (title, paste, file, status/error) and `viewIndexedSource` opens a blob URL for the last indexed content (text blob or original PDF) in a new tab, revoking the URL shortly after.
+- Layout renders the tightened header (title `DeskMate`, subtitle “A service desk copilot”, tagline “Ingest docs. Ask with citations.”) with the provider pill + operator notes stack and a `New thread` control. Below sits the `Knowledge ingestion` card (mode tabs, inline success banner highlighting vectors stored locally + `View source`, error banner with `Retry`, primary `Upload and index` button, subtle `Clear` button, sentence-case labels). Main grid combines the chat panel and sidebar; the sidebar now shows an empty-state prompt with MFA/ticket examples, a `Clear history` link button, and a `Last answer` card that surfaces the single-line summary + `From: <title>` metadata. Buttons disable while `loading`.
 
 ### 3.2 Components
-- `Composer.tsx`: Controlled textarea with auto-height adjustments via `useEffect`. Intercepts Enter vs Shift+Enter to call `onSend` (awaited). Resets input and refocuses after send.
-- `MessageBubble.tsx`: Renders message bubble with class modifiers for role/pending/error. For assistant messages, toggles citations list with `showCitations` state, listing `[doc_id:chunk_id] Title` and snippet when available.
+- `Composer.tsx`: Controlled textarea with auto-height adjustments via `useEffect`. Placeholder reads “Ask anything about your service desk workflow”. Intercepts Enter vs Shift+Enter to call `onSend` (awaited), then resets input/refocuses. The primary button stays labelled `Ask` (with aria-label matching) and simply disables while a request is pending.
+- `MessageBubble.tsx`: Renders role-tagged bubbles with avatars (“U” and “D”), a single-line shimmer for pending replies (with screen-reader-only text), and error styling. Assistant messages disinfect their copy to drop boilerplate sentences such as “This information can be found at …” and strip inline `doc_id`/`chunk_id` tokens before display/copy. The toolbar offers `Copy answer` plus `Show/Hide citations`, and the citation chips quote up to 120 characters alongside the title. Clicking a chip copies the raw `doc_id:chunk_id` (surfaced via tooltip); expanding the drawer adds “Copy quote” / “Copy source ID” buttons per citation alongside relevance metadata.
 
 ### 3.3 Bootstrapping & Styling
 - `main.tsx`: Standard React 18 `createRoot` + `React.StrictMode` entry.
-- `styles.css`: Defines glassmorphism theme, layout grid, responsive breakpoints, bubble styling, composer, sidebar, etc. Uses CSS variables for colors, responsive adjustments under 920px (single-column) and 640px (mobile).
+- `styles.css`: Establishes a unified spacing scale (`--space-unit`), consistent card radius/shadows (with hover lift), visible focus rings, inline success/error banners, link/quiet/primary button treatments, avatar + skeleton styles, and responsive tweaks (grid collapses <920px, mobile padding <640px) on top of the glassmorphism palette.
 - `index.html`: Loads Google Fonts (Inter), sets root `<div id="root">`, includes module script `/src/main.tsx`.
 - Tooling config: `vite.config.ts` adds React plugin, sets dev/preview port 5173; `tsconfig.json` uses strict compiler options, bundler module resolution.
 
@@ -234,7 +245,9 @@ This document is the authoritative, self-contained map of the codebase. It enume
   - `make test`: Pytest suite.
   - `make compose-up/down`: manage Docker Compose Neo4j service.
   - `make ingest-sample`: Curl helper to seed sample ingest payload.
-- **scripts/start_slm.sh**: Auto-detects `ollama` CLI; starts `ollama serve` if not running (logs to `logs/ollama.log`); if `LLAMACPP_BIN` set and executable plus `MODEL_PATH`, launches llama.cpp server on port 8080 (logs to `logs/llamacpp.log`). Emits guidance when neither provider available.
+  - `make bench-air`: Compares local vs hosted latency and writes `logs/mac-air-check.txt`.
+- **scripts/start_slm.sh**: Auto-detects `ollama` CLI; starts `ollama serve` if not running (logs to `logs/ollama.log`); if `LLAMACPP_BIN` set and executable plus `MODEL_PATH`, launches llama.cpp server on port 8080 (logs to `logs/llamacpp.log`). Prefers Phi 3 Mini, falls back to TinyLlama, and prints the active selection or instructions when neither model is available.
+- **scripts/mac_air_check.py**: Sends a short prompt to the active local model and the Groq hosted model, records latency stats, and writes `logs/mac-air-check.txt`. Exposed via `make bench-air`.
 - **docker-compose.yml**: Only Neo4j service enabled by default (ports 7474/7687, heaps 512-1024 MiB, APOC plugin, healthcheck). Binds host state to `~/Documents/service-desk-copilot/neo4j/{data,logs,plugins}`. Ollama service provided as commented template.
 
 ## 6. Data, Logs, and Runtime Directories
@@ -266,7 +279,7 @@ This document is the authoritative, self-contained map of the codebase. It enume
    - Missing Chroma path: warns and uses in-memory vector store (no persistence, simple list search).
    - Missing Neo4j driver or connectivity: warns and uses in-memory graph store (dict-backed, functional for tests/dev but ephemeral).
    - Missing embeddings provider: `_safe_embedding_provider` logs warning and falls back to deterministic stub embeddings.
-   - Provider HTTP errors/timeouts: Ollama/llama.cpp adapters raise `RuntimeError`; the responder logs the failure and returns the stub answer prefixed with `"Local model unavailable; falling back to stub."` while still reporting the original provider.
+  - Provider HTTP errors/timeouts: Ollama/llama.cpp/Groq adapters raise `RuntimeError`; the responder logs the failure and returns the stub answer prefixed with `"Model provider unavailable; falling back to stub."` while still reporting the original provider.
    - PDF extraction issues: bubbled as HTTP 400 with reason.
 
 ## 9. Rebuilding the Project
@@ -306,7 +319,7 @@ This document is the authoritative, self-contained map of the codebase. It enume
 ## 12. Future Extension Points
 - `backend/app/api/__init__.py` reserved for modular routers (currently unused).
 - Add more embedding providers by extending `EmbeddingProvider` protocol and wiring `get_embedding_provider`.
-- Frontend citations currently display raw chunk text; consider adding highlight or doc titles when available.
+- Citation chips already quote and title each source; future polish could include inline highlighting inside the answer body or grouping long citation lists.
 - For production, add persistence for chat history and authentication gates.
 
 Keep this file in sync after any structural or behavioural change so that it remains a ground-truth reconstruction guide.

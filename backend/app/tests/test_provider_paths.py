@@ -9,7 +9,7 @@ import requests
 
 from backend.app.core.config import DEFAULT_STUB_ANSWER
 
-FALLBACK_PREFIX = "Local model unavailable; falling back to stub. "
+FALLBACK_PREFIX = "Model provider unavailable; falling back to stub. "
 
 
 def _call_ask(client, question: str = "hello") -> Dict[str, Any]:
@@ -39,7 +39,7 @@ def test_stub_provider_path(make_client, tmp_path):
 def test_ollama_provider_success(monkeypatch, make_client, tmp_path):
     payload = {
         "MODEL_PROVIDER": "ollama",
-        "MODEL_NAME": "llama3:8b",
+        "MODEL_NAME": "phi3:mini",
         "EMBED_PROVIDER": "stub",
         "CHROMA_DIR": tmp_path / "chroma",
     }
@@ -74,7 +74,7 @@ def test_ollama_provider_success(monkeypatch, make_client, tmp_path):
 def test_ollama_provider_failure_falls_back(monkeypatch, make_client, tmp_path):
     payload = {
         "MODEL_PROVIDER": "ollama",
-        "MODEL_NAME": "llama3:8b",
+        "MODEL_NAME": "phi3:mini",
         "EMBED_PROVIDER": "stub",
         "CHROMA_DIR": tmp_path / "chroma",
     }

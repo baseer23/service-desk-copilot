@@ -44,8 +44,8 @@ export default function Composer({ onSend, disabled }: Props) {
         aria-label="Message input"
         disabled={disabled}
       />
-      <button className="composer-send" type="button" onClick={submit} disabled={disabled}>
-        {disabled ? 'Thinking…' : 'Ask'}
+      <button className="composer-send" type="button" onClick={submit} disabled={disabled} aria-label="Ask">
+        Ask
       </button>
     </div>
   )
