@@ -15,7 +15,8 @@ class OllamaProvider(LocalModelProvider):
         s = get_settings()
         self.model = model or s.model_name
         self.timeout = timeout_sec or s.model_timeout_sec
-        self.base_url = "http://localhost:11434/api/generate"
+        host = getattr(s, "ollama_host", "http://localhost:11434")
+        self.base_url = f"{host.rstrip('/')}/api/generate"
 
     def generate(self, prompt: str) -> str:
         payload: Dict[str, Any] = {
@@ -36,4 +37,3 @@ class OllamaProvider(LocalModelProvider):
         except Exception as e:
             logger.warning("Ollama generate failed: %s", e)
             return DEFAULT_STUB_ANSWER
-

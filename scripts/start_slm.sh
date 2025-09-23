@@ -1,62 +1,39 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Start a local small language model (SLM) provider if available.
-# Priority: Ollama -> llama.cpp server -> instructions.
-
-MODEL_NAME=${MODEL_NAME:-tinyllama}
 LOG_DIR=${LOG_DIR:-logs}
 mkdir -p "$LOG_DIR"
 
-info()  { echo "[slm] $*"; }
-warn()  { echo "[slm][warn] $*"; }
+info()  { printf '[slm] %s\n' "$*"; }
+warn()  { printf '[slm][warn] %s\n' "$*"; }
 
 if command -v ollama >/dev/null 2>&1; then
-  info "Ollama CLI found. Ensuring 'ollama serve' is running..."
+  info "Detected Ollama CLI." 
   if ! pgrep -f "ollama serve" >/dev/null 2>&1; then
+    info "Starting 'ollama serve' in the background..."
     nohup ollama serve >"$LOG_DIR/ollama.log" 2>&1 &
-    info "Started ollama serve (logs: $LOG_DIR/ollama.log). Waiting a moment..."
     sleep 2
   else
-    info "ollama serve already running."
+    info "'ollama serve' already running."
   fi
-
-  # Check models and pull if missing
-  if ! ollama list | awk '{print $1}' | grep -q "^${MODEL_NAME}$"; then
-    info "Model '${MODEL_NAME}' not found. Pulling..."
-    if ollama pull "${MODEL_NAME}"; then
-      info "Model '${MODEL_NAME}' pulled successfully."
-    else
-      warn "Failed to pull model '${MODEL_NAME}'. You can try a different MODEL_NAME."
-    fi
-  else
-    info "Model '${MODEL_NAME}' already available."
-  fi
-
-  info "Ollama ready on http://localhost:11434 (model: ${MODEL_NAME})."
+  info "You can pull a model with: ollama pull \"${MODEL_NAME:-tinyllama}\""
   exit 0
 fi
 
-# Fallback: llama.cpp server
-LLAMACPP_BIN=${LLAMACPP_BIN:-""}
-if [[ -z "$LLAMACPP_BIN" && -x ./llama.cpp ]]; then
-  LLAMACPP_BIN=./llama.cpp
-fi
-
+LLAMACPP_BIN=${LLAMACPP_BIN:-}
+MODEL_PATH=${MODEL_PATH:-}
 if [[ -n "$LLAMACPP_BIN" ]]; then
-  if [[ -z "${MODEL_PATH:-}" ]]; then
-    warn "LLAMACPP_BIN is set but MODEL_PATH not provided. Set MODEL_PATH to your .gguf model file."
-    warn "Example: MODEL_PATH=./models/your-model.gguf $0"
+  if [[ ! -x "$LLAMACPP_BIN" ]]; then
+    warn "LLAMACPP_BIN is set but not executable: $LLAMACPP_BIN"
+  elif [[ -z "$MODEL_PATH" ]]; then
+    warn "Provide MODEL_PATH to launch llama.cpp server."
+  else
+    info "Starting llama.cpp server on :8080..."
+    nohup "$LLAMACPP_BIN" -m "$MODEL_PATH" --port 8080 --host 127.0.0.1 >"$LOG_DIR/llamacpp.log" 2>&1 &
     exit 0
   fi
-  info "Starting llama.cpp server on :8080 using $LLAMACPP_BIN"
-  nohup "$LLAMACPP_BIN" -m "$MODEL_PATH" --port 8080 --host 127.0.0.1 >"$LOG_DIR/llamacpp.log" 2>&1 &
-  info "llama.cpp server started (logs: $LOG_DIR/llamacpp.log)."
-  exit 0
 fi
 
-warn "No local SLM provider found. Install Ollama for easiest setup:"
-warn "  brew install ollama && ollama run ${MODEL_NAME}"
-warn "Then run: make slm"
+warn "No local SLM detected. Install Ollama (https://ollama.ai) for the quickest setup."
+warn "Alternatively, export LLAMACPP_BIN and MODEL_PATH to start a llama.cpp server."
 exit 0
-

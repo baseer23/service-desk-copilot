@@ -1,0 +1,32 @@
+services:
+  neo4j:
+    image: neo4j:5.25.1
+    container_name: service-desk-neo4j
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-neo4j}
+      NEO4J_dbms_memory_heap_initial__size: 512m
+      NEO4J_dbms_memory_heap_max__size: 1024m
+      NEO4J_PLUGINS: '["apoc"]'
+    volumes:
+      - ~/Documents/service-desk-copilot/neo4j/data:/data
+      - ~/Documents/service-desk-copilot/neo4j/logs:/logs
+      - ~/Documents/service-desk-copilot/neo4j/plugins:/plugins
+      - ./scripts/neo4j:/bootstrap
+    healthcheck:
+      test: ["CMD", "neo4j", "status"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Uncomment to run Ollama in Docker once you're ready for a local model
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   container_name: service-desk-ollama
+  #   ports:
+  #     - "11434:11434"
+  #   volumes:
+  #     - ./store/ollama:/root/.ollama
+  #   restart: unless-stopped

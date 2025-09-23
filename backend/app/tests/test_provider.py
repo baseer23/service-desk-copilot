@@ -1,41 +1,36 @@
-import os
-import socket
-
-from starlette.testclient import TestClient
+import pytest
+from fastapi.testclient import TestClient
 
 
-def is_port_open(host: str, port: int) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(0.2)
-        try:
-            s.connect((host, port))
-            return True
-        except Exception:
-            return False
-
-
-def test_ask_stub_provider(monkeypatch):
+@pytest.fixture()
+def client(monkeypatch):
     monkeypatch.setenv("MODEL_PROVIDER", "stub")
-    from backend.app.main import app  # import after env set
-
-    client = TestClient(app)
-    r = client.post("/ask", json={"question": "test"})
-    assert r.status_code == 200
-    data = r.json()
-    assert data["answer"] == "hi, this was a test you pass"
-    assert data["provider"] == "stub"
-
-
-def test_provider_field_if_ollama_available(monkeypatch):
-    if not is_port_open("127.0.0.1", 11434):
-        return  # skip if ollama not reachable locally
-    monkeypatch.setenv("MODEL_PROVIDER", "ollama")
-    monkeypatch.setenv("MODEL_TIMEOUT_SEC", "3")
     from backend.app.main import app
 
-    client = TestClient(app)
-    r = client.post("/ask", json={"question": "Hello"})
-    assert r.status_code == 200
-    data = r.json()
-    assert data["provider"] == "ollama"
+    return TestClient(app)
 
+
+def test_health_returns_status_and_provider(client):
+    response = client.get("/health")
+    assert response.status_code == 200
+    body = response.json()
+    assert body == {"status": "ok", "provider": "stub"}
+
+
+def test_ask_returns_stub_answer(client):
+    payload = {"question": "hello"}
+    response = client.post("/ask", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["answer"] == "hi, this was a test you pass"
+    assert body["provider"] == "stub"
+    assert body["question"] == "hello"
+    assert "citations" in body
+    assert isinstance(body["citations"], list)
+
+
+def test_ask_rejects_payload_over_one_megabyte(client):
+    big_question = "a" * (1024 * 1024 + 1)
+    response = client.post("/ask", json={"question": big_question})
+    assert response.status_code == 413
+    assert response.json()["detail"] == "Payload too large"

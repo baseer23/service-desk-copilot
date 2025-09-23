@@ -1,68 +1,283 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react'
+import React, { useMemo, useRef, useState } from 'react'
 import Composer from './components/Composer'
-import MessageBubble, { Message } from './components/MessageBubble'
+import MessageBubble, { Citation, Message } from './components/MessageBubble'
 
-const TEST_REPLY = 'hi, this was a test you pass'
+const API_BASE = import.meta.env.VITE_API_BASE ?? (typeof window !== 'undefined' ? window.location.origin : '')
+
+type AskResponse = {
+  answer: string
+  provider: string
+  question: string
+  citations: Citation[]
+  planner: Record<string, unknown>
+  latency_ms: number
+  confidence: number
+}
+
+type IngestResult = {
+  chunks: number
+  entities: number
+  vector_count: number
+  ms: number
+  pages?: number
+}
+
+const INITIAL_PROMPT = "Ask a question about your service desk docs to see answers with citations."
+
+async function postJSON<T>(url: string, body: unknown): Promise<T> {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!response.ok) {
+    const detail = await response.json().catch(() => ({ detail: response.statusText || 'Unexpected error' }))
+    throw new Error(detail.detail ?? response.statusText)
+  }
+  return response.json() as Promise<T>
+}
 
 export default function App() {
   const [messages, setMessages] = useState<Message[]>([])
   const [loading, setLoading] = useState(false)
-  const [lastAssistant, setLastAssistant] = useState<string | null>(null)
+  const [recentQuestions, setRecentQuestions] = useState<string[]>([])
+  const [ingestMode, setIngestMode] = useState<'paste' | 'pdf'>('paste')
+  const [pasteTitle, setPasteTitle] = useState('')
+  const [pasteText, setPasteText] = useState('')
+  const [pdfFile, setPdfFile] = useState<File | null>(null)
+  const [ingestStatus, setIngestStatus] = useState<IngestResult | null>(null)
+  const [ingestError, setIngestError] = useState<string | null>(null)
   const threadRef = useRef<HTMLDivElement | null>(null)
 
-  // Restore last assistant reply for Speak
-  useEffect(() => {
-    const stored = localStorage.getItem('lastAssistantReply')
-    if (stored) {
-      setMessages([{ id: 'init-assistant', role: 'assistant', text: stored }])
-      setLastAssistant(stored)
+  const lastAssistant = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      if (messages[i].role === 'assistant' && !messages[i].pending) {
+        return messages[i]
+      }
     }
-  }, [])
-
-  useEffect(() => {
-    // auto-scroll to bottom on new message
-    if (threadRef.current) {
-      threadRef.current.scrollTop = threadRef.current.scrollHeight
-    }
+    return null
   }, [messages])
 
-  const onSend = async (text: string, files: File[]) => {
-    setLoading(true)
-    const ts = Date.now()
-    setMessages((prev) => [
-      ...prev,
-      { id: `u-${ts}`, role: 'user', text, ts },
-      { id: `a-${ts}`, role: 'assistant', text: TEST_REPLY, ts: ts + 1 },
-    ])
-    localStorage.setItem('lastAssistantReply', TEST_REPLY)
-    setLastAssistant(TEST_REPLY)
-    setLoading(false)
+  const scrollToBottom = () => {
+    requestAnimationFrame(() => {
+      const node = threadRef.current
+      if (node) node.scrollTop = node.scrollHeight
+    })
   }
 
-  const speak = () => {
-    const toSpeak = lastAssistant || localStorage.getItem('lastAssistantReply')
-    if (!toSpeak || !('speechSynthesis' in window)) return
-    const u = new SpeechSynthesisUtterance(toSpeak)
-    window.speechSynthesis.cancel()
-    window.speechSynthesis.speak(u)
+  const handleAsk = async (text: string) => {
+    const trimmed = text.trim()
+    if (!trimmed) return
+
+    const timestamp = Date.now()
+    const userMessage: Message = { id: `u-${timestamp}`, role: 'user', text: trimmed }
+    const assistantPlaceholder: Message = {
+      id: `a-${timestamp}`,
+      role: 'assistant',
+      text: 'Thinking…',
+      pending: true,
+      citations: [],
+    }
+
+    setMessages((prev) => [...prev, userMessage, assistantPlaceholder])
+    setRecentQuestions((prev) => [trimmed, ...prev.filter((q) => q !== trimmed)].slice(0, 5))
+    setLoading(true)
+    scrollToBottom()
+
+    try {
+      const response = await postJSON<AskResponse>(`${API_BASE}/ask`, { question: trimmed })
+      setMessages((prev) =>
+        prev.map((message) =>
+          message.id === assistantPlaceholder.id
+            ? {
+                ...message,
+                text: response.answer,
+                pending: false,
+                citations: response.citations,
+                metadata: { planner: response.planner, latency: response.latency_ms, confidence: response.confidence },
+              }
+            : message,
+        ),
+      )
+    } catch (error) {
+      const fallback = error instanceof Error ? error.message : 'Request failed'
+      setMessages((prev) =>
+        prev.map((message) =>
+          message.id === assistantPlaceholder.id
+            ? {
+                ...message,
+                text: `I could not reach the backend (${fallback}). Please ensure it is running on port 8000.`,
+                pending: false,
+                error: true,
+              }
+            : message,
+        ),
+      )
+    } finally {
+      setLoading(false)
+      scrollToBottom()
+    }
+  }
+
+  const resetThread = () => {
+    setMessages([])
+  }
+
+  const handlePasteIngest = async () => {
+    setIngestError(null)
+    if (!pasteText.trim()) {
+      setIngestError('Provide some text to ingest.')
+      return
+    }
+    setIngestStatus(null)
+    try {
+      const result = await postJSON<IngestResult>(`${API_BASE}/ingest/paste`, {
+        title: pasteTitle || 'Untitled Paste',
+        text: pasteText,
+      })
+      setIngestStatus(result)
+      setPasteText('')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to ingest text'
+      setIngestError(message)
+    }
+  }
+
+  const handlePdfIngest = async () => {
+    setIngestError(null)
+    if (!pdfFile) {
+      setIngestError('Select a PDF file to upload.')
+      return
+    }
+    setIngestStatus(null)
+    const formData = new FormData()
+    formData.append('file', pdfFile)
+    try {
+      const response = await fetch(`${API_BASE}/ingest/pdf`, {
+        method: 'POST',
+        body: formData,
+      })
+      if (!response.ok) {
+        const detail = await response.json().catch(() => ({ detail: response.statusText || 'Unexpected error' }))
+        throw new Error(detail.detail ?? response.statusText)
+      }
+      const result = (await response.json()) as IngestResult
+      setIngestStatus(result)
+      setPdfFile(null)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to ingest PDF'
+      setIngestError(message)
+    }
+  }
+
+  const handleIngest = () => {
+    if (ingestMode === 'paste') {
+      handlePasteIngest()
+    } else {
+      handlePdfIngest()
+    }
   }
 
   return (
     <div className="app-page">
       <div className="app-container">
-        <div className="chat-panel">
-          <div className="chat-header">
-            DeskMate — GraphRAG Service Desk Pilot
+        <header className="chat-header">
+          <div>
+            <h1>Service Desk Copilot</h1>
+            <p>Hybrid GraphRAG playground. Ingest knowledge locally and ask questions with citations.</p>
           </div>
-          <div className="chat-thread" ref={threadRef}>
-            {messages.length === 0 && (
-              <div className="muted">Ask a question to get started.</div>
+          <button type="button" className="ghost" onClick={resetThread} disabled={loading}>
+            New thread
+          </button>
+        </header>
+
+        <section className="ingest-panel">
+          <div className="ingest-tabs">
+            <button
+              type="button"
+              className={ingestMode === 'paste' ? 'active' : ''}
+              onClick={() => setIngestMode('paste')}
+            >
+              Paste
+            </button>
+            <button
+              type="button"
+              className={ingestMode === 'pdf' ? 'active' : ''}
+              onClick={() => setIngestMode('pdf')}
+            >
+              PDF
+            </button>
+          </div>
+
+          {ingestMode === 'paste' ? (
+            <div className="ingest-form">
+              <input
+                type="text"
+                placeholder="Title (optional)"
+                value={pasteTitle}
+                onChange={(event) => setPasteTitle(event.target.value)}
+              />
+              <textarea
+                placeholder="Paste knowledge base text here..."
+                value={pasteText}
+                onChange={(event) => setPasteText(event.target.value)}
+              />
+            </div>
+          ) : (
+            <div className="ingest-form">
+              <input
+                type="file"
+                accept="application/pdf"
+                onChange={(event) => setPdfFile(event.target.files?.[0] ?? null)}
+              />
+              {pdfFile && <span className="file-chip">{pdfFile.name}</span>}
+            </div>
+          )}
+
+          <div className="ingest-actions">
+            <button type="button" onClick={handleIngest} disabled={loading}>
+              Ingest
+            </button>
+            {ingestStatus && (
+              <span className="ingest-result">
+                Chunks: {ingestStatus.chunks} • Entities: {ingestStatus.entities} • Vectors: {ingestStatus.vector_count}
+                {typeof ingestStatus.pages === 'number' ? ` • Pages: ${ingestStatus.pages}` : ''}
+              </span>
             )}
-            {messages.map((m) => (
-              <MessageBubble key={m.id} m={m} />
-            ))}
+            {ingestError && <span className="ingest-error">{ingestError}</span>}
           </div>
-          <Composer onSend={onSend} loading={loading} onSpeak={speak} lastAssistant={lastAssistant} />
+        </section>
+
+        <div className="main-content">
+          <div className="chat-panel">
+            <div className="chat-thread" ref={threadRef}>
+              {messages.length === 0 ? (
+                <div className="placeholder">{INITIAL_PROMPT}</div>
+              ) : (
+                messages.map((message) => <MessageBubble key={message.id} message={message} />)
+              )}
+            </div>
+            <Composer onSend={handleAsk} disabled={loading} />
+          </div>
+
+          <aside className="sidebar">
+            <h2>Recent questions</h2>
+            {recentQuestions.length === 0 ? (
+              <p className="muted">Ask something to see it appear here.</p>
+            ) : (
+              <ul>
+                {recentQuestions.map((question) => (
+                  <li key={question}>{question}</li>
+                ))}
+              </ul>
+            )}
+            {lastAssistant && (
+              <div className="sidebar-card">
+                <h3>Last answer</h3>
+                <p>{lastAssistant.text}</p>
+              </div>
+            )}
+          </aside>
         </div>
       </div>
     </div>
