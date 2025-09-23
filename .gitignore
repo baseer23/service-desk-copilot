@@ -14,3 +14,9 @@ logs/*
 
 # Build outputs
 frontend/dist/
+
+# Local development artifacts
+.env
+.venv/
+.vscode/
+store/chroma/

@@ -1,122 +1,52 @@
-# Service Desk Copilot — Agent Notes
+# Service Desk Copilot - Agent Notes
 
 ## Sprint 2 Snapshot
-- FastAPI backend now supports hybrid GraphRAG:
-  - `/ingest/paste` and `/ingest/pdf` chunk incoming content, embed via Ollama/sentence-transformers/stub, persist to Chroma (vectors) and Neo4j (graph).
-  - `/ask` performs planner → retrieval → answer synthesis, returning citations, planner metadata, latency, and confidence. Stub provider remains the default.
-- Optional local LLMs: Ollama (`MODEL_PROVIDER=ollama`) and llama.cpp (`MODEL_PROVIDER=llamacpp`). When unavailable the stub path keeps everything local and deterministic.
-- React frontend exposes an Ingest panel (Paste | PDF), real-time chat with citations, and a recent question sidebar. Conversation state is no longer persisted across refresh.
-- Tooling additions: Docker Compose launches Neo4j (`neo4j:5.25.1`, APOC enabled) with volumes rooted under `~/Documents/service-desk-copilot/neo4j` (Docker Desktop friendly) and an optional commented Ollama service; Makefile targets cover `compose-up`, `compose-down`, `ingest-sample`, plus the existing dev/fmt/test helpers.
+- FastAPI backend runs a full hybrid GraphRAG pipeline: ingestion endpoints chunk content, embed it, and persist to Chroma (vectors) plus Neo4j (document/chunk/entity graph) with in-memory fallbacks for offline work.
+- `/ask` executes planner -> retriever -> responder, returning grounded answers with citations, planner metadata, latency, and a heuristic confidence score. Stub responses stay deterministic for tests.
+- React frontend exposes a dual-mode ingest panel (Paste | PDF), a chat workspace with expandable citations, and a recent-question sidebar. Threads reset on refresh.
+- Tooling additions include Docker Compose for Neo4j (APOC-enabled), helper scripts for dev orchestration and local SLM startup, and Make targets for fmt/test/dev/compose/ingest-sample.
 
-## Repository Layout (updated)
-```
-.
-├── .editorconfig
-├── .env.example
-├── docker-compose.yml
-├── agent.md
-├── backend/
-│   ├── logging.ini
-│   └── app/
-│       ├── core/config.py
-│       ├── main.py
-│       ├── models/
-│       │   ├── dto.py
-│       │   ├── provider.py / factory / stub / ollama / llamacpp
-│       ├── adapters/embeddings.py
-│       ├── services/
-│       │   ├── chunking.py
-│       │   ├── entities.py
-│       │   └── ingest_service.py
-│       ├── store/
-│       │   ├── graph_repo.py
-│       │   └── vector_chroma.py
-│       ├── rag/
-│       │   ├── planner.py
-│       │   ├── retrieve.py
-│       │   └── answer.py
-│       └── tests/
-│           ├── test_answer.py
-│           ├── test_chunking.py
-│           ├── test_dto.py
-│           ├── test_embeddings.py
-│           ├── test_entities.py
-│           ├── test_graph_repo.py
-│           ├── test_ingest_integration.py (slow, optional)
-│           ├── test_ingest_service.py
-│           ├── test_planner.py
-│           ├── test_provider.py
-│           ├── test_retrieve.py
-│           └── test_vector_store.py
-├── docs/
-│   ├── README.md
-│   └── RAG.md
-├── frontend/
-│   ├── README.md
-│   ├── package.json
-│   ├── tsconfig.json
-│   ├── vite.config.ts
-│   └── src/
-│       ├── App.tsx
-│       ├── main.tsx
-│       ├── styles.css
-│       └── components/
-│           ├── Composer.tsx
-│           └── MessageBubble.tsx
-├── scripts/
-│   ├── dev.sh
-│   ├── start_slm.sh
-│   └── neo4j/00_constraints.cypher
-├── store/
-│   ├── .gitkeep
-│   └── chroma/ (created at runtime)
-└── Makefile
-```
+## Backend Overview
+- **App wiring (`backend/app/main.py`)**
+  - Configured once via `get_settings()`, sets CORS, logs requests, and enforces payload limits (1 MiB for `/ask`, 5 MiB for ingest endpoints).
+  - Startup initialises a persistent `VectorChromaStore` and `GraphRepository`; if Chroma, the neo4j driver, or connectivity is unavailable the API swaps to in-memory stores and logs the fallback.
+  - `/ingest/paste` validates body size, instantiates `IngestService`, and returns an `IngestPasteResponse`. `/ingest/pdf` accepts `application/pdf` or octet-stream uploads, extracts text with pdfminer, and reuses the text pipeline.
+  - `/ask` builds a planner with the active graph repo, derives `top_k`, executes vector/graph/hybrid retrieval as indicated, then calls the provider-backed responder. Graph/hybrid fall back to vector search when no results are found.
+  - `SpaStaticFiles` serves the built frontend (`frontend/dist`) while preserving SPA routing.
+- **Configuration (`backend/app/core/config.py`)**
+  - Pydantic `Settings` surface model, embedding, graph, and planner controls, normalising case and guarding positive integers. `get_settings()` ensures `logs/` and `store/chroma/` directories exist.
+- **Services**
+  - `chunking.py` approximates token counts and splits text based on env-driven `chunk_tokens` / `chunk_overlap` with sane bounds.
+  - `entities.py` prefers spaCy (`en_core_web_sm`) when available; otherwise falls back to regex heuristics while normalising entity names.
+  - `ingest_service.py` splits chunks, generates embeddings, upserts into Chroma, records documents/chunks/entities in Neo4j, links relationships, and reports elapsed time. PDF ingest counts pages via form-feed markers before delegating to text ingest.
+- **Embedding providers (`adapters/embeddings.py`)**
+  - Supports Ollama embeddings, sentence-transformers, and a deterministic stub. `auto` tries Ollama -> sentence-transformers -> stub and surfaces HTTP/installation errors as fallbacks.
+- **RAG components (`backend/app/rag`)**
+  - `Planner` extracts entities, queries graph degree, and chooses `GRAPH`, `VECTOR`, or `HYBRID` (graph threshold >=3). Sparse or empty graphs default to vector mode.
+  - `Retriever` performs vector search (Chroma), graph lookups (Neo4j entity-degree filtering), or hybrid intersection; empty results drop back to vector results.
+  - `Responder` composes a DeskMate prompt, calls the selected provider, and emits citations with snippets. Stub provider returns `DEFAULT_STUB_ANSWER` for hermetic testing.
+- **Stores (`backend/app/store`)**
+  - `VectorChromaStore` lazily creates a persistent collection and exposes `upsert`/`search`. `InMemoryVectorStore` offers a basic fallback list search.
+  - `GraphRepository` bootstraps Neo4j constraints, maintains document/chunk/entity nodes, associates relationships, and handles case-insensitive entity lookups. `InMemoryGraphRepository` mirrors the interface using dict/set storage.
 
-## Backend Notes
-- **Config (`core/config.py`)**
-  - Adds Neo4j (`neo4j_uri/user/password`), Chroma directory, embedding provider settings (`embed_provider`, `embed_model_name`, `ollama_embed_model`, `ollama_host`), and planner knobs (`top_k`, `chunk_tokens`, `chunk_overlap`).
-  - `get_settings()` now creates both `logs/` and `store/chroma` directories.
+## Frontend Overview (`frontend/src`)
+- `App.tsx` orchestrates ingest mode toggles, chat thread state, error handling, and API calls against `import.meta.env.VITE_API_BASE` (falls back to `window.location.origin`). Recent questions keep the latest five prompts.
+- `Composer.tsx` auto-resizes the textarea, intercepts Enter vs Shift+Enter, and delegates to the supplied `onSend` handler.
+- `MessageBubble.tsx` renders role-labelled bubbles, exposes expandable citations, and shows pending/error styling.
+- `styles.css` defines the glassmorphism layout, responsive two-column grid, and UI polish for ingest and chat surfaces.
 
-- **Ingestion (`services/ingest_service.py`)**
-  - `ingest_text` → `split_text` → embed → `VectorChromaStore.upsert` → `GraphRepository` upserts + entity linking → returns `IngestPasteResponse` (chunks/entities/vector_count/ms).
-  - `ingest_pdf` extracts text via pdfminer, tracks page count, reuses the text pipeline.
-  - `split_text` in `services/chunking.py` uses env-driven chunk/overlap sizes with deterministic token estimation.
+## Data, Storage, and Fallbacks
+- Vector data persists under `store/chroma`; Neo4j mounts to `~/Documents/service-desk-copilot/neo4j` when run via Docker Compose.
+- `logs/` captures backend and helper-script output (e.g. `scripts/start_slm.sh`).
+- Missing optional dependencies (neo4j driver, spaCy model, sentence-transformers, Ollama) all degrade gracefully to in-memory stores or stub providers while logging warnings.
 
-- **Graph & Vector stores**
-  - `GraphRepository` (Neo4j driver) + in-memory fallback for offline mode. Supports constraint bootstrap, document/chunk/entity upserts, relationship linking, and entity-degree queries.
-  - `VectorChromaStore` manages a persistent Chroma collection (`chunks`). `InMemoryVectorStore` fallback retains data in-memory when Chroma is unavailable.
+## Tooling & Operations
+- **docker-compose.yml** spins up Neo4j 5.25.1 with APOC and health checks; an Ollama service is ready to uncomment when needed.
+- **Make targets**: `make dev`, `make fmt`, `make test`, `make compose-up`, `make compose-down`, `make ingest-sample`.
+- **Scripts**: `scripts/dev.sh` starts uvicorn + Vite with a cleanup trap; `scripts/start_slm.sh` detects/starts Ollama or llama.cpp servers; `scripts/neo4j/00_constraints.cypher` is ready for additional graph bootstrapping.
 
-- **Planner / Retriever / Responder (`backend/app/rag`)**
-  - `Planner` extracts entities from the question, checks graph degree, and chooses GRAPH / VECTOR / HYBRID, returning reasons + `top_k`.
-  - `Retriever` performs vector search (Chroma), graph search (Neo4j), or hybrid filtering.
-  - `Responder` builds a prompt, queries the configured provider (stub | Ollama | llama.cpp), and emits an `AskResponse` with citations (including snippets), planner metadata, latency, and confidence.
+## Testing
+- Backend unit tests live in `backend/app/tests` and cover DTOs, chunking, embeddings, entities, RAG planner/retriever/answer flows, and vector/graph adapters. `test_ingest_integration.py` is marked slow/optional for end-to-end ingest coverage.
+- Use `make test` (pytest) and `make fmt` (Ruff/Black/Prettier) before pushing changes.
 
-- **Routes in `main.py`**
-  - Startup initialises vector store (Chroma with fallback) and graph repo (Neo4j with fallback) and caches them on `app.state`.
-  - `/ingest/paste` and `/ingest/pdf` instantiate `IngestService` per request, enforce payload limits (5 MiB for ingestion), and return DTO responses.
-  - `/ask` orchestrates plan → retrieve → answer. Body limit for questions remains 1 MiB.
-  - Graceful fallbacks: stub embeddings when Ollama/sentence-transformers unavailable; in-memory graph/vector stores if services are offline.
-
-## Frontend Notes
-- No more localStorage persistence—refreshing the page clears the thread.
-- Ingest panel (Paste | PDF) posts to `/ingest` endpoints and shows counts.
-- Chat messages include citations (expandable) and recent questions appear in a sidebar.
-- API base URL resolves from `import.meta.env.VITE_API_BASE` or falls back to `window.location.origin`.
-
-## Tooling
-- `docker-compose.yml` provisions Neo4j Community with APOC. Optional Ollama service commented out.
-- Make targets:
-  - `make dev` — uvicorn + Vite with cleanup trap.
-  - `make compose-up` / `make compose-down` — manage docker services.
-  - `make ingest-sample` — posts a sample document to `/ingest/paste`.
-  - `make fmt` — Ruff/Black/Prettier.
-  - `make test` — pytest suite (unit + optional slow integration).
-
-## RAG Flow Overview
-See `docs/RAG.md` for the ASCII diagram. High-level:
-1. **Ingest** → chunking → embeddings → Chroma + Neo4j.
-2. **Ask** → planner decides GRAPH/VECTOR/HYBRID → retriever gathers contexts → responder synthesizes answer with citations.
-3. Stub path remains deterministic; launching Ollama/llama.cpp upgrades the answer while keeping citations intact.
-
-Keep this file aligned with future changes so new prompts can rely on a single authoritative source.
+Keep these notes updated whenever the ingest flow, retrieval strategy, model providers, or developer tooling changes so that future prompts can rely on a single authoritative reference.
