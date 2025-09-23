@@ -39,7 +39,7 @@ body {
 .chat-header {
   display: flex;
   justify-content: space-between;
-  align-items: flex-end;
+  align-items: center;
   gap: 16px;
 }
 
@@ -52,6 +52,12 @@ body {
 .chat-header p {
   margin: 4px 0 0;
   color: var(--muted);
+}
+
+.chat-header .header-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
 }
 
 .chat-header .ghost {
@@ -68,6 +74,25 @@ body {
 .chat-header .ghost:disabled {
   opacity: 0.6;
   cursor: not-allowed;
+}
+
+.provider-pill {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 8px 14px;
+  font-size: 13px;
+  background: rgba(255, 255, 255, 0.7);
+  color: var(--text);
+}
+
+.health-banner {
+  border: 1px solid #f97316;
+  background: rgba(249, 115, 22, 0.1);
+  color: #b45309;
+  border-radius: 12px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  font-size: 13px;
 }
 
 .ingest-panel {

@@ -1,8 +1,10 @@
-import React, { useMemo, useRef, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import Composer from './components/Composer'
 import MessageBubble, { Citation, Message } from './components/MessageBubble'
 
-const API_BASE = import.meta.env.VITE_API_BASE ?? (typeof window !== 'undefined' ? window.location.origin : '')
+const API_BASE =
+  import.meta.env.VITE_API_BASE ??
+  (import.meta.env.DEV ? 'http://localhost:8000' : typeof window !== 'undefined' ? window.location.origin : '')
 
 type AskResponse = {
   answer: string
@@ -20,6 +22,16 @@ type IngestResult = {
   vector_count: number
   ms: number
   pages?: number
+}
+
+type HealthResponse = {
+  status: string
+  provider: string
+  ollama_reachable: boolean
+  llamacpp_reachable: boolean
+  neo4j_reachable: boolean
+  vector_store_path: string
+  vector_store_path_exists: boolean
 }
 
 const INITIAL_PROMPT = "Ask a question about your service desk docs to see answers with citations."
@@ -47,6 +59,8 @@ export default function App() {
   const [pdfFile, setPdfFile] = useState<File | null>(null)
   const [ingestStatus, setIngestStatus] = useState<IngestResult | null>(null)
   const [ingestError, setIngestError] = useState<string | null>(null)
+  const [health, setHealth] = useState<HealthResponse | null>(null)
+  const [healthError, setHealthError] = useState<string | null>(null)
   const threadRef = useRef<HTMLDivElement | null>(null)
 
   const lastAssistant = useMemo(() => {
@@ -178,17 +192,47 @@ export default function App() {
     }
   }
 
+  useEffect(() => {
+    let cancelled = false
+    const loadHealth = async () => {
+      try {
+        const response = await fetch(`${API_BASE}/health`)
+        if (!response.ok) throw new Error(response.statusText || 'Health check failed')
+        const data = (await response.json()) as HealthResponse
+        if (!cancelled) {
+          setHealth(data)
+          setHealthError(null)
+        }
+      } catch (error) {
+        if (!cancelled) {
+          const message = `Backend ${API_BASE} not reachable — run make dev and ensure VITE_API_BASE points to the backend`
+          setHealth(null)
+          setHealthError(message)
+        }
+      }
+    }
+
+    loadHealth()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
   return (
     <div className="app-page">
       <div className="app-container">
+        {healthError && <div className="health-banner">{healthError}</div>}
         <header className="chat-header">
           <div>
             <h1>Service Desk Copilot</h1>
             <p>Hybrid GraphRAG playground. Ingest knowledge locally and ask questions with citations.</p>
           </div>
-          <button type="button" className="ghost" onClick={resetThread} disabled={loading}>
-            New thread
-          </button>
+          <div className="header-actions">
+            <span className="provider-pill">Provider: {health?.provider ?? 'loading…'}</span>
+            <button type="button" className="ghost" onClick={resetThread} disabled={loading}>
+              New thread
+            </button>
+          </div>
         </header>
 
         <section className="ingest-panel">

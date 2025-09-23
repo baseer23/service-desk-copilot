@@ -1,41 +1,70 @@
+"""Response composition for Ask requests."""
+
 from __future__ import annotations
 
+import logging
+import textwrap
 import time
 from dataclasses import dataclass
 from typing import Dict, List
 
 from backend.app.core.config import DEFAULT_STUB_ANSWER
 from backend.app.models.dto import AskResponse, Citation
+from backend.app.models.provider import LocalModelProvider
 
 
-PROMPT_TEMPLATE = """You are DeskMate, a helpful service desk copilot.
-Use the provided knowledge base snippets to answer the question. Always ground your response in the snippets and reference them as [doc_id:chunk_id].
+logger = logging.getLogger(__name__)
+FALLBACK_PREFIX = "Local model unavailable; falling back to stub. "
 
-Question:
-{question}
 
-Context:
-{context}
+def compose_prompt(question: str, chunks: List[Dict[str, object]]) -> str:
+    """Build the final prompt sent to the language model."""
 
-Answer:
-"""
+    header = (
+        "You are DeskMate, a helpful service desk copilot.\n"
+        "Use ONLY the provided context to answer.\n"
+        "Cite supporting evidence with [doc_id:chunk_id] tags that already exist in the context."
+    )
+
+    context_lines = []
+    for chunk in chunks:
+        metadata = chunk.get("metadata", {})
+        doc_id = metadata.get("doc_id", "unknown")
+        chunk_id = chunk.get("id", "")
+        title = metadata.get("title") or doc_id
+        snippet = (chunk.get("text") or "").strip().replace("\n", " ")
+        snippet = textwrap.shorten(snippet, width=500, placeholder="…")
+        context_lines.append(f"[{doc_id}:{chunk_id}] {title}: {snippet}")
+
+    context_block = "\n".join(context_lines) if context_lines else "(no context available)"
+    prompt = (
+        f"{header}\n\nContext:\n{context_block}\n\n"
+        f"Question: {question.strip()}\nAnswer:"
+    )
+    return prompt
 
 
 @dataclass
 class Responder:
     settings: object
-    provider: object
+    provider: LocalModelProvider
 
     def answer(self, question: str, planner: Dict[str, object], chunks: List[Dict[str, object]]) -> AskResponse:
         started = time.perf_counter()
-        context = self._render_context(chunks)
-        prompt = PROMPT_TEMPLATE.format(question=question, context=context)
+        prompt = compose_prompt(question, chunks)
 
-        model_provider = getattr(self.settings, "model_provider", "stub").lower()
-        if model_provider == "stub":
+        provider_name = self.provider.name()
+        use_stub = provider_name == "stub"
+        answer_text: str
+
+        if use_stub:
             answer_text = DEFAULT_STUB_ANSWER
         else:
-            answer_text = self.provider.generate(prompt)
+            try:
+                answer_text = self.provider.generate(prompt)
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                logger.warning("Provider %s failed, using stub fallback: %s", provider_name, exc)
+                answer_text = f"{FALLBACK_PREFIX}{DEFAULT_STUB_ANSWER}"
 
         citations = [
             Citation(
@@ -53,21 +82,13 @@ class Responder:
 
         return AskResponse(
             answer=answer_text,
-            provider=model_provider,
+            provider=provider_name,
             question=question,
             citations=citations,
             planner=planner,
             latency_ms=latency_ms,
             confidence=confidence,
         )
-
-    def _render_context(self, chunks: List[Dict[str, object]]) -> str:
-        sections = []
-        for index, chunk in enumerate(chunks, 1):
-            metadata = chunk.get("metadata", {})
-            title = metadata.get("title") or metadata.get("doc_id", "unknown")
-            sections.append(f"[{index}] ({title})\n{chunk.get('text', '')}")
-        return "\n\n".join(sections)
 
     def _confidence_from_scores(self, scores: List[float]) -> float:
         if not scores:

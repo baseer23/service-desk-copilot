@@ -8,6 +8,9 @@ class DummyProvider:
     def __init__(self, text="Generated answer"):
         self.text = text
 
+    def name(self):
+        return "stub"
+
     def generate(self, prompt):
         return self.text
 

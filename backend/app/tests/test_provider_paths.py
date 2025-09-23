@@ -1,0 +1,130 @@
+"""Tests that exercise the provider selection and fallbacks."""
+
+from __future__ import annotations
+
+from typing import Any, Dict
+
+import pytest
+import requests
+
+from backend.app.core.config import DEFAULT_STUB_ANSWER
+
+FALLBACK_PREFIX = "Local model unavailable; falling back to stub. "
+
+
+def _call_ask(client, question: str = "hello") -> Dict[str, Any]:
+    response = client.post("/ask", json={"question": question})
+    assert response.status_code == 200
+    return response.json()
+
+
+def test_stub_provider_path(make_client, tmp_path):
+    client = make_client(
+        {
+            "MODEL_PROVIDER": "stub",
+            "EMBED_PROVIDER": "stub",
+            "CHROMA_DIR": tmp_path / "chroma",
+        }
+    )
+    try:
+        body = _call_ask(client, "quick check")
+    finally:
+        client.close()
+
+    assert body["answer"] == DEFAULT_STUB_ANSWER
+    assert body["provider"] == "stub"
+    assert isinstance(body.get("citations"), list)
+
+
+def test_ollama_provider_success(monkeypatch, make_client, tmp_path):
+    payload = {
+        "MODEL_PROVIDER": "ollama",
+        "MODEL_NAME": "llama3:8b",
+        "EMBED_PROVIDER": "stub",
+        "CHROMA_DIR": tmp_path / "chroma",
+    }
+    client = make_client(payload)
+
+    def fake_post(url, json, timeout):  # noqa: A002 - required by signature
+        assert url.endswith("/api/generate")
+
+        class _Resp:
+            status_code = 200
+
+            def raise_for_status(self) -> None:  # noqa: D401 - standard requests API
+                """Pretend everything is fine."""
+
+            def json(self) -> Dict[str, Any]:
+                return {"response": "Hello from Ollama"}
+
+        return _Resp()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    try:
+        body = _call_ask(client, "ol test")
+    finally:
+        client.close()
+
+    assert body["provider"] == "ollama"
+    assert body["answer"] == "Hello from Ollama"
+    assert body["answer"] != DEFAULT_STUB_ANSWER
+
+
+def test_ollama_provider_failure_falls_back(monkeypatch, make_client, tmp_path):
+    payload = {
+        "MODEL_PROVIDER": "ollama",
+        "MODEL_NAME": "llama3:8b",
+        "EMBED_PROVIDER": "stub",
+        "CHROMA_DIR": tmp_path / "chroma",
+    }
+    client = make_client(payload)
+
+    def fake_post(*_, **__):
+        raise requests.Timeout("simulated timeout")
+
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    try:
+        body = _call_ask(client, "timeout test")
+    finally:
+        client.close()
+
+    assert body["provider"] == "ollama"
+    assert body["answer"].startswith(FALLBACK_PREFIX)
+    assert DEFAULT_STUB_ANSWER in body["answer"]
+
+
+def test_llamacpp_provider_success(monkeypatch, make_client, tmp_path):
+    payload = {
+        "MODEL_PROVIDER": "llamacpp",
+        "MODEL_NAME": "custom-model",
+        "EMBED_PROVIDER": "stub",
+        "CHROMA_DIR": tmp_path / "chroma",
+    }
+    client = make_client(payload)
+
+    def fake_post(url, json, timeout):  # noqa: A002 - required by signature
+        assert url.endswith("/completion")
+
+        class _Resp:
+            status_code = 200
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> Dict[str, Any]:
+                return {"content": "Hi from llama.cpp"}
+
+        return _Resp()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    try:
+        body = _call_ask(client, "llama test")
+    finally:
+        client.close()
+
+    assert body["provider"] == "llamacpp"
+    assert body["answer"] == "Hi from llama.cpp"
+    assert body["answer"] != DEFAULT_STUB_ANSWER

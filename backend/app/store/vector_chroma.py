@@ -47,6 +47,14 @@ class VectorChromaStore:
             )
         return formatted
 
+    def ping(self) -> bool:
+        try:
+            if hasattr(self._collection, "count"):
+                self._collection.count()
+            return True
+        except Exception:  # pragma: no cover - runtime state dependent
+            return False
+
 
 class InMemoryVectorStore:
     def __init__(self):
@@ -58,3 +66,6 @@ class InMemoryVectorStore:
 
     def search(self, query_embedding: List[float], top_k: int = 5) -> List[Dict[str, object]]:  # pragma: no cover - simple fallback
         return list(self._records.values())[:top_k]
+
+    def ping(self) -> bool:
+        return True

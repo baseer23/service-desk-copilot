@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from typing import Dict, List, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, computed_field, field_validator
 
 
 class IngestPasteRequest(BaseModel):
@@ -17,6 +17,22 @@ class IngestPasteResponse(BaseModel):
     vector_count: int = Field(..., ge=0)
     ms: int = Field(..., ge=0)
 
+    @computed_field  # type: ignore[misc]
+    def chunks_ingested(self) -> int:
+        return self.chunks
+
+    @computed_field  # type: ignore[misc]
+    def entities_linked(self) -> int:
+        return self.entities
+
+    @computed_field  # type: ignore[misc]
+    def vectors_upserted(self) -> int:
+        return self.vector_count
+
+    @computed_field  # type: ignore[misc]
+    def latency_ms(self) -> int:
+        return self.ms
+
 
 class IngestPdfResponse(BaseModel):
     pages: int = Field(..., ge=0)
@@ -24,6 +40,26 @@ class IngestPdfResponse(BaseModel):
     entities: int = Field(..., ge=0)
     vector_count: int = Field(..., ge=0)
     ms: int = Field(..., ge=0)
+
+    @computed_field  # type: ignore[misc]
+    def pages_ingested(self) -> int:
+        return self.pages
+
+    @computed_field  # type: ignore[misc]
+    def chunks_ingested(self) -> int:
+        return self.chunks
+
+    @computed_field  # type: ignore[misc]
+    def entities_linked(self) -> int:
+        return self.entities
+
+    @computed_field  # type: ignore[misc]
+    def vectors_upserted(self) -> int:
+        return self.vector_count
+
+    @computed_field  # type: ignore[misc]
+    def latency_ms(self) -> int:
+        return self.ms
 
 
 class Citation(BaseModel):

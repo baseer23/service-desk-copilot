@@ -54,19 +54,23 @@ Edit `.env` or export overrides before launching. Common settings:
 - `VITE_API_BASE`: base URL the frontend uses to reach the API in development.
 
 ## Running locally
-Start Neo4j (creates Docker volumes under `~/Documents/service-desk-copilot/neo4j`):
-```bash
-docker compose up -d neo4j
-```
+1. **Start Neo4j** (data persists under `~/Documents/service-desk-copilot/neo4j`):
+   ```bash
+   docker compose up -d neo4j
+   ```
+2. **Optional – start a local model**:
+   ```bash
+   bash scripts/start_slm.sh
+   ```
+   This script will launch `ollama serve` or a llama.cpp server when available.
+3. **Run the dev servers** (FastAPI with reload + Vite dev server):
+   ```bash
+   source .venv/bin/activate
+   make dev
+   ```
+4. **Open the frontend** at http://localhost:5173. The header shows the active provider reported by `/health`; when the backend is offline a banner prompts you to start it.
 
-Launch the dev stack (FastAPI with reload + Vite dev server):
-```bash
-source .venv/bin/activate
-make dev
-```
-
-- Backend: http://localhost:8000
-- Frontend: http://localhost:5173 (Vite banner stays open in dev mode)
+The backend listens on http://localhost:8000. The Vite dev server keeps its status banner visible while running.
 
 To build the SPA for production:
 ```bash
@@ -106,6 +110,11 @@ Responses include the answer, citations (with document + chunk IDs and text snip
 - **Ollama**: `MODEL_PROVIDER=ollama`, `MODEL_NAME=llama3:8b`, ensure `ollama serve` is available at `OLLAMA_HOST`.
 - **llama.cpp**: launch your server on `http://localhost:8080` (`MODEL_PROVIDER=llamacpp`).
 - Leave the provider on `stub` for deterministic, dependency-free answers while developing.
+
+## Troubleshooting
+- **Backend banner complaining about reachability**: ensure `make dev` is running and `VITE_API_BASE` in `.env` points to the backend host (defaults to `http://localhost:8000`).
+- **Neo4j fails to start**: verify that `~/Documents/service-desk-copilot/neo4j` exists and is writable; Docker creates the directory on the first run.
+- **PDF ingest returns an error**: install `pdfminer.six` (`pip install pdfminer.six`) or run `pip install -r requirements.txt` to pull in the optional dependency.
 
 ## Tooling
 - `make dev` - launch FastAPI + frontend with a shared shutdown trap.

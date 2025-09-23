@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import time
 import uuid
+import logging
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Optional
 
 from pdfminer.high_level import extract_text
 
+from backend.app.adapters.embeddings import StubEmbeddingProvider
 from backend.app.models.dto import IngestPasteResponse, IngestPdfResponse
 from backend.app.services.chunking import approx_tokens, split_text
 from backend.app.services.entities import extract_entities
+
+
+logger = logging.getLogger("service-desk")
 
 
 @dataclass
@@ -37,7 +42,13 @@ class IngestService:
             chunk_texts.append(chunk_text)
             chunk["metadata"] = {"doc_id": doc_id, "ord": chunk["ord"]}
 
-        embeddings = self.embedding_provider.embed_texts(chunk_texts)
+        try:
+            embeddings = self.embedding_provider.embed_texts(chunk_texts)
+        except Exception as exc:  # pragma: no cover - runtime specific
+            logger.warning("Embedding provider failed (%s); falling back to stub embeddings", exc)
+            fallback = StubEmbeddingProvider()
+            embeddings = fallback.embed_texts(chunk_texts)
+            self.embedding_provider = fallback
         for chunk, embedding in zip(chunks, embeddings):
             records.append(
                 {

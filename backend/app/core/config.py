@@ -1,6 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
-from typing import List
+from typing import List, Union
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -14,9 +14,9 @@ class Settings(BaseSettings):
     """Application configuration derived from environment variables."""
 
     app_name: str = "Service Desk Copilot"
-    allowed_origins: List[str] = Field(default_factory=lambda: DEFAULT_ALLOWED_ORIGINS.copy())
+    allowed_origins: Union[List[str], str] = Field(default_factory=lambda: DEFAULT_ALLOWED_ORIGINS.copy())
     model_provider: str = "stub"
-    model_name: str = "tinyllama"
+    model_name: str = "llama3:8b"
     model_timeout_sec: int = 20
     log_dir: Path = Path("logs")
 
@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     embed_model_name: str = "all-MiniLM-L6-v2"
     ollama_embed_model: str = "nomic-embed-text"
     ollama_host: str = "http://localhost:11434"
+    llamacpp_host: str = "http://localhost:8080"
 
     # Planner / RAG
     top_k: int = 6
@@ -46,10 +47,10 @@ class Settings(BaseSettings):
     @field_validator("allowed_origins", mode="before")
     @classmethod
     def split_origins(cls, value):  # noqa: D401
-        """Support comma-delimited strings in the env file."""
+        """Support plain or comma-delimited strings in the env file."""
         if isinstance(value, str):
             return [origin.strip() for origin in value.split(",") if origin.strip()]
-        return value
+        return list(value)
 
     @field_validator("model_provider")
     @classmethod

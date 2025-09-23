@@ -2,13 +2,15 @@ import logging
 import logging.config
 import sys
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional, Tuple
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import FileResponse
 from starlette.staticfiles import StaticFiles
+
+import requests
 
 from backend.app.adapters.embeddings import StubEmbeddingProvider, get_embedding_provider
 from backend.app.core.config import get_settings
@@ -56,6 +58,8 @@ app = FastAPI(title=SETTINGS.app_name)
 app.state.vector_store = InMemoryVectorStore()
 app.state.graph_repo = InMemoryGraphRepository()
 app.state.graph_driver = None
+app.state.provider = get_provider(SETTINGS)
+app.state.settings = SETTINGS
 
 app.add_middleware(
     CORSMiddleware,
@@ -97,6 +101,7 @@ async def startup_event():  # pragma: no cover - exercised in integration tests
     repo, driver = _init_graph_repo(settings)
     app.state.graph_repo = repo
     app.state.graph_driver = driver
+    app.state.provider = get_provider(settings)
 
 
 @app.on_event("shutdown")
@@ -148,9 +153,20 @@ async def log_requests(request: Request, call_next: Callable):
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
-    settings = get_settings()
-    return {"status": "ok", "provider": settings.model_provider}
+def health() -> dict[str, object]:
+    settings = getattr(app.state, "settings", SETTINGS)
+    provider = getattr(app.state, "provider", get_provider(settings))
+    vector_path, vector_exists = _vector_store_state(getattr(app.state, "vector_store", None), settings)
+
+    return {
+        "status": "ok",
+        "provider": provider.name(),
+        "ollama_reachable": _probe_ollama(settings),
+        "llamacpp_reachable": _probe_llamacpp(settings),
+        "neo4j_reachable": _probe_neo4j(getattr(app.state, "graph_repo", None)),
+        "vector_store_path": vector_path,
+        "vector_store_path_exists": vector_exists,
+    }
 
 
 @app.post("/ingest/paste", response_model=IngestPasteResponse)
@@ -195,7 +211,7 @@ async def ingest_pdf(file: UploadFile = File(...), title: Optional[str] = None):
 
 @app.post("/ask", response_model=AskResponse)
 def ask(payload: AskRequest) -> AskResponse:
-    settings = get_settings()
+    settings = getattr(app.state, "settings", SETTINGS)
     planner = Planner(settings=settings, graph_repo=app.state.graph_repo)
     plan = planner.plan(payload.question)
     top_k = payload.top_k or plan.get("top_k", settings.top_k)
@@ -218,7 +234,7 @@ def ask(payload: AskRequest) -> AskResponse:
     else:
         contexts = retriever.vector_search(payload.question, top_k)
 
-    provider = get_provider()
+    provider = getattr(app.state, "provider", get_provider(settings))
     responder = Responder(settings=settings, provider=provider)
     response = responder.answer(payload.question, plan, contexts)
     return response
@@ -230,6 +246,49 @@ def _safe_embedding_provider(settings):
     except Exception as exc:
         logger.warning("Falling back to stub embeddings (%s)", exc)
         return StubEmbeddingProvider()
+
+
+def _probe_ollama(settings) -> bool:
+    host = getattr(settings, "ollama_host", "http://localhost:11434")
+    url = f"{host.rstrip('/')}/api/tags"
+    try:
+        response = requests.get(url, timeout=1)
+        response.raise_for_status()
+        return True
+    except requests.RequestException:  # pragma: no cover - network-dependent
+        return False
+
+
+def _probe_llamacpp(settings) -> bool:
+    host = getattr(settings, "llamacpp_host", "http://localhost:8080")
+    url = f"{host.rstrip('/')}/health"
+    try:
+        response = requests.get(url, timeout=1)
+        response.raise_for_status()
+        return True
+    except requests.RequestException:  # pragma: no cover - network-dependent
+        return False
+
+
+def _probe_neo4j(graph_repo) -> bool:
+    if graph_repo is None:
+        return False
+    ping = getattr(graph_repo, "ping", None)
+    if callable(ping):
+        try:
+            return bool(ping())
+        except Exception:  # pragma: no cover - defensive fallback
+            return False
+    return False
+
+
+def _vector_store_state(vector_store, settings) -> Tuple[str, bool]:
+    if vector_store is not None and hasattr(vector_store, "path"):
+        raw_path = getattr(vector_store, "path")
+        store_path = Path(raw_path)
+    else:
+        store_path = Path(getattr(settings, "chroma_dir", "store/chroma"))
+    return str(store_path), store_path.exists()
 
 
 if FRONTEND_DIST.exists():

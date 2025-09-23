@@ -144,6 +144,16 @@ class GraphRepository:
         with self._driver.session() as session:  # pragma: no cover - legacy driver path
             return session.execute_read(func)
 
+    def ping(self) -> bool:
+        def _tx(tx):
+            tx.run("RETURN 1 AS ok")
+            return True
+
+        try:
+            return bool(self._execute_read(_tx))
+        except Exception:  # pragma: no cover - depends on runtime connectivity
+            return False
+
 
 class InMemoryGraphRepository:
     def __init__(self) -> None:
@@ -201,6 +211,9 @@ class InMemoryGraphRepository:
                 }
                 collected.append({"id": chunk_id, "text": chunk["text"], "metadata": metadata, "score": 0.0})
         return collected[:limit]
+
+    def ping(self) -> bool:
+        return True
 
 
 def _safe_rel(rel: str) -> str:
