@@ -30,13 +30,32 @@ const ROLE_LABEL: Record<Message['role'], string> = {
 export default function MessageBubble({ message }: Props) {
   const label = ROLE_LABEL[message.role]
   const [showCitations, setShowCitations] = useState(false)
+  const isPending = Boolean(message.pending)
+  const avatar = message.role === 'user' ? 'U' : 'D'
 
   const hasCitations = message.role === 'assistant' && (message.citations?.length ?? 0) > 0
 
   return (
     <div className={`bubble ${message.role}${message.pending ? ' pending' : ''}${message.error ? ' error' : ''}`}>
-      <div className="bubble-role">{label}</div>
-      <div className="bubble-text">{message.text}</div>
+      <div className="bubble-header">
+        <span className="bubble-avatar" aria-hidden="true">
+          {avatar}
+        </span>
+        <div className="bubble-body">
+          <div className="bubble-role">{label}</div>
+          {isPending ? (
+            <>
+              <div className="bubble-skeleton" aria-hidden="true">
+                <span className="skeleton-line" />
+                <span className="skeleton-line short" />
+              </div>
+              <span className="sr-only">{message.text}</span>
+            </>
+          ) : (
+            <div className="bubble-text">{message.text}</div>
+          )}
+        </div>
+      </div>
       {hasCitations && (
         <div className="citations">
           <button type="button" onClick={() => setShowCitations((prev) => !prev)}>

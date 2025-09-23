@@ -34,7 +34,16 @@ type HealthResponse = {
   vector_store_path_exists: boolean
 }
 
-const INITIAL_PROMPT = "Ask a question about your service desk docs to see answers with citations."
+const INITIAL_PROMPT = 'Ask a real service desk question to see cited answers.'
+
+type IndexedSource = {
+  title: string
+  tokens: number
+  chunks: number
+  mode: 'paste' | 'pdf'
+  content?: string
+  file?: File
+}
 
 async function postJSON<T>(url: string, body: unknown): Promise<T> {
   const response = await fetch(url, {
@@ -57,8 +66,9 @@ export default function App() {
   const [pasteTitle, setPasteTitle] = useState('')
   const [pasteText, setPasteText] = useState('')
   const [pdfFile, setPdfFile] = useState<File | null>(null)
-  const [ingestStatus, setIngestStatus] = useState<IngestResult | null>(null)
-  const [ingestError, setIngestError] = useState<string | null>(null)
+  const [indexStatus, setIndexStatus] = useState<IngestResult | null>(null)
+  const [indexError, setIndexError] = useState<string | null>(null)
+  const [indexedSource, setIndexedSource] = useState<IndexedSource | null>(null)
   const [health, setHealth] = useState<HealthResponse | null>(null)
   const [healthError, setHealthError] = useState<string | null>(null)
   const threadRef = useRef<HTMLDivElement | null>(null)
@@ -71,6 +81,13 @@ export default function App() {
     }
     return null
   }, [messages])
+
+  const providerLabel = useMemo(() => {
+    const provider = health?.provider
+    if (!provider) return 'Ollama'
+    if (provider.length === 0) return 'Ollama'
+    return provider[0].toUpperCase() + provider.slice(1)
+  }, [health?.provider])
 
   const scrollToBottom = () => {
     requestAnimationFrame(() => {
@@ -138,35 +155,46 @@ export default function App() {
   }
 
   const handlePasteIngest = async () => {
-    setIngestError(null)
-    if (!pasteText.trim()) {
-      setIngestError('Provide some text to ingest.')
+    setIndexError(null)
+    const trimmedText = pasteText.trim()
+    if (!trimmedText) {
+      setIndexError('Provide some text to index.')
       return
     }
-    setIngestStatus(null)
+    setIndexStatus(null)
     try {
+      const title = pasteTitle.trim() || 'Untitled'
       const result = await postJSON<IngestResult>(`${API_BASE}/ingest/paste`, {
-        title: pasteTitle || 'Untitled Paste',
-        text: pasteText,
+        title,
+        text: trimmedText,
       })
-      setIngestStatus(result)
+      setIndexStatus(result)
+      setIndexedSource({
+        title,
+        tokens: result.vector_count,
+        chunks: result.chunks,
+        mode: 'paste',
+        content: trimmedText,
+      })
+      setPasteTitle('')
       setPasteText('')
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to ingest text'
-      setIngestError(message)
+      const message = error instanceof Error ? error.message : 'Failed to index text'
+      setIndexError(message)
     }
   }
 
   const handlePdfIngest = async () => {
-    setIngestError(null)
+    setIndexError(null)
     if (!pdfFile) {
-      setIngestError('Select a PDF file to upload.')
+      setIndexError('Select a PDF file to upload.')
       return
     }
-    setIngestStatus(null)
+    setIndexStatus(null)
     const formData = new FormData()
     formData.append('file', pdfFile)
     try {
+      const title = pdfFile.name || 'Untitled'
       const response = await fetch(`${API_BASE}/ingest/pdf`, {
         method: 'POST',
         body: formData,
@@ -176,11 +204,18 @@ export default function App() {
         throw new Error(detail.detail ?? response.statusText)
       }
       const result = (await response.json()) as IngestResult
-      setIngestStatus(result)
+      setIndexStatus(result)
+      setIndexedSource({
+        title,
+        tokens: result.vector_count,
+        chunks: result.chunks,
+        mode: 'pdf',
+        file: pdfFile,
+      })
       setPdfFile(null)
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to ingest PDF'
-      setIngestError(message)
+      const message = error instanceof Error ? error.message : 'Failed to index PDF'
+      setIndexError(message)
     }
   }
 
@@ -189,6 +224,30 @@ export default function App() {
       handlePasteIngest()
     } else {
       handlePdfIngest()
+    }
+  }
+
+  const clearIngestForm = () => {
+    setPasteTitle('')
+    setPasteText('')
+    setPdfFile(null)
+    setIndexError(null)
+    setIndexStatus(null)
+    setIndexedSource(null)
+  }
+
+  const viewIndexedSource = () => {
+    if (!indexedSource) return
+    if (typeof window === 'undefined') return
+    if (indexedSource.mode === 'paste' && indexedSource.content) {
+      const blob = new Blob([indexedSource.content], { type: 'text/plain' })
+      const url = URL.createObjectURL(blob)
+      window.open(url, '_blank', 'noopener')
+      setTimeout(() => URL.revokeObjectURL(url), 2000)
+    } else if (indexedSource.mode === 'pdf' && indexedSource.file) {
+      const url = URL.createObjectURL(indexedSource.file)
+      window.open(url, '_blank', 'noopener')
+      setTimeout(() => URL.revokeObjectURL(url), 2000)
     }
   }
 
@@ -223,12 +282,13 @@ export default function App() {
       <div className="app-container">
         {healthError && <div className="health-banner">{healthError}</div>}
         <header className="chat-header">
-          <div>
-            <h1>Service Desk Copilot</h1>
-            <p>Hybrid GraphRAG playground. Ingest knowledge locally and ask questions with citations.</p>
+          <div className="title-stack">
+            <h1>DeskMate</h1>
+            <p className="subtitle">A service desk copilot</p>
+            <p className="tagline">Ingest docs. Ask with citations.</p>
           </div>
           <div className="header-actions">
-            <span className="provider-pill">Provider: {health?.provider ?? 'loading…'}</span>
+            <span className="provider-pill">Provider: {providerLabel}</span>
             <button type="button" className="ghost" onClick={resetThread} disabled={loading}>
               New thread
             </button>
@@ -236,40 +296,78 @@ export default function App() {
         </header>
 
         <section className="ingest-panel">
-          <div className="ingest-tabs">
-            <button
-              type="button"
-              className={ingestMode === 'paste' ? 'active' : ''}
-              onClick={() => setIngestMode('paste')}
-            >
-              Paste
-            </button>
-            <button
-              type="button"
-              className={ingestMode === 'pdf' ? 'active' : ''}
-              onClick={() => setIngestMode('pdf')}
-            >
-              PDF
-            </button>
+          <div className="panel-header">
+            <h2>Knowledge ingestion</h2>
+            <div className="ingest-tabs" role="tablist" aria-label="Select indexing mode">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={ingestMode === 'paste'}
+                className={ingestMode === 'paste' ? 'active' : ''}
+                onClick={() => setIngestMode('paste')}
+              >
+                Paste
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={ingestMode === 'pdf'}
+                className={ingestMode === 'pdf' ? 'active' : ''}
+                onClick={() => setIngestMode('pdf')}
+              >
+                Upload PDF
+              </button>
+            </div>
           </div>
+
+          {indexStatus && indexedSource && (
+            <div className="inline-banner success" role="status">
+              <span>
+                Indexed "{indexedSource.title}" • {indexedSource.tokens} tokens • {indexedSource.chunks} chunks
+              </span>
+              <button type="button" className="link-button" onClick={viewIndexedSource}>
+                View source
+              </button>
+            </div>
+          )}
+
+          {indexError && (
+            <div className="inline-banner error" role="alert">
+              <span>Indexing failed. Try again.</span>
+              <button type="button" className="link-button" onClick={handleIngest}>
+                Retry
+              </button>
+            </div>
+          )}
 
           {ingestMode === 'paste' ? (
             <div className="ingest-form">
+              <label className="input-label" htmlFor="source-title">
+                Name this source optional
+              </label>
               <input
+                id="source-title"
                 type="text"
-                placeholder="Title (optional)"
                 value={pasteTitle}
                 onChange={(event) => setPasteTitle(event.target.value)}
               />
+              <label className="input-label" htmlFor="source-text">
+                Paste content
+              </label>
               <textarea
-                placeholder="Paste knowledge base text here..."
+                id="source-text"
+                placeholder="Paste or drop your playbook"
                 value={pasteText}
                 onChange={(event) => setPasteText(event.target.value)}
               />
             </div>
           ) : (
             <div className="ingest-form">
+              <label className="input-label" htmlFor="source-file">
+                Upload a PDF
+              </label>
               <input
+                id="source-file"
                 type="file"
                 accept="application/pdf"
                 onChange={(event) => setPdfFile(event.target.files?.[0] ?? null)}
@@ -279,16 +377,12 @@ export default function App() {
           )}
 
           <div className="ingest-actions">
-            <button type="button" onClick={handleIngest} disabled={loading}>
-              Ingest
+            <button type="button" className="primary" onClick={handleIngest} disabled={loading}>
+              Upload and index
             </button>
-            {ingestStatus && (
-              <span className="ingest-result">
-                Chunks: {ingestStatus.chunks} • Entities: {ingestStatus.entities} • Vectors: {ingestStatus.vector_count}
-                {typeof ingestStatus.pages === 'number' ? ` • Pages: ${ingestStatus.pages}` : ''}
-              </span>
-            )}
-            {ingestError && <span className="ingest-error">{ingestError}</span>}
+            <button type="button" className="quiet" onClick={clearIngestForm} disabled={loading}>
+              Clear
+            </button>
           </div>
         </section>
 
@@ -307,7 +401,7 @@ export default function App() {
           <aside className="sidebar">
             <h2>Recent questions</h2>
             {recentQuestions.length === 0 ? (
-              <p className="muted">Ask something to see it appear here.</p>
+              <p className="muted">Try "What is the MFA reset policy" or "How do I create a ticket".</p>
             ) : (
               <ul>
                 {recentQuestions.map((question) => (
@@ -321,6 +415,14 @@ export default function App() {
                 <p>{lastAssistant.text}</p>
               </div>
             )}
+            <button
+              type="button"
+              className="link-button sidebar-link"
+              onClick={() => setRecentQuestions([])}
+              disabled={recentQuestions.length === 0}
+            >
+              Clear history
+            </button>
           </aside>
         </div>
       </div>

@@ -36,7 +36,7 @@ export default function Composer({ onSend, disabled }: Props) {
       <textarea
         ref={textareaRef}
         className="composer-input"
-        placeholder="Ask anything about your service desk workflow..."
+        placeholder="Ask anything about your service desk workflow"
         value={text}
         onChange={(event) => setText(event.target.value)}
         onKeyDown={onKeyDown}
@@ -45,7 +45,7 @@ export default function Composer({ onSend, disabled }: Props) {
         disabled={disabled}
       />
       <button className="composer-send" type="button" onClick={submit} disabled={disabled}>
-        {disabled ? 'Thinking…' : 'Send'}
+        {disabled ? 'Thinking…' : 'Ask'}
       </button>
     </div>
   )
