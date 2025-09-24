@@ -1,10 +1,14 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Composer from './components/Composer'
 import MessageBubble, { Citation, Message } from './components/MessageBubble'
 
 const API_BASE =
   import.meta.env.VITE_API_BASE ??
   (import.meta.env.DEV ? 'http://localhost:8000' : typeof window !== 'undefined' ? window.location.origin : '')
+const ADMIN_SECRET = import.meta.env.VITE_ADMIN_API_SECRET ?? ''
+
+type ProviderOption = 'ollama' | 'groq'
+const PROVIDER_STORAGE_KEY = 'deskMate.providerPreference'
 
 type AskResponse = {
   answer: string
@@ -32,14 +36,25 @@ type HealthResponse = {
   provider_vendor: string | null
   local_model_available: boolean
   operator_message: string | null
-  hosted_reachable: boolean | null
+  hosted_reachable: boolean
   hosted_model_name: string | null
+  active_provider: string
+  active_model: string
+  graph_backend: string
   preferred_local_models: string[]
   ollama_reachable: boolean
   llamacpp_reachable: boolean
   neo4j_reachable: boolean
   vector_store_path: string
   vector_store_path_exists: boolean
+}
+
+type ProviderAdminResponse = {
+  active_provider: string
+  model_name: string
+  provider: string
+  provider_type: string
+  reason: string | null
 }
 
 const INITIAL_PROMPT = 'Ask a real service desk question to see cited answers.'
@@ -53,10 +68,14 @@ type IndexedSource = {
   file?: File
 }
 
-async function postJSON<T>(url: string, body: unknown): Promise<T> {
+async function postJSON<T>(
+  url: string,
+  body: unknown,
+  options: { headers?: Record<string, string> } = {},
+): Promise<T> {
   const response = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...(options.headers ?? {}) },
     body: JSON.stringify(body),
   })
   if (!response.ok) {
@@ -79,7 +98,31 @@ export default function App() {
   const [indexedSource, setIndexedSource] = useState<IndexedSource | null>(null)
   const [health, setHealth] = useState<HealthResponse | null>(null)
   const [healthError, setHealthError] = useState<string | null>(null)
+  const [providerChoice, setProviderChoice] = useState<ProviderOption>('ollama')
+  const [providerSaving, setProviderSaving] = useState(false)
+  const [providerError, setProviderError] = useState<string | null>(null)
+  const [attemptedRestore, setAttemptedRestore] = useState(false)
   const threadRef = useRef<HTMLDivElement | null>(null)
+  const healthFailureMessage = `Backend ${API_BASE} not reachable — run make dev and ensure VITE_API_BASE points to the backend`
+
+  const fetchHealthData = useCallback(async (): Promise<HealthResponse> => {
+    const response = await fetch(`${API_BASE}/health`)
+    if (!response.ok) throw new Error(response.statusText || 'Health check failed')
+    return (await response.json()) as HealthResponse
+  }, [API_BASE])
+
+  const refreshHealth = useCallback(async () => {
+    try {
+      const data = await fetchHealthData()
+      setHealth(data)
+      setHealthError(null)
+      return data
+    } catch (error) {
+      setHealth(null)
+      setHealthError(healthFailureMessage)
+      throw error
+    }
+  }, [fetchHealthData, healthFailureMessage])
 
   const lastAssistant = useMemo(() => {
     for (let i = messages.length - 1; i >= 0; i -= 1) {
@@ -110,11 +153,26 @@ export default function App() {
 
   const providerPill = useMemo(() => {
     if (!health) return 'Provider · unknown · unknown'
-    const rawType = (health.provider_type || health.provider || 'unknown').toLowerCase()
-    const typeLabel = rawType === 'hosted' ? 'api' : rawType
-    const modelSource = health.model_name?.trim() && health.model_name.trim().length > 0 ? health.model_name : health.provider
-    const model = modelSource && modelSource.length > 0 ? modelSource : 'unknown'
+    const rawKey = (health.active_provider || health.provider || 'unknown').toLowerCase()
+    const typeLabel = rawKey === 'groq' ? 'api' : rawKey
+    const preferredModel = (health.active_model || '').trim() || (health.model_name || '').trim()
+    const fallbackModel = preferredModel || health.provider
+    const model = fallbackModel && fallbackModel.length > 0 ? fallbackModel : 'unknown'
     return `Provider · ${typeLabel} · ${model}`
+  }, [health])
+
+  const graphPill = useMemo(() => {
+    if (!health) return 'Graph · fallback · offline'
+    const backend = (health.graph_backend || 'inmemory').toLowerCase()
+    const backendLabel = backend === 'aura' ? 'Aura' : 'Fallback'
+    const statusLabel = backend === 'aura' ? (health.neo4j_reachable ? 'online' : 'offline') : 'vector-only'
+    return `Graph · ${backendLabel} · ${statusLabel}`
+  }, [health])
+
+  const graphPillClass = useMemo(() => {
+    if (!health) return 'graph-pill warn'
+    const online = health.graph_backend === 'aura' && health.neo4j_reachable
+    return `graph-pill${online ? ' online' : ' warn'}`
   }, [health])
 
   const providerNotes = useMemo(() => {
@@ -129,15 +187,87 @@ export default function App() {
         tone: 'default',
       })
     }
-    if (health.provider_type === 'hosted') {
-      if (health.hosted_reachable === false) {
-        notes.push({ text: 'Hosted provider unreachable – responses will fall back to stub.', tone: 'warn' })
-      } else if (health.hosted_reachable === true) {
-        notes.push({ text: 'Hosted provider reachable.', tone: 'default' })
-      }
+    if (!health.ollama_reachable) {
+      notes.push({ text: 'Ollama endpoint unreachable – local provider will fall back to stub.', tone: 'warn' })
+    }
+    if (!health.hosted_reachable) {
+      notes.push({ text: 'Groq endpoint unreachable – hosted calls fall back to stub.', tone: 'warn' })
+    } else if (health.active_provider === 'groq') {
+      notes.push({ text: 'Groq endpoint reachable.', tone: 'default' })
     }
     return notes
   }, [health])
+
+  const providerMeta = useMemo(() => {
+    if (!health) return null
+    const rawModel = (health.active_model || health.model_name || '').trim()
+    const activeModel = rawModel.length > 0 ? rawModel : 'unknown'
+    const ollamaStatus = health.ollama_reachable ? 'Ollama: online' : 'Ollama: offline'
+    const groqStatus = health.hosted_reachable ? 'Groq: online' : 'Groq: offline'
+    return `Active: ${activeModel} · ${ollamaStatus} · ${groqStatus}`
+  }, [health])
+
+  const graphFallbackMessage = useMemo(() => {
+    if (!health) return null
+    if (health.graph_backend !== 'aura') {
+      return 'Graph database unavailable — operating in vector-only mode.'
+    }
+    if (!health.neo4j_reachable) {
+      return 'Neo4j Aura connection down — results will use vector fallback only.'
+    }
+    return null
+  }, [health])
+
+  const applyProvider = useCallback(
+    async (target: ProviderOption, options: { restore?: boolean } = {}) => {
+      if (!health) return
+      if (health.active_provider === target) {
+        setProviderChoice(target)
+        if (typeof window !== 'undefined') {
+          window.localStorage.setItem(PROVIDER_STORAGE_KEY, target)
+        }
+        return
+      }
+      if (providerSaving) return
+      setProviderChoice(target)
+      setProviderSaving(true)
+      setProviderError(null)
+      const headers: Record<string, string> = ADMIN_SECRET ? { 'x-admin-secret': ADMIN_SECRET } : {}
+      try {
+        await postJSON<ProviderAdminResponse>(`${API_BASE}/admin/provider`, { provider: target }, { headers })
+        if (typeof window !== 'undefined') {
+          window.localStorage.setItem(PROVIDER_STORAGE_KEY, target)
+        }
+        await refreshHealth()
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to switch provider'
+        setProviderError(message)
+        if (typeof window !== 'undefined' && options.restore) {
+          window.localStorage.removeItem(PROVIDER_STORAGE_KEY)
+        }
+        await refreshHealth().catch(() => undefined)
+      } finally {
+        setProviderSaving(false)
+      }
+    },
+    [ADMIN_SECRET, health, providerSaving, refreshHealth],
+  )
+
+  useEffect(() => {
+    if (!health) return
+    const activeKey: ProviderOption = health.active_provider === 'groq' ? 'groq' : 'ollama'
+    setProviderChoice(activeKey)
+    if (!attemptedRestore) {
+      const saved =
+        typeof window !== 'undefined'
+          ? (window.localStorage.getItem(PROVIDER_STORAGE_KEY) as ProviderOption | null)
+          : null
+      if (saved && saved !== activeKey) {
+        void applyProvider(saved, { restore: true })
+      }
+      setAttemptedRestore(true)
+    }
+  }, [health, attemptedRestore, applyProvider])
 
   const scrollToBottom = () => {
     requestAnimationFrame(() => {
@@ -166,7 +296,10 @@ export default function App() {
     scrollToBottom()
 
     try {
-      const response = await postJSON<AskResponse>(`${API_BASE}/ask`, { question: trimmed })
+      const response = await postJSON<AskResponse>(`${API_BASE}/ask`, {
+        question: trimmed,
+        provider_override: providerChoice,
+      })
       setMessages((prev) =>
         prev.map((message) =>
           message.id === assistantPlaceholder.id
@@ -309,27 +442,24 @@ export default function App() {
     let cancelled = false
     const loadHealth = async () => {
       try {
-        const response = await fetch(`${API_BASE}/health`)
-        if (!response.ok) throw new Error(response.statusText || 'Health check failed')
-        const data = (await response.json()) as HealthResponse
+        const data = await fetchHealthData()
         if (!cancelled) {
           setHealth(data)
           setHealthError(null)
         }
       } catch (error) {
         if (!cancelled) {
-          const message = `Backend ${API_BASE} not reachable — run make dev and ensure VITE_API_BASE points to the backend`
           setHealth(null)
-          setHealthError(message)
+          setHealthError(healthFailureMessage)
         }
       }
     }
 
-    loadHealth()
+    void loadHealth()
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [fetchHealthData, healthFailureMessage])
 
   return (
     <div className="app-page">
@@ -343,7 +473,31 @@ export default function App() {
           </div>
           <div className="header-actions">
             <div className="provider-stack">
-              <span className="provider-pill">{providerPill}</span>
+              <div className="provider-row">
+                <span className="provider-pill">{providerPill}</span>
+                <span className={graphPillClass}>{graphPill}</span>
+                <div className={`provider-toggle${providerSaving ? ' busy' : ''}`} role="group" aria-label="Select provider">
+                  {(['ollama', 'groq'] as ProviderOption[]).map((option) => {
+                    const isSelected = providerChoice === option
+                    const isServerActive = health?.active_provider === option
+                    return (
+                      <button
+                        key={option}
+                        type="button"
+                        className={`provider-toggle-option${isSelected ? ' active' : ''}`}
+                        disabled={!health || providerSaving || isServerActive}
+                        onClick={() => applyProvider(option)}
+                        aria-pressed={isSelected}
+                        title={option === 'ollama' ? 'Use Ollama for responses' : 'Use Groq for responses'}
+                      >
+                        {option === 'ollama' ? 'Ollama' : 'Groq'}
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+              {providerMeta && <span className="provider-meta">{providerMeta}</span>}
+              {providerError && <span className="provider-note warn">{providerError}</span>}
               {providerNotes.map((note, index) => (
                 <span key={index} className={`provider-note${note.tone === 'warn' ? ' warn' : ''}`}>
                   {note.text}
@@ -355,6 +509,12 @@ export default function App() {
             </button>
           </div>
         </header>
+
+        {graphFallbackMessage && (
+          <div className="inline-banner warn" role="status">
+            <span>{graphFallbackMessage}</span>
+          </div>
+        )}
 
         <section className="ingest-panel">
           <div className="panel-header">

@@ -36,10 +36,13 @@ def test_health_returns_status_and_provider(monkeypatch, make_client, tmp_path):
     assert body["provider_vendor"] is None
     assert body["local_model_available"] is False
     assert body["operator_message"].startswith("Stub provider active")
-    assert body["hosted_reachable"] is None
+    assert body["hosted_reachable"] is False
     assert isinstance(body["preferred_local_models"], list)
     assert "phi3:mini" in body["preferred_local_models"]
     assert body["hosted_model_name"] == "llama-3.1-8b-instant"
+    assert body["active_provider"] == "stub"
+    assert body["active_model"] == "stub"
+    assert body["graph_backend"] == "inmemory"
 
 
 def test_ask_returns_stub_answer(make_client, tmp_path):

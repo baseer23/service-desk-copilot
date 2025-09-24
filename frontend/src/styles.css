@@ -146,11 +146,89 @@ body {
   white-space: nowrap;
 }
 
+.graph-pill {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-size: 13px;
+  background: rgba(255, 255, 255, 0.7);
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  white-space: nowrap;
+}
+
+.graph-pill.online {
+  color: #166534;
+  border-color: rgba(34, 197, 94, 0.45);
+}
+
+.graph-pill.warn {
+  color: #b45309;
+  border-color: rgba(249, 115, 22, 0.45);
+  background: rgba(249, 115, 22, 0.12);
+}
+
 .provider-stack {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
   gap: 4px;
+}
+
+.provider-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.provider-toggle {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.7);
+  padding: 4px;
+  gap: 4px;
+}
+
+.provider-toggle.busy {
+  opacity: 0.75;
+}
+
+.provider-toggle-option {
+  border: none;
+  background: transparent;
+  padding: 6px 12px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease, transform 0.2s ease;
+}
+
+.provider-toggle-option:not(:disabled):hover {
+  background: rgba(37, 99, 235, 0.15);
+  color: #1d4ed8;
+}
+
+.provider-toggle-option.active {
+  background: linear-gradient(135deg, #2563eb, #1d4ed8);
+  color: #fff;
+  box-shadow: 0 6px 20px rgba(37, 99, 235, 0.35);
+}
+
+.provider-toggle-option:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.provider-meta {
+  font-size: 12px;
+  color: var(--muted);
+  text-align: right;
 }
 
 .provider-note {
@@ -292,6 +370,12 @@ body {
 .inline-banner.error {
   background: rgba(239, 68, 68, 0.14);
   color: #991b1b;
+}
+
+.inline-banner.warn {
+  background: rgba(249, 115, 22, 0.12);
+  color: #b45309;
+  border: 1px solid rgba(249, 115, 22, 0.2);
 }
 
 .banner-text {

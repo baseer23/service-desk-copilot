@@ -19,6 +19,12 @@ class Settings(BaseSettings):
     model_name: str = "phi3:mini"
     model_timeout_sec: int = 20
     log_dir: Path = Path("logs")
+    admin_api_secret: str | None = None
+    allow_url_ingest: bool = False
+    url_max_depth: int = 1
+    url_max_pages: int = 5
+    url_max_total_chars: int = 20000
+    url_rate_limit_sec: float = 1.0
 
     # Graph / Vector
     neo4j_uri: str = "bolt://localhost:7687"
@@ -74,6 +80,21 @@ class Settings(BaseSettings):
     @classmethod
     def non_negative(cls, value: int) -> int:
         return max(0, int(value))
+
+    @field_validator("url_max_depth", "url_max_pages")
+    @classmethod
+    def non_negative_int(cls, value: int) -> int:
+        return max(0, int(value))
+
+    @field_validator("url_max_total_chars")
+    @classmethod
+    def positive_text_cap(cls, value: int) -> int:
+        return max(1_000, int(value))
+
+    @field_validator("url_rate_limit_sec")
+    @classmethod
+    def non_negative_float(cls, value: float) -> float:
+        return max(0.0, float(value))
 
 
 @lru_cache

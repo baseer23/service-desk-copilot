@@ -48,21 +48,22 @@ def select_provider(settings: Settings) -> ProviderContext:
     """Return the most appropriate provider for the current environment."""
 
     provider_key = (settings.model_provider or "stub").lower()
+    return build_provider_context(settings, provider_key)
 
-    if provider_key in {"auto", "local"}:
+
+def build_provider_context(settings: Settings, provider_key: str) -> ProviderContext:
+    """Resolve a provider context for the given key with sensible fallbacks."""
+
+    key = (provider_key or "stub").lower()
+
+    if key in {"auto", "local"}:
         context = _auto_local(settings)
         if context is not None:
             return context
         logger.warning("No preferred local model detected; falling back to stub provider.")
-        return ProviderContext(
-            provider=StubProvider(),
-            provider_type="stub",
-            model_name="stub",
-            reason="No small local model detected; using deterministic stub.",
-            local_model_available=False,
-        )
+        return _stub_context("No small local model detected; using deterministic stub.")
 
-    if provider_key == "ollama":
+    if key == "ollama":
         model_name = settings.model_name or SMALL_OLLAMA_MODELS[0][0]
         return ProviderContext(
             provider=OllamaProvider(
@@ -76,7 +77,7 @@ def select_provider(settings: Settings) -> ProviderContext:
             local_model_available=True,
         )
 
-    if provider_key == "llamacpp":
+    if key == "llamacpp":
         model_name = settings.model_name or ""
         return ProviderContext(
             provider=LlamaCppProvider(
@@ -90,39 +91,14 @@ def select_provider(settings: Settings) -> ProviderContext:
             local_model_available=True,
         )
 
-    if provider_key in {"hosted", "groq"}:
-        model_name = settings.hosted_model_name or settings.model_name
-        try:
-            provider = GroqHostedProvider(
-                api_key=settings.groq_api_key,
-                model_name=model_name,
-                timeout_sec=settings.model_timeout_sec,
-                api_url=settings.groq_api_url,
-            )
-        except Exception as exc:  # pragma: no cover - defensive fall back
-            return ProviderContext(
-                provider=StubProvider(),
-                provider_type="stub",
-                model_name="stub",
-                reason=f"Hosted provider unavailable ({exc}); falling back to stub.",
-                local_model_available=False,
-            )
-        return ProviderContext(
-            provider=provider,
-            provider_type="hosted",
-            model_name=model_name,
-            vendor="Groq",
-            reason="Hosted Groq Llama 3.1 8B Instant ready for longer answers.",
-            local_model_available=False,
-        )
+    if key in {"hosted", "groq"}:
+        return _groq_context(settings)
 
-    return ProviderContext(
-        provider=StubProvider(),
-        provider_type="stub",
-        model_name="stub",
-        reason="Stub provider active (MODEL_PROVIDER=stub).",
-        local_model_available=False,
-    )
+    if key == "stub":
+        return _stub_context("Stub provider active (MODEL_PROVIDER=stub).")
+
+    logger.warning("Unknown provider '%s'; falling back to stub provider.", key)
+    return _stub_context(f"Unknown provider '{key}'; using deterministic stub.")
 
 
 def _auto_local(settings: Settings) -> ProviderContext | None:
@@ -145,6 +121,38 @@ def _auto_local(settings: Settings) -> ProviderContext | None:
             logger.info("Selected local model %s (%s)", model_name, reason)
             return context
     return None
+
+
+def _groq_context(settings: Settings) -> ProviderContext:
+    model_name = settings.hosted_model_name or settings.model_name
+    try:
+        provider = GroqHostedProvider(
+            api_key=settings.groq_api_key,
+            model_name=model_name,
+            timeout_sec=settings.model_timeout_sec,
+            api_url=settings.groq_api_url,
+        )
+    except Exception as exc:  # pragma: no cover - defensive fall back
+        logger.warning("Hosted provider unavailable; using stub context (%s)", exc)
+        return _stub_context(f"Hosted provider unavailable ({exc}); falling back to stub.")
+    return ProviderContext(
+        provider=provider,
+        provider_type="hosted",
+        model_name=model_name,
+        vendor="Groq",
+        reason="Hosted Groq Llama 3.1 8B Instant ready for longer answers.",
+        local_model_available=False,
+    )
+
+
+def _stub_context(reason: str) -> ProviderContext:
+    return ProviderContext(
+        provider=StubProvider(),
+        provider_type="stub",
+        model_name="stub",
+        reason=reason,
+        local_model_available=False,
+    )
 
 
 def _list_ollama_models(host: str) -> List[str]:
