@@ -58,6 +58,7 @@ const sanitizeAssistantText = (text: string) => {
   const withoutInlineIds = joined
     .replace(/\[doc_id:[^\]]*\]/gi, '')
     .replace(/\[chunk_id:[^\]]*\]/gi, '')
+    .replace(/\[[^:\]]+:[^\]]*\]/g, '')
     .replace(/\s{2,}/g, ' ')
     .trim()
 
@@ -66,6 +67,7 @@ const sanitizeAssistantText = (text: string) => {
   const fallback = text
     .replace(/\[doc_id:[^\]]*\]/gi, '')
     .replace(/\[chunk_id:[^\]]*\]/gi, '')
+    .replace(/\[[^:\]]+:[^\]]*\]/g, '')
     .replace(/\s{2,}/g, ' ')
     .trim()
 
