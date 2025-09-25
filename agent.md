@@ -56,7 +56,8 @@ This document is the authoritative, self-contained map of the codebase. It enume
 │     │  ├─ __init__.py
 │     │  ├─ chunking.py                      # Token approximation + chunk splitter
 │     │  ├─ entities.py                      # spaCy-or-regex entity extraction
-│     │  └─ ingest_service.py                # Chunk/embed/upsert pipeline (text + PDF)
+│     │  ├─ ingest_service.py                # Chunk/embed/upsert pipeline (text + PDF)
+│     │  └─ url_crawler.py                   # Same-origin crawler for URL ingestion
 │     ├─ store/
 │     │  ├─ __init__.py
 │     │  ├─ graph_repo.py                    # Neo4j repository + in-memory fallback
@@ -70,6 +71,7 @@ This document is the authoritative, self-contained map of the codebase. It enume
 │     │  ├─ test_graph_repo.py               # Neo4j repository query execution contracts
 │     │  ├─ test_ingest_integration.py       # Slow e2e ingest against real Neo4j (optional)
 │     │  ├─ test_ingest_service.py           # IngestService chunk/entity/vector bookkeeping
+│     │  ├─ test_ingest_url.py               # URL crawler limits + end-to-end ingest
 │     │  ├─ test_planner.py                  # Planner mode selection thresholds
 │     │  ├─ test_provider.py                 # FastAPI health + /ask payload guards
 │     │  └─ test_retrieve.py                 # Retriever vector/graph/hybrid orchestration
@@ -111,9 +113,10 @@ This document is the authoritative, self-contained map of the codebase. It enume
   - `enforce_body_limit` gates POST sizes on `/ask` and `/ingest/paste`. Checks `Content-Length` if provided; otherwise buffers body once and re-attaches it (`request._body`). Returns HTTP 413 on overflow.
   - `log_requests` logs `<METHOD> <PATH> -> <status>` for every response.
 - Endpoints:
-  - `GET /health`: returns the provider name, provider type (`local` / `hosted` / `stub`), active model, vendor (for hosted Groq), whether a small local model is available, the operator-facing reason string, hosted reachability flag, preferred local model list, reachability booleans (`ollama_reachable`, `llamacpp_reachable`, `neo4j_reachable`), and vector store path metadata. Failures never raise—probes are wrapped in try/except.
+  - `GET /health`: returns the active provider/model plus reachability flags for Ollama, hosted provider, and Neo4j, the current graph backend (`aura` vs `inmemory`), along with vector store path metadata. Failures never raise—probes are wrapped in try/except.
   - `POST /ingest/paste` (response model `IngestPasteResponse`): rejects payload over 5 MiB, builds `IngestService` with `_safe_embedding_provider` (falls back to `StubEmbeddingProvider` with a warning) and the live vector/graph stores. Calls `ingest_text(title, text)`.
   - `POST /ingest/pdf` (response model `IngestPdfResponse`): accepts `application/pdf` or `application/octet-stream`; size-protects; reads binary, feeds to `IngestService.ingest_pdf`. Wraps pdfminer errors in HTTP 400 with message.
+  - `POST /ingest/url` (response model `IngestUrlResponse`): when enabled, crawls same-origin HTML pages under configurable depth/page/character caps, respecting `robots.txt`, deduplicating by canonical URL + content hash, extracting article/main text, then using `IngestService` to chunk/embed/upsert into vector + graph stores. Returns pages/chunks/entities/vectors counts with latency.
   - `POST /ask` (response model `AskResponse`):
     - Builds `Planner` with the active graph repo to compute plan metadata.
     - Chooses `top_k`: payload `top_k` > plan `top_k` > `Settings.top_k`.
@@ -159,6 +162,9 @@ This document is the authoritative, self-contained map of the codebase. It enume
   - `ingest_pdf(title, data)`:
     - Uses pdfminer `extract_text` on BytesIO; counts form-feed (`\f`) occurrences to estimate pages.
     - Delegates to `ingest_text`, wrapping counts in `IngestPdfResponse` with total latency.
+- `url_crawler.py`:
+  - `UrlCrawler` visits same-origin links under configurable depth/page/character caps, respecting robots rules, enforcing HTML-only responses, per-host rate limiting, and deduplicating via canonical URL + content hash before yielding article/main body text.
+  - `crawl_url` helper wires the crawler with `Settings` defaults for `/ingest/url`.
 
 ### 2.5 Retrieval & Answer (`backend/app/rag`)
 - `Planner` (`planner.py`):
@@ -208,9 +214,11 @@ This document is the authoritative, self-contained map of the codebase. It enume
 - `handleRecentQuestionClick` pushes the stored prompt back through `handleAsk`, so re-clicking history items replays the request without duplicating whitespace.
 - `lastAnswerSummary` condenses the most recent assistant reply to the first sentence (≤110 chars) for the sidebar card, and `lastAnswerSourceTitle` prefers the first titled citation (defaulting to `Untitled`).
 - `handlePasteIngest` trims input, falls back to the title `Untitled`, posts to `/ingest/paste`, and captures the response as both `indexStatus` and an `indexedSource` snapshot (title, chunk/vector counts, original paste) before clearing the form fields. Errors surface through `indexError` with copy “Failed to index …”.
-- `handlePdfIngest` requires a selected file, posts `FormData` to `/ingest/pdf`, records the result in `indexStatus/indexedSource`, clears the file selector, and mirrors the same error handling copy. Both ingest paths reuse `handleIngest` dispatcher.
+- `handlePdfIngest` requires a selected file, posts `FormData` to `/ingest/pdf`, records the result in `indexStatus/indexedSource`, clears the file selector, and mirrors the same error handling copy.
+- `handleUrlIngest` posts JSON payloads to `/ingest/url` with optional depth/max page overrides, updates `indexStatus` plus an inline progress note (`urlProgress`), and clears the URL field on success. All three ingest paths share `handleIngest` for dispatch and reuse the unified success/error banner.
 - Auxiliary helpers: `clearIngestForm` wipes all ingest state (title, paste, file, status/error) and `viewIndexedSource` opens a blob URL for the last indexed content (text blob or original PDF) in a new tab, revoking the URL shortly after.
-- Layout renders the tightened header (title `DeskMate`, subtitle “A service desk copilot”, tagline “Ingest docs. Ask with citations.”) with the provider pill + operator notes stack and a `New thread` control. Below sits the `Knowledge ingestion` card (mode tabs, inline success banner highlighting vectors stored locally + `View source`, error banner with `Retry`, primary `Upload and index` button, subtle `Clear` button, sentence-case labels). Main grid combines the chat panel and sidebar; the sidebar now shows an empty-state prompt with MFA/ticket examples, a `Clear history` link button, and a `Last answer` card that surfaces the single-line summary + `From: <title>` metadata. Buttons disable while `loading`.
+- Layout now emphasises the chat column: the main grid widens the conversation panel, while the `Knowledge ingestion` card uses softer styling so it reads as secondary. The header includes a `System status` toggle that reveals provider/graph metadata and the provider switcher on demand, plus `New thread`/`Purge memory` controls. Ingestion keeps Paste / PDF / URL tabs, the indexed banner summarises pages/vectors/chunks/entities in compact badges, and the paste/PDF forms keep the same ergonomics. The chat thread sits in a glassmorphism card with generous spacing, composer styling now matches the brand placeholder “Type your question about the service desk workflow…”, and the sidebar presents recent questions as a lightweight timeline with a refreshed empty state and `Last answer` card.
+- Tests: `frontend/src/App.purge.test.tsx` covers the purge-confirmation modal, ensuring incorrect input blocks erasure and a confirmed `DELETE` wipes chat history, recent questions, and ingest banners.
 
 ### 3.2 Components
 - `Composer.tsx`: Controlled textarea with auto-height adjustments via `useEffect`. Placeholder reads “Ask anything about your service desk workflow”. Intercepts Enter vs Shift+Enter to call `onSend` (awaited), then resets input/refocuses. The primary button stays labelled `Ask` (with aria-label matching) and simply disables while a request is pending.
@@ -218,12 +226,13 @@ This document is the authoritative, self-contained map of the codebase. It enume
 
 ### 3.3 Bootstrapping & Styling
 - `main.tsx`: Standard React 18 `createRoot` + `React.StrictMode` entry.
-- `styles.css`: Establishes a unified spacing scale (`--space-unit`), consistent card radius/shadows (with hover lift), visible focus rings, inline success/error banners, link/quiet/primary button treatments, avatar + skeleton styles, and responsive tweaks (grid collapses <920px, mobile padding <640px) on top of the glassmorphism palette.
+- `styles.css`: Establishes the spacing scale (`--space-unit`), refreshed chat/ingest/side panel elevations, focus rings, inline banners, button treatments (primary/ghost/quiet/subtle), avatar + skeleton styles, timeline list styling for recent questions, the System status popover, rounded composer input, and responsive tweaks (grid collapses <920px, mobile padding <640px) alongside graph/provider pill treatments and the URL ingest form grid.
+  - Modal styling powers the purge confirmation dialog (`modal-backdrop`, `modal`, `danger` button), ensuring destructive actions require explicit DELETE confirmation.
 - `index.html`: Loads Google Fonts (Inter), sets root `<div id="root">`, includes module script `/src/main.tsx`.
 - Tooling config: `vite.config.ts` adds React plugin, sets dev/preview port 5173; `tsconfig.json` uses strict compiler options, bundler module resolution.
 
 ### 3.4 Frontend Tooling
-- `package.json`: Scripts `npm run dev|build|preview`; dependencies limited to React 18; dev-deps include TypeScript 5, Vite 5, Prettier, React type defs.
+- `package.json`: Scripts `npm run dev|build|preview|test`; dependencies stay lean around React 18; dev-deps add Vitest + Testing Library, jsdom, TypeScript 5, Vite 5, Prettier, React type defs.
 - `package-lock.json`: Full dependency tree (do not edit manually, keep in sync with npm install).
 
 ## 4. Tests (`backend/app/tests`)
@@ -234,6 +243,7 @@ This document is the authoritative, self-contained map of the codebase. It enume
   - `test_ask_end_to_end_stub.py` performs ingest + ask using in-memory repositories and expects citations/confidence/latency to surface.
   - `test_retrieval_integration_minimal.py` drives a real `VectorChromaStore` (stubbed in CI) plus the in-memory graph repo to assert hybrid filtering.
   - `test_ingest_pdf_guard.py` xfails gracefully when `pdfminer.six` is unavailable.
+  - `test_ingest_url.py` exercises robots compliance, crawl limits, content extraction, and end-to-end URL ingestion into graph + vector stores.
 - Existing tests cover provider payload guards, planner logic, retriever behaviour, DTO validation, and integration with optional Neo4j (`pytest.mark.slow` skipping automatically when env/driver missing).
 - Run `make test` (or `pytest backend/app/tests`).
 
@@ -262,14 +272,16 @@ This document is the authoritative, self-contained map of the codebase. It enume
   - `EMBED_PROVIDER` (`auto`, `ollama`, `sentence`, `stub`), `OLLAMA_EMBED_MODEL`, `OLLAMA_HOST`, `LLAMACPP_HOST`.
   - Graph + vector: `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, `CHROMA_DIR`.
   - CORS: `ALLOWED_ORIGINS` (comma list).
+  - URL ingest: `ALLOW_URL_INGEST` (boolean), `URL_MAX_DEPTH`, `URL_MAX_PAGES`, `URL_MAX_TOTAL_CHARS`, `URL_RATE_LIMIT_SEC`.
   - Planner: `TOP_K`, `CHUNK_TOKENS`, `CHUNK_OVERLAP` (validated to positive/zero).
   - Frontend dev: `VITE_API_BASE`.
-- `requirements.txt` ties backend to FastAPI 0.111+, uvicorn reload, pydantic v2, requests/httpx, pytest, Ruff/Black, ChromaDB 0.5+, sentence-transformers, numpy/scikit-learn, neo4j 5.x, pdfminer.six, python-dotenv.
+- `requirements.txt` ties backend to FastAPI 0.111+, uvicorn reload, pydantic v2, requests/httpx, pytest, Ruff/Black, ChromaDB 0.5+, BeautifulSoup4, sentence-transformers, numpy/scikit-learn, neo4j 5.x, pdfminer.six, python-dotenv.
 
 ## 8. Runtime Behaviour Summary
-1. **Ingest Paste/PDF**
-   - FastAPI validates size → `IngestService` splits text, hashes embeddings (stub/HF/Ollama), stores vectors + graph nodes, extracts entities.
-   - Responses include chunk/entity/vector counts and wall-clock latency (ms), plus PDF page counts when applicable.
+1. **Ingest Paste/PDF/URL**
+   - FastAPI validates size/limits → `IngestService` splits text, hashes embeddings (stub/HF/Ollama), stores vectors + graph nodes, extracts entities.
+   - `/ingest/url` first crawls permitted same-origin pages (respecting robots, HTML-only, depth/page/char caps, per-host pacing, canonical dedupe, article/main extraction) then feeds each page into `IngestService`.
+   - Responses include chunk/entity/vector counts and wall-clock latency (ms), plus page counts when applicable.
 2. **Ask**
    - Planner inspects question for entities (spaCy when installed, regex fallback otherwise).
    - Graph repo returns degrees; planner selects `VECTOR`, `GRAPH`, or `HYBRID`.
@@ -309,7 +321,7 @@ This document is the authoritative, self-contained map of the codebase. It enume
 ## 11. Testing & Quality Gates
 - Run `make fmt` to auto-format (Ruff fix, Black, Prettier).
 - Run `make test` for backend tests; note integration test may skip without Neo4j env.
-- Frontend currently lacks automated tests; rely on manual QA or extend with e.g. Vitest if needed.
+- Frontend Vitest suite (`npm run test`) validates the purge flow; expand with additional UI scenarios as needed.
 - Acceptance checks:
   - `/health` always responds with provider + reachability booleans and vector store path info (no crashes when services are down).
   - Provider adapters raise on network failures; the responder prefixes fallback answers while keeping citations intact.

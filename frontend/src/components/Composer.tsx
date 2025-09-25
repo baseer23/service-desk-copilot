@@ -36,7 +36,7 @@ export default function Composer({ onSend, disabled }: Props) {
       <textarea
         ref={textareaRef}
         className="composer-input"
-        placeholder="Ask anything about your service desk workflow"
+        placeholder="Type your question about the service desk workflow…"
         value={text}
         onChange={(event) => setText(event.target.value)}
         onKeyDown={onKeyDown}

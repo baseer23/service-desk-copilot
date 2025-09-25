@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict
+from typing import Dict
 
 import pytest
 
@@ -159,20 +159,18 @@ def test_url_ingest_end_to_end(fake_site, make_client, tmp_path):
         }
     )
 
+    graph_repo = None
     try:
         response = client.post(
             "/ingest/url",
             json={"url": "https://example.com/start", "max_depth": 1, "max_pages": 2},
         )
         body = response.json()
+        import backend.app.main as main
+
+        graph_repo = main.app.state.graph_repo
     finally:
-        graph_repo = None
-        try:
-            import backend.app.main as main
-+
-            graph_repo = main.app.state.graph_repo
-        finally:
-            client.close()
+        client.close()
 
     assert response.status_code == 200
     assert body["pages"] == 2

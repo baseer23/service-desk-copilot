@@ -76,6 +76,7 @@ export default function MessageBubble({ message }: Props) {
   const label = ROLE_LABEL[message.role]
   const [showCitations, setShowCitations] = useState(false)
   const [copyKey, setCopyKey] = useState<string | null>(null)
+  const [showDebug, setShowDebug] = useState(false)
   const copyTimeout = useRef<number | null>(null)
   const isPending = Boolean(message.pending)
   const avatar = message.role === 'user' ? 'U' : 'D'
@@ -96,23 +97,23 @@ export default function MessageBubble({ message }: Props) {
   const citations = useMemo(() => {
     if (message.role !== 'assistant' || !message.citations) return []
 
-    return message.citations.map((citation) => {
+    return message.citations.map((citation, index) => {
       const snippet = citation.snippet?.trim()
       const base = snippet && snippet.length > 0 ? snippet : displayText
       const safeBase = base && base.length > 0 ? base : 'Preview unavailable.'
       const title = citation.title?.trim() && citation.title.trim().length > 0 ? citation.title.trim() : 'Untitled'
       const shortExcerpt = toSmartQuote(buildExcerpt(safeBase, SHORT_QUOTE_LENGTH))
       const longExcerpt = toSmartQuote(buildExcerpt(safeBase, LONG_QUOTE_LENGTH))
-      const rawId = `${citation.doc_id}:${citation.chunk_id}`
-      const relevance = Number.isFinite(citation.score) ? citation.score.toFixed(2) : '—'
+      const identifier = `${citation.doc_id}:${citation.chunk_id || index}`
+      const relevance = Number.isFinite(citation.score) ? citation.score.toFixed(2) : undefined
       return {
         original: citation,
         title,
         shortExcerpt,
         longExcerpt,
-        rawId,
         relevance,
         humanLine: `${longExcerpt} — ${title}`,
+        id: identifier,
       }
     })
   }, [displayText, message.citations, message.role])
@@ -151,6 +152,13 @@ export default function MessageBubble({ message }: Props) {
   const handleCopyAnswer = () => copyText(displayText, 'answer')
 
   const handleToggleCitations = () => setShowCitations((prev) => !prev)
+  const handleToggleDebug = () => setShowDebug((prev) => !prev)
+
+  const hasDebugDetails = useMemo(() => {
+    const metadataEntries = message.metadata && Object.keys(message.metadata).length > 0
+    const citationDebug = hasCitations
+    return Boolean(metadataEntries || citationDebug)
+  }, [hasCitations, message.metadata])
 
   return (
     <div className={`bubble ${message.role}${message.pending ? ' pending' : ''}${message.error ? ' error' : ''}`}>
@@ -172,27 +180,31 @@ export default function MessageBubble({ message }: Props) {
           )}
         </div>
         {message.role === 'assistant' && !isPending && (
-          <div className="bubble-toolbar">
-            <button
-              type="button"
-              className="bubble-action"
-              onClick={handleCopyAnswer}
-              aria-label="Copy answer"
-            >
+          <div className="bubble-actions">
+            <button type="button" className="pill-button" onClick={handleCopyAnswer} aria-label="Copy answer">
               {copyKey === 'answer' ? 'Copied' : 'Copy answer'}
             </button>
             {hasCitations && (
-              <>
-                <button
-                  type="button"
-                  className="bubble-action"
-                  onClick={handleToggleCitations}
-                  aria-expanded={showCitations}
-                  aria-label={showCitations ? 'Hide citations' : 'Show citations'}
-                >
-                  {showCitations ? 'Hide citations' : 'Show citations'}
-                </button>
-              </>
+              <button
+                type="button"
+                className="pill-button"
+                onClick={handleToggleCitations}
+                aria-expanded={showCitations}
+                aria-label={showCitations ? 'Hide citations' : 'Show citations'}
+              >
+                {showCitations ? 'Hide citations' : 'Show citations'}
+              </button>
+            )}
+            {hasDebugDetails && (
+              <button
+                type="button"
+                className="pill-button"
+                onClick={handleToggleDebug}
+                aria-expanded={showDebug}
+                aria-label={showDebug ? 'Hide technical details' : 'Show technical details'}
+              >
+                {showDebug ? 'Hide debug' : 'Debug info'}
+              </button>
             )}
           </div>
         )}
@@ -202,16 +214,16 @@ export default function MessageBubble({ message }: Props) {
         <div className="citation-summary">
           <ul className="citation-chips">
             {citations.map((citation) => (
-              <li key={citation.rawId}>
+              <li key={citation.id}>
                 <button
                   type="button"
                   className="citation-chip"
-                  onClick={() => copyText(citation.rawId, `chip-${citation.rawId}`)}
-                  title={citation.rawId}
-                  aria-label={`Copy source ID for ${citation.title}`}
+                  onClick={() => copyText(citation.longExcerpt, `chip-${citation.id}`)}
+                  aria-label={`Copy excerpt from ${citation.title}`}
                 >
+                  <span className="citation-chip-title">{citation.title}</span>
                   <span className="citation-chip-quote">{citation.shortExcerpt}</span>
-                  <span className="citation-chip-title"> — {citation.title}</span>
+                  <span className="citation-chip-copy">{copyKey === `chip-${citation.id}` ? 'Copied' : 'Copy snippet'}</span>
                 </button>
               </li>
             ))}
@@ -220,42 +232,48 @@ export default function MessageBubble({ message }: Props) {
           {showCitations && (
             <div className="citation-drawer">
               {citations.map((citation) => (
-                <article key={`drawer-${citation.rawId}`} className="citation-entry">
+                <article key={`drawer-${citation.id}`} className="citation-entry">
                   <h4 className="citation-entry-title">{citation.title}</h4>
                   <p className="citation-entry-subtitle">{citation.longExcerpt}</p>
-                  <div className="citation-entry-meta">
-                    <span>Relevance {citation.relevance}</span>
-                    <span aria-hidden="true" className="meta-dot">
-                      •
-                    </span>
-                    <button
-                      type="button"
-                      className="meta-id"
-                      onClick={() => copyText(citation.rawId, `meta-${citation.rawId}`)}
-                      title={citation.rawId}
-                      aria-label={`Copy source ID ${citation.rawId}`}
-                    >
-                      {copyKey === `meta-${citation.rawId}` ? 'Copied' : 'Source ID'}
-                    </button>
-                  </div>
                   <div className="citation-entry-actions">
                     <button
                       type="button"
-                      onClick={() => copyText(citation.humanLine, `quote-${citation.rawId}`)}
+                      onClick={() => copyText(citation.humanLine, `quote-${citation.id}`)}
                       aria-label={`Copy quote from ${citation.title}`}
                     >
-                      {copyKey === `quote-${citation.rawId}` ? 'Copied' : 'Copy quote'}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => copyText(citation.rawId, `source-${citation.rawId}`)}
-                      aria-label={`Copy source ID ${citation.rawId}`}
-                    >
-                      {copyKey === `source-${citation.rawId}` ? 'Copied' : 'Copy source ID'}
+                      {copyKey === `quote-${citation.id}` ? 'Copied' : 'Copy quote'}
                     </button>
                   </div>
                 </article>
               ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {showDebug && hasDebugDetails && (
+        <div className="debug-panel">
+          {citations.length > 0 && (
+            <div className="debug-block">
+              <h4>Sources</h4>
+              <ul>
+                {citations.map((citation) => (
+                  <li key={`debug-source-${citation.id}`}>
+                    <strong>{citation.title}</strong>
+                    <div className="debug-meta">
+                      <span>doc_id: {citation.original.doc_id}</span>
+                      <span>chunk_id: {citation.original.chunk_id}</span>
+                      {citation.relevance && <span>score: {citation.relevance}</span>}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {message.metadata && Object.keys(message.metadata).length > 0 && (
+            <div className="debug-block">
+              <h4>Response metadata</h4>
+              <pre>{JSON.stringify(message.metadata, null, 2)}</pre>
             </div>
           )}
         </div>

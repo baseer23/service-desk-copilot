@@ -103,7 +103,7 @@ class UrlCrawler:
 
             soup = BeautifulSoup(html, "html.parser")
             canonical_url = self._canonical_url(soup, page_url)
-            if canonical_url in seen_urls:
+            if canonical_url != current_url and canonical_url in seen_urls:
                 continue
 
             text, title = self._extract_text_and_title(soup, canonical_url)
@@ -121,6 +121,7 @@ class UrlCrawler:
             result.pages.append(CrawledPage(url=canonical_url, title=title or canonical_url, content=text))
             total_chars += len(text)
             result.pages_visited += 1
+            seen_urls.add(canonical_url)
 
             if depth < limits.max_depth and len(result.pages) < limits.max_pages:
                 links = self._extract_same_origin_links(soup, canonical_url, parsed_root)

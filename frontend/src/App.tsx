@@ -63,9 +63,10 @@ type IndexedSource = {
   title: string
   tokens: number
   chunks: number
-  mode: 'paste' | 'pdf'
+  mode: 'paste' | 'pdf' | 'url'
   content?: string
   file?: File
+  url?: string
 }
 
 async function postJSON<T>(
@@ -89,21 +90,29 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([])
   const [loading, setLoading] = useState(false)
   const [recentQuestions, setRecentQuestions] = useState<string[]>([])
-  const [ingestMode, setIngestMode] = useState<'paste' | 'pdf'>('paste')
+  const [ingestMode, setIngestMode] = useState<'paste' | 'pdf' | 'url'>('paste')
   const [pasteTitle, setPasteTitle] = useState('')
   const [pasteText, setPasteText] = useState('')
   const [pdfFile, setPdfFile] = useState<File | null>(null)
+  const [urlTarget, setUrlTarget] = useState('')
+  const [urlDepth, setUrlDepth] = useState('1')
+  const [urlMaxPages, setUrlMaxPages] = useState('5')
   const [indexStatus, setIndexStatus] = useState<IngestResult | null>(null)
   const [indexError, setIndexError] = useState<string | null>(null)
   const [indexedSource, setIndexedSource] = useState<IndexedSource | null>(null)
+  const [urlProgress, setUrlProgress] = useState<{ pages: number; chunks: number; entities: number } | null>(null)
   const [health, setHealth] = useState<HealthResponse | null>(null)
   const [healthError, setHealthError] = useState<string | null>(null)
+  const [isPurgeModalOpen, setIsPurgeModalOpen] = useState(false)
+  const [purgeConfirmation, setPurgeConfirmation] = useState('')
+  const [purgeError, setPurgeError] = useState<string | null>(null)
   const [providerChoice, setProviderChoice] = useState<ProviderOption>('ollama')
   const [providerSaving, setProviderSaving] = useState(false)
   const [providerError, setProviderError] = useState<string | null>(null)
   const [attemptedRestore, setAttemptedRestore] = useState(false)
+  const [showSystemStatus, setShowSystemStatus] = useState(false)
   const threadRef = useRef<HTMLDivElement | null>(null)
-  const healthFailureMessage = `Backend ${API_BASE} not reachable — run make dev and ensure VITE_API_BASE points to the backend`
+  const healthFailureMessage = `We’re having trouble reaching the backend at ${API_BASE}. Make sure it’s running (try “make dev”) and that VITE_API_BASE points to it.`
 
   const fetchHealthData = useCallback(async (): Promise<HealthResponse> => {
     const response = await fetch(`${API_BASE}/health`)
@@ -154,7 +163,7 @@ export default function App() {
   const providerPill = useMemo(() => {
     if (!health) return 'Provider · unknown · unknown'
     const rawKey = (health.active_provider || health.provider || 'unknown').toLowerCase()
-    const typeLabel = rawKey === 'groq' ? 'api' : rawKey
+    const typeLabel = rawKey === 'groq' ? 'API' : rawKey
     const preferredModel = (health.active_model || '').trim() || (health.model_name || '').trim()
     const fallbackModel = preferredModel || health.provider
     const model = fallbackModel && fallbackModel.length > 0 ? fallbackModel : 'unknown'
@@ -183,15 +192,15 @@ export default function App() {
     }
     if (!health.local_model_available && (health.preferred_local_models?.length ?? 0) > 0) {
       notes.push({
-        text: `Preferred small models: ${health.preferred_local_models.join(' → ')}.`,
+        text: `Preferred small models: ${health.preferred_local_models.join(' → ')}`,
         tone: 'default',
       })
     }
     if (!health.ollama_reachable) {
-      notes.push({ text: 'Ollama endpoint unreachable – local provider will fall back to stub.', tone: 'warn' })
+      notes.push({ text: 'Ollama endpoint unreachable — local provider will fall back to stub.', tone: 'warn' })
     }
     if (!health.hosted_reachable) {
-      notes.push({ text: 'Groq endpoint unreachable – hosted calls fall back to stub.', tone: 'warn' })
+      notes.push({ text: 'Groq endpoint unreachable — hosted calls fall back to stub.', tone: 'warn' })
     } else if (health.active_provider === 'groq') {
       notes.push({ text: 'Groq endpoint reachable.', tone: 'default' })
     }
@@ -217,6 +226,19 @@ export default function App() {
     }
     return null
   }, [health])
+
+  const ingestBannerSegments = useMemo(() => {
+    if (!indexStatus || !indexedSource) return null
+    const segments: string[] = []
+    if (indexedSource.mode === 'url') {
+      const pageCount = indexStatus.pages ?? 0
+      segments.push(`${pageCount} fetched page${pageCount === 1 ? '' : 's'}`)
+    }
+    segments.push(`${indexStatus.vector_count} vector${indexStatus.vector_count === 1 ? '' : 's'}`)
+    segments.push(`${indexStatus.chunks} chunk${indexStatus.chunks === 1 ? '' : 's'}`)
+    segments.push(`${indexStatus.entities} entit${indexStatus.entities === 1 ? 'y' : 'ies'}`)
+    return segments
+  }, [indexStatus, indexedSource])
 
   const applyProvider = useCallback(
     async (target: ProviderOption, options: { restore?: boolean } = {}) => {
@@ -320,7 +342,7 @@ export default function App() {
           message.id === assistantPlaceholder.id
             ? {
                 ...message,
-                text: `I could not reach the backend (${fallback}). Please ensure it is running on port 8000.`,
+                text: `We’re having trouble connecting to the server. Please check that it’s running on port 8000 and try again. (${fallback})`,
                 pending: false,
                 error: true,
               }
@@ -343,9 +365,10 @@ export default function App() {
 
   const handlePasteIngest = async () => {
     setIndexError(null)
+    setUrlProgress(null)
     const trimmedText = pasteText.trim()
     if (!trimmedText) {
-      setIndexError('Provide some text to index.')
+      setIndexError('Enter some content to index before uploading.')
       return
     }
     setIndexStatus(null)
@@ -366,15 +389,16 @@ export default function App() {
       setPasteTitle('')
       setPasteText('')
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to index text'
-      setIndexError(message)
+      const message = error instanceof Error ? error.message : 'We couldn’t index that content. Please try again.'
+      setIndexError(`We couldn’t index that content. Please try again. (${message})`)
     }
   }
 
   const handlePdfIngest = async () => {
     setIndexError(null)
+    setUrlProgress(null)
     if (!pdfFile) {
-      setIndexError('Select a PDF file to upload.')
+      setIndexError('Select a PDF file to upload before indexing.')
       return
     }
     setIndexStatus(null)
@@ -401,16 +425,57 @@ export default function App() {
       })
       setPdfFile(null)
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to index PDF'
-      setIndexError(message)
+      const message = error instanceof Error ? error.message : 'We couldn’t index that PDF. Please try again.'
+      setIndexError(`We couldn’t index that PDF. Please try again. (${message})`)
+    }
+  }
+
+  const handleUrlIngest = async () => {
+    setIndexError(null)
+    const trimmedUrl = urlTarget.trim()
+    if (!trimmedUrl) {
+      setIndexError('Enter a URL to crawl and ingest.')
+      return
+    }
+    setIndexStatus(null)
+    setUrlProgress(null)
+    setLoading(true)
+    try {
+      const depthValue = Number(urlDepth)
+      const pagesValue = Number(urlMaxPages)
+      const payload: Record<string, unknown> = {
+        url: trimmedUrl,
+      }
+      if (!Number.isNaN(depthValue) && depthValue >= 0) payload.max_depth = depthValue
+      if (!Number.isNaN(pagesValue) && pagesValue > 0) payload.max_pages = pagesValue
+
+      const result = await postJSON<IngestResult>(`${API_BASE}/ingest/url`, payload)
+      setIndexStatus(result)
+      const resolvedPages = result.pages ?? (!Number.isNaN(pagesValue) ? pagesValue : 0)
+      setUrlProgress({ pages: resolvedPages, chunks: result.chunks, entities: result.entities })
+      setIndexedSource({
+        title: trimmedUrl,
+        tokens: result.vector_count,
+        chunks: result.chunks,
+        mode: 'url',
+        url: trimmedUrl,
+      })
+      setUrlTarget('')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'We couldn’t crawl that URL. Please try again.'
+      setIndexError(`We couldn’t crawl that URL. Please try again. (${message})`)
+    } finally {
+      setLoading(false)
     }
   }
 
   const handleIngest = () => {
     if (ingestMode === 'paste') {
       handlePasteIngest()
-    } else {
+    } else if (ingestMode === 'pdf') {
       handlePdfIngest()
+    } else {
+      handleUrlIngest()
     }
   }
 
@@ -418,9 +483,13 @@ export default function App() {
     setPasteTitle('')
     setPasteText('')
     setPdfFile(null)
+    setUrlTarget('')
+    setUrlDepth('1')
+    setUrlMaxPages('5')
     setIndexError(null)
     setIndexStatus(null)
     setIndexedSource(null)
+    setUrlProgress(null)
   }
 
   const viewIndexedSource = () => {
@@ -435,6 +504,8 @@ export default function App() {
       const url = URL.createObjectURL(indexedSource.file)
       window.open(url, '_blank', 'noopener')
       setTimeout(() => URL.revokeObjectURL(url), 2000)
+    } else if (indexedSource.mode === 'url' && indexedSource.url) {
+      window.open(indexedSource.url, '_blank', 'noopener')
     }
   }
 
@@ -461,6 +532,35 @@ export default function App() {
     }
   }, [fetchHealthData, healthFailureMessage])
 
+  const openPurgeModal = () => {
+    setPurgeConfirmation('')
+    setPurgeError(null)
+    setIsPurgeModalOpen(true)
+  }
+
+  const closePurgeModal = () => {
+    setIsPurgeModalOpen(false)
+    setPurgeConfirmation('')
+    setPurgeError(null)
+  }
+
+  const performPurge = () => {
+    setMessages([])
+    setRecentQuestions([])
+    clearIngestForm()
+    setIndexedSource(null)
+    setUrlProgress(null)
+  }
+
+  const handlePurgeConfirm = () => {
+    if (purgeConfirmation.trim() === 'DELETE') {
+      performPurge()
+      closePurgeModal()
+    } else {
+      setPurgeError('Confirmation text does not match DELETE. Memory purge cancelled.')
+    }
+  }
+
   return (
     <div className="app-page">
       <div className="app-container">
@@ -472,10 +572,22 @@ export default function App() {
             <p className="tagline">Ingest docs. Ask with citations.</p>
           </div>
           <div className="header-actions">
-            <div className="provider-stack">
-              <div className="provider-row">
-                <span className="provider-pill">{providerPill}</span>
-                <span className={graphPillClass}>{graphPill}</span>
+            <div className="status-pill-group">
+              <span className="provider-pill">{providerPill}</span>
+              <span className={graphPillClass}>{graphPill}</span>
+              <button
+                type="button"
+                className={`ghost subtle${showSystemStatus ? ' active' : ''}`}
+                onClick={() => health && setShowSystemStatus((prev) => !prev)}
+                aria-expanded={showSystemStatus}
+                disabled={!health}
+              >
+                {showSystemStatus ? 'Hide status' : 'System status'}
+              </button>
+            </div>
+            {showSystemStatus && health && (
+              <div className="status-popover" role="region" aria-label="System status">
+                {providerMeta && <span className="provider-meta">{providerMeta}</span>}
                 <div className={`provider-toggle${providerSaving ? ' busy' : ''}`} role="group" aria-label="Select provider">
                   {(['ollama', 'groq'] as ProviderOption[]).map((option) => {
                     const isSelected = providerChoice === option
@@ -495,17 +607,19 @@ export default function App() {
                     )
                   })}
                 </div>
+                {providerError && <span className="provider-note warn">{providerError}</span>}
+                {providerNotes.map((note, index) => (
+                  <span key={index} className={`provider-note${note.tone === 'warn' ? ' warn' : ''}`}>
+                    {note.text}
+                  </span>
+                ))}
               </div>
-              {providerMeta && <span className="provider-meta">{providerMeta}</span>}
-              {providerError && <span className="provider-note warn">{providerError}</span>}
-              {providerNotes.map((note, index) => (
-                <span key={index} className={`provider-note${note.tone === 'warn' ? ' warn' : ''}`}>
-                  {note.text}
-                </span>
-              ))}
-            </div>
+            )}
             <button type="button" className="ghost" onClick={resetThread} disabled={loading}>
               New thread
+            </button>
+            <button type="button" className="quiet" onClick={openPurgeModal} disabled={loading}>
+              Purge memory
             </button>
           </div>
         </header>
@@ -538,21 +652,30 @@ export default function App() {
               >
                 Upload PDF
               </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={ingestMode === 'url'}
+                className={ingestMode === 'url' ? 'active' : ''}
+                onClick={() => setIngestMode('url')}
+              >
+                URL
+              </button>
             </div>
           </div>
 
-          {indexStatus && indexedSource && (
+          {indexStatus && indexedSource && ingestBannerSegments && (
             <div className="inline-banner success" role="status">
               <p className="banner-text">
                 <span className="banner-segment">Indexed “{indexedSource.title}”</span>
-                <span className="banner-separator" aria-hidden="true">
-                  •
-                </span>
-                <span className="banner-segment">{indexStatus.vector_count} vectors stored locally</span>
-                <span className="banner-separator" aria-hidden="true">
-                  •
-                </span>
-                <span className="banner-segment">{indexStatus.chunks} chunks</span>
+                {ingestBannerSegments.map((segment, index) => (
+                  <React.Fragment key={`seg-${index}`}>
+                    <span className="banner-separator" aria-hidden="true">
+                      •
+                    </span>
+                    <span className="banner-segment">{segment}</span>
+                  </React.Fragment>
+                ))}
               </p>
               <button type="button" className="link-button banner-link" onClick={viewIndexedSource}>
                 View source
@@ -590,7 +713,7 @@ export default function App() {
                 onChange={(event) => setPasteText(event.target.value)}
               />
             </div>
-          ) : (
+          ) : ingestMode === 'pdf' ? (
             <div className="ingest-form">
               <label className="input-label" htmlFor="source-file">
                 Upload a PDF
@@ -602,6 +725,48 @@ export default function App() {
                 onChange={(event) => setPdfFile(event.target.files?.[0] ?? null)}
               />
               {pdfFile && <span className="file-chip">{pdfFile.name}</span>}
+            </div>
+          ) : (
+            <div className="ingest-form">
+              <label className="input-label" htmlFor="source-url">
+                URL to ingest
+              </label>
+              <input
+                id="source-url"
+                type="url"
+                value={urlTarget}
+                onChange={(event) => setUrlTarget(event.target.value)}
+                placeholder="https://example.com"
+              />
+              <div className="url-grid">
+                <div>
+                  <label className="input-label" htmlFor="url-depth">
+                    Max depth
+                  </label>
+                  <input
+                    id="url-depth"
+                    type="number"
+                    min={0}
+                    value={urlDepth}
+                    onChange={(event) => setUrlDepth(event.target.value)}
+                  />
+                </div>
+                <div>
+                  <label className="input-label" htmlFor="url-pages">
+                    Max pages
+                  </label>
+                  <input
+                    id="url-pages"
+                    type="number"
+                    min={1}
+                    value={urlMaxPages}
+                    onChange={(event) => setUrlMaxPages(event.target.value)}
+                  />
+                </div>
+              </div>
+              {urlProgress && (
+                <p className="muted">Fetched {urlProgress.pages} pages · {urlProgress.chunks} chunks · {urlProgress.entities} entities.</p>
+              )}
             </div>
           )}
 
@@ -623,18 +788,19 @@ export default function App() {
               ) : (
                 messages.map((message) => <MessageBubble key={message.id} message={message} />)
               )}
-            </div>
-            <Composer onSend={handleAsk} disabled={loading} />
           </div>
+          <Composer onSend={handleAsk} disabled={loading} />
+        </div>
 
           <aside className="sidebar">
             <h2>Recent questions</h2>
             {recentQuestions.length === 0 ? (
-              <p className="muted">Try "What is the MFA reset policy" or "How do I create a ticket".</p>
+              <p className="muted">Try “What is the MFA reset policy?” or “How do I create a ticket?”</p>
             ) : (
-              <ul className="recent-question-list">
+              <ul className="recent-question-list" role="list">
                 {recentQuestions.map((question) => (
                   <li key={question}>
+                    <span className="timeline-dot" aria-hidden="true" />
                     <button
                       type="button"
                       className="recent-question"
@@ -664,6 +830,37 @@ export default function App() {
           </aside>
         </div>
       </div>
+
+      {isPurgeModalOpen && (
+        <div className="modal-backdrop" role="presentation">
+          <div className="modal" role="dialog" aria-modal="true" aria-labelledby="purge-title">
+            <h2 id="purge-title">Purge Memory</h2>
+            <p className="muted">
+              This will erase all current conversation history and ingest state. This action cannot be undone.
+              Type DELETE to confirm.
+            </p>
+            <label className="input-label" htmlFor="purge-confirmation">
+              Confirmation
+            </label>
+            <input
+              id="purge-confirmation"
+              type="text"
+              value={purgeConfirmation}
+              onChange={(event) => setPurgeConfirmation(event.target.value)}
+              autoFocus
+            />
+            {purgeError && <p className="modal-error">{purgeError}</p>}
+            <div className="modal-actions">
+              <button type="button" className="quiet" onClick={closePurgeModal}>
+                Cancel
+              </button>
+              <button type="button" className="danger" onClick={handlePurgeConfirm}>
+                Confirm purge
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
