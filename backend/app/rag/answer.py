@@ -12,7 +12,6 @@ from backend.app.core.config import DEFAULT_STUB_ANSWER
 from backend.app.models.dto import AskResponse, Citation
 from backend.app.models.provider import LocalModelProvider
 
-
 logger = logging.getLogger(__name__)
 FALLBACK_PREFIX = "Model provider unavailable; falling back to stub. "
 
@@ -46,10 +45,14 @@ def compose_prompt(question: str, chunks: List[Dict[str, object]]) -> str:
 
 @dataclass
 class Responder:
+    """Adapter that turns retrieved chunks into a final user-facing answer."""
+
     settings: object
     provider: LocalModelProvider
 
     def answer(self, question: str, planner: Dict[str, object], chunks: List[Dict[str, object]]) -> AskResponse:
+        """Generate an answer for the supplied question and context."""
+
         started = time.perf_counter()
         prompt = compose_prompt(question, chunks)
 
@@ -91,6 +94,8 @@ class Responder:
         )
 
     def _confidence_from_scores(self, scores: List[float]) -> float:
+        """Return a bounded confidence value derived from retrieval scores."""
+
         if not scores:
             return 0.5
         mean_score = sum(scores) / len(scores)

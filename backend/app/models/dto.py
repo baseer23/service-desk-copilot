@@ -7,11 +7,13 @@ from pydantic import BaseModel, Field, computed_field, field_validator
 
 
 class IngestPasteRequest(BaseModel):
+    """Payload accepted when ingesting pasted text."""
     text: str = Field(..., min_length=1)
     title: Optional[str] = Field(default=None)
 
 
 class IngestPasteResponse(BaseModel):
+    """Summary metrics returned after ingesting pasted text."""
     chunks: int = Field(..., ge=0)
     entities: int = Field(..., ge=0)
     vector_count: int = Field(..., ge=0)
@@ -19,22 +21,27 @@ class IngestPasteResponse(BaseModel):
 
     @computed_field  # type: ignore[misc]
     def chunks_ingested(self) -> int:
+        """Maintain compatibility with earlier response field names."""
         return self.chunks
 
     @computed_field  # type: ignore[misc]
     def entities_linked(self) -> int:
+        """Expose entity counts under legacy naming."""
         return self.entities
 
     @computed_field  # type: ignore[misc]
     def vectors_upserted(self) -> int:
+        """Alias vector counts for older clients."""
         return self.vector_count
 
     @computed_field  # type: ignore[misc]
     def latency_ms(self) -> int:
+        """Expose total processing latency in milliseconds."""
         return self.ms
 
 
 class IngestPdfResponse(BaseModel):
+    """Response payload describing PDF ingestion results."""
     pages: int = Field(..., ge=0)
     chunks: int = Field(..., ge=0)
     entities: int = Field(..., ge=0)
@@ -43,26 +50,32 @@ class IngestPdfResponse(BaseModel):
 
     @computed_field  # type: ignore[misc]
     def pages_ingested(self) -> int:
+        """Return the number of pages processed."""
         return self.pages
 
     @computed_field  # type: ignore[misc]
     def chunks_ingested(self) -> int:
+        """Maintain compatibility with earlier response field names."""
         return self.chunks
 
     @computed_field  # type: ignore[misc]
     def entities_linked(self) -> int:
+        """Expose entity counts under legacy naming."""
         return self.entities
 
     @computed_field  # type: ignore[misc]
     def vectors_upserted(self) -> int:
+        """Alias vector counts for older clients."""
         return self.vector_count
 
     @computed_field  # type: ignore[misc]
     def latency_ms(self) -> int:
+        """Expose total processing latency in milliseconds."""
         return self.ms
 
 
 class Citation(BaseModel):
+    """Citation metadata surfaced alongside answers."""
     doc_id: str
     chunk_id: str
     score: float = Field(..., ge=0.0)
@@ -71,6 +84,7 @@ class Citation(BaseModel):
 
 
 class AskRequest(BaseModel):
+    """Ask endpoint payload containing the user question."""
     question: str = Field(..., min_length=1)
     top_k: Optional[int] = Field(default=None, ge=1)
     provider_override: Optional[str] = Field(default=None)
@@ -78,6 +92,7 @@ class AskRequest(BaseModel):
     @field_validator("top_k", mode="before")
     @classmethod
     def default_top_k(cls, value: Optional[int]) -> Optional[int]:
+        """Prefer explicit payload values, falling back to environment defaults."""
         if value is not None:
             return value
         env_value = os.getenv("TOP_K")
@@ -93,6 +108,7 @@ class AskRequest(BaseModel):
     @field_validator("provider_override")
     @classmethod
     def validate_override(cls, value: Optional[str]) -> Optional[str]:
+        """Normalise and validate provider overrides from the client."""
         if value is None:
             return None
         normalized = value.strip().lower()
@@ -103,6 +119,7 @@ class AskRequest(BaseModel):
 
 
 class AskResponse(BaseModel):
+    """Response body returned by the ask endpoint."""
     answer: str
     provider: str
     question: str
@@ -113,11 +130,13 @@ class AskResponse(BaseModel):
 
 
 class ProviderToggleRequest(BaseModel):
+    """Admin payload used to switch the active provider."""
     provider: str = Field(..., min_length=1)
 
     @field_validator("provider")
     @classmethod
     def validate_provider(cls, value: str) -> str:
+        """Ensure toggled providers are restricted to supported options."""
         normalized = value.strip().lower()
         if normalized not in {"ollama", "groq"}:
             raise ValueError("provider must be ollama or groq")
@@ -125,6 +144,7 @@ class ProviderToggleRequest(BaseModel):
 
 
 class IngestUrlRequest(BaseModel):
+    """Payload describing a crawl request for URL ingestion."""
     url: str = Field(..., min_length=1)
     max_depth: Optional[int] = Field(default=None, ge=0)
     max_pages: Optional[int] = Field(default=None, ge=1)
@@ -132,6 +152,7 @@ class IngestUrlRequest(BaseModel):
     @field_validator("url")
     @classmethod
     def validate_url(cls, value: str) -> str:
+        """Validate URL ingestion targets and enforce HTTP(S) scheme."""
         value = value.strip()
         if not value:
             raise ValueError("url must not be empty")
@@ -141,6 +162,7 @@ class IngestUrlRequest(BaseModel):
 
 
 class IngestUrlResponse(BaseModel):
+    """Metrics captured after ingesting content from URLs."""
     pages: int = Field(..., ge=0)
     chunks: int = Field(..., ge=0)
     entities: int = Field(..., ge=0)
@@ -149,20 +171,25 @@ class IngestUrlResponse(BaseModel):
 
     @computed_field  # type: ignore[misc]
     def pages_ingested(self) -> int:
+        """Return the number of pages processed."""
         return self.pages
 
     @computed_field  # type: ignore[misc]
     def chunks_ingested(self) -> int:
+        """Maintain compatibility with earlier response field names."""
         return self.chunks
 
     @computed_field  # type: ignore[misc]
     def entities_linked(self) -> int:
+        """Expose entity counts under legacy naming."""
         return self.entities
 
     @computed_field  # type: ignore[misc]
     def vectors_upserted(self) -> int:
+        """Alias vector counts for older clients."""
         return self.vector_count
 
     @computed_field  # type: ignore[misc]
     def latency_ms(self) -> int:
+        """Expose total processing latency in milliseconds."""
         return self.ms

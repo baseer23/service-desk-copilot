@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import logging
 import time
 import uuid
-import logging
 from dataclasses import dataclass
 from io import BytesIO
-from typing import Optional
+from typing import Iterable, List, Mapping, Optional
 
 from pdfminer.high_level import extract_text
 
@@ -14,31 +14,43 @@ from backend.app.models.dto import IngestPasteResponse, IngestPdfResponse
 from backend.app.services.chunking import approx_tokens, split_text
 from backend.app.services.entities import extract_entities
 
-
 logger = logging.getLogger("service-desk")
 
 
 @dataclass
 class IngestService:
+    """Orchestrates chunking, embedding, and persistence for new documents."""
+
     settings: object
     vector_store: object
     graph_repo: object
     embedding_provider: object
 
     def ingest_text(self, title: Optional[str], text: str) -> IngestPasteResponse:
+        """Ingest plain text by chunking, embedding, and writing to stores."""
+
         started = time.perf_counter()
-        chunks = split_text(text, getattr(self.settings, "chunk_tokens", None), getattr(self.settings, "chunk_overlap", None))
+        chunks = split_text(
+            text,
+            getattr(self.settings, "chunk_tokens", None),
+            getattr(self.settings, "chunk_overlap", None),
+        )
         if not chunks:
-            return IngestPasteResponse(chunks=0, entities=0, vector_count=0, ms=int((time.perf_counter() - started) * 1000))
+            return IngestPasteResponse(
+                chunks=0,
+                entities=0,
+                vector_count=0,
+                ms=int((time.perf_counter() - started) * 1000),
+            )
 
         doc_id = uuid.uuid4().hex
-        chunk_texts = []
-        records = []
+        chunk_texts: List[str] = []
+        records: List[Mapping[str, object]] = []
         for chunk in chunks:
             chunk_id = f"{doc_id}-{chunk['ord']}"
             chunk["chunk_id"] = chunk_id
             chunk["id"] = chunk_id
-            chunk_text = chunk["text"]
+            chunk_text = str(chunk["text"])
             chunk_texts.append(chunk_text)
             chunk["metadata"] = {"doc_id": doc_id, "ord": chunk["ord"]}
 
@@ -54,7 +66,7 @@ class IngestService:
                 {
                     "id": chunk["chunk_id"],
                     "text": chunk["text"],
-                    "metadata": chunk["metadata"],
+                    "metadata": chunk.get("metadata", {}),
                     "embedding": embedding,
                 }
             )
@@ -67,8 +79,8 @@ class IngestService:
                 doc_id,
                 chunk["chunk_id"],
                 ord=chunk["ord"],
-                text=chunk["text"],
-                token_count=approx_tokens(chunk["text"]),
+                text=str(chunk["text"]),
+                token_count=approx_tokens(str(chunk["text"])),
             )
             self.graph_repo.link_doc_chunk(doc_id, chunk["chunk_id"])
 
@@ -76,7 +88,7 @@ class IngestService:
         for entity in entities:
             entity_id = self.graph_repo.upsert_entity(entity)
             for chunk in chunks:
-                if entity in chunk["text"].lower():
+                if entity in str(chunk["text"]).lower():
                     self.graph_repo.link_chunk_entity(chunk["chunk_id"], entity_id)
 
         elapsed_ms = int((time.perf_counter() - started) * 1000)
@@ -88,6 +100,8 @@ class IngestService:
         )
 
     def ingest_pdf(self, title: Optional[str], data: bytes) -> IngestPdfResponse:
+        """Ingest a PDF document by extracting text then delegating to ingest_text."""
+
         started = time.perf_counter()
         text = extract_text(BytesIO(data))
         page_count = text.count("\f") + 1 if text else 0

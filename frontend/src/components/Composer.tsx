@@ -1,10 +1,16 @@
 import React, { useEffect, useRef, useState } from 'react'
 
+/**
+ * Props accepted by the Composer component.
+ */
 type Props = {
   onSend: (text: string) => Promise<void> | void
   disabled?: boolean
 }
 
+/**
+ * Controlled textarea for authoring a new question.
+ */
 export default function Composer({ onSend, disabled }: Props) {
   const [text, setText] = useState('')
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)

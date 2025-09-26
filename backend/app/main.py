@@ -3,10 +3,10 @@ import logging.config
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Awaitable, Callable, Optional, Tuple
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import FileResponse
 from starlette.staticfiles import StaticFiles
@@ -168,7 +168,8 @@ _set_active_provider(_initial_provider_key(SETTINGS), settings=SETTINGS)
 
 
 @app.on_event("startup")
-async def startup_event():  # pragma: no cover - exercised in integration tests
+async def startup_event() -> None:  # pragma: no cover - exercised in integration tests
+    """Initialise application state before serving requests."""
     settings = get_settings()
     app.state.settings = settings
     app.state.vector_store = _init_vector_store(settings)
@@ -179,7 +180,8 @@ async def startup_event():  # pragma: no cover - exercised in integration tests
 
 
 @app.on_event("shutdown")
-async def shutdown_event():  # pragma: no cover - exercised in integration tests
+async def shutdown_event() -> None:  # pragma: no cover - exercised in integration tests
+    """Tear down external resources on application shutdown."""
     driver = getattr(app.state, "graph_driver", None)
     if driver:
         driver.close()
@@ -188,7 +190,8 @@ async def shutdown_event():  # pragma: no cover - exercised in integration tests
 class SpaStaticFiles(StaticFiles):
     """Serve SPA assets while falling back to index.html for unknown routes."""
 
-    async def get_response(self, path: str, scope):  # type: ignore[override]
+    async def get_response(self, path: str, scope: dict[str, Any]) -> Response:  # type: ignore[override]
+        """Serve static files and fall back to index.html for SPA routes."""
         try:
             return await super().get_response(path, scope)
         except Exception:  # pragma: no cover - relies on filesystem state
@@ -199,7 +202,10 @@ class SpaStaticFiles(StaticFiles):
 
 
 @app.middleware("http")
-async def enforce_body_limit(request: Request, call_next: Callable):
+async def enforce_body_limit(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
+    """Reject payloads that exceed configured request body limits."""
     protected_paths = {"/ask", "/ingest/paste"}
     if request.method.upper() == "POST" and request.url.path in protected_paths:
         content_length = request.headers.get("content-length")
@@ -220,7 +226,10 @@ async def enforce_body_limit(request: Request, call_next: Callable):
 
 
 @app.middleware("http")
-async def log_requests(request: Request, call_next: Callable):
+async def log_requests(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
+    """Log request method/path pairs alongside the response status."""
     response = await call_next(request)
     logger.info("%s %s -> %s", request.method, request.url.path, response.status_code)
     return response
@@ -228,6 +237,7 @@ async def log_requests(request: Request, call_next: Callable):
 
 @app.get("/health")
 def health() -> dict[str, object]:
+    """Return deployment health, reachability, and provider metadata."""
     settings = getattr(app.state, "settings", SETTINGS)
     provider_context = _resolve_provider_context(None, settings)
     provider = provider_context.provider
@@ -259,7 +269,8 @@ def health() -> dict[str, object]:
 
 
 @app.post("/ingest/paste", response_model=IngestPasteResponse)
-def ingest_paste(request: IngestPasteRequest):
+def ingest_paste(request: IngestPasteRequest) -> IngestPasteResponse:
+    """Ingest pasted text content via the standard pipeline."""
     if len(request.text.encode("utf-8")) > MAX_INGEST_BYTES:
         raise HTTPException(status_code=413, detail="Payload too large")
 
@@ -276,7 +287,8 @@ def ingest_paste(request: IngestPasteRequest):
 
 
 @app.post("/ingest/pdf", response_model=IngestPdfResponse)
-async def ingest_pdf(file: UploadFile = File(...), title: Optional[str] = None):
+async def ingest_pdf(file: UploadFile = File(...), title: Optional[str] = None) -> IngestPdfResponse:
+    """Accept a PDF upload, extract text, and index it."""
     if file.content_type not in {"application/pdf", "application/octet-stream"}:
         raise HTTPException(status_code=415, detail="Unsupported file type")
     content = await file.read()
@@ -300,6 +312,7 @@ async def ingest_pdf(file: UploadFile = File(...), title: Optional[str] = None):
 
 @app.post("/ask", response_model=AskResponse)
 def ask(payload: AskRequest) -> AskResponse:
+    """Execute retrieval, provider selection, and response composition."""
     settings = getattr(app.state, "settings", SETTINGS)
     planner = Planner(settings=settings, graph_repo=app.state.graph_repo)
     plan = planner.plan(payload.question)
@@ -330,7 +343,8 @@ def ask(payload: AskRequest) -> AskResponse:
 
 
 @app.post("/admin/provider")
-def set_active_provider(selection: ProviderToggleRequest, request: Request):
+def set_active_provider(selection: ProviderToggleRequest, request: Request) -> dict[str, object]:
+    """Switch the active local provider, enforcing the admin secret."""
     settings = getattr(app.state, "settings", SETTINGS)
     _require_admin_secret(request, settings)
     context = _set_active_provider(selection.provider, settings=settings)
@@ -344,7 +358,8 @@ def set_active_provider(selection: ProviderToggleRequest, request: Request):
 
 
 @app.post("/ingest/url", response_model=IngestUrlResponse)
-def ingest_url(request: IngestUrlRequest):
+def ingest_url(request: IngestUrlRequest) -> IngestUrlResponse:
+    """Ingest content discovered by crawling a single URL."""
     settings = get_settings()
     if not settings.allow_url_ingest:
         raise HTTPException(status_code=403, detail="URL ingestion is disabled")

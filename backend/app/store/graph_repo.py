@@ -1,14 +1,30 @@
 from __future__ import annotations
 
 import re
-from typing import Optional
+from typing import Any, Callable, Dict, Iterable, List, MutableMapping, Optional, Sequence, Set, Tuple, TypeVar
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover - import is for type checking only
+    from neo4j import Driver, Session, Transaction
+else:  # pragma: no cover - runtime driver types resolved dynamically
+    Driver = Any
+    Session = Any
+    Transaction = Any
+
+T = TypeVar("T")
+ChunkRecord = Dict[str, object]
 
 
 class GraphRepository:
-    def __init__(self, driver) -> None:
-        self._driver = driver
+    """Persistence adapter for document, chunk, and entity metadata in Neo4j."""
+
+    def __init__(self, driver: Driver) -> None:
+        """Store the Neo4j driver for subsequent transactional work."""
+        self._driver: Driver = driver
 
     def ensure_constraints(self) -> None:
+        """Create Neo4j constraints and indexes required for ingest operations."""
+
         statements = [
             "CREATE CONSTRAINT IF NOT EXISTS FOR (d:Document) REQUIRE d.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (c:Chunk) REQUIRE c.id IS UNIQUE",
@@ -20,7 +36,9 @@ class GraphRepository:
                 session.run(statement)
 
     def upsert_document(self, doc_id: str, title: Optional[str] = None, source: str = "paste") -> None:
-        def _tx(tx):
+        """Insert or update a document node and basic metadata."""
+
+        def _tx(tx: Transaction) -> None:
             tx.run(
                 "MERGE (d:Document {id: $doc_id}) "
                 "SET d.title = $title, d.source = $source, d.updated_at = timestamp()",
@@ -32,7 +50,9 @@ class GraphRepository:
         self._execute_write(_tx)
 
     def upsert_chunk(self, doc_id: str, chunk_id: str, ord: int, text: str, token_count: int) -> None:
-        def _tx(tx):
+        """Insert or update a chunk node with ordering and token metadata."""
+
+        def _tx(tx: Transaction) -> None:
             tx.run(
                 "MERGE (c:Chunk {id: $chunk_id}) "
                 "SET c.ord = $ord, c.text = $text, c.tokens = $token_count, c.updated_at = timestamp()",
@@ -45,7 +65,9 @@ class GraphRepository:
         self._execute_write(_tx)
 
     def link_doc_chunk(self, doc_id: str, chunk_id: str) -> None:
-        def _tx(tx):
+        """Ensure the relationship between a document and one of its chunks exists."""
+
+        def _tx(tx: Transaction) -> None:
             tx.run(
                 "MATCH (d:Document {id: $doc_id}), (c:Chunk {id: $chunk_id}) "
                 "MERGE (d)-[:HAS_CHUNK]->(c)",
@@ -56,7 +78,9 @@ class GraphRepository:
         self._execute_write(_tx)
 
     def upsert_entity(self, name: str, type: str = "TERM") -> str:
-        def _tx(tx):
+        """Insert or update an entity node, returning its canonical identifier."""
+
+        def _tx(tx: Transaction) -> str:
             result = tx.run(
                 "MERGE (e:Entity {id: toLower($name)}) "
                 "SET e.name = $name, e.type = $type, e.updated_at = timestamp() "
@@ -73,9 +97,11 @@ class GraphRepository:
         return str(result)
 
     def link_chunk_entity(self, chunk_id: str, entity_id: str, rel: str = "ABOUT") -> None:
+        """Create a relationship between a chunk and an entity."""
+
         rel_type = _safe_rel(rel)
 
-        def _tx(tx):
+        def _tx(tx: Transaction) -> None:
             tx.run(
                 f"MATCH (c:Chunk {{id: $chunk_id}}), (e:Entity {{id: $entity_id}}) "
                 f"MERGE (c)-[:{rel_type}]->(e)",
@@ -85,13 +111,16 @@ class GraphRepository:
 
         self._execute_write(_tx)
 
-    def get_entity_degrees(self, names):
-        if not names:
+    def get_entity_degrees(self, names: Iterable[str]) -> Dict[str, int]:
+        """Return a mapping of entity id to degree counts for the requested names."""
+
+        name_list = list(names)
+        if not name_list:
             return {}
 
-        lower_names = [name.lower() for name in names]
+        lower_names = [name.lower() for name in name_list]
 
-        def _tx(tx):
+        def _tx(tx: Transaction) -> Dict[str, int]:
             result = tx.run(
                 "MATCH (e:Entity) WHERE e.id IN $ids "
                 "OPTIONAL MATCH (e)--(n) "
@@ -101,29 +130,34 @@ class GraphRepository:
             return {record["id"]: record["degree"] for record in result}
 
         degrees = self._execute_read(_tx)
-        # ensure every requested name appears in result
-        return {name: degrees.get(name.lower(), 0) for name in names}
+        return {name: degrees.get(name.lower(), 0) for name in name_list}
 
-    def fetch_chunks_for_entities(self, names, limit):
+    def fetch_chunks_for_entities(self, names: Sequence[str], limit: int) -> List[ChunkRecord]:
+        """Fetch chunks connected to any of the provided entity names."""
+
         if not names:
             return []
 
         lower_names = [name.lower() for name in names]
 
-        def _tx(tx):
+        def _tx(tx: Transaction) -> List[ChunkRecord]:
             result = tx.run(
                 "MATCH (e:Entity) WHERE e.id IN $ids "
                 "MATCH (e)<-[:ABOUT]-(c:Chunk)<-[:HAS_CHUNK]-(d:Document) "
                 "RETURN c.id AS chunk_id, c.text AS text, c.ord AS ord, d.id AS doc_id, d.title AS title",
                 ids=lower_names,
             )
-            records = []
+            records: List[ChunkRecord] = []
             for record in result:
                 records.append(
                     {
                         "id": record["chunk_id"],
                         "text": record["text"],
-                        "metadata": {"doc_id": record["doc_id"], "title": record["title"], "ord": record["ord"]},
+                        "metadata": {
+                            "doc_id": record["doc_id"],
+                            "title": record.get("title"),
+                            "ord": record.get("ord"),
+                        },
                         "score": 0.0,
                     }
                 )
@@ -132,20 +166,10 @@ class GraphRepository:
         records = self._execute_read(_tx)
         return records[:limit]
 
-    def _execute_write(self, func):
-        if hasattr(self._driver, "execute_write"):
-            return self._driver.execute_write(func)
-        with self._driver.session() as session:  # pragma: no cover - legacy driver path
-            return session.execute_write(func)
-
-    def _execute_read(self, func):
-        if hasattr(self._driver, "execute_read"):
-            return self._driver.execute_read(func)
-        with self._driver.session() as session:  # pragma: no cover - legacy driver path
-            return session.execute_read(func)
-
     def ping(self) -> bool:
-        def _tx(tx):
+        """Return True when the database responds to a trivial read."""
+
+        def _tx(tx: Transaction) -> bool:
             tx.run("RETURN 1 AS ok")
             return True
 
@@ -154,20 +178,43 @@ class GraphRepository:
         except Exception:  # pragma: no cover - depends on runtime connectivity
             return False
 
+    def _execute_write(self, func: Callable[[Transaction], T]) -> T:
+        """Execute a write transaction using the best available driver API."""
+
+        if hasattr(self._driver, "execute_write"):
+            return self._driver.execute_write(func)
+        with self._driver.session() as session:  # pragma: no cover - legacy driver path
+            return session.execute_write(func)  # type: ignore[call-arg]
+
+    def _execute_read(self, func: Callable[[Transaction], T]) -> T:
+        """Execute a read transaction using the best available driver API."""
+
+        if hasattr(self._driver, "execute_read"):
+            return self._driver.execute_read(func)
+        with self._driver.session() as session:  # pragma: no cover - legacy driver path
+            return session.execute_read(func)  # type: ignore[call-arg]
+
 
 class InMemoryGraphRepository:
-    def __init__(self) -> None:
-        self.documents = {}
-        self.chunks = {}
-        self.entity_links = {}
+    """Minimal in-memory substitute implementing the GraphRepository interface."""
 
-    def ensure_constraints(self) -> None:  # pragma: no cover - no-op
-        return
+    def __init__(self) -> None:
+        """Initialise empty dictionaries for documents, chunks, and entities."""
+        self.documents: MutableMapping[str, Dict[str, Optional[str]]] = {}
+        self.chunks: MutableMapping[str, Dict[str, Any]] = {}
+        self.entity_links: MutableMapping[str, Dict[str, Any]] = {}
+
+    def ensure_constraints(self) -> None:  # pragma: no cover - no-op for in-memory variant
+        """In-memory store has no constraints to create."""
 
     def upsert_document(self, doc_id: str, title: Optional[str] = None, source: str = "paste") -> None:
+        """Store document metadata in-memory."""
+
         self.documents[doc_id] = {"title": title, "source": source}
 
     def upsert_chunk(self, doc_id: str, chunk_id: str, ord: int, text: str, token_count: int) -> None:
+        """Persist chunk metadata in-memory for testing."""
+
         self.chunks[chunk_id] = {
             "doc_id": doc_id,
             "text": text,
@@ -175,48 +222,61 @@ class InMemoryGraphRepository:
             "tokens": token_count,
         }
 
-    def link_doc_chunk(self, doc_id: str, chunk_id: str) -> None:  # pragma: no cover - implicit in storage
-        return
+    def link_doc_chunk(self, doc_id: str, chunk_id: str) -> None:  # pragma: no cover - no-op
+        """Document/chunk relationships are implicit in the in-memory structure."""
 
     def upsert_entity(self, name: str, type: str = "TERM") -> str:
+        """Store entity metadata and return its normalized id."""
+
         entity_id = name.lower()
         if entity_id not in self.entity_links:
-            self.entity_links[entity_id] = {"name": name, "chunks": set()}
+            self.entity_links[entity_id] = {"name": name, "type": type, "chunks": set()}
         return entity_id
 
     def link_chunk_entity(self, chunk_id: str, entity_id: str, rel: str = "ABOUT") -> None:
-        info = self.entity_links.setdefault(entity_id, {"name": entity_id, "chunks": set()})
-        info["chunks"].add(chunk_id)
+        """Record a chunk→entity relationship in-memory."""
 
-    def get_entity_degrees(self, names):
-        degrees = {}
+        info = self.entity_links.setdefault(entity_id, {"name": entity_id, "type": "TERM", "chunks": set()})
+        chunks: Set[str] = info.setdefault("chunks", set())  # type: ignore[assignment]
+        chunks.add(chunk_id)
+
+    def get_entity_degrees(self, names: Iterable[str]) -> Dict[str, int]:
+        """Return entity linkage counts for the supplied names."""
+
+        degrees: Dict[str, int] = {}
         for name in names:
             entity_id = name.lower()
-            chunks = self.entity_links.get(entity_id, {"chunks": set()})["chunks"]
+            chunks = self.entity_links.get(entity_id, {"chunks": set()}).get("chunks", set())
             degrees[name] = len(chunks)
         return degrees
 
-    def fetch_chunks_for_entities(self, names, limit):
-        collected = []
+    def fetch_chunks_for_entities(self, names: Sequence[str], limit: int) -> List[ChunkRecord]:
+        """Return stored chunks associated with the requested entities."""
+
+        collected: List[ChunkRecord] = []
         for name in names:
             entity_id = name.lower()
-            for chunk_id in self.entity_links.get(entity_id, {"chunks": set()})["chunks"]:
+            for chunk_id in self.entity_links.get(entity_id, {"chunks": set()}).get("chunks", set()):
                 chunk = self.chunks.get(chunk_id)
                 if not chunk:
                     continue
                 metadata = {
                     "doc_id": chunk["doc_id"],
                     "title": self.documents.get(chunk["doc_id"], {}).get("title"),
-                    "ord": chunk["ord"],
+                    "ord": chunk.get("ord"),
                 }
                 collected.append({"id": chunk_id, "text": chunk["text"], "metadata": metadata, "score": 0.0})
         return collected[:limit]
 
     def ping(self) -> bool:
+        """In-memory store is always available."""
+
         return True
 
 
 def _safe_rel(rel: str) -> str:
+    """Return a Neo4j relationship label comprised of safe characters only."""
+
     candidate = (rel or "ABOUT").upper()
     if not re.match(r"^[A-Z_][A-Z0-9_]*$", candidate):
         return "ABOUT"

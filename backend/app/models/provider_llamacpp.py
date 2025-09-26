@@ -7,7 +7,6 @@ import requests
 
 from .provider import LocalModelProvider
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -15,14 +14,19 @@ class LlamaCppProvider(LocalModelProvider):
     """Adapter for the llama.cpp REST-compatible server."""
 
     def __init__(self, host: str, model: Optional[str], timeout_sec: int) -> None:
+        """Initialise the llama.cpp provider with host, model, and timeout."""
         self._host = host.rstrip("/") or "http://localhost:8080"
         self._model = model
         self._timeout = timeout_sec
 
     def name(self) -> str:
+        """Return the provider identifier."""
+
         return "llamacpp"
 
     def generate(self, prompt: str) -> str:
+        """Call the llama.cpp completion endpoint and normalise the payload."""
+
         url = f"{self._host}/completion"
         payload: Dict[str, Any] = {
             "prompt": prompt,
@@ -47,7 +51,9 @@ class LlamaCppProvider(LocalModelProvider):
             raise RuntimeError("llama.cpp response missing text")
         return text.strip()
 
-    def _extract_text(self, data: Dict[str, Any]) -> str | None:
+    def _extract_text(self, data: Dict[str, Any]) -> Optional[str]:
+        """Normalise the many possible llama.cpp response shapes into a string."""
+
         if not isinstance(data, dict):
             return None
         if isinstance(data.get("content"), str):

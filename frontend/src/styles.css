@@ -580,8 +580,8 @@ body {
 
 .main-content {
   display: grid;
-  grid-template-columns: minmax(0, 1.8fr) minmax(280px, 0.8fr);
-  gap: calc(var(--space-unit) * 3);
+  grid-template-columns: minmax(0, 2.2fr) minmax(280px, 0.75fr);
+  gap: calc(var(--space-unit) * 3.25);
   align-items: start;
 }
 
@@ -679,10 +679,13 @@ body {
 
 .bubble-actions {
   display: flex;
+  flex-direction: column;
   gap: 8px;
-  flex-wrap: wrap;
-  align-items: center;
-  margin-top: 8px;
+  align-items: flex-end;
+  justify-content: flex-start;
+  margin-top: 4px;
+  margin-left: auto;
+  min-width: 152px;
 }
 
 .pill-button {
@@ -695,6 +698,34 @@ body {
   font-weight: 600;
   cursor: pointer;
   transition: background 0.2s ease, color 0.2s ease;
+}
+
+.bubble-actions .pill-button {
+  width: 100%;
+  text-align: right;
+}
+
+.bubble-actions .pill-button.two-line {
+  width: auto;
+  text-align: center;
+  align-self: flex-end;
+}
+
+.pill-button.two-line {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  padding: 8px 12px;
+}
+
+.pill-button.two-line .pill-button-line {
+  display: block;
+  line-height: 1.05;
+  white-space: nowrap;
+  hyphens: none;
+  word-break: keep-all;
 }
 
 .pill-button:hover {
@@ -1084,6 +1115,15 @@ body {
 
   .sidebar {
     order: -1;
+  }
+
+  .bubble-actions {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-start;
+    margin-left: 0;
+    min-width: auto;
   }
 }
 

@@ -89,7 +89,7 @@ describe('Purge memory flow', () => {
       return jsonResponse({ detail: 'not found' }, 404)
     })
 
-    global.fetch = fetchMock as unknown as typeof fetch
+    globalThis.fetch = fetchMock as unknown as typeof fetch
     window.localStorage.clear()
   })
 

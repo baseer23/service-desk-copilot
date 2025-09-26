@@ -6,7 +6,7 @@ import hashlib
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Deque, Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import ParseResult, urljoin, urlparse, urlsplit, urlunsplit
 from urllib.robotparser import RobotFileParser
 
@@ -18,6 +18,8 @@ from backend.app.core.config import Settings
 
 @dataclass
 class CrawlLimits:
+    """Bounds used to control crawl scope and rate."""
+
     max_depth: int
     max_pages: int
     max_total_chars: int
@@ -26,6 +28,8 @@ class CrawlLimits:
 
 @dataclass
 class CrawledPage:
+    """Represents content extracted from a crawled page."""
+
     url: str
     title: str
     content: str
@@ -33,6 +37,8 @@ class CrawledPage:
 
 @dataclass
 class CrawlResult:
+    """Aggregate crawl outcome including visited pages and skips."""
+
     pages: List[CrawledPage] = field(default_factory=list)
     skipped_urls: List[str] = field(default_factory=list)
     pages_visited: int = 0
@@ -48,11 +54,14 @@ class UrlCrawler:
     USER_AGENT = "ServiceDeskCopilotBot/1.0 (+https://example.com)"
 
     def __init__(self, settings: Settings, session: Optional[requests.Session] = None) -> None:
+        """Store configuration and instantiate an HTTP session if needed."""
         self._settings = settings
         self._session = session or requests.Session()
         self._session.headers.setdefault("User-Agent", self.USER_AGENT)
 
     def crawl(self, root_url: str, overrides: Optional[CrawlLimits] = None) -> CrawlResult:
+        """Crawl the supplied root URL and return extracted content."""
+
         parsed_root = urlparse(root_url)
         if parsed_root.scheme not in {"http", "https"}:
             raise CrawlError("Only HTTP/HTTPS schemes are supported.")
@@ -62,7 +71,7 @@ class UrlCrawler:
         limits = overrides or self._default_limits()
         robot_parser = self._load_robots(parsed_root)
 
-        queue: deque[Tuple[str, int]] = deque([(self._normalize_url(root_url), 0)])
+        queue: Deque[Tuple[str, int]] = deque([(self._normalize_url(root_url), 0)])
         seen_urls: Set[str] = set()
         seen_hashes: Set[str] = set()
         total_chars = 0
@@ -132,6 +141,8 @@ class UrlCrawler:
         return result
 
     def _default_limits(self) -> CrawlLimits:
+        """Construct CrawlLimits using application settings."""
+
         return CrawlLimits(
             max_depth=self._settings.url_max_depth,
             max_pages=max(1, self._settings.url_max_pages),
@@ -139,7 +150,9 @@ class UrlCrawler:
             rate_limit_sec=self._settings.url_rate_limit_sec,
         )
 
-    def _load_robots(self, parsed_root) -> RobotFileParser:
+    def _load_robots(self, parsed_root: ParseResult) -> RobotFileParser:
+        """Load and parse robots.txt for the target origin."""
+
         robots_url = urlunsplit((parsed_root.scheme, parsed_root.netloc, "/robots.txt", "", ""))
         parser = RobotFileParser()
         try:
@@ -154,12 +167,16 @@ class UrlCrawler:
         return parser
 
     def _can_fetch(self, parser: RobotFileParser, url: str) -> bool:
+        """Return True when the crawler is permitted to fetch the given URL."""
+
         try:
             return parser.can_fetch(self.USER_AGENT, url)
         except Exception:  # pragma: no cover - defensive
             return True
 
     def _respect_rate_limit(self, last_fetch: float, rate_limit_sec: float) -> float:
+        """Sleep as required to honour crawl rate limits and return new timestamp."""
+
         if rate_limit_sec <= 0:
             return time.monotonic()
         now = time.monotonic()
@@ -169,6 +186,8 @@ class UrlCrawler:
         return time.monotonic()
 
     def _safe_get(self, url: str) -> Optional[requests.Response]:
+        """Perform a GET request handling exceptions and non-200 codes."""
+
         try:
             response = self._session.get(url, timeout=10)
             if response.status_code != 200:
@@ -178,11 +197,15 @@ class UrlCrawler:
             return None
 
     def _normalize_url(self, url: str) -> str:
+        """Return a normalised URL suitable for deduplication."""
+
         parsed = urlsplit(url)
         normalized = urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", "", ""))
         return normalized.rstrip("/") or normalized
 
     def _canonical_url(self, soup: BeautifulSoup, fallback_url: str) -> str:
+        """Resolve a canonical URL from the page when provided."""
+
         link = soup.find("link", rel=lambda value: value and "canonical" in value.lower())
         if link and link.get("href"):
             canonical = urljoin(fallback_url, link["href"])
@@ -190,6 +213,8 @@ class UrlCrawler:
         return self._normalize_url(fallback_url)
 
     def _extract_text_and_title(self, soup: BeautifulSoup, url: str) -> Tuple[str, str]:
+        """Return plain text content and page title for the supplied soup."""
+
         for tag in soup(["script", "style", "noscript", "template", "nav", "footer", "form", "aside", "iframe"]):
             tag.decompose()
 
@@ -213,6 +238,8 @@ class UrlCrawler:
     def _extract_same_origin_links(
         self, soup: BeautifulSoup, base_url: str, root: ParseResult
     ) -> Iterable[str]:
+        """Yield same-origin links discovered within the provided soup."""
+
         parsed_root = root
         collected: Set[str] = set()
         for anchor in soup.find_all("a", href=True):
@@ -229,5 +256,7 @@ class UrlCrawler:
 
 
 def crawl_url(root_url: str, settings: Settings, overrides: Optional[CrawlLimits] = None) -> CrawlResult:
+    """Convenience helper constructing a UrlCrawler and invoking crawl."""
+
     crawler = UrlCrawler(settings=settings)
     return crawler.crawl(root_url, overrides=overrides)

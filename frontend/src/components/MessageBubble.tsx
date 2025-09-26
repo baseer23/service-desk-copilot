@@ -1,5 +1,10 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 
+import { featureFlags } from '../featureFlags'
+
+/**
+ * Citation metadata rendered beneath assistant answers.
+ */
 export type Citation = {
   doc_id: string
   chunk_id: string
@@ -42,6 +47,23 @@ const buildExcerpt = (raw: string, max: number) => {
 
 const toSmartQuote = (text: string) => `${SMART_OPEN}${text}${SMART_CLOSE}`
 
+const stripHexArtifacts = (input: string) =>
+  input
+    .replace(/(?:\b[0-9a-f]{16,}\b:?)+/gi, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+
+const polishNarrative = (input: string) =>
+  input
+    .replace(/\(\s*\)/g, '')
+    .replace(/:\s*-\s+/g, ': ')
+    .replace(/([.!?])\s*-\s+/g, '$1 ')
+    .replace(/\s+-\s+/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/\s+([,.;:])/g, '$1')
+    .replace(/([,.;:])(\S)/g, '$1 $2')
+    .trim()
+
 const sanitizeAssistantText = (text: string) => {
   const sentences = text.split(/(?<=[.!?])\s+/)
   const filteredSentences = sentences.filter((sentence) => {
@@ -55,25 +77,31 @@ const sanitizeAssistantText = (text: string) => {
   })
 
   const joined = filteredSentences.join(' ').trim()
-  const withoutInlineIds = joined
-    .replace(/\[doc_id:[^\]]*\]/gi, '')
-    .replace(/\[chunk_id:[^\]]*\]/gi, '')
-    .replace(/\[[^:\]]+:[^\]]*\]/g, '')
-    .replace(/\s{2,}/g, ' ')
-    .trim()
+  const withoutInlineIds = stripHexArtifacts(
+    joined
+      .replace(/\[doc_id:[^\]]*\]/gi, '')
+      .replace(/\[chunk_id:[^\]]*\]/gi, '')
+      .replace(/\[[^:\]]+:[^\]]*\]/g, '')
+      .trim(),
+  )
 
-  if (withoutInlineIds.length > 0) return withoutInlineIds
+  const polished = polishNarrative(withoutInlineIds)
+  if (polished.length > 0) return polished
 
-  const fallback = text
-    .replace(/\[doc_id:[^\]]*\]/gi, '')
-    .replace(/\[chunk_id:[^\]]*\]/gi, '')
-    .replace(/\[[^:\]]+:[^\]]*\]/g, '')
-    .replace(/\s{2,}/g, ' ')
-    .trim()
+  const fallback = polishNarrative(stripHexArtifacts(
+    text
+      .replace(/\[doc_id:[^\]]*\]/gi, '')
+      .replace(/\[chunk_id:[^\]]*\]/gi, '')
+      .replace(/\[[^:\]]+:[^\]]*\]/g, '')
+      .trim(),
+  ))
 
   return fallback.length > 0 ? fallback : text
 }
 
+/**
+ * Render a single chat bubble with optional citations and debug detail toggles.
+ */
 export default function MessageBubble({ message }: Props) {
   const label = ROLE_LABEL[message.role]
   const [showCitations, setShowCitations] = useState(false)
@@ -183,29 +211,63 @@ export default function MessageBubble({ message }: Props) {
         </div>
         {message.role === 'assistant' && !isPending && (
           <div className="bubble-actions">
-            <button type="button" className="pill-button" onClick={handleCopyAnswer} aria-label="Copy answer">
-              {copyKey === 'answer' ? 'Copied' : 'Copy answer'}
+            <button
+              type="button"
+              className={`pill-button${
+                featureFlags.twoLineCopyAnswerButton ? ' two-line' : ''
+              }`}
+              onClick={handleCopyAnswer}
+              aria-label="Copy answer"
+            >
+              {featureFlags.twoLineCopyAnswerButton ? (
+                <>
+                  <span className="pill-button-line">Copy</span>
+                  <span className="pill-button-line">Answer</span>
+                </>
+              ) : (
+                copyKey === 'answer' ? 'Copied' : 'Copy answer'
+              )}
             </button>
             {hasCitations && (
               <button
                 type="button"
-                className="pill-button"
+                className={`pill-button${
+                  featureFlags.twoLineCitationsButton ? ' two-line' : ''
+                }`}
                 onClick={handleToggleCitations}
                 aria-expanded={showCitations}
-                aria-label={showCitations ? 'Hide citations' : 'Show citations'}
+                aria-label="Copy citations"
               >
-                {showCitations ? 'Hide citations' : 'Show citations'}
+                {featureFlags.twoLineCitationsButton ? (
+                  <>
+                    <span className="pill-button-line">Copy</span>
+                    <span className="pill-button-line">Citations</span>
+                  </>
+                ) : (
+                  showCitations ? 'Hide citations' : 'Show citations'
+                )}
               </button>
             )}
             {hasDebugDetails && (
               <button
                 type="button"
-                className="pill-button"
+                className={`pill-button${
+                  featureFlags.twoLineDebugInfoButton ? ' two-line' : ''
+                }`}
                 onClick={handleToggleDebug}
                 aria-expanded={showDebug}
-                aria-label={showDebug ? 'Hide technical details' : 'Show technical details'}
+                aria-label={showDebug ? 'Hide technical details' : 'Debug info'}
               >
-                {showDebug ? 'Hide debug' : 'Debug info'}
+                {featureFlags.twoLineDebugInfoButton ? (
+                  <>
+                    <span className="pill-button-line">Debug</span>
+                    <span className="pill-button-line">Info</span>
+                  </>
+                ) : showDebug ? (
+                  'Hide debug'
+                ) : (
+                  'Debug info'
+                )}
               </button>
             )}
           </div>

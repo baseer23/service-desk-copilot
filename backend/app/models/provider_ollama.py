@@ -7,7 +7,6 @@ import requests
 
 from .provider import LocalModelProvider
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -15,14 +14,19 @@ class OllamaProvider(LocalModelProvider):
     """Adapter for the Ollama local REST API."""
 
     def __init__(self, model_name: str, host: str, timeout_sec: int) -> None:
+        """Initialise the Ollama provider with host, model, and timeout settings."""
         self._model = model_name
         self._host = host.rstrip("/") or "http://localhost:11434"
         self._timeout = timeout_sec
 
     def name(self) -> str:
+        """Return the provider identifier."""
+
         return "ollama"
 
     def generate(self, prompt: str) -> str:
+        """Call the Ollama REST API and return generated text."""
+
         url = f"{self._host}/api/generate"
         payload: Dict[str, Any] = {
             "model": self._model,

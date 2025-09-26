@@ -1,6 +1,9 @@
 SHELL := /bin/bash
 
-.PHONY: dev slm fmt test compose-up compose-down ingest-sample bench-air
+BACKEND_DIR := backend
+FRONTEND_DIR := frontend
+
+.PHONY: dev slm fmt lint type test security compose-up compose-down ingest-sample bench-air
 
 dev:
 	@bash scripts/dev.sh
@@ -9,12 +12,25 @@ slm:
 	@bash scripts/start_slm.sh
 
 fmt:
-	ruff check --fix backend
-	black backend
-	cd frontend && npx prettier -w .
+	ruff check --fix $(BACKEND_DIR)
+	black $(BACKEND_DIR)
+	cd $(FRONTEND_DIR) && npm run format
+
+lint:
+	ruff check $(BACKEND_DIR)
+	cd $(FRONTEND_DIR) && npm run lint
+
+type:
+	mypy $(BACKEND_DIR)/app
+	cd $(FRONTEND_DIR) && npm run typecheck
 
 test:
-	pytest backend/app/tests
+	pytest $(BACKEND_DIR)/app/tests
+	cd $(FRONTEND_DIR) && npm run test
+
+security:
+	safety check --full-report
+	cd $(FRONTEND_DIR) && npm run audit
 
 compose-up:
 	docker compose up -d neo4j

@@ -51,11 +51,12 @@ class Settings(BaseSettings):
         env_file=PROJECT_ROOT / ".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        protected_namespaces=("settings_",),
     )
 
     @field_validator("allowed_origins", mode="before")
     @classmethod
-    def split_origins(cls, value):  # noqa: D401
+    def split_origins(cls, value: list[str] | str) -> list[str]:  # noqa: D401
         """Support plain or comma-delimited strings in the env file."""
         if isinstance(value, str):
             return [origin.strip() for origin in value.split(",") if origin.strip()]
@@ -64,36 +65,43 @@ class Settings(BaseSettings):
     @field_validator("model_provider")
     @classmethod
     def normalize_provider(cls, value: str) -> str:
+        """Normalise provider identifiers to lowercase."""
         return value.lower()
 
     @field_validator("embed_provider")
     @classmethod
     def normalize_embed_provider(cls, value: str) -> str:
+        """Normalise embedding provider identifiers, defaulting to stub."""
         return (value or "stub").lower()
 
     @field_validator("top_k", "chunk_tokens")
     @classmethod
     def positive_int(cls, value: int) -> int:
+        """Clamp integer configuration values to be strictly positive."""
         return max(1, int(value))
 
     @field_validator("chunk_overlap")
     @classmethod
     def non_negative(cls, value: int) -> int:
+        """Ensure overlap counts remain non-negative."""
         return max(0, int(value))
 
     @field_validator("url_max_depth", "url_max_pages")
     @classmethod
     def non_negative_int(cls, value: int) -> int:
+        """Clamp depth/page inputs to non-negative integers."""
         return max(0, int(value))
 
     @field_validator("url_max_total_chars")
     @classmethod
     def positive_text_cap(cls, value: int) -> int:
+        """Ensure total character caps stay above the minimum threshold."""
         return max(1_000, int(value))
 
     @field_validator("url_rate_limit_sec")
     @classmethod
     def non_negative_float(cls, value: float) -> float:
+        """Prevent negative rate limits that would break throttling."""
         return max(0.0, float(value))
 
 

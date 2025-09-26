@@ -1,0 +1,41 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.5.6
+    hooks:
+      - id: ruff
+        args: ["--fix"]
+        files: ^backend/
+      - id: ruff-format
+        files: ^backend/
+  - repo: https://github.com/psf/black
+    rev: 24.4.2
+    hooks:
+      - id: black
+        files: ^backend/
+  - repo: local
+    hooks:
+      - id: mypy-backend
+        name: mypy backend
+        entry: mypy backend/app
+        language: system
+        pass_filenames: false
+      - id: prettier-frontend
+        name: prettier frontend
+        entry: npx prettier --config frontend/.prettierrc.json --write
+        language: system
+        files: ^frontend/src/.*\.(ts|tsx|css|md|json)$
+      - id: eslint-frontend
+        name: eslint frontend
+        entry: npx eslint --max-warnings=0
+        language: system
+        files: ^frontend/src/.*\.(ts|tsx)$
+      - id: pytest-backend
+        name: pytest backend
+        entry: pytest backend/app/tests
+        language: system
+        pass_filenames: false
+      - id: vitest-frontend
+        name: vitest frontend
+        entry: npm run test
+        language: system
+        pass_filenames: false

@@ -21,6 +21,7 @@ class GroqHostedProvider(LocalModelProvider):
         timeout_sec: int,
         api_url: str = "https://api.groq.com/openai/v1/chat/completions",
     ) -> None:
+        """Initialise the hosted Groq provider with credentials and model."""
         if not api_key:
             raise ValueError("GROQ_API_KEY must be set for hosted Groq provider")
         self._api_key = api_key
@@ -29,9 +30,11 @@ class GroqHostedProvider(LocalModelProvider):
         self._api_url = api_url.rstrip("/")
 
     def name(self) -> str:
+        """Return the provider identifier used in planner metadata."""
         return "hosted-groq"
 
     def generate(self, prompt: str) -> str:
+        """Call the hosted Groq endpoint and return the answer text."""
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
@@ -65,6 +68,7 @@ class GroqHostedProvider(LocalModelProvider):
         return content.strip()
 
     def _extract_content(self, data: Dict[str, Any]) -> str | None:
+        """Normalise Groq response payloads into a plain string."""
         if not isinstance(data, dict):
             return None
         choices = data.get("choices")

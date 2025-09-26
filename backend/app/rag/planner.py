@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, Iterable
 
 from backend.app.services.entities import extract_entities
 
@@ -10,10 +10,14 @@ GRAPH_THRESHOLD = 3
 
 @dataclass
 class Planner:
+    """Selects retrieval mode based on detected entity graph connectivity."""
+
     settings: object
     graph_repo: object
 
     def plan(self, question: str) -> Dict[str, object]:
+        """Return planner metadata guiding downstream retrieval."""
+
         entities = extract_entities([{"text": question}])
         entity_degrees = self.graph_repo.get_entity_degrees(entities) if entities else {}
         top_k = getattr(self.settings, "top_k", 6)

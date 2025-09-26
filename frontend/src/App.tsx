@@ -69,6 +69,12 @@ type IndexedSource = {
   url?: string
 }
 
+/**
+ * POST JSON payloads to the backend and return the parsed response.
+ * @param url API endpoint to call.
+ * @param body Serializable request body.
+ * @param options Optional fetch overrides such as headers.
+ */
 async function postJSON<T>(
   url: string,
   body: unknown,
@@ -86,6 +92,9 @@ async function postJSON<T>(
   return response.json() as Promise<T>
 }
 
+/**
+ * Root application component coordinating ask and ingest flows.
+ */
 export default function App() {
   const [messages, setMessages] = useState<Message[]>([])
   const [loading, setLoading] = useState(false)

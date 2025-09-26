@@ -6,10 +6,12 @@ This document is the authoritative, self-contained map of the codebase. It enume
 ```
 .
 ├─ LICENSE                                  # Proprietary notice
-├─ Makefile                                  # make dev|slm|fmt|test|compose-*|ingest-sample|bench-air
+├─ Makefile                                  # make dev|slm|fmt|lint|type|test|security|compose-*|ingest-sample|bench-air
 ├─ agent.md                                  # You are here (repo snapshot)
 ├─ docker-compose.yml                        # Neo4j (APOC-enabled) service definition
-├─ requirements.txt                          # Backend + tooling Python deps
+├─ requirements.txt                          # Pinned backend + tooling Python deps
+├─ pyproject.toml                            # Ruff/Black/Mypy configuration
+├─ .pre-commit-config.yaml                   # Git hook running lint/type/test on staged files
 ├─ docs/
 │  ├─ README.md                              # High-level project overview & setup
 │  ├─ RAG.md                                 # ASCII diagram of ingestion + retrieval flow
@@ -79,6 +81,8 @@ This document is the authoritative, self-contained map of the codebase. It enume
 ├─ frontend/
 │  ├─ README.md                              # SPA setup + features
 │  ├─ index.html                             # Root HTML shell (loads /src/main.tsx)
+│  ├─ .eslintrc.cjs                          # ESLint config (TS, React, Testing Library)
+│  ├─ .prettierrc.json                       # Prettier formatting defaults
 │  ├─ package-lock.json                      # Pinned npm dependency graph
 │  ├─ package.json                           # Frontend scripts + deps
 │  ├─ tsconfig.json                          # TS compiler config (strict)
@@ -185,8 +189,9 @@ This document is the authoritative, self-contained map of the codebase. It enume
 
 ### 2.6 Persistence Stores (`backend/app/store`)
 - `vector_chroma.py`:
+  - Defines a `VectorStore` protocol documenting the `upsert`, `search`, and `ping` contract shared by concrete implementations.
   - `VectorChromaStore`: ensures directory exists, instantiates `chromadb.PersistentClient` (telemetry disabled). `upsert` accepts chunk dicts (id, text, metadata, embedding). `search` queries using embedding and returns list of dicts containing id, text, metadata, score (distance).
-  - `InMemoryVectorStore`: dictionary keyed by chunk id; `search` returns first `top_k` chunks (deterministic fallback).
+  - `InMemoryVectorStore`: dictionary keyed by chunk id implementing the same protocol; `search` returns first `top_k` chunks (deterministic fallback).
 - `graph_repo.py`:
   - `GraphRepository` wraps Neo4j driver `execute_write/read` (falls back to manual session for old drivers). Provides methods to upsert documents/chunks/entities, create relationships (`HAS_CHUNK`, dynamic `rel` sanitized via `_safe_rel`), compute entity degrees, and fetch chunk metadata for entity sets.
   - `InMemoryGraphRepository`: dictionaries of documents/chunks/entities sets; minimal operations to mimic interface, degrees based on linked chunk counts, fetch returns stored chunk snapshots.
@@ -221,7 +226,7 @@ This document is the authoritative, self-contained map of the codebase. It enume
 - Tests: `frontend/src/App.purge.test.tsx` covers the purge-confirmation modal, ensuring incorrect input blocks erasure and a confirmed `DELETE` wipes chat history, recent questions, and ingest banners.
 
 ### 3.2 Components
-- `Composer.tsx`: Controlled textarea with auto-height adjustments via `useEffect`. Placeholder reads “Ask anything about your service desk workflow”. Intercepts Enter vs Shift+Enter to call `onSend` (awaited), then resets input/refocuses. The primary button stays labelled `Ask` (with aria-label matching) and simply disables while a request is pending.
+- `Composer.tsx`: Controlled textarea with auto-height adjustments via `useEffect`. Placeholder reads “Type your question about the service desk workflow…”. Intercepts Enter vs Shift+Enter to call `onSend` (awaited), then resets input/refocuses. The primary button stays labelled `Ask` (with aria-label matching) and simply disables while a request is pending.
 - `MessageBubble.tsx`: Renders role-tagged bubbles with avatars (“U” and “D”), a single-line shimmer for pending replies (with screen-reader-only text), and error styling. Assistant messages disinfect their copy to drop boilerplate sentences such as “This information can be found at …” and strip inline `doc_id`/`chunk_id` tokens before display/copy. The toolbar offers `Copy answer` plus `Show/Hide citations`, and the citation chips quote up to 120 characters alongside the title. Clicking a chip copies the raw `doc_id:chunk_id` (surfaced via tooltip); expanding the drawer adds “Copy quote” / “Copy source ID” buttons per citation alongside relevance metadata.
 
 ### 3.3 Bootstrapping & Styling
@@ -245,20 +250,25 @@ This document is the authoritative, self-contained map of the codebase. It enume
   - `test_ingest_pdf_guard.py` xfails gracefully when `pdfminer.six` is unavailable.
   - `test_ingest_url.py` exercises robots compliance, crawl limits, content extraction, and end-to-end URL ingestion into graph + vector stores.
 - Existing tests cover provider payload guards, planner logic, retriever behaviour, DTO validation, and integration with optional Neo4j (`pytest.mark.slow` skipping automatically when env/driver missing).
-- Run `make test` (or `pytest backend/app/tests`).
+- Run `make test` for the full Pytest + Vitest suite (or `pytest backend/app/tests` for backend-only).
 
 ## 5. Dev Tooling & Operations
 - **Makefile targets**:
   - `make dev`: delegates to `scripts/dev.sh` (runs uvicorn reload + `npm run dev` with shared trap; `LOG_DIR` env supported).
   - `make slm`: executes `scripts/start_slm.sh` to spin up Ollama/llama.cpp helpers.
-  - `make fmt`: Ruff (`--fix`) + Black on backend; Prettier on frontend.
-  - `make test`: Pytest suite.
+  - `make fmt`: Ruff (`--fix`) + Black on backend; `npm run format` on frontend.
+  - `make lint`: Ruff check (no fixes) on backend; `npm run lint` (ESLint) on frontend.
+  - `make type`: mypy on `backend/app`; `npm run typecheck` on frontend.
+  - `make test`: Pytest suite plus `npm run test` (Vitest).
+  - `make security`: `safety check --full-report` and `npm run audit` (high severity).
   - `make compose-up/down`: manage Docker Compose Neo4j service.
   - `make ingest-sample`: Curl helper to seed sample ingest payload.
   - `make bench-air`: Compares local vs hosted latency and writes `logs/mac-air-check.txt`.
 - **scripts/start_slm.sh**: Auto-detects `ollama` CLI; starts `ollama serve` if not running (logs to `logs/ollama.log`); if `LLAMACPP_BIN` set and executable plus `MODEL_PATH`, launches llama.cpp server on port 8080 (logs to `logs/llamacpp.log`). Prefers Phi 3 Mini, falls back to TinyLlama, and prints the active selection or instructions when neither model is available.
 - **scripts/mac_air_check.py**: Sends a short prompt to the active local model and the Groq hosted model, records latency stats, and writes `logs/mac-air-check.txt`. Exposed via `make bench-air`.
 - **docker-compose.yml**: Only Neo4j service enabled by default (ports 7474/7687, heaps 512-1024 MiB, APOC plugin, healthcheck). Binds host state to `~/Documents/service-desk-copilot/neo4j/{data,logs,plugins}`. Ollama service provided as commented template.
+- **pyproject.toml**: Centralises Black (line-length 100), Ruff rulesets, and strict mypy (Pydantic plugin) while pinning pytest defaults.
+- **.pre-commit-config.yaml**: Runs Ruff/Black/mypy/pytest for backend and Prettier/ESLint/Vitest for frontend on staged files.
 
 ## 6. Data, Logs, and Runtime Directories
 - `logs/`: Created automatically by `get_settings()` and scripts. Contains rotating `app.log` plus optional `ollama.log` / `llamacpp.log` from helper scripts.
@@ -275,7 +285,7 @@ This document is the authoritative, self-contained map of the codebase. It enume
   - URL ingest: `ALLOW_URL_INGEST` (boolean), `URL_MAX_DEPTH`, `URL_MAX_PAGES`, `URL_MAX_TOTAL_CHARS`, `URL_RATE_LIMIT_SEC`.
   - Planner: `TOP_K`, `CHUNK_TOKENS`, `CHUNK_OVERLAP` (validated to positive/zero).
   - Frontend dev: `VITE_API_BASE`.
-- `requirements.txt` ties backend to FastAPI 0.111+, uvicorn reload, pydantic v2, requests/httpx, pytest, Ruff/Black, ChromaDB 0.5+, BeautifulSoup4, sentence-transformers, numpy/scikit-learn, neo4j 5.x, pdfminer.six, python-dotenv.
+- `requirements.txt` pins FastAPI 0.111.0, uvicorn[standard] 0.30.1, Pydantic 2.7.4, Pydantic Settings 2.3.1, python-multipart 0.0.9, Requests 2.32.3, HTTPX 0.27.0, Pytest 7.4.4, Ruff 0.5.6, Black 24.4.2, ChromaDB 0.5.3, BeautifulSoup4 4.12.3, sentence-transformers 2.6.1, Neo4j 5.20.0, pdfminer.six 20231228, plus tooling such as Safety 3.2.4, mypy 1.10.0, pre-commit 3.7.1, and types stubs for requests/urllib3.
 
 ## 8. Runtime Behaviour Summary
 1. **Ingest Paste/PDF/URL**

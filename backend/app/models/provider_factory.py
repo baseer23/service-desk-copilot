@@ -102,6 +102,7 @@ def build_provider_context(settings: Settings, provider_key: str) -> ProviderCon
 
 
 def _auto_local(settings: Settings) -> ProviderContext | None:
+    """Return a local provider context when a preferred Ollama model exists."""
     models = _list_ollama_models(settings.ollama_host)
     if not models:
         return None
@@ -124,6 +125,7 @@ def _auto_local(settings: Settings) -> ProviderContext | None:
 
 
 def _groq_context(settings: Settings) -> ProviderContext:
+    """Build a provider context targeting the hosted Groq endpoint."""
     model_name = settings.hosted_model_name or settings.model_name
     try:
         provider = GroqHostedProvider(
@@ -146,6 +148,7 @@ def _groq_context(settings: Settings) -> ProviderContext:
 
 
 def _stub_context(reason: str) -> ProviderContext:
+    """Return a stub provider context with the supplied reason."""
     return ProviderContext(
         provider=StubProvider(),
         provider_type="stub",
@@ -156,6 +159,7 @@ def _stub_context(reason: str) -> ProviderContext:
 
 
 def _list_ollama_models(host: str) -> List[str]:
+    """Return model names advertised by the Ollama instance."""
     url = f"{host.rstrip('/')}/api/tags"
     try:
         response = requests.get(url, timeout=1)
