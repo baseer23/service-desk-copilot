@@ -18,5 +18,6 @@ frontend/dist/
 # Local development artifacts
 .env
 .venv/
+venv/
 .vscode/
 store/chroma/
