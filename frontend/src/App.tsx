@@ -120,6 +120,7 @@ export default function App() {
   const [providerError, setProviderError] = useState<string | null>(null)
   const [attemptedRestore, setAttemptedRestore] = useState(false)
   const [showSystemStatus, setShowSystemStatus] = useState(false)
+  const [expandedRightPanel, setExpandedRightPanel] = useState(false)
   const threadRef = useRef<HTMLDivElement | null>(null)
   const healthFailureMessage = `We’re having trouble reaching the backend at ${API_BASE}. Make sure it’s running (try “make dev”) and that VITE_API_BASE points to it.`
 
@@ -179,6 +180,19 @@ export default function App() {
     return `Provider · ${typeLabel} · ${model}`
   }, [health])
 
+  const providerPillClass = useMemo(() => {
+    if (!health) return 'provider-pill warn'
+    const active = (health.active_provider || health.provider || '').toLowerCase()
+    if (active === 'groq') {
+      return `provider-pill ${health.hosted_reachable ? 'healthy' : 'fail'}`
+    }
+    if (active === 'ollama' || active === 'llamacpp') {
+      const reachable = health.ollama_reachable || health.llamacpp_reachable || health.local_model_available
+      return `provider-pill ${reachable ? 'healthy' : 'fail'}`
+    }
+    return 'provider-pill warn'
+  }, [health])
+
   const graphPill = useMemo(() => {
     if (!health) return 'Graph · fallback · offline'
     const backend = (health.graph_backend || 'inmemory').toLowerCase()
@@ -189,8 +203,9 @@ export default function App() {
 
   const graphPillClass = useMemo(() => {
     if (!health) return 'graph-pill warn'
-    const online = health.graph_backend === 'aura' && health.neo4j_reachable
-    return `graph-pill${online ? ' online' : ' warn'}`
+    if (health.graph_backend !== 'aura') return 'graph-pill fail'
+    if (!health.neo4j_reachable) return 'graph-pill fail'
+    return 'graph-pill healthy'
   }, [health])
 
   const providerNotes = useMemo(() => {
@@ -582,7 +597,7 @@ export default function App() {
           </div>
           <div className="header-actions">
             <div className="status-pill-group">
-              <span className="provider-pill">{providerPill}</span>
+              <span className={providerPillClass}>{providerPill}</span>
               <span className={graphPillClass}>{graphPill}</span>
               <button
                 type="button"
@@ -789,7 +804,7 @@ export default function App() {
           </div>
         </section>
 
-        <div className="main-content">
+        <div className={`main-content ${expandedRightPanel ? 'right-expanded' : 'right-collapsed'}`}>
           <div className="chat-panel">
             <div className="chat-thread" ref={threadRef}>
               {messages.length === 0 ? (
@@ -797,11 +812,11 @@ export default function App() {
               ) : (
                 messages.map((message) => <MessageBubble key={message.id} message={message} />)
               )}
+            </div>
+            <Composer onSend={handleAsk} disabled={loading} />
           </div>
-          <Composer onSend={handleAsk} disabled={loading} />
-        </div>
 
-          <aside className="sidebar">
+          <aside className="sidebar" onClick={() => setExpandedRightPanel((prev) => !prev)}>
             <h2>Recent questions</h2>
             {recentQuestions.length === 0 ? (
               <p className="muted">Try “What is the MFA reset policy?” or “How do I create a ticket?”</p>

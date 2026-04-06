@@ -106,8 +106,10 @@ export default function MessageBubble({ message }: Props) {
   const label = ROLE_LABEL[message.role]
   const [showCitations, setShowCitations] = useState(false)
   const [copyKey, setCopyKey] = useState<string | null>(null)
+  const [copied, setCopied] = useState(false)
   const [showDebug, setShowDebug] = useState(false)
   const copyTimeout = useRef<number | null>(null)
+  const answerCopyTimeout = useRef<number | null>(null)
   const isPending = Boolean(message.pending)
   const avatar = message.role === 'user' ? 'U' : 'D'
 
@@ -120,6 +122,9 @@ export default function MessageBubble({ message }: Props) {
     return () => {
       if (copyTimeout.current) {
         window.clearTimeout(copyTimeout.current)
+      }
+      if (answerCopyTimeout.current) {
+        window.clearTimeout(answerCopyTimeout.current)
       }
     }
   }, [])
@@ -154,10 +159,17 @@ export default function MessageBubble({ message }: Props) {
     if (copyTimeout.current) {
       window.clearTimeout(copyTimeout.current)
     }
-    copyTimeout.current = window.setTimeout(() => setCopyKey(null), 1600)
+    copyTimeout.current = window.setTimeout(() => setCopyKey(null), 1500)
   }
 
-  const copyText = async (content: string, key: string) => {
+  const scheduleAnswerReset = () => {
+    if (answerCopyTimeout.current) {
+      window.clearTimeout(answerCopyTimeout.current)
+    }
+    answerCopyTimeout.current = window.setTimeout(() => setCopied(false), 1500)
+  }
+
+  const copyText = async (content: string, options: { key?: string; markCopied?: boolean } = {}) => {
     try {
       if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(content)
@@ -172,14 +184,20 @@ export default function MessageBubble({ message }: Props) {
         document.execCommand('copy')
         document.body.removeChild(textarea)
       }
-      setCopyKey(key)
-      scheduleReset()
+      if (options.key) {
+        setCopyKey(options.key)
+        scheduleReset()
+      }
+      if (options.markCopied) {
+        setCopied(true)
+        scheduleAnswerReset()
+      }
     } catch (error) {
       console.error('Failed to copy', error)
     }
   }
 
-  const handleCopyAnswer = () => copyText(displayText, 'answer')
+  const handleCopyAnswer = () => copyText(displayText, { markCopied: true })
 
   const handleToggleCitations = () => setShowCitations((prev) => !prev)
   const handleToggleDebug = () => setShowDebug((prev) => !prev)
@@ -197,7 +215,39 @@ export default function MessageBubble({ message }: Props) {
           {avatar}
         </span>
         <div className="bubble-body">
-          <div className="bubble-role">{label}</div>
+          <div className="bubble-meta">
+            <div className="bubble-role">{label}</div>
+            {message.role === 'assistant' && !isPending && (
+              <button
+                type="button"
+                className={`copy-button${copied ? ' copied' : ''}`}
+                onClick={handleCopyAnswer}
+                aria-label="Copy answer"
+              >
+                <span className="copy-button-icon" aria-hidden="true">
+                  {copied ? (
+                    <svg
+                      viewBox="0 0 20 20"
+                      width="16"
+                      height="16"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.6"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <path d="M4 10l4 4 8-8" />
+                    </svg>
+                  ) : (
+                    <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.6">
+                      <rect x="6" y="6" width="10" height="10" rx="2" />
+                      <rect x="3" y="3" width="10" height="10" rx="2" />
+                    </svg>
+                  )}
+                </span>
+              </button>
+            )}
+          </div>
           {isPending ? (
             <>
               <div className="bubble-skeleton single" aria-hidden="true">
@@ -211,23 +261,6 @@ export default function MessageBubble({ message }: Props) {
         </div>
         {message.role === 'assistant' && !isPending && (
           <div className="bubble-actions">
-            <button
-              type="button"
-              className={`pill-button${
-                featureFlags.twoLineCopyAnswerButton ? ' two-line' : ''
-              }`}
-              onClick={handleCopyAnswer}
-              aria-label="Copy answer"
-            >
-              {featureFlags.twoLineCopyAnswerButton ? (
-                <>
-                  <span className="pill-button-line">Copy</span>
-                  <span className="pill-button-line">Answer</span>
-                </>
-              ) : (
-                copyKey === 'answer' ? 'Copied' : 'Copy answer'
-              )}
-            </button>
             {hasCitations && (
               <button
                 type="button"
@@ -248,28 +281,6 @@ export default function MessageBubble({ message }: Props) {
                 )}
               </button>
             )}
-            {hasDebugDetails && (
-              <button
-                type="button"
-                className={`pill-button${
-                  featureFlags.twoLineDebugInfoButton ? ' two-line' : ''
-                }`}
-                onClick={handleToggleDebug}
-                aria-expanded={showDebug}
-                aria-label={showDebug ? 'Hide technical details' : 'Debug info'}
-              >
-                {featureFlags.twoLineDebugInfoButton ? (
-                  <>
-                    <span className="pill-button-line">Debug</span>
-                    <span className="pill-button-line">Info</span>
-                  </>
-                ) : showDebug ? (
-                  'Hide debug'
-                ) : (
-                  'Debug info'
-                )}
-              </button>
-            )}
           </div>
         )}
       </div>
@@ -282,7 +293,7 @@ export default function MessageBubble({ message }: Props) {
                 <button
                   type="button"
                   className="citation-chip"
-                  onClick={() => copyText(citation.longExcerpt, `chip-${citation.id}`)}
+                  onClick={() => copyText(citation.longExcerpt, { key: `chip-${citation.id}` })}
                   aria-label={`Copy excerpt from ${citation.title}`}
                 >
                   <span className="citation-chip-title">{citation.title}</span>
@@ -302,7 +313,7 @@ export default function MessageBubble({ message }: Props) {
                   <div className="citation-entry-actions">
                     <button
                       type="button"
-                      onClick={() => copyText(citation.humanLine, `quote-${citation.id}`)}
+                      onClick={() => copyText(citation.humanLine, { key: `quote-${citation.id}` })}
                       aria-label={`Copy quote from ${citation.title}`}
                     >
                       {copyKey === `quote-${citation.id}` ? 'Copied' : 'Copy quote'}
@@ -344,7 +355,7 @@ export default function MessageBubble({ message }: Props) {
       )}
 
       <div className="sr-only" aria-live="polite">
-        {copyKey ? 'Copied to clipboard.' : ''}
+        {copyKey || copied ? 'Copied to clipboard.' : ''}
       </div>
     </div>
   )
