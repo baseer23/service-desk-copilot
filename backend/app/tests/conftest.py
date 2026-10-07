@@ -104,11 +104,11 @@ def make_client(monkeypatch) -> Callable[[Dict[str, Any]], TestClient]:
         importlib.reload(main)
         if not use_real_repos:
             from backend.app.store.graph_repo import InMemoryGraphRepository
-            from backend.app.store.vector_chroma import InMemoryVectorStore
+            from backend.app.store.vector_chroma import VectorChromaStore
 
             main._init_graph_repo = lambda settings: (InMemoryGraphRepository(), None)  # type: ignore[attr-defined]
-            main._init_vector_store = lambda settings: InMemoryVectorStore()  # type: ignore[attr-defined]
-            main.app.state.vector_store = InMemoryVectorStore()
+            main._init_vector_store = lambda settings: VectorChromaStore(path=str(settings.chroma_dir))  # type: ignore[attr-defined]
+            main.app.state.vector_store = VectorChromaStore(path=str(main.SETTINGS.chroma_dir))
             main.app.state.graph_repo = InMemoryGraphRepository()
             main.app.state.graph_driver = None
         client = TestClient(main.app)

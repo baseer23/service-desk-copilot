@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     app_name: str = "Service Desk Copilot"
     allowed_origins: Union[List[str], str] = Field(default_factory=lambda: DEFAULT_ALLOWED_ORIGINS.copy())
     model_provider: str = "auto"
-    model_name: str = "phi3:mini"
+    model_name: str = "hosted"
     model_timeout_sec: int = 20
     log_dir: Path = Path("logs")
     admin_api_secret: str | None = None
@@ -35,9 +35,6 @@ class Settings(BaseSettings):
     # Embeddings
     embed_provider: str = "sentence"
     embed_model_name: str = "all-MiniLM-L6-v2"
-    ollama_embed_model: str = "nomic-embed-text"
-    ollama_host: str = "http://localhost:11434"
-    llamacpp_host: str = "http://localhost:8080"
     hosted_model_name: str = "llama-3.1-8b-instant"
     groq_api_key: str | None = None
     groq_api_url: str = "https://api.groq.com/openai/v1/chat/completions"

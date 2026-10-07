@@ -7,7 +7,7 @@ const API_BASE =
   (import.meta.env.DEV ? 'http://localhost:8000' : typeof window !== 'undefined' ? window.location.origin : '')
 const ADMIN_SECRET = import.meta.env.VITE_ADMIN_API_SECRET ?? ''
 
-type ProviderOption = 'ollama' | 'groq'
+type ProviderOption = 'groq' | 'stub'
 const PROVIDER_STORAGE_KEY = 'deskMate.providerPreference'
 
 type AskResponse = {
@@ -115,7 +115,7 @@ export default function App() {
   const [isPurgeModalOpen, setIsPurgeModalOpen] = useState(false)
   const [purgeConfirmation, setPurgeConfirmation] = useState('')
   const [purgeError, setPurgeError] = useState<string | null>(null)
-  const [providerChoice, setProviderChoice] = useState<ProviderOption>('ollama')
+  const [providerChoice, setProviderChoice] = useState<ProviderOption>('groq')
   const [providerSaving, setProviderSaving] = useState(false)
   const [providerError, setProviderError] = useState<string | null>(null)
   const [attemptedRestore, setAttemptedRestore] = useState(false)
@@ -142,127 +142,6 @@ export default function App() {
       throw error
     }
   }, [fetchHealthData, healthFailureMessage])
-
-  const lastAssistant = useMemo(() => {
-    for (let i = messages.length - 1; i >= 0; i -= 1) {
-      if (messages[i].role === 'assistant' && !messages[i].pending) {
-        return messages[i]
-      }
-    }
-    return null
-  }, [messages])
-
-  const lastAnswerSummary = useMemo(() => {
-    if (!lastAssistant) return null
-    const flattened = lastAssistant.text.replace(/\s+/g, ' ').trim()
-    if (!flattened) return null
-    const sentenceMatch = flattened.match(/.*?[.!?](?:\s|$)/)
-    const candidate = sentenceMatch ? sentenceMatch[0].trim() : flattened
-    const trimmed = candidate.length > 110 ? `${candidate.slice(0, 110).trimEnd()}…` : candidate
-    return trimmed
-  }, [lastAssistant])
-
-  const lastAnswerSourceTitle = useMemo(() => {
-    if (!lastAssistant) return 'Untitled'
-    if (!lastAssistant.citations || lastAssistant.citations.length === 0) return 'Untitled'
-    const firstTitled = lastAssistant.citations.find((citation) => citation.title && citation.title.trim().length > 0)
-    const title = firstTitled?.title?.trim()
-    return title && title.length > 0 ? title : 'Untitled'
-  }, [lastAssistant])
-
-  const providerPill = useMemo(() => {
-    if (!health) return 'Provider · unknown · unknown'
-    const rawKey = (health.active_provider || health.provider || 'unknown').toLowerCase()
-    const typeLabel = rawKey === 'groq' ? 'API' : rawKey
-    const preferredModel = (health.active_model || '').trim() || (health.model_name || '').trim()
-    const fallbackModel = preferredModel || health.provider
-    const model = fallbackModel && fallbackModel.length > 0 ? fallbackModel : 'unknown'
-    return `Provider · ${typeLabel} · ${model}`
-  }, [health])
-
-  const providerPillClass = useMemo(() => {
-    if (!health) return 'provider-pill warn'
-    const active = (health.active_provider || health.provider || '').toLowerCase()
-    if (active === 'groq') {
-      return `provider-pill ${health.hosted_reachable ? 'healthy' : 'fail'}`
-    }
-    if (active === 'ollama' || active === 'llamacpp') {
-      const reachable = health.ollama_reachable || health.llamacpp_reachable || health.local_model_available
-      return `provider-pill ${reachable ? 'healthy' : 'fail'}`
-    }
-    return 'provider-pill warn'
-  }, [health])
-
-  const graphPill = useMemo(() => {
-    if (!health) return 'Graph · fallback · offline'
-    const backend = (health.graph_backend || 'inmemory').toLowerCase()
-    const backendLabel = backend === 'aura' ? 'Aura' : 'Fallback'
-    const statusLabel = backend === 'aura' ? (health.neo4j_reachable ? 'online' : 'offline') : 'vector-only'
-    return `Graph · ${backendLabel} · ${statusLabel}`
-  }, [health])
-
-  const graphPillClass = useMemo(() => {
-    if (!health) return 'graph-pill warn'
-    if (health.graph_backend !== 'aura') return 'graph-pill fail'
-    if (!health.neo4j_reachable) return 'graph-pill fail'
-    return 'graph-pill healthy'
-  }, [health])
-
-  const providerNotes = useMemo(() => {
-    if (!health) return [] as Array<{ text: string; tone: 'default' | 'warn' }>
-    const notes: Array<{ text: string; tone: 'default' | 'warn' }> = []
-    if (health.operator_message) {
-      notes.push({ text: health.operator_message, tone: health.local_model_available ? 'default' : 'warn' })
-    }
-    if (!health.local_model_available && (health.preferred_local_models?.length ?? 0) > 0) {
-      notes.push({
-        text: `Preferred small models: ${health.preferred_local_models.join(' → ')}`,
-        tone: 'default',
-      })
-    }
-    if (!health.ollama_reachable) {
-      notes.push({ text: 'Ollama endpoint unreachable — local provider will fall back to stub.', tone: 'warn' })
-    }
-    if (!health.hosted_reachable) {
-      notes.push({ text: 'Groq endpoint unreachable — hosted calls fall back to stub.', tone: 'warn' })
-    } else if (health.active_provider === 'groq') {
-      notes.push({ text: 'Groq endpoint reachable.', tone: 'default' })
-    }
-    return notes
-  }, [health])
-
-  const providerMeta = useMemo(() => {
-    if (!health) return null
-    const rawModel = (health.active_model || health.model_name || '').trim()
-    const activeModel = rawModel.length > 0 ? rawModel : 'unknown'
-    const ollamaStatus = health.ollama_reachable ? 'Ollama: online' : 'Ollama: offline'
-    const groqStatus = health.hosted_reachable ? 'Groq: online' : 'Groq: offline'
-    return `Active: ${activeModel} · ${ollamaStatus} · ${groqStatus}`
-  }, [health])
-
-  const graphFallbackMessage = useMemo(() => {
-    if (!health) return null
-    if (health.graph_backend !== 'aura') {
-      return 'Graph database unavailable — operating in vector-only mode.'
-    }
-    if (!health.neo4j_reachable) {
-      return 'Neo4j Aura connection down — results will use vector fallback only.'
-    }
-    return null
-  }, [health])
-
-  const ingestBannerSegments = useMemo(() => {
-    if (!indexStatus || !indexedSource) return null
-    const segments: string[] = []
-    if (indexedSource.mode === 'url') {
-      const pageCount = indexStatus.pages ?? 0
-      segments.push(`${pageCount} fetched page${pageCount === 1 ? '' : 's'}`)
-    }
-    segments.push(`${indexStatus.vector_count} vector${indexStatus.vector_count === 1 ? '' : 's'}`)
-    segments.push(`${indexStatus.chunks} chunk${indexStatus.chunks === 1 ? '' : 's'}`)
-    segments.push(`${indexStatus.entities} entit${indexStatus.entities === 1 ? 'y' : 'ies'}`)
-    return segments
-  }, [indexStatus, indexedSource])
 
   const applyProvider = useCallback(
     async (target: ProviderOption, options: { restore?: boolean } = {}) => {
@@ -301,7 +180,7 @@ export default function App() {
 
   useEffect(() => {
     if (!health) return
-    const activeKey: ProviderOption = health.active_provider === 'groq' ? 'groq' : 'ollama'
+    const activeKey: ProviderOption = health.active_provider === 'groq' ? 'groq' : 'stub'
     setProviderChoice(activeKey)
     if (!attemptedRestore) {
       const saved =
@@ -585,6 +464,93 @@ export default function App() {
     }
   }
 
+  const lastAssistant = [...messages].reverse().find((message) => message.role === 'assistant') ?? null
+  const lastAnswerSummary = lastAssistant?.text ?? null
+  const lastAnswerSourceTitle = lastAssistant?.citations?.[0]?.title ?? 'Knowledge base'
+
+  const providerPill = useMemo(() => {
+    if (!health) return 'Provider · unknown · unknown'
+    const rawKey = (health.active_provider || health.provider || 'unknown').toLowerCase()
+    const typeLabel = rawKey === 'groq' ? 'API' : 'Stub'
+    const preferredModel = (health.active_model || '').trim() || (health.model_name || '').trim()
+    const fallbackModel = preferredModel || health.provider
+    const model = fallbackModel && fallbackModel.length > 0 ? fallbackModel : 'unknown'
+    return `Provider · ${typeLabel} · ${model}`
+  }, [health])
+
+  const providerPillClass = useMemo(() => {
+    if (!health) return 'provider-pill warn'
+    const active = (health.active_provider || health.provider || '').toLowerCase()
+    if (active === 'groq') {
+      return `provider-pill ${health.hosted_reachable ? 'healthy' : 'fail'}`
+    }
+    return 'provider-pill warn'
+  }, [health])
+
+  const graphPill = useMemo(() => {
+    if (!health) return 'Graph · fallback · offline'
+    const backend = (health.graph_backend || 'inmemory').toLowerCase()
+    const backendLabel = backend === 'aura' ? 'Aura' : 'Fallback'
+    const statusLabel = backend === 'aura' ? (health.neo4j_reachable ? 'online' : 'offline') : 'vector-only'
+    return `Graph · ${backendLabel} · ${statusLabel}`
+  }, [health])
+
+  const graphPillClass = useMemo(() => {
+    if (!health) return 'graph-pill warn'
+    if (health.graph_backend !== 'aura') return 'graph-pill fail'
+    if (!health.neo4j_reachable) return 'graph-pill fail'
+    return 'graph-pill healthy'
+  }, [health])
+
+  const providerNotes = useMemo(() => {
+    if (!health) return [] as Array<{ text: string; tone: 'default' | 'warn' }>
+    const notes: Array<{ text: string; tone: 'default' | 'warn' }> = []
+    if (health.operator_message) {
+      notes.push({ text: health.operator_message, tone: health.local_model_available ? 'default' : 'warn' })
+    }
+    if (health.active_provider === 'stub') {
+      notes.push({ text: 'Stub mode is the deterministic fallback for local testing.', tone: 'default' })
+    }
+    if (!health.hosted_reachable) {
+      notes.push({ text: 'Groq endpoint unreachable — hosted calls fall back to stub.', tone: 'warn' })
+    } else if (health.active_provider === 'groq') {
+      notes.push({ text: 'Groq endpoint reachable.', tone: 'default' })
+    }
+    return notes
+  }, [health])
+
+  const providerMeta = useMemo(() => {
+    if (!health) return null
+    const rawModel = (health.active_model || health.model_name || '').trim()
+    const activeModel = rawModel.length > 0 ? rawModel : 'unknown'
+    const groqStatus = health.hosted_reachable ? 'Groq: online' : 'Groq: offline'
+    return `Active: ${activeModel} · ${groqStatus}`
+  }, [health])
+
+  const graphFallbackMessage = useMemo(() => {
+    if (!health) return null
+    if (health.graph_backend !== 'aura') {
+      return 'Graph database unavailable — operating in vector-only mode.'
+    }
+    if (!health.neo4j_reachable) {
+      return 'Neo4j Aura connection down — results will use vector fallback only.'
+    }
+    return null
+  }, [health])
+
+  const ingestBannerSegments = useMemo(() => {
+    if (!indexStatus || !indexedSource) return null
+    const segments: string[] = []
+    if (indexedSource.mode === 'url') {
+      const pageCount = indexStatus.pages ?? 0
+      segments.push(`${pageCount} fetched page${pageCount === 1 ? '' : 's'}`)
+    }
+    segments.push(`${indexStatus.vector_count} vector${indexStatus.vector_count === 1 ? '' : 's'}`)
+    segments.push(`${indexStatus.chunks} chunk${indexStatus.chunks === 1 ? '' : 's'}`)
+    segments.push(`${indexStatus.entities} entit${indexStatus.entities === 1 ? 'y' : 'ies'}`)
+    return segments
+  }, [indexStatus, indexedSource])
+
   return (
     <div className="app-page">
       <div className="app-container">
@@ -613,7 +579,7 @@ export default function App() {
               <div className="status-popover" role="region" aria-label="System status">
                 {providerMeta && <span className="provider-meta">{providerMeta}</span>}
                 <div className={`provider-toggle${providerSaving ? ' busy' : ''}`} role="group" aria-label="Select provider">
-                  {(['ollama', 'groq'] as ProviderOption[]).map((option) => {
+                  {(['groq', 'stub'] as ProviderOption[]).map((option) => {
                     const isSelected = providerChoice === option
                     const isServerActive = health?.active_provider === option
                     return (
@@ -624,9 +590,9 @@ export default function App() {
                         disabled={!health || providerSaving || isServerActive}
                         onClick={() => applyProvider(option)}
                         aria-pressed={isSelected}
-                        title={option === 'ollama' ? 'Use Ollama for responses' : 'Use Groq for responses'}
+                        title={option === 'groq' ? 'Use Groq for responses' : 'Use the deterministic stub'}
                       >
-                        {option === 'ollama' ? 'Ollama' : 'Groq'}
+                        {option === 'groq' ? 'Groq' : 'Stub'}
                       </button>
                     )
                   })}

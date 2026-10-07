@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import requests
 
@@ -11,62 +11,32 @@ logger = logging.getLogger(__name__)
 
 
 class LlamaCppProvider(LocalModelProvider):
-    """Adapter for the llama.cpp REST-compatible server."""
+    """Adapter for a llama.cpp OpenAI-compatible completion endpoint."""
 
-    def __init__(self, host: str, model: Optional[str], timeout_sec: int) -> None:
-        """Initialise the llama.cpp provider with host, model, and timeout."""
-        self._host = host.rstrip("/") or "http://localhost:8080"
-        self._model = model
+    def __init__(self, model_name: str, host: str = "http://localhost:8080", timeout_sec: int = 20) -> None:
+        self._model_name = model_name or "default"
+        self._host = host.rstrip("/")
         self._timeout = timeout_sec
 
     def name(self) -> str:
-        """Return the provider identifier."""
-
         return "llamacpp"
 
     def generate(self, prompt: str) -> str:
-        """Call the llama.cpp completion endpoint and normalise the payload."""
-
-        url = f"{self._host}/completion"
         payload: Dict[str, Any] = {
+            "model": self._model_name,
             "prompt": prompt,
-            "temperature": 0,
             "stream": False,
-            "n_predict": 256,
+            "temperature": 0,
         }
-        if self._model:
-            payload["model"] = self._model
-
         try:
-            response = requests.post(url, json=payload, timeout=self._timeout)
+            response = requests.post(f"{self._host}/completion", json=payload, timeout=self._timeout)
             response.raise_for_status()
             data = response.json()
-        except (requests.RequestException, ValueError) as exc:  # pragma: no cover - network failure
+        except (requests.RequestException, ValueError) as exc:  # pragma: no cover - network dependent
             logger.warning("llama.cpp request failed: %s", exc)
             raise RuntimeError("llama.cpp request failed") from exc
 
-        text = self._extract_text(data)
-        if not text:
-            logger.warning("llama.cpp response missing text: %s", data)
-            raise RuntimeError("llama.cpp response missing text")
+        text = data.get("content") if isinstance(data, dict) else None
+        if not isinstance(text, str) or not text.strip():
+            raise RuntimeError("llama.cpp response missing content")
         return text.strip()
-
-    def _extract_text(self, data: Dict[str, Any]) -> Optional[str]:
-        """Normalise the many possible llama.cpp response shapes into a string."""
-
-        if not isinstance(data, dict):
-            return None
-        if isinstance(data.get("content"), str):
-            return data["content"]
-        if isinstance(data.get("text"), str):
-            return data["text"]
-        choices = data.get("choices")
-        if isinstance(choices, list) and choices:
-            choice = choices[0]
-            if isinstance(choice, dict):
-                if isinstance(choice.get("text"), str):
-                    return choice["text"]
-                message = choice.get("message")
-                if isinstance(message, dict) and isinstance(message.get("content"), str):
-                    return message["content"]
-        return None

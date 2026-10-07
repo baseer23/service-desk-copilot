@@ -27,7 +27,6 @@ from backend.app.models.dto import (
 )
 from backend.app.models.provider_factory import (
     ProviderContext,
-    SMALL_OLLAMA_MODELS,
     build_provider_context,
 )
 from backend.app.rag.answer import Responder
@@ -37,6 +36,8 @@ from backend.app.services.ingest_service import IngestService
 from backend.app.services.url_crawler import CrawlError, CrawlLimits, crawl_url
 from backend.app.store.graph_repo import GraphRepository, InMemoryGraphRepository
 from backend.app.store.vector_chroma import InMemoryVectorStore, VectorChromaStore
+from backend.app.mcp.client import DeskMateMCPClient
+from backend.app.workflows.research_graph import run_research_loop
 
 try:  # pragma: no cover - optional dependency for Neo4j
     from neo4j import GraphDatabase
@@ -96,13 +97,13 @@ def _init_graph_repo(settings):
     is_aura = isinstance(uri, str) and uri.startswith(aura_uri_prefixes)
 
     if not is_aura:
-        logger.info("Neo4j Aura URI not configured; using in-memory graph store")
-        app.state.graph_backend = "inmemory"
+        logger.info("Neo4j Aura URI not configured; vector-only mode is active")
+        app.state.graph_backend = "vector-only"
         return InMemoryGraphRepository(), None
 
     if GraphDatabase is None:  # pragma: no cover - driver not installed
-        logger.warning("neo4j driver not installed; using in-memory graph store")
-        app.state.graph_backend = "inmemory"
+        logger.warning("neo4j driver not installed; vector-only mode is active")
+        app.state.graph_backend = "vector-only"
         return InMemoryGraphRepository(), None
 
     driver = None
@@ -114,25 +115,27 @@ def _init_graph_repo(settings):
         app.state.graph_backend = "aura"
         return repo, driver
     except Exception as exc:  # pragma: no cover - handle offline graph
-        logger.warning("Neo4j Aura unavailable (%s); using in-memory graph store", exc)
+        logger.warning("Neo4j Aura unavailable (%s); vector-only mode is active", exc)
         if driver is not None:
             try:
                 driver.close()
             except Exception:  # pragma: no cover - defensive cleanup
                 pass
-        app.state.graph_backend = "inmemory"
+        app.state.graph_backend = "vector-only"
         return InMemoryGraphRepository(), None
 
 
 def _initial_provider_key(settings) -> str:
     configured = (getattr(settings, "model_provider", "auto") or "auto").lower()
     if configured in {"auto", "local"}:
-        return "ollama"
-    if configured in {"hosted", "groq"}:
+        return "groq" if getattr(settings, "groq_api_key", None) else "stub"
+    if configured in {"hosted", "groq", "hosted-groq"}:
         return "groq"
-    if configured in {"ollama", "llamacpp", "stub"}:
+    if configured in {"ollama", "llamacpp"}:
         return configured
-    return "ollama"
+    if configured == "stub":
+        return "stub"
+    return "stub"
 
 
 def _set_active_provider(provider_key: str, *, settings=None) -> ProviderContext:
@@ -244,8 +247,9 @@ def health() -> dict[str, object]:
     active_provider = getattr(app.state, "active_provider_key", _initial_provider_key(settings))
     vector_path, vector_exists = _vector_store_state(getattr(app.state, "vector_store", None), settings)
     hosted_reachable = _probe_hosted(settings)
-    graph_backend = getattr(app.state, "graph_backend", "inmemory")
+    graph_backend = getattr(app.state, "graph_backend", "vector-only")
 
+    preferred_local_models = ["phi3:mini", "llama3.2:3b", "qwen2.5:7b"] if provider_context.provider_type == "stub" else []
     return {
         "status": "ok",
         "provider": provider.name(),
@@ -259,7 +263,7 @@ def health() -> dict[str, object]:
         "active_provider": active_provider,
         "active_model": provider_context.model_name,
         "graph_backend": graph_backend,
-        "preferred_local_models": [choice for choice, _ in SMALL_OLLAMA_MODELS],
+        "preferred_local_models": preferred_local_models,
         "ollama_reachable": _probe_ollama(settings),
         "llamacpp_reachable": _probe_llamacpp(settings),
         "neo4j_reachable": _probe_neo4j(getattr(app.state, "graph_repo", None), graph_backend),
@@ -318,27 +322,24 @@ def ask(payload: AskRequest) -> AskResponse:
     plan = planner.plan(payload.question)
     top_k = payload.top_k or plan.get("top_k", settings.top_k)
 
-    embedding_provider = _safe_embedding_provider(settings)
-    retriever = Retriever(
-        settings=settings,
-        vector_store=app.state.vector_store,
-        graph_repo=app.state.graph_repo,
-        embedding_provider=embedding_provider,
-    )
-
     mode = plan.get("mode", "VECTOR").upper()
-    if mode == "GRAPH":
-        contexts = retriever.graph_search(payload.question, top_k)
-        if not contexts:
-            contexts = retriever.vector_search(payload.question, top_k)
-    elif mode == "HYBRID":
-        contexts = retriever.hybrid_search(payload.question, top_k)
-    else:
-        contexts = retriever.vector_search(payload.question, top_k)
-
     provider_context = _resolve_provider_context(payload.provider_override, settings)
-    responder = Responder(settings=settings, provider=provider_context.provider)
-    response = responder.answer(payload.question, plan, contexts)
+
+    logger.info("/ask received | Planner selected %s | LangGraph workflow start", mode)
+    try:
+        response = run_research_loop(
+            settings=settings,
+            vector_store=app.state.vector_store,
+            graph_repo=app.state.graph_repo,
+            embedding_provider=_safe_embedding_provider(settings),
+            provider=provider_context.provider,
+            question=payload.question,
+            top_k=top_k,
+        )
+    except Exception as exc:  # pragma: no cover - workflow failure path
+        logger.exception("LangGraph /ask workflow failed")
+        raise HTTPException(status_code=502, detail=f"LangGraph workflow failed: {exc}") from exc
+
     return response
 
 

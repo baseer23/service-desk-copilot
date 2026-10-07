@@ -1,347 +1,432 @@
-# Service Desk Copilot – Full Snapshot (Sprint 2)
+# Service Desk Copilot / DeskMate
 
-This document is the authoritative, self-contained map of the codebase. It enumerates every file, explains how pieces connect, and records the defaults, fallbacks, and operational contracts so another engineer (or model) can rebuild the repository from scratch.
+This file is the LLM-facing source of truth for the current repository. It is based on the code and tests that exist now, not on older sprint notes. If this file conflicts with `docs/README.md`, `frontend/README.md`, or stale comments, trust the code and the tests.
 
-## 1. Repository Layout
-```
-.
-├─ LICENSE                                  # Proprietary notice
-├─ Makefile                                  # make dev|slm|fmt|lint|type|test|security|compose-*|ingest-sample|bench-air
-├─ agent.md                                  # You are here (repo snapshot)
-├─ docker-compose.yml                        # Neo4j (APOC-enabled) service definition
-├─ requirements.txt                          # Pinned backend + tooling Python deps
-├─ pyproject.toml                            # Ruff/Black/Mypy configuration
-├─ .pre-commit-config.yaml                   # Git hook running lint/type/test on staged files
-├─ docs/
-│  ├─ README.md                              # High-level project overview & setup
-│  ├─ RAG.md                                 # ASCII diagram of ingestion + retrieval flow
-│  └─ mac-air-runbook.md                     # Operator guidance for MacBook Air tiers
-├─ logs/
-│  └─ .gitkeep                               # Ensures logs/ exists in git
-├─ scripts/
-│  ├─ dev.sh                                 # Launch uvicorn + Vite with cleanup trap
-│  ├─ start_slm.sh                           # Helper to start Ollama or llama.cpp locally
-│  ├─ mac_air_check.py                       # Mac Air latency benchmark (local vs hosted)
-│  └─ neo4j/
-│     └─ 00_constraints.cypher               # Neo4j schema bootstrap (constraints/index)
-├─ templates/
-│  ├─ tier-a-mac-air.env                     # Tier A: MacBook Air local defaults (Phi 3 Mini)
-│  ├─ tier-b-hosted-hybrid.env               # Tier B: Hosted Groq with local embeddings
-│  └─ tier-c-budget-cloud.env                # Tier C: TinyLlama on a budget cloud host
-├─ backend/
-│  ├─ __init__.py
-│  ├─ logging.ini                            # Rotating file + console logging config
-│  └─ app/
-│     ├─ __init__.py
-│     ├─ api/
-│     │  └─ __init__.py                      # Reserved namespace for future routers
-│     ├─ adapters/
-│     │  ├─ __init__.py
-│     │  └─ embeddings.py                    # Embedding provider implementations + factory
-│     ├─ core/
-│     │  ├─ __init__.py
-│     │  └─ config.py                        # Pydantic Settings + defaults + cache helpers
-│     ├─ models/
-│     │  ├─ __init__.py
-│     │  ├─ dto.py                           # Pydantic request/response models
-│     │  ├─ provider.py                      # LocalModelProvider ABC
-│     │  ├─ provider_factory.py              # select_provider(): auto/local/hosted/stub chooser
-│     │  ├─ provider_llamacpp.py             # llama.cpp REST client with fallbacks
-│     │  ├─ provider_ollama.py               # Ollama REST client with fallbacks
-│     │  └─ provider_stub.py                 # Deterministic stub provider (DEFAULT_STUB_ANSWER)
-│     ├─ rag/
-│     │  ├─ __init__.py
-│     │  ├─ answer.py                        # Responder -> prompt + provider call + citations
-│     │  ├─ planner.py                       # Planner -> choose VECTOR/GRAPH/HYBRID via entity degree
-│     │  └─ retrieve.py                      # Retriever -> vector/graph/hybrid search pipeline
-│     ├─ services/
-│     │  ├─ __init__.py
-│     │  ├─ chunking.py                      # Token approximation + chunk splitter
-│     │  ├─ entities.py                      # spaCy-or-regex entity extraction
-│     │  ├─ ingest_service.py                # Chunk/embed/upsert pipeline (text + PDF)
-│     │  └─ url_crawler.py                   # Same-origin crawler for URL ingestion
-│     ├─ store/
-│     │  ├─ __init__.py
-│     │  ├─ graph_repo.py                    # Neo4j repository + in-memory fallback
-│     │  └─ vector_chroma.py                 # Chroma persistent store + in-memory fallback
-│     ├─ tests/
-│     │  ├─ test_answer.py                   # Responder citations & stub behaviour
-│     │  ├─ test_chunking.py                 # Chunk splitter heuristics & env overrides
-│     │  ├─ test_dto.py                      # Pydantic schema validation + env-driven top_k
-│     │  ├─ test_embeddings.py               # Stub embeddings determinism
-│     │  ├─ test_entities.py                 # Regex-driven entity extraction
-│     │  ├─ test_graph_repo.py               # Neo4j repository query execution contracts
-│     │  ├─ test_ingest_integration.py       # Slow e2e ingest against real Neo4j (optional)
-│     │  ├─ test_ingest_service.py           # IngestService chunk/entity/vector bookkeeping
-│     │  ├─ test_ingest_url.py               # URL crawler limits + end-to-end ingest
-│     │  ├─ test_planner.py                  # Planner mode selection thresholds
-│     │  ├─ test_provider.py                 # FastAPI health + /ask payload guards
-│     │  └─ test_retrieve.py                 # Retriever vector/graph/hybrid orchestration
-│     └─ main.py                             # FastAPI app wiring, middleware, endpoints
-├─ frontend/
-│  ├─ README.md                              # SPA setup + features
-│  ├─ index.html                             # Root HTML shell (loads /src/main.tsx)
-│  ├─ .eslintrc.cjs                          # ESLint config (TS, React, Testing Library)
-│  ├─ .prettierrc.json                       # Prettier formatting defaults
-│  ├─ package-lock.json                      # Pinned npm dependency graph
-│  ├─ package.json                           # Frontend scripts + deps
-│  ├─ tsconfig.json                          # TS compiler config (strict)
-│  ├─ vite.config.ts                         # Vite + React plugin, dev/preview port 5173
-│  └─ src/
-│     ├─ App.tsx                             # UI state machine (ingest + chat + sidebar)
-│     ├─ components/
-│     │  ├─ Composer.tsx                     # Autosizing textarea + Enter handling
-│     │  └─ MessageBubble.tsx                # Role bubbles, citation toggle
-│     ├─ main.tsx                            # React.StrictMode renderer
-│     └─ styles.css                          # Glassmorphism layout styles
-└─ store/                                    # Created at runtime (Chroma vectors, etc.)
-```
+## 1. Project in one paragraph
 
-## 2. Backend (FastAPI + GraphRAG)
+Service Desk Copilot is a local-first RAG playground for service desk knowledge. The backend is a FastAPI app that ingests pasted text, PDFs, and optionally crawled web pages; chunks the content; creates embeddings; stores vectors in Chroma; stores document/chunk/entity relationships in either Neo4j Aura or an in-memory graph; retrieves relevant chunks with vector, graph, or hybrid search; and asks a language-model provider to answer with citations. The frontend is a Vite + React SPA branded as `DeskMate`.
 
-### Provider Matrix
-| Provider | Text Gen Endpoint | Embeddings | Default |
-| --- | --- | --- | --- |
-| auto | Selects Ollama Phi 3 Mini → TinyLlama fallback | Sentence-transformers (local) | ✅ |
-| stub | n/a (deterministic text) | Stub embedding provider |  |
-| ollama | `POST {OLLAMA_HOST}/api/generate` | `POST {OLLAMA_HOST}/api/embeddings` (falls back to sentence-transformers, then stub) |  |
-| llamacpp | `POST {LLAMACPP_HOST}/completion` | Sentence-transformers (falls back to stub) |  |
+## 2. The most important implementation truths
 
-### 2.1 Application entry (`backend/app/main.py`)
-- Initializes logging from `backend/logging.ini`, falls back to `logging.basicConfig` when missing.
-- Global constants: `MAX_BODY_BYTES = 1 MiB` for `/ask` and `MAX_INGEST_BYTES = 5 MiB` for ingest endpoints.
-- On import, builds the `FastAPI` instance, applies CORS (from `Settings.allowed_origins`), and seeds `app.state` with in-memory vector/graph stores plus the provider context returned by `select_provider(SETTINGS)` (prefers Phi 3 Mini, falls back to TinyLlama, otherwise stub).
-- Startup handler refreshes settings (`get_settings()`), reinitialises the vector store (`VectorChromaStore` → `InMemoryVectorStore` fallback), graph repo (`GraphRepository` with constraint bootstrap → `InMemoryGraphRepository` fallback), and provider context, storing the active Neo4j driver on `app.state.graph_driver` for shutdown.
-- Shutdown handler closes the Neo4j driver when present.
-- Middleware:
-  - `enforce_body_limit` gates POST sizes on `/ask` and `/ingest/paste`. Checks `Content-Length` if provided; otherwise buffers body once and re-attaches it (`request._body`). Returns HTTP 413 on overflow.
-  - `log_requests` logs `<METHOD> <PATH> -> <status>` for every response.
-- Endpoints:
-  - `GET /health`: returns the active provider/model plus reachability flags for Ollama, hosted provider, and Neo4j, the current graph backend (`aura` vs `inmemory`), along with vector store path metadata. Failures never raise—probes are wrapped in try/except.
-  - `POST /ingest/paste` (response model `IngestPasteResponse`): rejects payload over 5 MiB, builds `IngestService` with `_safe_embedding_provider` (falls back to `StubEmbeddingProvider` with a warning) and the live vector/graph stores. Calls `ingest_text(title, text)`.
-  - `POST /ingest/pdf` (response model `IngestPdfResponse`): accepts `application/pdf` or `application/octet-stream`; size-protects; reads binary, feeds to `IngestService.ingest_pdf`. Wraps pdfminer errors in HTTP 400 with message.
-  - `POST /ingest/url` (response model `IngestUrlResponse`): when enabled, crawls same-origin HTML pages under configurable depth/page/character caps, respecting `robots.txt`, deduplicating by canonical URL + content hash, extracting article/main text, then using `IngestService` to chunk/embed/upsert into vector + graph stores. Returns pages/chunks/entities/vectors counts with latency.
-  - `POST /ask` (response model `AskResponse`):
-    - Builds `Planner` with the active graph repo to compute plan metadata.
-    - Chooses `top_k`: payload `top_k` > plan `top_k` > `Settings.top_k`.
-    - Instantiates `Retriever` with the current stores + embedding provider.
-    - Branches on plan mode: `GRAPH` -> graph search fallback to vector; `HYBRID` -> `Retriever.hybrid_search`; default -> vector search.
-    - `Responder` uses the provider stored on `app.state` (stub/Ollama/llama.cpp/Groq). When the provider raises, the response body is prefixed with `“Model provider unavailable; falling back to stub. …”` and the deterministic stub answer.
-- SPA mounting: if `frontend/dist` exists at runtime, mounts `/` to `SpaStaticFiles`. Custom subclass returns `index.html` fallback for unknown paths, enabling client-side routing.
+- The UI name is `DeskMate`, but the repo and backend app name are `Service Desk Copilot`.
+- All live API routes are defined in `backend/app/main.py`. `backend/app/api/` is currently just an empty placeholder package.
+- `MODEL_PROVIDER=auto` is not truly auto in the running FastAPI app today. `backend/app/main.py` maps `auto` and `local` to the active provider key `ollama`, so the live server behaves like "manual Ollama using MODEL_NAME" plus a stub fallback when requests fail.
+- The provider factory itself does support a real `auto` path in `backend/app/models/provider_factory.py`, but the main app does not use that path for its active provider state.
+- The graph backend only initializes a real `GraphRepository` when `NEO4J_URI` starts with `neo4j+s://` or `neo4j+ssc://`. A local Docker Neo4j on `bolt://localhost:7687` does not become the active graph backend in the current app.
+- Because of that, the default local setup is usually `persistent Chroma + in-memory graph`, not `persistent Chroma + persistent Neo4j`.
+- The in-memory graph is functional during the current process. It is not the same as "graph disabled". Ingested entities/chunks can still drive `GRAPH` or `HYBRID` planning while the server stays up.
+- The in-memory graph does not survive restart. Chroma does survive restart. After restart, old vectors can still be searched, but graph relationships are gone until the content is ingested again.
+- The frontend currently labels non-Aura graph mode as effectively "vector-only", which is an oversimplification. It is only truly vector-only after a restart or when no in-memory graph data exists.
+- URL ingestion exists and works, but it is off by default. It requires `ALLOW_URL_INGEST=1`.
+- Frontend chat history and ingest state are not persisted across refresh. The only client-side persistence is the provider preference stored in `localStorage` under `deskMate.providerPreference`.
+- The frontend sends `provider_override` on every `/ask` request, so the UI chooses the provider per request. The admin provider toggle endpoint mostly keeps server state and `/health` aligned.
+- Provider failures fall back to the deterministic stub answer, but the response `provider` field stays as the original provider name. Example: a Groq failure still returns `provider: hosted-groq` plus a stub-prefixed answer.
+- Chroma fallback quality is intentionally weak. `InMemoryVectorStore.search()` ignores similarity and returns the first `top_k` records.
+- Vector metadata currently stores `doc_id` and `ord`, but not the document title or source URL. Vector-only citations therefore often have no title.
+- The workspace `.env` file contains real service credentials. Treat it as sensitive and never paste secrets into prompts, commits, or docs.
 
-### 2.2 Configuration (`backend/app/core/config.py`)
-- `Settings` extends `BaseSettings` with `.env` support and default values:
-  - `app_name`, `allowed_origins` (comma string parsed to list), log directory, provider options (`model_provider=auto`, `model_name=phi3:mini`, `model_timeout_sec`), embedding options (`embed_provider=sentence`, `ollama_embed_model=nomic-embed-text`), hosted knobs (`hosted_model_name=llama-3.1-8b-instant`, `groq_api_url`, optional `groq_api_key`), and host URLs (`ollama_host=http://localhost:11434`, `llamacpp_host=http://localhost:8080`).
-  - Graph defaults: `neo4j_uri=bolt://localhost:7687`, credentials `neo4j/neo4j` (aligns with docker-compose `neo4j:5.25.1`), `chroma_dir=store/chroma`.
-  - RAG controls: `top_k=6`, `chunk_tokens=512`, `chunk_overlap=64`.
-- Validators enforce lowercase provider names and non-negative/positive numeric constraints.
-- `get_settings()` is `@lru_cache`d; ensures `logs/` and `store/chroma/` directories exist on each call.
-- `reload_settings()` clears the cache (used by tests).
-- `DEFAULT_STUB_ANSWER = "hi, this was a test you pass"` consumed by stub responders.
+## 3. High-level architecture
 
-### 2.3 Embeddings (`backend/app/adapters/embeddings.py`)
-- Defines a `Protocol` `EmbeddingProvider` with `embed_texts` contract.
-- Providers:
-  - `OllamaEmbeddingProvider`: POSTs to `<host>/api/embeddings`, expects `data` array or single `embedding`. Raises `RuntimeError` on HTTP error or malformed payload.
-  - `SentenceTransformersEmbeddingProvider`: loads configurable sentence-transformers model; returns list of float vectors.
-  - `StubEmbeddingProvider`: deterministic hash-backed pseudo-random vectors (defaults dim=384) normalized to unit length.
-- Factory `get_embedding_provider(settings)` supports providers: `ollama`, `sentence`, `stub`, `auto` (tries `_ollama_available` ping -> SentenceTransformer -> Stub). Raises `ValueError` for unknown provider strings.
+User flow:
 
-### 2.4 Services (`backend/app/services`)
-- `chunking.py`:
-  - `approx_tokens(text)`: heuristics mixing word and char counts (char/4) for stable token approximation.
-  - `split_text(text, chunk_tokens=None, overlap=None)`: tokenizes on whitespace; chunk size/overlap read from args or env vars `CHUNK_TOKENS`, `CHUNK_OVERLAP` (via `_read_int_env`). Ensures sensible bounds (chunk > 0, overlap >=0 < chunk). Returns list of dicts with `id`, `ord`, `text`, `tokens`.
-- `entities.py`:
-  - Attempts to load spaCy `en_core_web_sm` at import; on failure uses regex fallback.
-  - `extract_entities(chunks)`: concatenates chunk text; spaCy path collects entity text + noun chunks. Regex path matches capitalized phrases, stores all suffixes, and adds alphabetic words >=4 chars. Returns sorted, deduplicated, lowercased entity list.
-- `ingest_service.py` (`IngestService` dataclass):
-  - Expects `settings`, `vector_store`, `graph_repo`, `embedding_provider` to implement required methods.
-  - `ingest_text(title, text)`:
-    - Splits text to chunks using settings chunk parameters. If no chunks, returns zero-count `IngestPasteResponse` immediately (latency measured).
-    - Generates a `doc_id = uuid4().hex` and per-chunk `chunk_id` (`{doc_id}-{ord}`) with metadata `doc_id` + `ord`.
-    - Calls `embedding_provider.embed_texts(chunk_texts)`; couples embeddings with chunk metadata and `vector_store.upsert(records)`.
-    - Writes document and chunk nodes via `graph_repo.upsert_document`, `upsert_chunk`, `link_doc_chunk` with token counts from `approx_tokens`.
-    - Extracts entities from chunks; upserts entities, then links chunk→entity for any chunk where entity substring appears (`entity in chunk['text'].lower()`).
-    - Returns `IngestPasteResponse` capturing chunk/entity/vector counts and elapsed ms.
-  - `ingest_pdf(title, data)`:
-    - Uses pdfminer `extract_text` on BytesIO; counts form-feed (`\f`) occurrences to estimate pages.
-    - Delegates to `ingest_text`, wrapping counts in `IngestPdfResponse` with total latency.
-- `url_crawler.py`:
-  - `UrlCrawler` visits same-origin links under configurable depth/page/character caps, respecting robots rules, enforcing HTML-only responses, per-host rate limiting, and deduplicating via canonical URL + content hash before yielding article/main body text.
-  - `crawl_url` helper wires the crawler with `Settings` defaults for `/ingest/url`.
+1. A user ingests content through `POST /ingest/paste`, `POST /ingest/pdf`, or `POST /ingest/url`.
+2. The backend splits the content into chunks, computes embeddings, writes vectors to Chroma, writes document/chunk/entity data to the graph repo, and returns counts.
+3. A user asks a question through `POST /ask`.
+4. The planner chooses `VECTOR`, `GRAPH`, or `HYBRID`.
+5. The retriever pulls chunks from the vector store, graph repo, or both.
+6. The responder builds a prompt from those chunks, calls the chosen provider, and returns an answer plus a separate citation array.
+7. The frontend renders the answer, sanitizes raw citation IDs from the visible text, and shows citation chips built from the backend citation payload.
 
-### 2.5 Retrieval & Answer (`backend/app/rag`)
-- `Planner` (`planner.py`):
-  - `plan(question)` extracts question entities, asks `graph_repo.get_entity_degrees`.
-  - If no entities or all degrees zero → mode `VECTOR` with reason.
-  - Otherwise determines `max_degree`. `GRAPH` when `max_degree >= GRAPH_THRESHOLD (3)`, else `HYBRID` with reason `graph is sparse`.
-  - Returns dict with `mode`, `reasons`, `top_k`, `entities` (non-zero degree names).
-- `Retriever` (`retrieve.py`):
-  - `vector_search`: embed question text and call `vector_store.search(embedding, top_k)`.
-  - `graph_search`: extract entities, filter to positive-degree names, fetch chunks via `graph_repo.fetch_chunks_for_entities(relevant, top_k)`.
-  - `hybrid_search`: run `graph_search`; if empty fallback to vector; else perform vector search and filter to chunk IDs intersecting graph results (`allowed_ids`), returning filtered list or full vector results if filter empty.
-- `Responder` (`answer.py`):
-  - `PROMPT_TEMPLATE` instructs DeskMate persona to answer using context with `[doc_id:chunk_id]` citations.
-  - `answer(question, planner, chunks)` builds context string enumerating `[index] (title or doc_id)` lines. If settings `model_provider == 'stub'` returns `DEFAULT_STUB_ANSWER`; otherwise delegates to provider `generate(prompt)`.
-  - Builds `Citation` models using chunk metadata (`doc_id`, `title`, `score`, snippet `text`).
-  - Confidence heuristic: `1 / (1 + mean_score)` clamped [0.1, 0.99]; defaults to 0.5 with no scores.
-  - Populates `AskResponse` with latency, planner metadata, provider name, citations.
+## 4. Repository map
 
-### 2.6 Persistence Stores (`backend/app/store`)
-- `vector_chroma.py`:
-  - Defines a `VectorStore` protocol documenting the `upsert`, `search`, and `ping` contract shared by concrete implementations.
-  - `VectorChromaStore`: ensures directory exists, instantiates `chromadb.PersistentClient` (telemetry disabled). `upsert` accepts chunk dicts (id, text, metadata, embedding). `search` queries using embedding and returns list of dicts containing id, text, metadata, score (distance).
-  - `InMemoryVectorStore`: dictionary keyed by chunk id implementing the same protocol; `search` returns first `top_k` chunks (deterministic fallback).
-- `graph_repo.py`:
-  - `GraphRepository` wraps Neo4j driver `execute_write/read` (falls back to manual session for old drivers). Provides methods to upsert documents/chunks/entities, create relationships (`HAS_CHUNK`, dynamic `rel` sanitized via `_safe_rel`), compute entity degrees, and fetch chunk metadata for entity sets.
-  - `InMemoryGraphRepository`: dictionaries of documents/chunks/entities sets; minimal operations to mimic interface, degrees based on linked chunk counts, fetch returns stored chunk snapshots.
+Top-level directories and files that matter:
 
-### 2.7 DTOs & Providers (`backend/app/models`)
-- `dto.py`: Pydantic models for ingest requests/responses, `Citation`, `AskRequest`, and `AskResponse`. `IngestPasteResponse` / `IngestPdfResponse` expose both legacy fields (`chunks`, `entities`, `ms`) and computed aliases (`chunks_ingested`, `entities_linked`, `latency_ms`, `pages_ingested`, etc.). `AskRequest.top_k` validator honors explicit payload, then `TOP_K` env var if positive.
-- `provider.py`: `LocalModelProvider` protocol with `name() -> str` and `generate(prompt) -> str` methods.
-- `provider_stub.py`: returns `DEFAULT_STUB_ANSWER` for deterministic results/testing and reports `name()='stub'`.
-- `provider_ollama.py`: HTTP POST to `{OLLAMA_HOST}/api/generate`, strict JSON parsing; raises `RuntimeError` on non-200 or malformed payloads so the responder can warn and fall back.
-- `provider_llamacpp.py`: HTTP POST to `{LLAMACPP_HOST}/completion`, supports common response shapes (`content`, `text`, OpenAI-like `choices`). Raises `RuntimeError` when the request or payload fails.
-- `provider_factory.py`: `select_provider(settings)` inspects the environment and available Ollama models, preferring Phi 3 Mini then TinyLlama, otherwise returning a stub fallback. Supports explicit `ollama`, `llamacpp`, or Groq hosted providers and surfaces metadata (`provider_type`, `model_name`, `vendor`, human-readable reason). A compatibility `get_provider()` still returns the underlying adapter.
+- `backend/`: FastAPI app, RAG logic, stores, adapters, and tests.
+- `frontend/`: Vite + React TypeScript SPA.
+- `docs/`: supporting docs. Useful, but partially stale.
+- `scripts/`: dev helpers for starting the app, local model helpers, and a small benchmark.
+- `templates/`: example `.env` fragments for different operating modes.
+- `store/`: runtime storage. Chroma lives under `store/chroma`.
+- `logs/`: runtime logs such as `logs/app.log` and `logs/ollama.log`.
+- `data/`: placeholder directories (`raw/`, `processed/`) that are currently unused by runtime code.
+- `docker-compose.yml`: Neo4j container definition.
+- `Makefile`: common dev/test commands.
+- `agent.md`: this file.
 
-### 2.8 Logging
-- `backend/logging.ini` configures root + `service-desk` logger to use rotating file handler `logs/app.log` (1 MiB, 3 backups) plus console STDOUT handler with uniform formatter `%Y-%m-%d ...`.
+## 5. Backend: actual runtime behavior
 
-## 3. Frontend (Vite + React + TypeScript)
+### 5.1 Entry point and app state
 
-- Central React component that coordinates ingest UI, chat thread, and sidebar state.
-- Constants: `API_BASE = import.meta.env.VITE_API_BASE ?? window.location.origin`.
-- Defines typed responses `AskResponse`, `IngestResult`, and `HealthResponse` to mirror backend schemas.
-- Local state slices: messages array (`Message` type with pending/error flags + citations), ingest mode toggle (`paste` or `pdf`), paste form fields, selected PDF `File`, index status/error records, the latest `indexedSource` metadata (title, chunk/vector counts, original payload reference), loading flag, recent questions (last five unique), health status/error banner, memoised provider pill text, derived operator notes, and a reference to the scroll container.
-- `useEffect` issues a one-shot fetch to `/health`; on success it captures provider type/model/vendor, preferred local models, and reachability probes, otherwise sets a banner instructing to run `make dev`. The header pill now reads `Provider · <type> · <model>` (hosted types collapse to `api`, unknowns fall back to `unknown`) and the stacked notes explain why that tier is active or if hosted reachability failed.
-- `postJSON` helper handles fetch, raising `Error(detail)` on non-200 responses.
-- `handleAsk` pipeline: append user message + placeholder assistant bubble, update recent questions, set loading, call `/ask` with `question`. On success patch placeholder with full answer text, citations, metadata (planner, latency, confidence). On failure, show error bubble instructing to ensure backend is running. Always scroll to bottom.
-- `handleRecentQuestionClick` pushes the stored prompt back through `handleAsk`, so re-clicking history items replays the request without duplicating whitespace.
-- `lastAnswerSummary` condenses the most recent assistant reply to the first sentence (≤110 chars) for the sidebar card, and `lastAnswerSourceTitle` prefers the first titled citation (defaulting to `Untitled`).
-- `handlePasteIngest` trims input, falls back to the title `Untitled`, posts to `/ingest/paste`, and captures the response as both `indexStatus` and an `indexedSource` snapshot (title, chunk/vector counts, original paste) before clearing the form fields. Errors surface through `indexError` with copy “Failed to index …”.
-- `handlePdfIngest` requires a selected file, posts `FormData` to `/ingest/pdf`, records the result in `indexStatus/indexedSource`, clears the file selector, and mirrors the same error handling copy.
-- `handleUrlIngest` posts JSON payloads to `/ingest/url` with optional depth/max page overrides, updates `indexStatus` plus an inline progress note (`urlProgress`), and clears the URL field on success. All three ingest paths share `handleIngest` for dispatch and reuse the unified success/error banner.
-- Auxiliary helpers: `clearIngestForm` wipes all ingest state (title, paste, file, status/error) and `viewIndexedSource` opens a blob URL for the last indexed content (text blob or original PDF) in a new tab, revoking the URL shortly after.
-- Layout now emphasises the chat column: the main grid widens the conversation panel, while the `Knowledge ingestion` card uses softer styling so it reads as secondary. The header includes a `System status` toggle that reveals provider/graph metadata and the provider switcher on demand, plus `New thread`/`Purge memory` controls. Ingestion keeps Paste / PDF / URL tabs, the indexed banner summarises pages/vectors/chunks/entities in compact badges, and the paste/PDF forms keep the same ergonomics. The chat thread sits in a glassmorphism card with generous spacing, composer styling now matches the brand placeholder “Type your question about the service desk workflow…”, and the sidebar presents recent questions as a lightweight timeline with a refreshed empty state and `Last answer` card.
-- Tests: `frontend/src/App.purge.test.tsx` covers the purge-confirmation modal, ensuring incorrect input blocks erasure and a confirmed `DELETE` wipes chat history, recent questions, and ingest banners.
+`backend/app/main.py` is the real application entry point.
 
-### 3.2 Components
-- `Composer.tsx`: Controlled textarea with auto-height adjustments via `useEffect`. Placeholder reads “Type your question about the service desk workflow…”. Intercepts Enter vs Shift+Enter to call `onSend` (awaited), then resets input/refocuses. The primary button stays labelled `Ask` (with aria-label matching) and simply disables while a request is pending.
-- `MessageBubble.tsx`: Renders role-tagged bubbles with avatars (“U” and “D”), a single-line shimmer for pending replies (with screen-reader-only text), and error styling. Assistant messages disinfect their copy to drop boilerplate sentences such as “This information can be found at …” and strip inline `doc_id`/`chunk_id` tokens before display/copy. The toolbar offers `Copy answer` plus `Show/Hide citations`, and the citation chips quote up to 120 characters alongside the title. Clicking a chip copies the raw `doc_id:chunk_id` (surfaced via tooltip); expanding the drawer adds “Copy quote” / “Copy source ID” buttons per citation alongside relevance metadata.
+- Creates the FastAPI app.
+- Configures CORS from `Settings.allowed_origins`.
+- Initializes app state for vector store, graph repo, graph driver, provider, provider context, and active provider key.
+- On startup it re-loads settings, re-initializes the vector store and graph repo, and re-applies the active provider.
+- On shutdown it closes the Neo4j driver if one exists.
+- If `frontend/dist` exists, FastAPI serves the built SPA at `/` via `SpaStaticFiles`.
 
-### 3.3 Bootstrapping & Styling
-- `main.tsx`: Standard React 18 `createRoot` + `React.StrictMode` entry.
-- `styles.css`: Establishes the spacing scale (`--space-unit`), refreshed chat/ingest/side panel elevations, focus rings, inline banners, button treatments (primary/ghost/quiet/subtle), avatar + skeleton styles, timeline list styling for recent questions, the System status popover, rounded composer input, and responsive tweaks (grid collapses <920px, mobile padding <640px) alongside graph/provider pill treatments and the URL ingest form grid.
-  - Modal styling powers the purge confirmation dialog (`modal-backdrop`, `modal`, `danger` button), ensuring destructive actions require explicit DELETE confirmation.
-- `index.html`: Loads Google Fonts (Inter), sets root `<div id="root">`, includes module script `/src/main.tsx`.
-- Tooling config: `vite.config.ts` adds React plugin, sets dev/preview port 5173; `tsconfig.json` uses strict compiler options, bundler module resolution.
+### 5.2 Request limits and middleware
 
-### 3.4 Frontend Tooling
-- `package.json`: Scripts `npm run dev|build|preview|test`; dependencies stay lean around React 18; dev-deps add Vitest + Testing Library, jsdom, TypeScript 5, Vite 5, Prettier, React type defs.
-- `package-lock.json`: Full dependency tree (do not edit manually, keep in sync with npm install).
+- `POST /ask` is limited to 1 MiB.
+- `POST /ingest/paste` and `POST /ingest/pdf` are limited to 5 MiB.
+- The body-limit middleware checks `Content-Length` when present and otherwise buffers the body.
+- A logging middleware logs `<METHOD> <PATH> -> <status>`.
 
-## 4. Tests (`backend/app/tests`)
-- Suite exercises schema validation, chunking heuristics, entity extraction, store adapters, planner/retriever/responder orchestration, FastAPI endpoints, and ingest pipeline (unit + integration).
-- New coverage:
-  - `test_provider_paths.py` mocks Ollama/llama.cpp happy paths and failure fallbacks, asserting the responder prefixes the stub message when a provider fails.
-  - `test_health_reachability.py` patches probe helpers to ensure `/health` emits provider + reachability booleans and vector store path metadata.
-  - `test_ask_end_to_end_stub.py` performs ingest + ask using in-memory repositories and expects citations/confidence/latency to surface.
-  - `test_retrieval_integration_minimal.py` drives a real `VectorChromaStore` (stubbed in CI) plus the in-memory graph repo to assert hybrid filtering.
-  - `test_ingest_pdf_guard.py` xfails gracefully when `pdfminer.six` is unavailable.
-  - `test_ingest_url.py` exercises robots compliance, crawl limits, content extraction, and end-to-end URL ingestion into graph + vector stores.
-- Existing tests cover provider payload guards, planner logic, retriever behaviour, DTO validation, and integration with optional Neo4j (`pytest.mark.slow` skipping automatically when env/driver missing).
-- Run `make test` for the full Pytest + Vitest suite (or `pytest backend/app/tests` for backend-only).
+### 5.3 API routes
 
-## 5. Dev Tooling & Operations
-- **Makefile targets**:
-  - `make dev`: delegates to `scripts/dev.sh` (runs uvicorn reload + `npm run dev` with shared trap; `LOG_DIR` env supported).
-  - `make slm`: executes `scripts/start_slm.sh` to spin up Ollama/llama.cpp helpers.
-  - `make fmt`: Ruff (`--fix`) + Black on backend; `npm run format` on frontend.
-  - `make lint`: Ruff check (no fixes) on backend; `npm run lint` (ESLint) on frontend.
-  - `make type`: mypy on `backend/app`; `npm run typecheck` on frontend.
-  - `make test`: Pytest suite plus `npm run test` (Vitest).
-  - `make security`: `safety check --full-report` and `npm run audit` (high severity).
-  - `make compose-up/down`: manage Docker Compose Neo4j service.
-  - `make ingest-sample`: Curl helper to seed sample ingest payload.
-  - `make bench-air`: Compares local vs hosted latency and writes `logs/mac-air-check.txt`.
-- **scripts/start_slm.sh**: Auto-detects `ollama` CLI; starts `ollama serve` if not running (logs to `logs/ollama.log`); if `LLAMACPP_BIN` set and executable plus `MODEL_PATH`, launches llama.cpp server on port 8080 (logs to `logs/llamacpp.log`). Prefers Phi 3 Mini, falls back to TinyLlama, and prints the active selection or instructions when neither model is available.
-- **scripts/mac_air_check.py**: Sends a short prompt to the active local model and the Groq hosted model, records latency stats, and writes `logs/mac-air-check.txt`. Exposed via `make bench-air`.
-- **docker-compose.yml**: Only Neo4j service enabled by default (ports 7474/7687, heaps 512-1024 MiB, APOC plugin, healthcheck). Binds host state to `~/Documents/service-desk-copilot/neo4j/{data,logs,plugins}`. Ollama service provided as commented template.
-- **pyproject.toml**: Centralises Black (line-length 100), Ruff rulesets, and strict mypy (Pydantic plugin) while pinning pytest defaults.
-- **.pre-commit-config.yaml**: Runs Ruff/Black/mypy/pytest for backend and Prettier/ESLint/Vitest for frontend on staged files.
+`GET /health`
 
-## 6. Data, Logs, and Runtime Directories
-- `logs/`: Created automatically by `get_settings()` and scripts. Contains rotating `app.log` plus optional `ollama.log` / `llamacpp.log` from helper scripts.
-- `store/chroma`: Ensured on settings load; Chroma persists vector collections here. Delete to reset vector store.
-- `~/Documents/service-desk-copilot/neo4j`: Populated when running Docker Neo4j (matching Compose volume mount).
-- `frontend/dist`: Built assets appear here after `npm run build`; FastAPI serves it when present.
+- Returns provider metadata, active provider key, reachability probes, graph backend, and vector store path information.
+- Fields include `provider`, `provider_type`, `model_name`, `provider_vendor`, `local_model_available`, `operator_message`, `hosted_reachable`, `hosted_model_name`, `active_provider`, `active_model`, `graph_backend`, `preferred_local_models`, `ollama_reachable`, `llamacpp_reachable`, `neo4j_reachable`, `vector_store_path`, and `vector_store_path_exists`.
 
-## 7. Configuration & Environment
-- `.env` (not tracked) should define overrides:
-  - `MODEL_PROVIDER` (`stub`, `ollama`, `llamacpp`), `MODEL_NAME` (default `llama3:8b`), `MODEL_TIMEOUT_SEC`.
-  - `EMBED_PROVIDER` (`auto`, `ollama`, `sentence`, `stub`), `OLLAMA_EMBED_MODEL`, `OLLAMA_HOST`, `LLAMACPP_HOST`.
-  - Graph + vector: `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, `CHROMA_DIR`.
-  - CORS: `ALLOWED_ORIGINS` (comma list).
-  - URL ingest: `ALLOW_URL_INGEST` (boolean), `URL_MAX_DEPTH`, `URL_MAX_PAGES`, `URL_MAX_TOTAL_CHARS`, `URL_RATE_LIMIT_SEC`.
-  - Planner: `TOP_K`, `CHUNK_TOKENS`, `CHUNK_OVERLAP` (validated to positive/zero).
-  - Frontend dev: `VITE_API_BASE`.
-- `requirements.txt` pins FastAPI 0.111.0, uvicorn[standard] 0.30.1, Pydantic 2.7.4, Pydantic Settings 2.3.1, python-multipart 0.0.9, Requests 2.32.3, HTTPX 0.27.0, Pytest 7.4.4, Ruff 0.5.6, Black 24.4.2, ChromaDB 0.5.3, BeautifulSoup4 4.12.3, sentence-transformers 2.6.1, Neo4j 5.20.0, pdfminer.six 20231228, plus tooling such as Safety 3.2.4, mypy 1.10.0, pre-commit 3.7.1, and types stubs for requests/urllib3.
+`POST /ingest/paste`
 
-## 8. Runtime Behaviour Summary
-1. **Ingest Paste/PDF/URL**
-   - FastAPI validates size/limits → `IngestService` splits text, hashes embeddings (stub/HF/Ollama), stores vectors + graph nodes, extracts entities.
-   - `/ingest/url` first crawls permitted same-origin pages (respecting robots, HTML-only, depth/page/char caps, per-host pacing, canonical dedupe, article/main extraction) then feeds each page into `IngestService`.
-   - Responses include chunk/entity/vector counts and wall-clock latency (ms), plus page counts when applicable.
-2. **Ask**
-   - Planner inspects question for entities (spaCy when installed, regex fallback otherwise).
-   - Graph repo returns degrees; planner selects `VECTOR`, `GRAPH`, or `HYBRID`.
-   - Retriever executes chosen strategy: vector search uses Chroma; graph search fetches chunks linked to entities; hybrid intersects vector results with graph results.
-   - Responder formats context, prompts provider (stub or external LLM) and attaches citations. Confidence derived from vector distances.
-3. **Fallbacks**
-   - Missing Chroma path: warns and uses in-memory vector store (no persistence, simple list search).
-   - Missing Neo4j driver or connectivity: warns and uses in-memory graph store (dict-backed, functional for tests/dev but ephemeral).
-   - Missing embeddings provider: `_safe_embedding_provider` logs warning and falls back to deterministic stub embeddings.
-  - Provider HTTP errors/timeouts: Ollama/llama.cpp/Groq adapters raise `RuntimeError`; the responder logs the failure and returns the stub answer prefixed with `"Model provider unavailable; falling back to stub."` while still reporting the original provider.
-   - PDF extraction issues: bubbled as HTTP 400 with reason.
+- Accepts `IngestPasteRequest { title?, text }`.
+- Rejects payloads over 5 MiB.
+- Builds an `IngestService` and indexes the pasted text.
 
-## 9. Rebuilding the Project
-- **Backend**
-  1. Create virtualenv, install `requirements.txt`.
-  2. Provide `.env` with desired providers; stub works out of the box.
-  3. Run `uvicorn backend.app.main:app --reload` (or `make dev`).
-- **Frontend**
-  1. `cd frontend && npm install`.
-  2. `npm run dev` (port 5173) or `npm run build` for production bundle (served by FastAPI).
-- **Neo4j** (optional but recommended for full GraphRAG): `docker compose up -d neo4j`, credentials `neo4j/neo4j` unless overridden.
-- **Chroma**: auto-initialises. Delete `store/chroma` to clear vectors.
+`POST /ingest/pdf`
 
-## 10. Reference Constants & Interfaces
-- `DEFAULT_STUB_ANSWER = "hi, this was a test you pass"` – consistent across backend tests and stub responses.
-- Middleware enforced limits: `/ask` 1,048,576 bytes; ingest endpoints 5,242,880 bytes.
-- Planner threshold: `GRAPH_THRESHOLD = 3` (entity degree >= 3 → Graph mode).
-- `Citation` model: `doc_id`, `chunk_id`, `score ≥ 0`, optional `title`, `snippet`.
-- Vector record schema (Chroma): `{id: str, text: str, metadata: dict(doc_id, ord, title?), embedding: List[float]}`.
-- Graph relationships:
-  - `MERGE (d:Document {id})`
-  - `MERGE (c:Chunk {id})`, `SET` ord/text/tokens
-  - `MERGE (d)-[:HAS_CHUNK]->(c)`
-  - `MERGE (e:Entity {id: lower(name)})`, `SET name/type`
-  - `MERGE (c)-[:ABOUT]->(e)` (rel sanitized by `_safe_rel`).
+- Accepts multipart upload plus optional `title`.
+- Only accepts `application/pdf` and `application/octet-stream`.
+- Uses `pdfminer.six` to extract text.
+- Returns page/chunk/entity/vector counts.
 
-## 11. Testing & Quality Gates
-- Run `make fmt` to auto-format (Ruff fix, Black, Prettier).
-- Run `make test` for backend tests; note integration test may skip without Neo4j env.
-- Frontend Vitest suite (`npm run test`) validates the purge flow; expand with additional UI scenarios as needed.
-- Acceptance checks:
-  - `/health` always responds with provider + reachability booleans and vector store path info (no crashes when services are down).
-  - Provider adapters raise on network failures; the responder prefixes fallback answers while keeping citations intact.
-  - Ingest + Ask with the stub provider yields citations, planner metadata, latency, and bounded confidence in the response body.
-  - Chroma/Neo4j outages trigger warnings and in-memory fallbacks without user-visible errors.
+`POST /ingest/url`
 
-## 12. Future Extension Points
-- `backend/app/api/__init__.py` reserved for modular routers (currently unused).
-- Add more embedding providers by extending `EmbeddingProvider` protocol and wiring `get_embedding_provider`.
-- Citation chips already quote and title each source; future polish could include inline highlighting inside the answer body or grouping long citation lists.
-- For production, add persistence for chat history and authentication gates.
+- Accepts `IngestUrlRequest { url, max_depth?, max_pages? }`.
+- Requires `ALLOW_URL_INGEST=1`.
+- Crawls same-origin HTML pages only, respects `robots.txt`, deduplicates by canonical URL and content hash, extracts article/main text, and ingests each crawled page with `IngestService`.
 
-Keep this file in sync after any structural or behavioural change so that it remains a ground-truth reconstruction guide.
+`POST /ask`
+
+- Accepts `AskRequest { question, top_k?, provider_override? }`.
+- Runs planner -> retriever -> responder.
+- `provider_override` can be `ollama`, `groq`, `stub`, or `llamacpp`.
+- Returns `AskResponse { answer, provider, question, citations, planner, latency_ms, confidence }`.
+
+`POST /admin/provider`
+
+- Accepts `ProviderToggleRequest { provider }`.
+- Only supports `ollama` and `groq`.
+- If `ADMIN_API_SECRET` is set, the request must include header `x-admin-secret`.
+- Updates the active provider stored in app state.
+
+### 5.4 Settings and environment
+
+`backend/app/core/config.py` defines `Settings` using `pydantic-settings`.
+
+Important variables:
+
+- `APP_NAME`
+- `ALLOWED_ORIGINS`
+- `MODEL_PROVIDER`
+- `MODEL_NAME`
+- `MODEL_TIMEOUT_SEC`
+- `ADMIN_API_SECRET`
+- `ALLOW_URL_INGEST`
+- `URL_MAX_DEPTH`
+- `URL_MAX_PAGES`
+- `URL_MAX_TOTAL_CHARS`
+- `URL_RATE_LIMIT_SEC`
+- `NEO4J_URI`
+- `NEO4J_USER`
+- `NEO4J_PASSWORD`
+- `CHROMA_DIR`
+- `EMBED_PROVIDER`
+- `EMBED_MODEL_NAME`
+- `OLLAMA_EMBED_MODEL`
+- `OLLAMA_HOST`
+- `LLAMACPP_HOST`
+- `HOSTED_MODEL_NAME`
+- `GROQ_API_KEY`
+- `GROQ_API_URL`
+- `TOP_K`
+- `CHUNK_TOKENS`
+- `CHUNK_OVERLAP`
+- `VITE_API_BASE` and `VITE_ADMIN_API_SECRET` are frontend-side variables used in the browser build, not backend settings.
+
+Other config facts:
+
+- `get_settings()` is cached with `lru_cache`.
+- `get_settings()` creates `logs/` and `store/chroma/` if they do not exist.
+- `DEFAULT_STUB_ANSWER` is `hi, this was a test you pass`.
+
+### 5.5 Provider model layer
+
+Files:
+
+- `backend/app/models/provider_factory.py`
+- `backend/app/models/provider_ollama.py`
+- `backend/app/models/provider_llamacpp.py`
+- `backend/app/models/provider_groq.py`
+- `backend/app/models/provider_stub.py`
+
+Supported providers:
+
+- `stub`: deterministic answer for tests and fallbacks.
+- `ollama`: posts to `{OLLAMA_HOST}/api/generate`.
+- `llamacpp`: posts to `{LLAMACPP_HOST}/completion`.
+- `groq` / `hosted`: posts to the Groq OpenAI-compatible chat completions endpoint.
+- `auto`: only implemented in the factory helper, not as the live app's active provider behavior.
+
+Important provider details:
+
+- The factory's intended preferred local model order is `phi3:mini`, then `tinyllama`.
+- The running app's default path effectively pins Ollama to `MODEL_NAME`.
+- `GroqHostedProvider` requires `GROQ_API_KEY` at construction time.
+- Provider errors are caught in `Responder.answer()` and converted to a stub-prefixed answer.
+
+### 5.6 Embeddings
+
+`backend/app/adapters/embeddings.py` defines the embedding layer.
+
+Supported embedding providers:
+
+- `sentence`: `SentenceTransformersEmbeddingProvider`
+- `ollama`: `OllamaEmbeddingProvider`
+- `stub`: deterministic hash-based embeddings
+- `auto`: Ollama if reachable, else sentence-transformers, else stub
+
+Important embedding facts:
+
+- The default config is `EMBED_PROVIDER=sentence`.
+- The stub embedding provider returns deterministic unit-length pseudo-random vectors.
+- If the chosen embedding provider fails during ingest, `IngestService` falls back to `StubEmbeddingProvider`.
+
+### 5.7 Ingestion pipeline
+
+Core files:
+
+- `backend/app/services/chunking.py`
+- `backend/app/services/entities.py`
+- `backend/app/services/ingest_service.py`
+- `backend/app/services/url_crawler.py`
+
+Chunking behavior:
+
+- Chunking is whitespace-based, not tokenizer-based.
+- `split_text()` uses `chunk_tokens` and `chunk_overlap`, either from args or from env vars.
+- Overlap is clamped so it cannot be negative or greater than/equal to chunk size.
+- `approx_tokens()` is heuristic and mixes word count with a char-based estimate.
+
+Entity extraction:
+
+- Tries `spacy` with `en_core_web_sm` if available.
+- Falls back to regex extraction otherwise.
+- Entities are normalized to lower-case strings.
+
+Text ingest:
+
+- `IngestService.ingest_text()` creates a new `doc_id`, creates per-chunk IDs of the form `{doc_id}-{ord}`, embeds chunk text, upserts vectors, upserts document and chunk nodes, extracts entities, and links chunk-to-entity edges when the entity string appears in the chunk text.
+- Graph document nodes store `title` and a `source`, but `ingest_text()` does not pass a custom `source`, so the graph-level source defaults to `paste` even for PDF and URL ingestion.
+- Vector metadata currently stores only `doc_id` and `ord`.
+
+PDF ingest:
+
+- `IngestService.ingest_pdf()` extracts text using `pdfminer.high_level.extract_text`.
+- Page count is estimated by counting form-feed characters (`\f`), so it is approximate.
+
+URL ingest:
+
+- `UrlCrawler` only allows `http` and `https`.
+- It stays on the same origin as the root URL.
+- It respects `robots.txt`.
+- It skips non-HTML responses.
+- It removes `script`, `style`, `noscript`, `template`, `nav`, `footer`, `form`, `aside`, and `iframe`.
+- It extracts text mainly from `article`, `main`, or `body` via headings and paragraphs.
+- It rate-limits requests per host.
+- It deduplicates by canonical URL and page content hash.
+- It does not persist the original URL into vector metadata or graph metadata today.
+
+### 5.8 Stores
+
+Vector store: `backend/app/store/vector_chroma.py`
+
+- `VectorChromaStore` persists to disk under `CHROMA_DIR`.
+- It uses a Chroma collection named `chunks`.
+- If Chroma metadata types are incompatible with old data, the store resets the collection.
+- Search returns items shaped like `{ id, text, metadata, score }`.
+
+In-memory vector fallback:
+
+- `InMemoryVectorStore` is deterministic but low-fidelity.
+- Its `search()` method ignores similarity and returns the first `top_k` records in insertion order.
+
+Graph store: `backend/app/store/graph_repo.py`
+
+- `GraphRepository` wraps Neo4j reads/writes and can create constraints/indexes.
+- `InMemoryGraphRepository` mirrors the same interface with plain Python dictionaries and sets.
+- The in-memory graph stores enough data for planner and graph retrieval to work within the current process.
+
+### 5.9 Planner, retriever, responder
+
+Planner: `backend/app/rag/planner.py`
+
+- Extracts entities from the question.
+- Calls `graph_repo.get_entity_degrees()`.
+- If there are no relevant entity degrees, returns `mode: VECTOR`.
+- If the maximum degree is at least `GRAPH_THRESHOLD = 3`, returns `mode: GRAPH`.
+- Otherwise returns `mode: HYBRID`.
+
+Retriever: `backend/app/rag/retrieve.py`
+
+- `vector_search()` embeds the question and queries the vector store.
+- `graph_search()` finds entities in the question, filters to entities with degree > 0, and fetches chunks for them from the graph repo.
+- `hybrid_search()` gets graph results first, then filters vector results to IDs allowed by the graph result set, falling back to plain vector results when needed.
+
+Responder: `backend/app/rag/answer.py`
+
+- Builds a prompt from the retrieved chunks.
+- Uses a provider to generate the answer unless the provider is already `stub`.
+- Builds the citation list directly from retrieved chunks. The citation list does not depend on whether the model produced inline citation text correctly.
+- Confidence is derived from the mean retrieval score and clamped to `[0.1, 0.99]`, with `0.5` when there are no scores.
+
+## 6. Frontend: actual behavior
+
+The frontend is in `frontend/src`. `App.tsx` is the central state machine.
+
+### 6.1 Main app behavior
+
+`frontend/src/App.tsx` handles:
+
+- health loading from `/health`
+- provider selection and provider restore from `localStorage`
+- asking questions through `/ask`
+- ingesting paste, PDF, and URL content
+- rendering the system-status popover
+- rendering recent questions
+- rendering the "Last answer" sidebar card
+- resetting the current thread
+- purging all client-side memory after a typed `DELETE` confirmation
+
+Important frontend facts:
+
+- `API_BASE` defaults to `http://localhost:8000` in dev and `window.location.origin` in production.
+- `ADMIN_SECRET` comes from `VITE_ADMIN_API_SECRET` and is sent only to `/admin/provider`.
+- Every ask request includes `provider_override: providerChoice`.
+- The provider choice is restored from `localStorage` and synchronized with health data.
+- The app does not persist messages, indexed sources, or recent questions across refresh.
+
+### 6.2 Ingest UI
+
+The ingestion panel has three modes:
+
+- `Paste`: posts JSON to `/ingest/paste`.
+- `Upload PDF`: posts multipart form data to `/ingest/pdf`.
+- `URL`: posts JSON to `/ingest/url`.
+
+Frontend ingest behavior:
+
+- Success banners show chunks, entities, vectors, and page counts when available.
+- The last indexed source can be viewed again.
+- Pasted text opens as a text blob.
+- PDF opens as a blob URL.
+- URL opens the original URL in a new tab.
+
+### 6.3 Chat UI
+
+Files:
+
+- `frontend/src/components/Composer.tsx`
+- `frontend/src/components/MessageBubble.tsx`
+
+Composer:
+
+- Controlled textarea.
+- Enter sends.
+- Shift+Enter inserts a newline.
+
+Message bubble behavior:
+
+- Assistant answers are sanitized before display.
+- The UI strips boilerplate phrases like "This information can be found at ...".
+- The UI strips inline citation IDs such as `doc_id`, `chunk_id`, and bracketed tags from the visible answer text.
+- Citations are shown as chips and an expandable drawer.
+- Citation chips copy an excerpt, not the raw backend IDs.
+- A debug panel exists in the component state, but there is currently no visible button that exposes it.
+
+### 6.4 Styling and build
+
+- `frontend/src/styles.css` contains the full UI styling.
+- `frontend/src/main.tsx` mounts the app with `React.StrictMode`.
+- `frontend/vite.config.ts` sets port `5173` for dev and preview and configures Vitest with jsdom.
+- When `frontend/dist` exists, the backend serves it directly.
+
+## 7. Commands and scripts
+
+Main commands from `Makefile`:
+
+- `make dev`: start FastAPI on `:8000` and Vite on `:5173`
+- `make slm`: run `scripts/start_slm.sh`
+- `make fmt`: Ruff fix + Black + frontend Prettier
+- `make lint`: Ruff + frontend ESLint
+- `make type`: mypy + frontend TypeScript typecheck
+- `make test`: backend pytest + frontend Vitest
+- `make security`: Safety + `npm audit`
+- `make compose-up`: start Neo4j container
+- `make compose-down`: stop Docker services
+- `make ingest-sample`: send a sample paste-ingest request
+- `make bench-air`: run the small local-vs-hosted benchmark
+
+Script notes:
+
+- `scripts/dev.sh` starts both servers and cleans them up on exit.
+- `scripts/start_slm.sh` starts `ollama serve` if needed, checks for `phi3:mini` then `tinyllama`, and can also start a llama.cpp server if `LLAMACPP_BIN` and `MODEL_PATH` are provided.
+- `scripts/mac_air_check.py` compares local Ollama latency with Groq latency and writes a short report to `logs/mac-air-check.txt`.
+
+## 8. Tests that best describe intended behavior
+
+Backend tests live in `backend/app/tests`.
+
+The most informative tests for understanding the system are:
+
+- `test_provider_paths.py`: provider selection, request-level overrides, admin toggle, provider failure fallback
+- `test_provider.py`: baseline `/health` and `/ask` contracts plus ask payload-size limit
+- `test_health_reachability.py`: meaning of `/health` fields
+- `test_ingest_url.py`: URL ingest gate, robots handling, content extraction, same-origin crawl behavior
+- `test_graph_repo.py`: Aura graph-repo path and Neo4j abstraction behavior
+- `test_ask_end_to_end_stub.py`: ingest plus ask cycle through the stub provider
+- `test_retrieval_integration_minimal.py`: vector plus hybrid retrieval with Chroma and in-memory graph
+- `test_ingest_pdf_guard.py`: PDF round-trip when `pdfminer.six` is available
+- `frontend/src/App.purge.test.tsx`: purge confirmation behavior and client-side state clearing
+
+There is also a `slow` pytest marker in `pytest.ini`. `backend/app/tests/test_optional_slow.py` contains opt-in live-service checks for Neo4j and Ollama.
+
+## 9. Files to read first when changing the code
+
+If you need to understand or modify the app quickly, read these files in this order:
+
+1. `backend/app/main.py`
+2. `backend/app/core/config.py`
+3. `backend/app/models/provider_factory.py`
+4. `backend/app/services/ingest_service.py`
+5. `backend/app/services/url_crawler.py`
+6. `backend/app/rag/planner.py`
+7. `backend/app/rag/retrieve.py`
+8. `backend/app/rag/answer.py`
+9. `backend/app/store/vector_chroma.py`
+10. `backend/app/store/graph_repo.py`
+11. `frontend/src/App.tsx`
+12. `frontend/src/components/MessageBubble.tsx`
+13. `backend/app/tests/test_provider_paths.py`
+14. `backend/app/tests/test_ingest_url.py`
+15. `frontend/src/App.purge.test.tsx`
+
+## 10. Known gaps, drift, and non-obvious limitations
+
+- `docs/README.md` and `frontend/README.md` are useful orientation docs, but they are not fully up to date with the real code.
+- `docker-compose.yml` and `.env.example` suggest local Neo4j is a normal path, but the running backend only treats Aura-style URIs as a real graph backend.
+- `make compose-up` may start Neo4j successfully without changing the app's actual `graph_backend`.
+- The default runtime setup is therefore usually "persistent vectors, ephemeral graph".
+- Since vector metadata lacks titles, citations can degrade to `Untitled` in vector-only paths.
+- URL ingest does not store page URLs in retrieval metadata, so later citations do not point back to the original URL.
+- The frontend graph warning text is stricter than the backend reality; the in-memory graph still supports graph lookups until restart.
+- `featureFlags.ts` exists, but it currently only affects some UI label layout. It does not introduce major alternate flows.
+- `backend/app/api/` exists but is not the routing layer.
+- `data/raw/` and `data/processed/` are placeholders and are not used by the backend ingest pipeline today.
+
+## 11. Short version
+
+The real project is a FastAPI + React service-desk RAG app with Chroma persistence, optional Aura-backed graph persistence, a functional in-memory graph fallback, and provider-based answer generation through Ollama, llama.cpp, Groq, or a deterministic stub. The two biggest traps are that the running app does not really honor `MODEL_PROVIDER=auto` the way the factory suggests, and the default local Neo4j setup in docs does not become the active graph backend in the current `main.py`.

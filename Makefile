@@ -9,7 +9,7 @@ dev:
 	@bash scripts/dev.sh
 
 slm:
-	@bash scripts/start_slm.sh
+	@echo "Local LLM inference is not part of the supported runtime. Use hosted inference or the stub provider."
 
 fmt:
 	ruff check --fix $(BACKEND_DIR)
@@ -33,10 +33,10 @@ security:
 	cd $(FRONTEND_DIR) && npm run audit
 
 compose-up:
-	docker compose up -d neo4j
+	@echo "Neo4j local Docker is not part of the supported runtime. Use Aura or run without a graph backend."
 
 compose-down:
-	docker compose down
+	@echo "No local Neo4j stack is required for the supported runtime."
 
 ingest-sample:
 	curl -s -X POST http://localhost:8000/ingest/paste \
