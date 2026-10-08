@@ -25,6 +25,9 @@ class VectorStore(Protocol):
     def ping(self) -> bool:
         """Return True when the store is reachable."""
 
+    def count(self) -> int:
+        """Return the number of stored chunks in the collection."""
+
 
 @dataclass
 class VectorChromaStore:
@@ -89,6 +92,14 @@ class VectorChromaStore:
             )
         return formatted
 
+    def count(self) -> int:
+        """Return the number of stored chunks in the collection."""
+
+        try:
+            return int(self._collection.count())
+        except Exception:  # pragma: no cover - runtime state dependent
+            return 0
+
     def ping(self) -> bool:
         """Return True when the underlying Chroma collection responds."""
 
@@ -145,6 +156,11 @@ class InMemoryVectorStore(VectorStore):
         """Return the first N chunks; ignores the query embedding."""
 
         return list(self._records.values())[:top_k]
+
+    def count(self) -> int:
+        """Return the number of stored chunks in memory."""
+
+        return len(self._records)
 
     def ping(self) -> bool:
         """In-memory store is always reachable."""

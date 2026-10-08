@@ -38,6 +38,8 @@ from backend.app.store.graph_repo import GraphRepository, InMemoryGraphRepositor
 from backend.app.store.vector_chroma import InMemoryVectorStore, VectorChromaStore
 from backend.app.mcp.client import DeskMateMCPClient
 from backend.app.workflows.research_graph import run_research_loop
+from backend.app.agent.graph import ServiceDeskAgent
+from backend.app.agent.memory import CaseMemoryStore
 
 try:  # pragma: no cover - optional dependency for Neo4j
     from neo4j import GraphDatabase
@@ -170,6 +172,42 @@ def _require_admin_secret(request: Request, settings) -> None:
 _set_active_provider(_initial_provider_key(SETTINGS), settings=SETTINGS)
 
 
+def _seed_default_knowledge_if_needed(settings) -> None:
+    """Populate a minimal default knowledge base when the live runtime is empty."""
+    try:
+        vector_store = getattr(app.state, "vector_store", None)
+        if vector_store is None:
+            return
+        if hasattr(vector_store, "count") and vector_store.count() > 0:
+            return
+
+        service = IngestService(
+            settings=settings,
+            vector_store=vector_store,
+            graph_repo=app.state.graph_repo,
+            embedding_provider=_safe_embedding_provider(settings),
+        )
+        default_docs = [
+            (
+                "MFA reset guidance",
+                "Multi-Factor Authentication (MFA) adds a second verification step such as a code from an authenticator app or SMS. Users should register a new device, confirm approval prompts, and contact the help desk if the verification method is unavailable.",
+            ),
+            (
+                "Password reset procedure",
+                "To reset a password, verify identity with the self-service portal, choose a new password that meets policy, and sign out of all active sessions if the account is suspected to be compromised.",
+            ),
+            (
+                "Laptop access troubleshooting",
+                "If a laptop cannot join the corporate network, confirm Wi-Fi access, ensure the VPN client is updated, and verify the device is enrolled in the management system before escalating to the service desk.",
+            ),
+        ]
+        for title, text in default_docs:
+            service.ingest_text(title, text)
+        logger.info("Seeded default DeskMate knowledge into the runtime vector store")
+    except Exception as exc:  # pragma: no cover - startup best effort only
+        logger.warning("Default knowledge seed skipped: %s", exc)
+
+
 @app.on_event("startup")
 async def startup_event() -> None:  # pragma: no cover - exercised in integration tests
     """Initialise application state before serving requests."""
@@ -180,6 +218,14 @@ async def startup_event() -> None:  # pragma: no cover - exercised in integratio
     app.state.graph_repo = repo
     app.state.graph_driver = driver
     _set_active_provider(getattr(app.state, "active_provider_key", None) or _initial_provider_key(settings), settings=settings)
+    _seed_default_knowledge_if_needed(settings)
+    # Initialise case memory and service-desk agent
+    try:
+        app.state.case_store = CaseMemoryStore()
+        app.state.service_agent = ServiceDeskAgent(mcp_client=DeskMateMCPClient(), memory_store=app.state.case_store)
+        logger.info("ServiceDeskAgent and CaseMemoryStore initialised")
+    except Exception as exc:  # pragma: no cover - best-effort only
+        logger.warning("Failed to initialise ServiceDeskAgent or CaseMemoryStore: %s", exc)
 
 
 @app.on_event("shutdown")
@@ -488,6 +534,116 @@ def _vector_store_state(vector_store, settings) -> Tuple[str, bool]:
     else:
         store_path = Path(getattr(settings, "chroma_dir", "store/chroma"))
     return str(store_path), store_path.exists()
+
+
+@app.get("/cases")
+def list_cases() -> dict[str, object]:
+    store: CaseMemoryStore | None = getattr(app.state, "case_store", None)
+    if store is None:
+        return {"cases": []}
+    return {"cases": store.list_cases()}
+
+
+@app.get("/cases/{case_id}")
+def get_case(case_id: str) -> dict[str, object]:
+    store: CaseMemoryStore | None = getattr(app.state, "case_store", None)
+    if store is None:
+        raise HTTPException(status_code=404, detail="Case store unavailable")
+    state = store.load_case(case_id) or {}
+    return {"case_id": case_id, "state": state}
+
+
+@app.post("/cases")
+def create_or_update_case(payload: dict) -> dict[str, object]:
+    store: CaseMemoryStore | None = getattr(app.state, "case_store", None)
+    if store is None:
+        raise HTTPException(status_code=503, detail="Case store unavailable")
+    case_id = payload.get("case_id") or payload.get("id")
+    if not case_id:
+        raise HTTPException(status_code=400, detail="Missing case_id")
+    store.save_case(case_id, payload.get("state", payload))
+    return {"case_id": case_id, "status": "saved"}
+
+
+@app.post("/cases/{case_id}/investigate")
+def investigate_case(case_id: str, payload: dict) -> dict[str, object]:
+    agent: ServiceDeskAgent | None = getattr(app.state, "service_agent", None)
+    if agent is None:
+        raise HTTPException(status_code=503, detail="Service agent unavailable")
+    ticket = payload.get("ticket") or {}
+    question = payload.get("question")
+    result = agent.run_case(case_id, ticket=ticket, question=question)
+    return {"case_id": case_id, "result": result}
+
+
+@app.post("/cases/{case_id}/resume")
+def resume_case(case_id: str, payload: dict) -> dict[str, object]:
+    """Resume a paused LangGraph investigation by recording a human answer and continuing the same case."""
+    agent: ServiceDeskAgent | None = getattr(app.state, "service_agent", None)
+    store: CaseMemoryStore | None = getattr(app.state, "case_store", None)
+    if agent is None or store is None:
+        raise HTTPException(status_code=503, detail="Agent or case store unavailable")
+    answer = payload.get("answer")
+    if not isinstance(answer, str) or not answer.strip():
+        raise HTTPException(status_code=400, detail="Missing answer")
+    # Persist the human answer as a fact tied to the case so the agent can pick it up
+    try:
+        store.save_fact(case_id, source="human", fact_text=answer)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Failed to persist resume answer: %s", exc)
+    # Load existing case to get the ticket and continue
+    state = store.load_case(case_id) or {}
+    ticket = state.get("ticket") or {}
+    # Continue the agent run which will load persisted state and incorporate remembered facts
+    result = agent.run_case(case_id, ticket=ticket, question=None)
+    return {"case_id": case_id, "result": result}
+
+
+@app.post("/cases/{case_id}/resume")
+def resume_case(case_id: str, payload: dict) -> dict[str, object]:
+    """Resume an existing LangGraph investigation by applying a human answer and continuing the graph.
+
+    Expected payload: { "answer": "2nd floor" }
+    """
+    store: CaseMemoryStore | None = getattr(app.state, "case_store", None)
+    agent: ServiceDeskAgent | None = getattr(app.state, "service_agent", None)
+    if store is None or agent is None:
+        raise HTTPException(status_code=503, detail="Case store or agent unavailable")
+
+    answer = payload.get("answer")
+    if not answer:
+        raise HTTPException(status_code=400, detail="Missing 'answer' in payload")
+
+    # Persist the human answer as an observable fact and event so it's available to future cases
+    fact = {
+        "case_id": case_id,
+        "subject": case_id,
+        "predicate": "human_answer",
+        "value": str(answer),
+        "source": "human",
+        "source_system": "ui",
+        "observed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "confidence": 1.0,
+        "reliability": "confirmed",
+        "metadata": {},
+    }
+    try:
+        store.save_fact(fact)
+    except Exception:
+        # best-effort; continue
+        pass
+    try:
+        store.record_event(case_id, "human", "user", f"resume answer: {answer}")
+    except Exception:
+        pass
+
+    # Load existing state to preserve ticket and other context
+    existing_state = store.load_case(case_id) or {}
+    ticket = existing_state.get("ticket") or {}
+
+    # Re-run the agent for the same case; agent.run_case will load saved state and continue
+    result = agent.run_case(case_id, ticket=ticket, question=None)
+    return {"case_id": case_id, "result": result}
 
 
 if FRONTEND_DIST.exists():

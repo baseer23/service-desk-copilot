@@ -6,7 +6,7 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_STUB_ANSWER = "hi, this was a test you pass"
-DEFAULT_ALLOWED_ORIGINS = ["http://localhost:5173"]
+DEFAULT_ALLOWED_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
