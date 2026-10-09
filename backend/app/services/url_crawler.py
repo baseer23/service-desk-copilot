@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import hashlib
+from backend.app.services.web import (
+    fetch_response,
+    validate_public_url,
+    extract_html,
+    normalize_url,
+)
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, Dict, Iterable, List, Optional, Set, Tuple
-from urllib.parse import ParseResult, urljoin, urlparse, urlsplit, urlunsplit
+from typing import Deque, Iterable, List, Optional, Set, Tuple
+from urllib.parse import ParseResult, urljoin, urlparse, urlunsplit
 from urllib.robotparser import RobotFileParser
 
 import requests
@@ -62,6 +68,7 @@ class UrlCrawler:
     def crawl(self, root_url: str, overrides: Optional[CrawlLimits] = None) -> CrawlResult:
         """Crawl the supplied root URL and return extracted content."""
 
+        validate_public_url(root_url)
         parsed_root = urlparse(root_url)
         if parsed_root.scheme not in {"http", "https"}:
             raise CrawlError("Only HTTP/HTTPS schemes are supported.")
@@ -119,7 +126,7 @@ class UrlCrawler:
             if not text:
                 continue
 
-            text_hash = hashlib.sha1(text.encode("utf-8")).hexdigest()
+            text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
             if text_hash in seen_hashes:
                 continue
             seen_hashes.add(text_hash)
@@ -127,7 +134,9 @@ class UrlCrawler:
             if total_chars + len(text) > limits.max_total_chars:
                 break
 
-            result.pages.append(CrawledPage(url=canonical_url, title=title or canonical_url, content=text))
+            result.pages.append(
+                CrawledPage(url=canonical_url, title=title or canonical_url, content=text)
+            )
             total_chars += len(text)
             result.pages_visited += 1
             seen_urls.add(canonical_url)
@@ -156,7 +165,7 @@ class UrlCrawler:
         robots_url = urlunsplit((parsed_root.scheme, parsed_root.netloc, "/robots.txt", "", ""))
         parser = RobotFileParser()
         try:
-            response = self._session.get(robots_url, timeout=5)
+            response = fetch_response(robots_url, self._session, self._settings.web_max_bytes)
             if response.status_code >= 400:
                 parser.parse([])
             else:
@@ -189,7 +198,7 @@ class UrlCrawler:
         """Perform a GET request handling exceptions and non-200 codes."""
 
         try:
-            response = self._session.get(url, timeout=10)
+            response = fetch_response(url, self._session, self._settings.web_max_bytes)
             if response.status_code != 200:
                 return None
             return response
@@ -199,41 +208,17 @@ class UrlCrawler:
     def _normalize_url(self, url: str) -> str:
         """Return a normalised URL suitable for deduplication."""
 
-        parsed = urlsplit(url)
-        normalized = urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", "", ""))
-        return normalized.rstrip("/") or normalized
+        return normalize_url(url)
 
     def _canonical_url(self, soup: BeautifulSoup, fallback_url: str) -> str:
         """Resolve a canonical URL from the page when provided."""
 
-        link = soup.find("link", rel=lambda value: value and "canonical" in value.lower())
-        if link and link.get("href"):
-            canonical = urljoin(fallback_url, link["href"])
-            return self._normalize_url(canonical)
-        return self._normalize_url(fallback_url)
+        page, _ = extract_html(str(soup), fallback_url)
+        return page["url"]
 
-    def _extract_text_and_title(self, soup: BeautifulSoup, url: str) -> Tuple[str, str]:
-        """Return plain text content and page title for the supplied soup."""
-
-        for tag in soup(["script", "style", "noscript", "template", "nav", "footer", "form", "aside", "iframe"]):
-            tag.decompose()
-
-        title_tag = soup.find("title")
-        title_text = title_tag.get_text(" ", strip=True) if title_tag else ""
-
-        article = soup.find("article") or soup.find("main") or soup.body or soup
-        lines: List[str] = []
-        for element in article.descendants:
-            if getattr(element, "name", None) in {"h1", "h2", "h3", "h4", "h5", "h6"}:
-                heading = element.get_text(" ", strip=True)
-                if heading:
-                    lines.append(heading)
-            elif getattr(element, "name", None) == "p":
-                paragraph = element.get_text(" ", strip=True)
-                if paragraph:
-                    lines.append(paragraph)
-        text = "\n\n".join(line for line in lines if line)
-        return text.strip(), title_text.strip()
+    def _extract_text_and_title(self, soup, url):
+        page, _ = extract_html(str(soup), url)
+        return page["text"], page["title"]
 
     def _extract_same_origin_links(
         self, soup: BeautifulSoup, base_url: str, root: ParseResult
@@ -255,7 +240,9 @@ class UrlCrawler:
         return collected
 
 
-def crawl_url(root_url: str, settings: Settings, overrides: Optional[CrawlLimits] = None) -> CrawlResult:
+def crawl_url(
+    root_url: str, settings: Settings, overrides: Optional[CrawlLimits] = None
+) -> CrawlResult:
     """Convenience helper constructing a UrlCrawler and invoking crawl."""
 
     crawler = UrlCrawler(settings=settings)

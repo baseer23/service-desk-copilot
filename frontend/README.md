@@ -1,28 +1,20 @@
-# Service Desk Copilot Frontend
+# DeskMate frontend
 
-Single-page Vite + React (TypeScript) UI that speaks to the FastAPI backend. Sprint 2 adds an ingestion panel, hybrid RAG controls, and citation viewing in the chat stream.
+React and TypeScript case-investigation interface for the DeskMate FastAPI Case API.
 
-## Setup
 ```bash
-npm install
-npm run dev
+npm ci
+npm run dev -- --host 127.0.0.1
 ```
 
-By default the app calls the backend on `http://localhost:8000`. Override during development with:
+Open http://127.0.0.1:5173 with the backend running on port 8000. Vite proxies `/cases`, `/health` and `/ingest`; `API_PROXY_TARGET` changes its backend target. `VITE_API_BASE` sets an explicit API origin when building for another hosting arrangement.
+
+The interface creates cases, renders actual events, asks for missing human input, resumes the same case and displays assessment, confirmed facts, remembered facts and source provenance. Text, PDF and public URL ingestion remain available. Fixture evidence is labeled visibly.
+
 ```bash
-VITE_API_BASE=http://localhost:8000 npm run dev
-```
-
-## Features
-- **Ingest panel** (Paste | PDF) for uploading knowledge locally. Success feedback shows chunk/entity/vector counts.
-- **Chat** section with a ChatGPT-style layout. Messages are *not* persisted across refresh.
-- **Citations** displayed beneath assistant replies; expand to read the relevant chunk text.
-- **Recent questions** sidebar tracks the last five prompts for quick reference.
-
-Use Enter to send, Shift+Enter for a newline. A pending state (“Thinking…”) mirrors server latency while the backend plans, retrieves, and synthesizes.
-
-## Build for production
-```bash
+npm test
 npm run build
+npm run test:e2e
 ```
-The compiled assets land in `frontend/dist` and are served automatically by the FastAPI app when present.
+
+Vitest discovers only source unit tests. Playwright starts isolated backend/frontend servers on 8001/5174 with fresh temporary storage and test providers. It exercises the complete Jake flow and a second case with cross-case facts using real HTTP. Ports must be free; it will not reuse unrelated servers. Backend setup uses the repository `.venv` described in `../docs/README.md`.

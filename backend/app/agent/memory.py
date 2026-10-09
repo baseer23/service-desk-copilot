@@ -16,7 +16,7 @@ class CaseMemoryStore:
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path))
+        conn = sqlite3.connect(str(self.db_path), timeout=30)
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -77,13 +77,27 @@ class CaseMemoryStore:
 
     def load_case(self, case_id: str) -> dict[str, Any] | None:
         with closing(self._connect()) as conn:
-            row = conn.execute("SELECT state_json FROM cases WHERE case_id = ?", (case_id,)).fetchone()
+            row = conn.execute(
+                "SELECT state_json FROM cases WHERE case_id = ?", (case_id,)
+            ).fetchone()
             if row is None:
                 return None
             return json.loads(row["state_json"])
 
     def save_fact(self, fact: dict[str, Any]) -> None:
         with closing(self._connect()) as conn:
+            existing = conn.execute(
+                "SELECT id FROM facts WHERE case_id=? AND subject=? AND predicate=? AND value=? AND source=?",
+                (
+                    fact.get("case_id"),
+                    fact["subject"],
+                    fact["predicate"],
+                    fact["value"],
+                    fact["source"],
+                ),
+            ).fetchone()
+            if existing:
+                return
             conn.execute(
                 """
                 INSERT INTO facts(case_id, subject, predicate, value, source, source_system, observed_at, confidence, reliability, metadata_json)
@@ -113,13 +127,13 @@ class CaseMemoryStore:
                     WHERE subject = ? AND (
                         predicate LIKE ? OR value LIKE ? OR source LIKE ? OR metadata_json LIKE ?
                     )
-                    ORDER BY observed_at DESC
+                    ORDER BY observed_at DESC, id DESC
                     """,
                     (subject, f"%{query}%", f"%{query}%", f"%{query}%", f"%{query}%"),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT * FROM facts WHERE subject = ? ORDER BY observed_at DESC",
+                    "SELECT * FROM facts WHERE subject = ? ORDER BY observed_at DESC, id DESC",
                     (subject,),
                 ).fetchall()
             results = []
@@ -156,6 +170,7 @@ class CaseMemoryStore:
             ).fetchall()
             return [
                 {
+                    "id": row["id"],
                     "tool": row["tool"],
                     "source": row["source"],
                     "content": row["content"],
@@ -172,7 +187,7 @@ class CaseMemoryStore:
     def list_facts_for_case(self, case_id: str) -> list[dict[str, Any]]:
         with closing(self._connect()) as conn:
             rows = conn.execute(
-                "SELECT * FROM facts WHERE case_id = ? ORDER BY observed_at DESC",
+                "SELECT * FROM facts WHERE case_id = ? ORDER BY observed_at DESC, id DESC",
                 (case_id,),
             ).fetchall()
             return [

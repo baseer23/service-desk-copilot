@@ -1,126 +1,143 @@
-from __future__ import annotations
+"""DeskMate's capability boundary, exposed through the official stdio MCP SDK."""
 
-import logging
+from functools import lru_cache
 from typing import Any
-
-import requests
-from bs4 import BeautifulSoup
-from duckduckgo_search import DDGS
 from mcp.server.fastmcp import FastMCP
-
-from backend.app.adapters.embeddings import get_embedding_provider
+from backend.app.agent.memory import CaseMemoryStore
+from backend.app.agent.models import MemoryFact
 from backend.app.core.config import get_settings
-from backend.app.rag.retrieve import Retriever
-from backend.app.store.graph_repo import GraphRepository, InMemoryGraphRepository
-from backend.app.store.vector_chroma import InMemoryVectorStore, VectorChromaStore
+from backend.app.repositories.fixtures import FixtureRepository
 
-logger = logging.getLogger("service-desk")
 server = FastMCP("deskmate")
+fixtures = FixtureRepository()
 
 
-def _build_retriever() -> Retriever:
-    settings = get_settings()
-
-    vector_store = VectorChromaStore(path=str(settings.chroma_dir))
-    graph_repo: Any = InMemoryGraphRepository()
-
-    neo4j_uri = getattr(settings, "neo4j_uri", "") or ""
-    if neo4j_uri.startswith(("neo4j+s://", "neo4j+ssc://")):
-        try:
-            from neo4j import GraphDatabase
-
-            driver = GraphDatabase.driver(neo4j_uri, auth=(settings.neo4j_user, settings.neo4j_password))
-            driver.verify_connectivity()
-            graph_repo = GraphRepository(driver)
-            graph_repo.ensure_constraints()
-        except Exception as exc:  # pragma: no cover - runtime-dependent connectivity
-            logger.warning("Neo4j Aura unavailable in MCP server (%s); using in-memory graph fallback", exc)
-            graph_repo = InMemoryGraphRepository()
-
-    embedding_provider = get_embedding_provider(settings)
-    return Retriever(
-        settings=settings,
-        vector_store=vector_store,
-        graph_repo=graph_repo,
-        embedding_provider=embedding_provider,
-    )
+@lru_cache
+def memory():
+    return CaseMemoryStore(get_settings().case_db_path)
 
 
-@server.tool(name="search_knowledge")
-def search_knowledge(question: str, mode: str = "VECTOR", top_k: int = 6) -> dict[str, list[dict[str, Any]]]:
-    """Execute the existing Retriever through the MCP boundary."""
-    logger.info("MCP server received search_knowledge question='%s' mode=%s top_k=%s", question, mode, top_k)
-    normalized = (mode or "VECTOR").upper()
-    if normalized not in {"VECTOR", "GRAPH", "HYBRID"}:
-        raise ValueError("mode must be one of VECTOR, GRAPH, HYBRID")
+@lru_cache
+def retriever():
+    from backend.app.adapters.embeddings import get_embedding_provider
+    from backend.app.rag.retrieve import Retriever
+    from backend.app.services.capabilities import knowledge_stores
 
-    retriever = _build_retriever()
-    if normalized == "GRAPH":
-        results = retriever.graph_search(question, top_k)
-    elif normalized == "HYBRID":
-        results = retriever.hybrid_search(question, top_k)
-    else:
-        results = retriever.vector_search(question, top_k)
-
-    cleaned: list[dict[str, Any]] = []
-    for result in results:
-        metadata = result.get("metadata", {}) or {}
-        cleaned.append(
-            {
-                "id": result.get("id"),
-                "text": result.get("text"),
-                "score": result.get("score"),
-                "metadata": {
-                    "doc_id": metadata.get("doc_id"),
-                    "title": metadata.get("title"),
-                    "source": metadata.get("source"),
-                    "ord": metadata.get("ord"),
-                },
-            }
-        )
-
-    logger.info("MCP server returned %s chunks from Retriever", len(cleaned))
-    return {"result": cleaned}
+    s = get_settings()
+    vector, graph, _ = knowledge_stores(s)
+    return Retriever(s, vector, graph, get_embedding_provider(s))
 
 
-@server.tool(name="search_web")
-def search_web(query: str, max_results: int = 5) -> dict[str, list[dict[str, Any]]]:
-    """Return a small set of public search results for web fallback."""
-    logger.info("MCP server received search_web query='%s' max_results=%s", query, max_results)
-    if not query or not query.strip():
+@server.tool()
+def search_knowledge(question: str, mode: str = "HYBRID", top_k: int = 6) -> dict:
+    """Retrieve Chroma knowledge with optional Aura graph context."""
+    if mode.upper() not in {"VECTOR", "GRAPH", "HYBRID"}:
+        raise ValueError("mode must be VECTOR, GRAPH or HYBRID")
+    if not 1 <= top_k <= 30:
+        raise ValueError("top_k must be between 1 and 30")
+    r = retriever()
+    method = {"VECTOR": r.vector_search, "GRAPH": r.graph_search, "HYBRID": r.hybrid_search}[
+        mode.upper()
+    ]
+    return {"result": method(question, top_k)}
+
+
+@server.tool()
+def search_web(query: str, max_results: int = 5) -> dict:
+    """Search the public web; results remain untrusted external evidence."""
+    from ddgs import DDGS
+
+    if not query.strip():
         return {"result": []}
-    with DDGS() as ddgs:
-        results = list(ddgs.text(query, max_results=max_results))
-    cleaned = []
-    for item in results:
-        href = item.get("href") or item.get("url") or ""
-        if not href:
-            continue
-        cleaned.append(
+    if not 1 <= max_results <= 10:
+        raise ValueError("max_results must be between 1 and 10")
+    results = DDGS(timeout=10).text(query, max_results=max_results)
+    return {
+        "result": [
             {
-                "title": item.get("title") or "Web result",
-                "url": href,
-                "snippet": item.get("body") or item.get("snippet") or "",
+                "title": x.get("title", ""),
+                "url": x.get("href", ""),
+                "snippet": x.get("body", ""),
+                "source_system": "public_web",
             }
-        )
-    logger.info("MCP server returned %s web hits", len(cleaned))
-    return {"result": cleaned}
+            for x in results
+            if x.get("href")
+        ]
+    }
 
 
-@server.tool(name="fetch_web_page")
-def fetch_web_page(url: str) -> dict[str, Any]:
-    """Fetch and extract clean text from a public web page for ingestion."""
-    logger.info("MCP server received fetch_web_page url='%s'", url)
-    if not url:
-        raise ValueError("url must not be empty")
-    response = requests.get(url, timeout=10)
-    response.raise_for_status()
-    soup = BeautifulSoup(response.text, "html.parser")
-    title = (soup.title.get_text(" ", strip=True) if soup.title else "") or url
-    text = soup.get_text(" ", strip=True)
-    return {"result": {"url": url, "title": title, "text": text}}
+@server.tool()
+def fetch_web_page(url: str) -> dict:
+    """Safely fetch and extract a bounded public HTML page."""
+    from backend.app.services.web import fetch_page
+
+    return {"result": fetch_page(url, max_bytes=get_settings().web_max_bytes)}
+
+
+@server.tool()
+def search_previous_tickets(
+    query: str, user: str | None = None, company: str | None = None, site: str | None = None
+) -> dict:
+    """Search previous incidents from the explicitly labeled local fixtures."""
+    return {"result": fixtures.search_previous_tickets(query, user, company, site)}
+
+
+@server.tool()
+def get_user_context(user_name: str, company: str | None = None) -> dict:
+    """Read fixture user context; current location and update state may be unknown."""
+    return {"result": fixtures.get_user_context(user_name, company)}
+
+
+@server.tool()
+def get_company_context(company: str) -> dict:
+    """Read fixture company context."""
+    return {"result": fixtures.get_company_context(company)}
+
+
+@server.tool()
+def get_site_context(company: str, site: str) -> dict:
+    """Read context for one fixture site."""
+    return {"result": fixtures.get_site_context(company, site)}
+
+
+@server.tool()
+def get_device_context(device_or_user: str) -> dict:
+    """Read fixture device context."""
+    return {"result": fixtures.get_device_context(device_or_user)}
+
+
+@server.tool()
+def get_active_alerts(company: str, site: str | None = None, product: str | None = None) -> dict:
+    """Read active fixture alerts including technician acknowledgement."""
+    return {"result": fixtures.get_active_alerts(company, site, product)}
+
+
+@server.tool()
+def get_recent_changes(company: str, site: str | None = None, product: str | None = None) -> dict:
+    """Read recent fixture configuration changes."""
+    return {"result": fixtures.get_recent_changes(company, site, product)}
+
+
+@server.tool()
+def save_case_note(case_id: str, text: str, source: str = "agent") -> dict:
+    """Append a case event in the shared SQLite memory store."""
+    memory().record_event(case_id, "save_case_note", source, text)
+    return {"result": {"saved": True, "case_id": case_id, "source_system": "sqlite_memory"}}
+
+
+@server.tool()
+def remember_fact(fact: dict[str, Any]) -> dict:
+    """Persist a provenance-validated confirmed fact, never a model guess."""
+    parsed = MemoryFact.model_validate(fact)
+    memory().save_fact(parsed.model_dump())
+    return {"result": parsed.model_dump()}
+
+
+@server.tool()
+def search_remembered_facts(subject: str, query: str | None = None) -> dict:
+    """Find confirmed facts about a subject across all cases."""
+    return {"result": memory().search_facts(subject, query)}
 
 
 if __name__ == "__main__":
-    logger.info("Starting DeskMate MCP server over stdio")
     server.run(transport="stdio")

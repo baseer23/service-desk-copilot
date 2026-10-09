@@ -20,14 +20,22 @@ def approx_tokens(text: str) -> int:
     return max(word_count, char_estimate)
 
 
-def split_text(text: str, chunk_tokens: int | None = None, overlap: int | None = None) -> List[Dict[str, object]]:
+def split_text(
+    text: str, chunk_tokens: int | None = None, overlap: int | None = None
+) -> List[Dict[str, object]]:
     """Split raw text into chunk dictionaries with token metadata."""
     tokens = re.findall(r"\S+", text)
     if not tokens:
         return []
 
-    chunk_size = chunk_tokens or _read_int_env("CHUNK_TOKENS", DEFAULT_CHUNK_TOKENS)
-    chunk_overlap = overlap or _read_int_env("CHUNK_OVERLAP", DEFAULT_CHUNK_OVERLAP)
+    chunk_size = (
+        chunk_tokens
+        if chunk_tokens is not None
+        else _read_int_env("CHUNK_TOKENS", DEFAULT_CHUNK_TOKENS)
+    )
+    chunk_overlap = (
+        overlap if overlap is not None else _read_int_env("CHUNK_OVERLAP", DEFAULT_CHUNK_OVERLAP)
+    )
 
     if chunk_size <= 0:
         chunk_size = DEFAULT_CHUNK_TOKENS

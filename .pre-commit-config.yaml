@@ -16,26 +16,26 @@ repos:
     hooks:
       - id: mypy-backend
         name: mypy backend
-        entry: mypy backend/app
+        entry: .venv/bin/mypy backend/app
         language: system
         pass_filenames: false
       - id: prettier-frontend
         name: prettier frontend
-        entry: npx prettier --config frontend/.prettierrc.json --write
+        entry: frontend/node_modules/.bin/prettier --config frontend/.prettierrc.json --write
         language: system
         files: ^frontend/src/.*\.(ts|tsx|css|md|json)$
       - id: eslint-frontend
         name: eslint frontend
-        entry: npx eslint --max-warnings=0
+        entry: frontend/node_modules/.bin/eslint --max-warnings=0
         language: system
         files: ^frontend/src/.*\.(ts|tsx)$
       - id: pytest-backend
         name: pytest backend
-        entry: pytest backend/app/tests
+        entry: .venv/bin/python -m pytest backend/app/tests
         language: system
         pass_filenames: false
       - id: vitest-frontend
         name: vitest frontend
-        entry: npm run test
+        entry: npm --prefix frontend test
         language: system
         pass_filenames: false

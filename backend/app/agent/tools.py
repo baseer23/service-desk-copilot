@@ -1,127 +1,73 @@
-from __future__ import annotations
+"""Bound LangChain schemas and wrappers; every capability crosses MCP."""
 
-import json
-from datetime import datetime, timezone
-from typing import Any, Dict, List
+from pydantic import create_model
+from langchain_core.tools import StructuredTool
 
-from langchain_core.tools import tool
-
-from backend.app.agent.memory import CaseMemoryStore
-from backend.app.mcp.client import DeskMateMCPClient
+TOOL_FIELDS = {
+    "search_knowledge": {"question": (str, ...), "mode": (str, "HYBRID"), "top_k": (int, 6)},
+    "search_web": {"query": (str, ...), "max_results": (int, 3)},
+    "fetch_web_page": {"url": (str, ...)},
+    "search_previous_tickets": {
+        "query": (str, ...),
+        "user": (str | None, None),
+        "company": (str | None, None),
+        "site": (str | None, None),
+    },
+    "get_user_context": {"user_name": (str, ...), "company": (str | None, None)},
+    "get_company_context": {"company": (str, ...)},
+    "get_site_context": {"company": (str, ...), "site": (str, ...)},
+    "get_device_context": {"device_or_user": (str, ...)},
+    "get_active_alerts": {
+        "company": (str, ...),
+        "site": (str | None, None),
+        "product": (str | None, None),
+    },
+    "get_recent_changes": {
+        "company": (str, ...),
+        "site": (str | None, None),
+        "product": (str | None, None),
+    },
+    "save_case_note": {"case_id": (str, ...), "text": (str, ...), "source": (str, "agent")},
+    "remember_fact": {"fact": (dict, ...)},
+    "search_remembered_facts": {"subject": (str, ...), "query": (str | None, None)},
+}
+READ_TOOLS = set(TOOL_FIELDS) - {"remember_fact", "save_case_note"}
 
 
 class AgentToolHarness:
-    """LangChain tool wrapper for the real MCP capability boundary."""
+    def __init__(self, mcp_client):
+        self.mcp_client = mcp_client
+        self.invocation_count = 0
+        self.tools = {name: self._bind(name, fields) for name, fields in TOOL_FIELDS.items()}
 
-    def __init__(self, mcp_client: DeskMateMCPClient, memory_store: CaseMemoryStore | None = None) -> None:
-        self.mcp = mcp_client
-        self.memory = memory_store
+    def _bind(self, name, fields):
+        async def invoke(**arguments):
+            self.invocation_count += 1
+            return await self.mcp_client.call_tool(name, arguments)
 
-    async def async_tools(self) -> Dict[str, Any]:
-        return {
-            "search_previous_tickets": self.search_previous_tickets,
-            "get_user_context": self.get_user_context,
-            "get_company_context": self.get_company_context,
-            "get_site_context": self.get_site_context,
-            "get_device_context": self.get_device_context,
-            "get_active_alerts": self.get_active_alerts,
-            "get_recent_changes": self.get_recent_changes,
-            "search_knowledge": self.search_knowledge,
-            "search_web": self.search_web,
-            "fetch_web_page": self.fetch_web_page,
-            "save_case_note": self.save_case_note,
-            "remember_fact": self.remember_fact,
-            "search_remembered_facts": self.search_remembered_facts,
-        }
+        return StructuredTool.from_function(
+            name=name,
+            description=f"DeskMate MCP capability: {name}.",
+            coroutine=invoke,
+            args_schema=create_model(name + "Input", **fields),
+        )
 
-    @tool
-    async def search_previous_tickets(self, query: str, user: str | None = None, company: str | None = None, site: str | None = None) -> str:
-        """Search previous tickets relevant to the query and optional user/company/site."""
-        result = await self.mcp.search_previous_tickets_async(query, user=user, company=company, site=site)
-        return json.dumps(result, default=str)
+    async def invoke(self, name, arguments):
+        if name not in self.tools:
+            raise ValueError(f"Unknown capability: {name}")
+        return await self.tools[name].ainvoke(arguments)
 
-    @tool
-    async def get_user_context(self, user_name: str, company: str | None = None) -> str:
-        """Return contextual information about a user from external systems."""
-        result = await self.mcp.get_user_context_async(user_name, company=company)
-        return json.dumps(result, default=str)
-
-    @tool
-    async def get_company_context(self, company: str) -> str:
-        """Return contextual information about a company from external systems."""
-        result = await self.mcp.get_company_context_async(company)
-        return json.dumps(result, default=str)
-
-    @tool
-    async def get_site_context(self, company: str, site: str) -> str:
-        """Return contextual information about a specific site for a company."""
-        result = await self.mcp.get_site_context_async(company, site)
-        return json.dumps(result, default=str)
-
-    @tool
-    async def get_device_context(self, device_or_user: str) -> str:
-        """Return device-level context or recent device activity."""
-        result = await self.mcp.get_device_context_async(device_or_user)
-        return json.dumps(result, default=str)
-
-    @tool
-    async def get_active_alerts(self, company: str, site: str | None = None, product: str | None = None) -> str:
-        """Return active alerts for a company/site/product."""
-        result = await self.mcp.get_active_alerts_async(company, site=site, product=product)
-        return json.dumps(result, default=str)
-
-    @tool
-    async def get_recent_changes(self, company: str, site: str | None = None, product: str | None = None) -> str:
-        """Return recent changes such as updates or configuration changes."""
-        result = await self.mcp.get_recent_changes_async(company, site=site, product=product)
-        return json.dumps(result, default=str)
-
-    @tool
-    async def search_knowledge(self, question: str, mode: str = "HYBRID", top_k: int = 6) -> str:
-        """Search the knowledge base (vector/graph/hybrid) for relevant documents."""
-        result = self.mcp.search_knowledge(question, mode, top_k)
-        return json.dumps(result, default=str)
-
-    @tool
-    async def search_web(self, query: str, max_results: int = 5) -> str:
-        """Run a public web search for the query and return summarized results."""
-        result = self.mcp.search_web(query, max_results=max_results)
-        return json.dumps(result, default=str)
-
-    @tool
-    async def fetch_web_page(self, url: str) -> str:
-        """Fetch a web page for scraping or citation purposes."""
-        result = self.mcp.fetch_web_page(url)
-        return json.dumps(result, default=str)
-
-    @tool
-    async def save_case_note(self, case_id: str, text: str, source: str) -> str:
-        """Persist a short note into the case event timeline."""
-        if self.memory is not None:
-            self.memory.record_event(case_id, None, source, text)
-        return json.dumps({"case_id": case_id, "source": source, "saved": True}, default=str)
-
-    @tool
-    async def remember_fact(self, subject: str, predicate: str, value: str, source: str, observed_at: str | None = None) -> str:
-        """Store a fact in the case memory store for later retrieval."""
-        if self.memory is not None:
-            fact = {
-                "subject": subject,
-                "predicate": predicate,
-                "value": value,
-                "source": source,
-                "source_system": "local_fixture",
-                "observed_at": observed_at or datetime.now(timezone.utc).isoformat(),
-                "confidence": 0.9,
-                "reliability": "confirmed",
-                "metadata": {},
+    def schemas(self):
+        # Keep the prompt compact while retaining actual argument types and
+        # required fields. LangChain performs full schema validation on invoke.
+        result = []
+        for name in sorted(READ_TOOLS):
+            schema = self.tools[name].args_schema.model_json_schema()
+            properties = {
+                key: {k: v for k, v in spec.items() if k not in {"title", "default"}}
+                for key, spec in schema["properties"].items()
             }
-            self.memory.save_fact(fact)
-        return json.dumps(fact, default=str)
-
-    @tool
-    async def search_remembered_facts(self, subject: str, query: str | None = None) -> str:
-        """Search persisted facts in the case memory store."""
-        if self.memory is None:
-            return json.dumps([])
-        return json.dumps(self.memory.search_facts(subject, query=query), default=str)
+            result.append(
+                {"name": name, "properties": properties, "required": schema.get("required", [])}
+            )
+        return result

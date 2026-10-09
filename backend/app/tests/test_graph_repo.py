@@ -153,7 +153,7 @@ def test_aura_backend_end_to_end(monkeypatch, make_client, tmp_path):
 
     class FakeGraphDatabase:
         @staticmethod
-        def driver(uri, auth=None):
+        def driver(uri, auth=None, **kwargs):
             assert uri.startswith("neo4j+s://")
             assert auth is not None
             return FakeDriver()
@@ -164,7 +164,7 @@ def test_aura_backend_end_to_end(monkeypatch, make_client, tmp_path):
 
     client = make_client(
         {
-            "MODEL_PROVIDER": "stub",
+            "GENERATION_PROVIDER": "stub",
             "EMBED_PROVIDER": "stub",
             "CHROMA_DIR": tmp_path / "chroma",
             "NEO4J_URI": "neo4j+s://demo.neo4j.io",
@@ -177,21 +177,10 @@ def test_aura_backend_end_to_end(monkeypatch, make_client, tmp_path):
     import backend.app.main as main
 
     try:
-        assert main.GraphDatabase is not None
-        assert main.GraphDatabase.__name__ == "FakeGraphDatabase"
-        uri_value = main.app.state.settings.neo4j_uri
-        assert isinstance(uri_value, str)
-        assert uri_value == "neo4j+s://demo.neo4j.io"
-        repo_initialized, driver_initialized = main._init_graph_repo(main.app.state.settings)
-        assert isinstance(repo_initialized, GraphRepository)
-        assert driver_initialized is not None
-        assert main.app.state.graph_backend == "aura"
-        main.app.state.graph_repo = repo_initialized
-        main.app.state.graph_driver = driver_initialized
-
+        assert isinstance(main.app.state.graph_repo, GraphRepository)
         health = client.get("/health").json()
-        assert health["graph_backend"] == "aura"
-        assert health["neo4j_reachable"] is True
+        assert health["aura_configured"] is True
+        assert health["aura_connected"] is True
 
         repo = main.app.state.graph_repo
 

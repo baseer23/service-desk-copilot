@@ -21,3 +21,15 @@ frontend/dist/
 venv/
 .vscode/
 store/chroma/
+
+# Operational memory and test artifacts
+store/*.db
+store/*.db-*
+store/*.sqlite3
+store/*.sqlite3-*
+frontend/test-results/
+frontend/playwright-report/
+*.tsbuildinfo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/

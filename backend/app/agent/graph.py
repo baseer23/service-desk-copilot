@@ -1,214 +1,459 @@
+"""The sole case orchestrator: durable LangGraph, structured reasoning, MCP tools."""
+
 from __future__ import annotations
-
 import asyncio
-import json
-import logging
-from typing import Any, TypedDict
+from datetime import datetime, timezone
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Command, interrupt
+from backend.app.agent.models import TicketAnalysis, InvestigationDecision, MemoryFact
+from backend.app.agent.state import InvestigationState
+from backend.app.agent.tools import AgentToolHarness, READ_TOOLS
+from backend.app.repositories.fixtures import canonical_site
 
-from langgraph.graph import END, START, StateGraph
-
-from backend.app.agent.memory import CaseMemoryStore
-from backend.app.agent.tools import AgentToolHarness
-from backend.app.mcp.client import DeskMateMCPClient
-
-logger = logging.getLogger("service-desk")
-
-
-class CaseGraphState(TypedDict, total=False):
-    case_id: str
-    ticket: dict[str, Any]
-    question: str
-    evidence: list[dict[str, Any]]
-    remembered_facts: list[dict[str, Any]]
-    missing_information: list[str]
-    pending_question: str | None
-    status: str
-    final_answer: str | None
-    confidence: float
-    uncertainty: list[str]
+LABELS = {
+    "search_knowledge": "Knowledge searched",
+    "search_previous_tickets": "Previous incidents searched",
+    "get_user_context": "User context checked",
+    "get_company_context": "Company context checked",
+    "get_site_context": "Site context checked",
+    "get_device_context": "Device context checked",
+    "get_active_alerts": "Alerts checked",
+    "get_recent_changes": "Recent changes checked",
+    "search_remembered_facts": "Cross-case memory searched",
+    "remember_fact": "Confirmed fact saved",
+    "search_web": "Public web searched",
+    "fetch_web_page": "Public page fetched",
+    "save_case_note": "Case note saved",
+}
 
 
 class ServiceDeskAgent:
-    """Stateful service-desk investigation workflow built on LangGraph."""
-
-    def __init__(self, *, mcp_client: DeskMateMCPClient | None = None, memory_store: CaseMemoryStore | None = None) -> None:
-        self.mcp = mcp_client or DeskMateMCPClient()
-        self.memory = memory_store or CaseMemoryStore()
-        self._tool_harness = AgentToolHarness(self.mcp, self.memory)
-
-    def build_graph(self) -> StateGraph:
-        graph = StateGraph(CaseGraphState)
-        graph.add_node("analyze_ticket", self._analyze_ticket)
-        graph.add_node("collect_evidence", self._collect_evidence)
-        graph.add_node("decide_next_step", self._decide_next_step)
-        graph.add_node("finalize", self._finalize)
-
+    def __init__(self, settings, mcp_client, memory_store, provider, checkpointer, ingest_service):
+        self.settings, self.memory, self.provider, self.ingest = (
+            settings,
+            memory_store,
+            provider,
+            ingest_service,
+        )
+        self.harness = AgentToolHarness(mcp_client)
+        self._case_locks = {}
+        graph = StateGraph(InvestigationState)
+        for name in (
+            "analyze_ticket",
+            "load_memory",
+            "investigate",
+            "reason",
+            "execute_tools",
+            "ask_human",
+            "research_web",
+            "finalize",
+        ):
+            graph.add_node(name, getattr(self, name))
         graph.add_edge(START, "analyze_ticket")
-        graph.add_edge("analyze_ticket", "collect_evidence")
-        graph.add_conditional_edges(
-            "collect_evidence",
-            self._route_after_evidence,
-            {"decide": "decide_next_step", "finalize": "finalize"},
-        )
-        graph.add_conditional_edges(
-            "decide_next_step",
-            self._route_after_decision,
-            {"finalize": "finalize", "decide": "collect_evidence"},
-        )
+        graph.add_edge("analyze_ticket", "load_memory")
+        graph.add_edge("load_memory", "investigate")
+        graph.add_edge("investigate", "reason")
+        graph.add_conditional_edges("reason", self.route)
+        graph.add_edge("execute_tools", "investigate")
+        graph.add_edge("ask_human", "investigate")
+        graph.add_edge("research_web", "reason")
         graph.add_edge("finalize", END)
-        return graph
+        self.graph = graph.compile(checkpointer=checkpointer)
 
-    def run_case(self, case_id: str, ticket: dict[str, Any], question: str | None = None) -> dict[str, Any]:
-        initial_state: CaseGraphState = {
-            "case_id": case_id,
-            "ticket": ticket,
-            "question": question or str(ticket.get("summary") or ticket.get("description") or "Need assistance"),
-            "evidence": [],
-            "remembered_facts": [],
-            "missing_information": [],
-            "pending_question": None,
-            "status": "active",
-            "final_answer": None,
-            "confidence": 0.0,
-            "uncertainty": [],
-        }
-        existing = self.memory.load_case(case_id)
-        if existing:
-            initial_state.update(existing)
-            if ticket:
-                initial_state["ticket"] = ticket
-        if question:
-            initial_state["question"] = question
-        compiled = self.build_graph().compile()
-        result = compiled.invoke(initial_state)
-        payload = dict(result)
-        payload.setdefault("case_id", case_id)
-        self.memory.save_case(case_id, payload)
+    def config(self, case_id):
+        return {"configurable": {"thread_id": case_id}, "recursion_limit": 100}
+
+    async def run_case(self, case_id, answer=None):
+        lock = self._case_locks.setdefault(case_id, asyncio.Lock())
+        async with lock:
+            stored = self.memory.load_case(case_id)
+            if stored is None:
+                raise KeyError(case_id)
+            config = self.config(case_id)
+            checkpoint = await self.graph.aget_state(config)
+            if answer is not None:
+                if not checkpoint.next or stored.get("status") != "needs_input":
+                    raise ValueError("This case is not awaiting human input")
+                graph_input = Command(resume=answer)
+            elif checkpoint.values:
+                # Retry a failed node using its checkpoint, never START. Paused
+                # human interrupts still require Command(resume=answer).
+                if stored.get("status") == "error" and checkpoint.next:
+                    graph_input = None
+                else:
+                    return self._save_snapshot(case_id, checkpoint.values)
+            else:
+                graph_input = {**stored, "status": "investigating", "research_iteration": 0}
+            try:
+                await self.graph.ainvoke(graph_input, config)
+                snapshot = await self.graph.aget_state(config)
+                return self._save_snapshot(case_id, snapshot.values)
+            except Exception:
+                snapshot = await self.graph.aget_state(config)
+                state = dict(snapshot.values or stored)
+                state.update(
+                    status="error",
+                    uncertainty=["Investigation failed; inspect the explicit API error."],
+                )
+                self.memory.save_case(case_id, state)
+                self.memory.record_event(case_id, "error", "application", "Investigation failed")
+                raise
+
+    def _save_snapshot(self, case_id, values):
+        state = dict(values)
+        self.memory.save_case(case_id, state)
+        return state
+
+    async def _call(self, state, name, arguments):
+        result = await self.harness.invoke(name, arguments)
+        count = len(result) if isinstance(result, list) else int(bool(result))
+        rows = result if isinstance(result, list) else [result] if result else []
+        source = rows[0].get("source_system") if rows else None
+        source = source or ("chroma" if name == "search_knowledge" else "capability")
         self.memory.record_event(
-            case_id,
-            "service_desk_agent",
-            "agent",
-            str(payload.get("final_answer") or payload.get("question") or "investigation updated"),
+            state["case_id"],
+            name,
+            source,
+            f"{LABELS.get(name, name)}: {count} result(s)",
         )
-        return payload
+        return result
 
-    def _analyze_ticket(self, state: CaseGraphState) -> dict[str, Any]:
-        ticket = state.get("ticket", {}) or {}
-        summary = (ticket.get("summary") or ticket.get("description") or "").strip()
-        if summary:
-            state["question"] = state.get("question") or summary
-        return {
-            "missing_information": self._infer_missing_information(ticket),
-            "uncertainty": ["Need to verify user/site/device details before finalizing."],
-            "status": "analyzing",
-        }
+    @staticmethod
+    def _evidence(name, result):
+        rows = result if isinstance(result, list) else [result] if result else []
+        evidence = []
+        for row in rows:
+            meta = row.get("metadata", {})
+            evidence.append(
+                {
+                    "tool": name,
+                    "source": row.get("source") or meta.get("source") or row.get("url") or name,
+                    "source_system": row.get("source_system")
+                    or ("chroma" if name == "search_knowledge" else "sqlite_memory"),
+                    "observed_at": row.get("observed_at")
+                    or meta.get("created_at")
+                    or datetime.now(timezone.utc).isoformat(),
+                    "content": row,
+                }
+            )
+        return evidence
 
-    def _collect_evidence(self, state: CaseGraphState) -> dict[str, Any]:
-        ticket = state.get("ticket", {})
-        question = state.get("question") or "service desk case investigation"
-        evidence: list[dict[str, Any]] = []
-        try:
-            overview = self.mcp.search_knowledge(question, "HYBRID", top_k=5)
-            if isinstance(overview, list):
-                evidence.extend(overview)
-        except Exception as exc:  # pragma: no cover - network dependent
-            logger.warning("Knowledge retrieval failed for case investigation: %s", exc)
-
-        user_name = ticket.get("user") or ticket.get("user_name")
-        if user_name:
-            try:
-                user_ctx = asyncio.run(self.mcp.get_user_context_async(user_name, ticket.get("company")))
-                evidence.append({"source": "user_context", "data": user_ctx})
-            except Exception as exc:  # pragma: no cover - network dependency
-                logger.warning("User context request failed: %s", exc)
-
-        company = ticket.get("company")
-        site = ticket.get("site")
-        if company:
-            try:
-                if site:
-                    evidence.append({"source": "site_context", "data": asyncio.run(self.mcp.get_site_context_async(company, site))})
-                evidence.append({"source": "company_context", "data": asyncio.run(self.mcp.get_company_context_async(company))})
-            except Exception as exc:  # pragma: no cover - network dependency
-                logger.warning("Company/site context request failed: %s", exc)
-
-        remembered = self.memory.list_facts_for_case(state.get("case_id")) if state.get("case_id") else []
-        return {
-            "evidence": evidence,
-            "remembered_facts": remembered,
-            "status": "gathered_evidence",
-        }
-
-    def _decide_next_step(self, state: CaseGraphState) -> dict[str, Any]:
-        ticket = state.get("ticket", {})
-        missing = self._infer_missing_information(ticket)
-        evidence = state.get("evidence", [])
-        if missing:
-            return {
-                "pending_question": "I need a quick verification: " + "; ".join(missing),
-                "missing_information": missing,
-                "status": "waiting_for_human",
-                "uncertainty": missing,
-            }
-        if not evidence:
-            return {
-                "pending_question": "I don't yet have enough evidence for this issue. Do you want me to continue with public web research?",
-                "status": "needs_review",
-                "confidence": 0.35,
-                "uncertainty": ["No local evidence was found."],
-            }
-        return {
-            "status": "ready",
-            "confidence": 0.82,
-            "uncertainty": [],
-        }
-
-    def _finalize(self, state: CaseGraphState) -> dict[str, Any]:
-        ticket = state.get("ticket", {})
-        summary = (ticket.get("summary") or ticket.get("description") or "Service request")
-        evidence_items = state.get("evidence", [])
-        answer = (
-            f"Investigation for case {state.get('case_id', 'unknown')}: "
-            f"I reviewed the available service-desk evidence for '{summary}'. "
-            f"The current record suggests a likely issue in the affected user/site/device path, and I have captured {len(evidence_items)} evidence items for follow-up."
+    async def analyze_ticket(self, state):
+        analysis = await self.provider.generate_structured(
+            "analyze_ticket", {"ticket": state["ticket"]}, TicketAnalysis
+        )
+        self.memory.record_event(
+            state["case_id"], "analyze_ticket", self.provider.name(), "Ticket analyzed"
         )
         return {
-            "final_answer": answer,
-            "status": "resolved",
-            "confidence": float(state.get("confidence", 0.82) or 0.82),
+            "analysis": analysis.model_dump(),
+            "hypotheses": analysis.initial_hypotheses,
+            "evidence": [],
+            "confirmed_facts": [],
+            "human_answers": [],
+            "tool_events": [],
+            "web_sources": [],
         }
 
-    def _route_after_evidence(self, state: CaseGraphState) -> str:
-        if not state.get("evidence"):
-            return "finalize"
-        return "decide"
+    async def load_memory(self, state):
+        subject = state["analysis"].get("user_name")
+        facts = (
+            await self._call(state, "search_remembered_facts", {"subject": subject})
+            if subject
+            else []
+        )
+        # Latest confirmed value per predicate; retain provenance and original case ID.
+        useful = {}
+        for fact in facts:
+            if fact.get("reliability") == "confirmed" and fact.get("source") in {
+                "human_confirmed",
+                "trusted_tool",
+                "resolved_outcome",
+            }:
+                useful.setdefault(fact["predicate"], fact)
+        return {"remembered_facts": list(useful.values())}
 
-    def _route_after_decision(self, state: CaseGraphState) -> str:
-        if state.get("pending_question") or state.get("missing_information"):
-            return "decide"
+    def _fact_values(self, state):
+        values = {f["predicate"]: f["value"] for f in state.get("remembered_facts", [])}
+        values.update({f["predicate"]: f["value"] for f in state.get("confirmed_facts", [])})
+        return values
+
+    async def investigate(self, state):
+        a = state["analysis"]
+        site = self._fact_values(state).get("current_site") or a.get("site")
+        if "previous_tickets" in state and state.get("context_site") == site:
+            return {}
+        calls = [
+            (
+                "search_knowledge",
+                {
+                    "question": state["ticket"]["summary"],
+                    "mode": "HYBRID",
+                    "top_k": self.settings.top_k,
+                },
+            ),
+            (
+                "search_previous_tickets",
+                {
+                    "query": a["symptoms"],
+                    "user": a.get("user_name"),
+                    "company": a.get("company"),
+                    "site": site,
+                },
+            ),
+        ]
+        if a.get("user_name"):
+            calls += [
+                ("get_user_context", {"user_name": a["user_name"], "company": a.get("company")}),
+                ("get_device_context", {"device_or_user": a.get("device") or a["user_name"]}),
+            ]
+        if a.get("company"):
+            calls += [
+                ("get_company_context", {"company": a["company"]}),
+                (
+                    "get_active_alerts",
+                    {"company": a["company"], "site": site, "product": a.get("product")},
+                ),
+                (
+                    "get_recent_changes",
+                    {"company": a["company"], "site": site, "product": a.get("product")},
+                ),
+            ]
+            if site:
+                calls += [("get_site_context", {"company": a["company"], "site": site})]
+        evidence = [e for e in state.get("evidence", []) if e["tool"] not in {n for n, _ in calls}]
+        update = {
+            "context_site": site,
+            "previous_tickets": [],
+            "knowledge": [],
+            "alerts": [],
+            "changes": [],
+        }
+        destinations = {
+            "search_knowledge": "knowledge",
+            "search_previous_tickets": "previous_tickets",
+            "get_active_alerts": "alerts",
+            "get_recent_changes": "changes",
+        }
+        for name, arguments in calls:
+            result = await self._call(state, name, arguments)
+            evidence += self._evidence(name, result)
+            if name in destinations:
+                update[destinations[name]] = result
+        update["evidence"] = evidence
+        return update
+
+    async def reason(self, state):
+        iteration = state.get("research_iteration", 0) + 1
+        context = {
+            k: state.get(k, [])
+            for k in (
+                "confirmed_facts",
+                "remembered_facts",
+                "evidence",
+                "previous_tickets",
+                "knowledge",
+                "alerts",
+                "changes",
+                "human_answers",
+                "web_sources",
+            )
+        }
+        context.update(
+            analysis=state["analysis"],
+            available_tools=self.harness.schemas(),
+            web_attempted=bool(state.get("web_sources"))
+            or any(e["tool"] == "search_web" for e in self.memory.list_events(state["case_id"])),
+        )
+        decision = await self.provider.generate_structured("reason", context, InvestigationDecision)
+        if not state.get("evidence") and decision.enough_information:
+            decision.enough_information = False
+            decision.confidence = 0
+            decision.uncertainty.append("No supporting evidence is available.")
+        if iteration >= self.settings.max_investigation_cycles:
+            decision.question_for_human = None
+            decision.human_field = None
+            decision.requested_tools = []
+            decision.needs_web_research = False
+            decision.enough_information = False
+            decision.uncertainty.append(
+                "Investigation cycle limit reached; additional technician evidence is required."
+            )
+        self.memory.record_event(
+            state["case_id"],
+            "reason",
+            self.provider.name(),
+            decision.decision_justification or decision.evidence_summary,
+        )
+        return {
+            "decision": decision.model_dump(),
+            "research_iteration": iteration,
+            "hypotheses": decision.hypotheses,
+            "inferences": decision.inferences,
+            "missing_information": decision.missing_information,
+            "confidence": decision.confidence,
+            "uncertainty": decision.uncertainty,
+            "likely_issue": decision.likely_issue,
+            "recommended_next_action": decision.recommended_next_action,
+            "pending_question": decision.question_for_human,
+            "pending_field": decision.human_field,
+            "requested_tools": [t.model_dump() for t in decision.requested_tools],
+            "status": "needs_input" if decision.question_for_human else "investigating",
+        }
+
+    @staticmethod
+    def route(state):
+        d = state["decision"]
+        if d.get("question_for_human"):
+            return "ask_human"
+        if d.get("requested_tools"):
+            return "execute_tools"
+        if d.get("needs_web_research"):
+            return "research_web"
         return "finalize"
 
-    def _infer_missing_information(self, ticket: dict[str, Any]) -> list[str]:
-        missing: list[str] = []
-        if not (ticket.get("user") or ticket.get("user_name")):
-            missing.append("user name")
-        if not ticket.get("company"):
-            missing.append("company")
-        if not ticket.get("site"):
-            missing.append("site")
-        if not ticket.get("device"):
-            missing.append("device")
-        if not ticket.get("summary") and not ticket.get("description"):
-            missing.append("issue summary")
-        return missing
+    async def execute_tools(self, state):
+        evidence = list(state.get("evidence", []))
+        update = {}
+        destinations = {
+            "search_knowledge": "knowledge",
+            "search_previous_tickets": "previous_tickets",
+            "get_active_alerts": "alerts",
+            "get_recent_changes": "changes",
+        }
+        for request in state["requested_tools"]:
+            if request["name"] not in READ_TOOLS:
+                raise ValueError("Reasoning may only request read capabilities")
+            result = await self._call(state, request["name"], request["arguments"])
+            evidence += self._evidence(request["name"], result)
+            if request["name"] in destinations:
+                update[destinations[request["name"]]] = result
+        return {**update, "evidence": evidence}
 
-    def _remembered_facts_for_case(self, case_id: str | None) -> list[dict[str, Any]]:
-        if not case_id:
-            return []
+    async def ask_human(self, state):
+        answer = interrupt(
+            {
+                "question": state["pending_question"],
+                "field": state["pending_field"],
+                "case_id": state["case_id"],
+            }
+        )
+        answer = str(answer).strip()
+        if not answer:
+            raise ValueError("Human answer cannot be empty")
+        a, field = state["analysis"], state["pending_field"]
+        value = (
+            canonical_site(answer, a.get("company") or "") if field == "current_site" else answer
+        )
+        if field == "required_update_installed":
+            lower = answer.lower()
+            if lower in {"yes", "installed", "yes installed", "yes, installed"}:
+                value = "Yes"
+            elif lower in {"no", "not installed"}:
+                value = "No"
+        fact = MemoryFact(
+            subject=a.get("user_name") or state["case_id"],
+            predicate=field or "human_answer",
+            value=value,
+            source="human_confirmed",
+            source_system="human_input",
+            observed_at=datetime.now(timezone.utc).isoformat(),
+            confidence=1,
+            case_id=state["case_id"],
+            metadata={"question": state["pending_question"], "answer": answer},
+        )
+        saved = await self._call(state, "remember_fact", {"fact": fact.model_dump()})
+        await self._call(
+            state,
+            "save_case_note",
+            {
+                "case_id": state["case_id"],
+                "text": f"Human confirmed {field}: {value}",
+                "source": "human_confirmed",
+            },
+        )
+        return {
+            "confirmed_facts": state.get("confirmed_facts", []) + [saved],
+            "human_answers": state.get("human_answers", [])
+            + [{"question": state["pending_question"], "answer": answer}],
+            "pending_question": None,
+            "pending_field": None,
+            "status": "investigating",
+        }
+
+    async def research_web(self, state):
+        evidence, sources = list(state.get("evidence", [])), list(state.get("web_sources", []))
         try:
-            return self.memory.list_facts_for_case(case_id)
-        except Exception:  # pragma: no cover - defensive fallback
-            return []
+            results = await self._call(
+                state, "search_web", {"query": state["ticket"]["summary"], "max_results": 3}
+            )
+            for result in results[:2]:
+                try:
+                    page = await self._call(state, "fetch_web_page", {"url": result["url"]})
+                    if not page.get("text") or len(page["text"].strip()) < 80:
+                        continue
+                    # Canonical IngestService is reused; repositories stay out of LangChain tools.
+                    await asyncio.to_thread(
+                        self.ingest.ingest_text,
+                        page["title"],
+                        page["text"],
+                        source=page["url"],
+                        source_type="web",
+                        url=page["url"],
+                    )
+                    sources.append(page)
+                    evidence += self._evidence("fetch_web_page", page)
+                    self.memory.record_event(
+                        state["case_id"],
+                        "ingest_web",
+                        "ingestion",
+                        f"Web knowledge ingested: {page['title']}",
+                    )
+                except Exception:
+                    self.memory.record_event(
+                        state["case_id"],
+                        "fetch_web_page",
+                        "public_web",
+                        "Web page could not be safely fetched or ingested",
+                    )
+            knowledge = await self._call(
+                state,
+                "search_knowledge",
+                {
+                    "question": state["ticket"]["summary"],
+                    "mode": "HYBRID",
+                    "top_k": self.settings.top_k,
+                },
+            )
+            evidence += self._evidence("search_knowledge", knowledge)
+        except Exception:
+            knowledge = state.get("knowledge", [])
+            self.memory.record_event(
+                state["case_id"], "search_web", "public_web", "Public web research unavailable"
+            )
+        return {"web_sources": sources, "knowledge": knowledge, "evidence": evidence}
 
-
-__all__ = ["CaseGraphState", "ServiceDeskAgent"]
+    async def finalize(self, state):
+        enough = state["decision"]["enough_information"] and bool(state.get("evidence"))
+        status = "assessment_ready" if enough else "insufficient_information"
+        action = (
+            state.get("recommended_next_action")
+            or "Collect diagnostic information with the service desk technician."
+        )
+        uncertainty = state.get("uncertainty", [])
+        if not enough and not uncertainty:
+            uncertainty = ["The available evidence is insufficient to recommend a cause."]
+        self.memory.record_event(
+            state["case_id"],
+            "finalize",
+            "agent",
+            "Assessment ready" if enough else "Insufficient information",
+        )
+        return {
+            "status": status,
+            "pending_question": None,
+            "pending_field": None,
+            "final_answer": action,
+            "uncertainty": uncertainty,
+            "confidence": state.get("confidence", 0) if state.get("evidence") else 0,
+        }

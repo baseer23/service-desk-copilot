@@ -1,153 +1,193 @@
-from __future__ import annotations
+"""Async MCP transport with one task owning the complete stdio lifetime."""
 
+from __future__ import annotations
 import asyncio
 import json
-import logging
+import os
 import sys
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
-
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
-logger = logging.getLogger("service-desk")
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
-class DeskMateMCPClient:
-    """Application-level client that performs real MCP tool calls into the DeskMate server."""
+class MCPToolError(RuntimeError):
+    """Server tool failure; the connection remains usable."""
 
-    def __init__(self, *, server_command: str | None = None, cwd: str | None = None) -> None:
+
+class MCPConnectionError(RuntimeError):
+    """Transport or initialization failed."""
+
+
+class DeskMateMCPClient:
+    def __init__(self, settings=None, *, server_command=None, cwd=None):
+        from backend.app.core.config import get_settings
+
+        self.settings = settings or get_settings()
         self.server_command = server_command or sys.executable
         self.cwd = cwd or str(PROJECT_ROOT)
-        self._stdio_cm = None
-        self._session = None
-        self._read = None
-        self._write = None
+        self._lock = asyncio.Lock()
+        self._task = None
+        self._queue = asyncio.Queue()
+        self._ready = None
+        self.connection_count = 0
 
-    async def _ensure_session(self) -> None:
-        if self._session is not None:
-            return
-        params_obj = StdioServerParameters(
-            command=self.server_command,
-            args=["-m", "backend.app.mcp.server"],
-            cwd=self.cwd,
-            env=None,
+    def subprocess_env(self):
+        s = self.settings
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k
+            in {
+                "PATH",
+                "HOME",
+                "USER",
+                "LOGNAME",
+                "SHELL",
+                "TMPDIR",
+                "SYSTEMROOT",
+                "HF_HOME",
+                "HF_HUB_CACHE",
+                "SENTENCE_TRANSFORMERS_HOME",
+                "SSL_CERT_FILE",
+            }
+        }
+        env.update(
+            {
+                "PYTHONPATH": str(PROJECT_ROOT),
+                "CHROMA_DIR": str(s.chroma_dir.resolve()),
+                "CASE_DB_PATH": str(s.case_db_path.resolve()),
+                "EMBED_PROVIDER": s.embed_provider,
+                "EMBED_MODEL_NAME": s.embed_model_name,
+                "NEO4J_URI": s.neo4j_uri,
+                "NEO4J_USER": s.neo4j_user,
+                "NEO4J_PASSWORD": s.neo4j_password,
+                "TEST_MODE": str(s.test_mode).lower(),
+                "GENERATION_PROVIDER": s.generation_provider,
+                "CHUNK_TOKENS": str(s.chunk_tokens),
+                "CHUNK_OVERLAP": str(s.chunk_overlap),
+                "WEB_MAX_BYTES": str(s.web_max_bytes),
+                "MODEL_TIMEOUT_SEC": str(s.model_timeout_sec),
+                "ANONYMIZED_TELEMETRY": "false",
+            }
         )
-        self._stdio_cm = stdio_client(params_obj)
-        self._read, self._write = await self._stdio_cm.__aenter__()
-        self._session = ClientSession(self._read, self._write)
-        await self._session.__aenter__()
-        await self._session.initialize()
+        return env
 
-    async def close(self) -> None:
-        if self._session is not None:
-            await self._session.__aexit__(None, None, None)
-            self._session = None
-        if self._stdio_cm is not None:
-            await self._stdio_cm.__aexit__(None, None, None)
-            self._stdio_cm = None
-        self._read = None
-        self._write = None
+    async def start(self):
+        async with self._lock:
+            if self._task is not None and not self._task.done():
+                return
+            self._queue = asyncio.Queue()
+            self._ready = asyncio.get_running_loop().create_future()
+            self._task = asyncio.create_task(self._own_session(), name="deskmate-mcp")
+            try:
+                await asyncio.wait_for(asyncio.shield(self._ready), timeout=60)
+            except BaseException:
+                self._task.cancel()
+                await asyncio.gather(self._task, return_exceptions=True)
+                self._task = None
+                raise
 
-    async def call_tool_async(self, tool_name: str, params: dict[str, Any]) -> list[dict[str, Any]] | dict[str, Any]:
-        await self._ensure_session()
-        result = await self._session.call_tool(tool_name, params)
-        payload = self._coerce_tool_result(result)
-        logger.info("MCP client received %s payload entries from %s", len(payload) if isinstance(payload, list) else 1, tool_name)
+    async def _own_session(self):
+        # AnyIO scopes are entered and exited by this same long-lived task.
+        active = None
+        try:
+            params = StdioServerParameters(
+                command=self.server_command,
+                args=["-m", "backend.app.mcp.server"],
+                cwd=self.cwd,
+                env=self.subprocess_env(),
+            )
+            async with stdio_client(params) as (read, write):
+                async with ClientSession(
+                    read, write, read_timeout_seconds=timedelta(seconds=60)
+                ) as session:
+                    await session.initialize()
+                    self.connection_count += 1
+                    self._ready.set_result(None)
+                    while True:
+                        item = await self._queue.get()
+                        if item is None:
+                            break
+                        name, arguments, active = item
+                        result = await session.call_tool(name, arguments)
+                        if not active.done():
+                            if result.isError:
+                                message = " ".join(getattr(c, "text", "") for c in result.content)
+                                active.set_exception(
+                                    MCPToolError(f"MCP tool {name} failed: {message}")
+                                )
+                            else:
+                                try:
+                                    active.set_result(self._coerce_tool_result(result))
+                                except ValueError as exc:
+                                    active.set_exception(
+                                        MCPToolError(f"Invalid result from {name}: {exc}")
+                                    )
+                        active = None
+        except BaseException as exc:
+            error = MCPConnectionError("DeskMate MCP connection failed")
+            if self._ready is not None and not self._ready.done():
+                self._ready.set_exception(error)
+            if active is not None and not active.done():
+                active.set_exception(error)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+        finally:
+            while not self._queue.empty():
+                item = self._queue.get_nowait()
+                if item is not None and not item[2].done():
+                    item[2].set_exception(MCPConnectionError("DeskMate MCP session closed"))
+
+    async def call_tool(self, tool_name: str, params: dict[str, Any]):
+        for attempt in range(2):
+            try:
+                await self.start()
+                future = asyncio.get_running_loop().create_future()
+                self._queue.put_nowait((tool_name, params, future))
+                return await future
+            except MCPConnectionError:
+                await self.close()
+                if attempt:
+                    raise
+
+    async def close(self):
+        async with self._lock:
+            if self._task is not None:
+                self._queue.put_nowait(None)
+                await asyncio.gather(self._task, return_exceptions=True)
+                self._task = None
+
+    async def search_knowledge(self, question: str, mode: str = "HYBRID", top_k: int = 6):
+        return await self.call_tool(
+            "search_knowledge", {"question": question, "mode": mode, "top_k": top_k}
+        )
+
+    async def search_web(self, query: str, max_results: int = 5):
+        return await self.call_tool("search_web", {"query": query, "max_results": max_results})
+
+    async def fetch_web_page(self, url: str):
+        payload = await self.call_tool("fetch_web_page", {"url": url})
+        if not isinstance(payload, dict):
+            raise MCPToolError("fetch_web_page must return an object")
         return payload
 
-    def search_knowledge(self, question: str, mode: str, top_k: int) -> list[dict[str, Any]]:
-        """Call the DeskMate MCP server's search_knowledge tool."""
-        logger.info("MCP client calling search_knowledge question='%s' mode=%s top_k=%s", question, mode, top_k)
-        return asyncio.run(self.call_tool_async("search_knowledge", {"question": question, "mode": mode, "top_k": top_k}))
-
-    def search_web(self, query: str, max_results: int = 5) -> list[dict[str, Any]]:
-        """Wrap the public web-search MCP tool."""
-        logger.info("MCP client calling search_web query='%s' max_results=%s", query, max_results)
-        return asyncio.run(self.call_tool_async("search_web", {"query": query, "max_results": max_results}))
-
-    def fetch_web_page(self, url: str) -> dict[str, Any]:
-        """Fetch a single public page through the web MCP tool."""
-        logger.info("MCP client calling fetch_web_page url='%s'", url)
-        result = asyncio.run(self.call_tool_async("fetch_web_page", {"url": url}))
-        return result[0] if isinstance(result, list) and result else {}
-
-    async def search_previous_tickets_async(self, query: str, user: str | None = None, company: str | None = None, site: str | None = None) -> list[dict[str, Any]]:
-        return await self.call_tool_async("search_previous_tickets", {"query": query, "user": user, "company": company, "site": site})
-
-    async def get_user_context_async(self, user_name: str, company: str | None = None) -> dict[str, Any]:
-        return await self.call_tool_async("get_user_context", {"user_name": user_name, "company": company})
-
-    async def get_company_context_async(self, company: str) -> dict[str, Any]:
-        return await self.call_tool_async("get_company_context", {"company": company})
-
-    async def get_site_context_async(self, company: str, site: str) -> dict[str, Any]:
-        return await self.call_tool_async("get_site_context", {"company": company, "site": site})
-
-    async def get_device_context_async(self, device_or_user: str) -> dict[str, Any]:
-        return await self.call_tool_async("get_device_context", {"device_or_user": device_or_user})
-
-    async def get_active_alerts_async(self, company: str, site: str | None = None, product: str | None = None) -> list[dict[str, Any]]:
-        return await self.call_tool_async("get_active_alerts", {"company": company, "site": site, "product": product})
-
-    async def get_recent_changes_async(self, company: str, site: str | None = None, product: str | None = None) -> list[dict[str, Any]]:
-        return await self.call_tool_async("get_recent_changes", {"company": company, "site": site, "product": product})
-
-    async def save_case_note_async(self, case_id: str, text: str, source: str) -> dict[str, Any]:
-        return await self.call_tool_async("save_case_note", {"case_id": case_id, "text": text, "source": source})
-
-    async def remember_fact_async(self, subject: str, predicate: str, value: str, source: str, observed_at: str) -> dict[str, Any]:
-        return await self.call_tool_async("remember_fact", {"subject": subject, "predicate": predicate, "value": value, "source": source, "observed_at": observed_at})
-
-    async def search_remembered_facts_async(self, subject: str, query: str | None = None) -> list[dict[str, Any]]:
-        return await self.call_tool_async("search_remembered_facts", {"subject": subject, "query": query})
-
     @staticmethod
-    def _coerce_tool_result(result: Any) -> list[dict[str, Any]] | dict[str, Any]:
-        if hasattr(result, "structuredContent") and result.structuredContent is not None:
-            payload = result.structuredContent
-            if isinstance(payload, list):
-                return payload
-            if isinstance(payload, dict):
-                for key in ("result", "results", "content"):
-                    if key in payload:
-                        value = payload[key]
-                        if isinstance(value, list):
-                            return value
-                        if isinstance(value, dict):
-                            return value.get("results", value)
-                return payload
-
-        if hasattr(result, "content"):
-            content = result.content
-            if isinstance(content, list):
-                for item in content:
-                    if hasattr(item, "text"):
-                        text = getattr(item, "text")
-                        if isinstance(text, str):
-                            try:
-                                parsed = json.loads(text)
-                                if isinstance(parsed, list):
-                                    return parsed
-                                if isinstance(parsed, dict):
-                                    if "result" in parsed:
-                                        return parsed["result"]
-                                    if "results" in parsed:
-                                        return parsed["results"]
-                                    return parsed
-                            except json.JSONDecodeError:
-                                continue
-
-        if isinstance(result, list):
-            return result
-        if isinstance(result, dict):
-            for key in ("result", "results", "content"):
-                if key in result:
-                    value = result[key]
-                    if isinstance(value, list):
-                        return value
-                    if isinstance(value, dict):
-                        return value.get("results", value)
-            return result
-        raise ValueError("MCP tool result did not contain structured payload data")
+    def _coerce_tool_result(result):
+        payload = getattr(result, "structuredContent", None)
+        if payload is None:
+            for item in getattr(result, "content", []):
+                if hasattr(item, "text"):
+                    try:
+                        payload = json.loads(item.text)
+                        break
+                    except json.JSONDecodeError:
+                        continue
+        if isinstance(payload, dict):
+            return payload.get("result", payload.get("results", payload))
+        if isinstance(payload, list):
+            return payload
+        raise ValueError("result must contain a JSON object or array")

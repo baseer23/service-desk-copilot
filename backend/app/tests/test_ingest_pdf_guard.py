@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
 
 
 try:  # pragma: no cover - exercised conditionally
@@ -11,29 +10,35 @@ except ImportError:  # pragma: no cover
     extract_text = None
 
 
-MINIMAL_PDF = (
-    b"%PDF-1.4\n"
-    b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
-    b"2 0 obj<</Type/Pages/Count 1/Kids[3 0 R]>>endobj\n"
-    b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n"
-    b"4 0 obj<</Length 55>>stream\n"
-    b"BT /F1 24 Tf 72 100 Td (Hello PDF) Tj ET\n"
-    b"endstream\nendobj\n"
-    b"5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\n"
-    b"xref\n0 6\n0000000000 65535 f \n0000000010 00000 n \n0000000059 00000 n \n0000000114 00000 n \n0000000223 00000 n \n0000000303 00000 n \n"
-    b"trailer<</Size 6/Root 1 0 R>>\nstartxref\n358\n%%EOF"
-)
+def minimal_pdf():
+    stream = b"BT /F1 24 Tf 72 100 Td (Hello PDF) Tj ET"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+        b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    data = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for i, obj in enumerate(objects, 1):
+        offsets.append(len(data))
+        data.extend(str(i).encode() + b" 0 obj\n" + obj + b"\nendobj\n")
+    start = len(data)
+    data.extend(b"xref\n0 6\n0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        data.extend(f"{offset:010d} 00000 n \n".encode())
+    data.extend(f"trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{start}\n%%EOF".encode())
+    return bytes(data)
 
 
-@pytest.mark.xfail(
-    extract_text is None or getattr(extract_text, "__module__", "") != "pdfminer.high_level",
-    reason="pdfminer.six not installed",
-    strict=False,
-)
+MINIMAL_PDF = minimal_pdf()
+
+
 def test_ingest_pdf_roundtrip(make_client, tmp_path):
     client = make_client(
         {
-            "MODEL_PROVIDER": "stub",
+            "GENERATION_PROVIDER": "stub",
             "EMBED_PROVIDER": "stub",
             "CHROMA_DIR": tmp_path / "chroma",
         }

@@ -17,13 +17,13 @@ cleanup() {
 trap cleanup INT TERM EXIT
 
 printf '[dev] Starting backend on http://localhost:8000 ...\n'
-uvicorn backend.app.main:app --reload --port 8000 --log-config backend/logging.ini &
+.venv/bin/python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 &
 BACKEND_PID=$!
 
 printf '[dev] Starting frontend on http://localhost:5173 ...\n'
 (
   cd frontend
-  npm run dev
+  npm run dev -- --host 127.0.0.1
 ) &
 FRONTEND_PID=$!
 

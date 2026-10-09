@@ -1,168 +1,150 @@
-from __future__ import annotations
+"""Persistent vector storage. Failures never reset or delete a collection."""
 
-import logging
-import os
-from dataclasses import dataclass
-from typing import Dict, List, Protocol
+from typing import Any, Protocol
 
-import chromadb
-from chromadb.config import Settings as ChromaSettings
+ChunkRecord = dict[str, Any]
 
-ChunkRecord = Dict[str, object]
 
-logger = logging.getLogger("service-desk")
+class StorageError(RuntimeError):
+    pass
 
 
 class VectorStore(Protocol):
-    """Protocol describing the vector store interface used by the application."""
-
-    def upsert(self, chunks: List[ChunkRecord]) -> None:
-        """Persist embeddings and chunk metadata."""
-
-    def search(self, query_embedding: List[float], top_k: int = 5) -> List[ChunkRecord]:
-        """Return the top matching chunks for a query embedding."""
-
-    def ping(self) -> bool:
-        """Return True when the store is reachable."""
-
-    def count(self) -> int:
-        """Return the number of stored chunks in the collection."""
+    def upsert(self, chunks: list[ChunkRecord]) -> None: ...
+    def search(self, query_embedding: list[float], top_k: int = 5) -> list[ChunkRecord]: ...
 
 
-@dataclass
 class VectorChromaStore:
-    """Chroma-backed vector store used for similarity search."""
+    def __init__(
+        self, path: str, collection_name="chunks", embedding_provider=None, embedding_model=None
+    ):
+        import chromadb
+        from chromadb.config import Settings
 
-    path: str
-    collection_name: str = "chunks"
+        self.path, self.collection_name = path, collection_name
+        self.embedding_provider, self.embedding_model = embedding_provider, embedding_model
+        try:
+            self._client = chromadb.PersistentClient(
+                path=path, settings=Settings(anonymized_telemetry=False)
+            )
+            metadata = (
+                {"embedding_provider": embedding_provider, "embedding_model": embedding_model}
+                if embedding_provider
+                else None
+            )
+            from chromadb.errors import InvalidCollectionException
+            from chromadb.db.base import UniqueConstraintError
 
-    def __post_init__(self) -> None:
-        """Initialise the persistent Chroma collection on first use."""
-        os.makedirs(self.path, exist_ok=True)
-        client_settings = ChromaSettings(is_persistent=True, anonymized_telemetry=False)
-        self._client = chromadb.PersistentClient(path=self.path, settings=client_settings)
-        self._collection = self._client.get_or_create_collection(name=self.collection_name)
+            try:
+                self._collection = self._client.get_collection(
+                    name=collection_name, embedding_function=None
+                )
+            except (InvalidCollectionException, ValueError) as missing:
+                if (
+                    isinstance(missing, ValueError)
+                    and str(missing) != f"Collection {collection_name} does not exist."
+                ):
+                    raise
+                try:
+                    self._collection = self._client.create_collection(
+                        name=collection_name, metadata=metadata, embedding_function=None
+                    )
+                except UniqueConstraintError:
+                    self._collection = self._client.get_collection(
+                        name=collection_name, embedding_function=None
+                    )
+            stored = self._collection.metadata or {}
+            if embedding_provider and any(stored.get(k) != v for k, v in metadata.items()):
+                raise StorageError(
+                    "Collection embedding provenance does not match the configured model"
+                )
+        except StorageError:
+            raise
+        except Exception as exc:
+            raise StorageError("Chroma initialization failed") from exc
 
-    def upsert(self, chunks: List[ChunkRecord]) -> None:
-        """Persist new or updated chunk embeddings."""
+    def contains_hash(self, content_hash):
+        try:
+            return bool(self._collection.get(where={"content_hash": content_hash}, limit=1)["ids"])
+        except Exception as exc:
+            raise StorageError("Chroma duplicate lookup failed") from exc
 
+    def upsert(self, chunks):
         if not chunks:
             return
-        ids = [chunk["id"] for chunk in chunks]
-        documents = [chunk.get("text", "") for chunk in chunks]
-        metadatas = [chunk.get("metadata", {}) for chunk in chunks]
-        embeddings = [chunk.get("embedding") for chunk in chunks]
+        for c in chunks:
+            meta = c.get("metadata", {})
+            if self.embedding_provider and (
+                meta.get("embedding_provider") != self.embedding_provider
+                or meta.get("embedding_model") != self.embedding_model
+            ):
+                raise StorageError("Chunk embedding provenance does not match this collection")
+            if self.embedding_provider and len(c["embedding"]) != 384:
+                raise StorageError("Expected 384-dimensional embeddings")
         try:
             self._collection.upsert(
-                ids=ids,
-                documents=documents,
-                metadatas=metadatas,
-                embeddings=embeddings,
+                ids=[c["id"] for c in chunks],
+                documents=[c["text"] for c in chunks],
+                metadatas=[c["metadata"] for c in chunks],
+                embeddings=[c["embedding"] for c in chunks],
             )
-        except TypeError as exc:
-            self._handle_metadata_corruption(exc)
-            self._collection.upsert(
-                ids=ids,
-                documents=documents,
-                metadatas=metadatas,
-                embeddings=embeddings,
-            )
+        except Exception as exc:
+            raise StorageError("Chroma upsert failed; stored data was preserved") from exc
 
-    def search(self, query_embedding: List[float], top_k: int = 5) -> List[ChunkRecord]:
-        """Query the store for the top-k most similar chunks."""
-
+    def search(self, query_embedding, top_k=5):
         try:
-            results = self._collection.query(query_embeddings=[query_embedding], n_results=top_k)
-        except TypeError as exc:
-            self._handle_metadata_corruption(exc)
-            return []
-        ids = results.get("ids", [[]])[0]
-        documents = results.get("documents", [[]])[0]
-        metadatas = results.get("metadatas", [[]])[0]
-        distances = results.get("distances", [[]])[0]
-        formatted: List[ChunkRecord] = []
-        for idx, chunk_id in enumerate(ids):
-            formatted.append(
+            count = self.count()
+            if not count:
+                return []
+            result = self._collection.query(
+                query_embeddings=[query_embedding], n_results=min(count, top_k)
+            )
+            return [
                 {
-                    "id": chunk_id,
-                    "text": documents[idx] if idx < len(documents) else "",
-                    "metadata": metadatas[idx] if idx < len(metadatas) else {},
-                    "score": distances[idx] if idx < len(distances) else None,
+                    "id": value,
+                    "text": result["documents"][0][i],
+                    "metadata": result["metadatas"][0][i],
+                    "score": result["distances"][0][i],
                 }
-            )
-        return formatted
+                for i, value in enumerate(result["ids"][0])
+            ]
+        except StorageError:
+            raise
+        except Exception as exc:
+            raise StorageError("Chroma search failed; stored data was preserved") from exc
 
-    def count(self) -> int:
-        """Return the number of stored chunks in the collection."""
-
+    def count(self):
         try:
-            return int(self._collection.count())
-        except Exception:  # pragma: no cover - runtime state dependent
-            return 0
+            return self._collection.count()
+        except Exception as exc:
+            raise StorageError("Chroma count failed") from exc
 
-    def ping(self) -> bool:
-        """Return True when the underlying Chroma collection responds."""
-
+    def ping(self):
         try:
-            if hasattr(self._collection, "count"):
-                self._collection.count()
+            self.count()
             return True
-        except Exception:  # pragma: no cover - runtime state dependent
+        except StorageError:
             return False
 
-    def _handle_metadata_corruption(self, exc: Exception) -> None:
-        """Reset the Chroma collection when legacy metadata causes type errors."""
 
-        logger.warning(
-            "Detected incompatible Chroma metadata for collection %s at %s; resetting store (%s)",
-            self.collection_name,
-            self.path,
-            exc,
+class InMemoryVectorStore:
+    def __init__(self):
+        self._records = {}
+
+    def upsert(self, chunks):
+        self._records.update({c["id"]: c for c in chunks})
+
+    def contains_hash(self, content_hash):
+        return any(
+            c.get("metadata", {}).get("content_hash") == content_hash
+            for c in self._records.values()
         )
-        self._reset_collection()
 
-    def _reset_collection(self) -> None:
-        """Drop and recreate the collection to recover from metadata incompatibilities."""
-
-        try:
-            self._client.delete_collection(name=self.collection_name)
-        except Exception:
-            try:
-                self._client.reset()
-            except Exception as reset_exc:  # pragma: no cover - defensive
-                logger.error(
-                    "Failed to reset Chroma persistent store at %s after metadata corruption: %s",
-                    self.path,
-                    reset_exc,
-                )
-                raise
-        self._collection = self._client.get_or_create_collection(name=self.collection_name)
-
-
-class InMemoryVectorStore(VectorStore):
-    """Simple dictionary-backed vector store for tests and development."""
-
-    def __init__(self) -> None:
-        """Create an empty, deterministic in-memory record store."""
-        self._records: Dict[str, ChunkRecord] = {}
-
-    def upsert(self, chunks: List[ChunkRecord]) -> None:
-        """Persist chunk embeddings into the in-memory dictionary."""
-
-        for chunk in chunks:
-            self._records[chunk["id"]] = chunk
-
-    def search(self, query_embedding: List[float], top_k: int = 5) -> List[ChunkRecord]:  # pragma: no cover - simple fallback
-        """Return the first N chunks; ignores the query embedding."""
-
+    def search(self, query_embedding, top_k=5):
         return list(self._records.values())[:top_k]
 
-    def count(self) -> int:
-        """Return the number of stored chunks in memory."""
-
+    def count(self):
         return len(self._records)
 
-    def ping(self) -> bool:
-        """In-memory store is always reachable."""
-
+    def ping(self):
         return True

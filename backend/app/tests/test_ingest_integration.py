@@ -16,6 +16,8 @@ except ImportError:  # pragma: no cover
 
 @pytest.mark.slow
 def test_ingest_pipeline_with_real_neo4j(tmp_path):
+    if os.getenv("RUN_AURA_TESTS") != "1":
+        pytest.skip("Set RUN_AURA_TESTS=1 with isolated Aura credentials")
     if GraphDatabase is None:
         pytest.skip("neo4j driver not installed")
 
@@ -31,7 +33,7 @@ def test_ingest_pipeline_with_real_neo4j(tmp_path):
 
     vector_store = VectorChromaStore(path=str(tmp_path / "chroma"))
     service = IngestService(
-        settings=Settings(),
+        settings=Settings(_env_file=None, test_mode=True, embed_provider="stub"),
         vector_store=vector_store,
         graph_repo=repo,
         embedding_provider=StubEmbeddingProvider(dim=16),

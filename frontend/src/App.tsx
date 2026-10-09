@@ -1,856 +1,509 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import Composer from './components/Composer'
-import MessageBubble, { Citation, Message } from './components/MessageBubble'
+import { FormEvent, useEffect, useState } from 'react'
 
-const API_BASE =
-  import.meta.env.VITE_API_BASE ??
-  (import.meta.env.DEV ? 'http://localhost:8000' : typeof window !== 'undefined' ? window.location.origin : '')
-const ADMIN_SECRET = import.meta.env.VITE_ADMIN_API_SECRET ?? ''
-
-type ProviderOption = 'groq' | 'stub'
-const PROVIDER_STORAGE_KEY = 'deskMate.providerPreference'
-
-type AskResponse = {
-  answer: string
-  provider: string
-  question: string
-  citations: Citation[]
-  planner: Record<string, unknown>
-  latency_ms: number
-  confidence: number
+type Fact = {
+  subject: string
+  predicate: string
+  value: string
+  source: string
+  source_system: string
+  observed_at: string
+  case_id: string
 }
-
-type IngestResult = {
-  chunks: number
-  entities: number
-  vector_count: number
-  ms: number
-  pages?: number
+type Evidence = {
+  tool: string
+  source: string
+  source_system: string
+  observed_at: string
+  content: unknown
 }
-
-type HealthResponse = {
+export type Case = {
+  case_id: string
+  thread_id: string
+  ticket: { summary: string }
   status: string
-  provider: string
-  provider_type: string
-  model_name: string
-  provider_vendor: string | null
-  local_model_available: boolean
-  operator_message: string | null
-  hosted_reachable: boolean
-  hosted_model_name: string | null
-  active_provider: string
-  active_model: string
-  graph_backend: string
-  preferred_local_models: string[]
-  ollama_reachable: boolean
-  llamacpp_reachable: boolean
-  neo4j_reachable: boolean
-  vector_store_path: string
-  vector_store_path_exists: boolean
+  pending_question: string | null
+  likely_issue: string | null
+  hypotheses: string[]
+  confirmed_facts: Fact[]
+  remembered_facts: Fact[]
+  inferences: string[]
+  recommended_next_action: string | null
+  confidence: number
+  uncertainty: string[]
+  evidence: Evidence[]
+  final_answer: string | null
 }
-
-type ProviderAdminResponse = {
-  active_provider: string
-  model_name: string
-  provider: string
-  provider_type: string
-  reason: string | null
+type Event = {
+  id: number
+  tool: string | null
+  source: string
+  content: string
+  created_at: string
 }
+const base = import.meta.env.VITE_API_BASE || ''
 
-const INITIAL_PROMPT = 'Ask a real service desk question to see cited answers.'
-
-type IndexedSource = {
-  title: string
-  tokens: number
-  chunks: number
-  mode: 'paste' | 'pdf' | 'url'
-  content?: string
-  file?: File
-  url?: string
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(base + path, init)
+  const body = await response.json()
+  if (!response.ok)
+    throw new Error(
+      typeof body.detail === 'string' ? body.detail : `Request failed (${response.status})`,
+    )
+  return body as T
 }
+const post = (body?: unknown): RequestInit => ({
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+})
+const timestamp = (value: string) =>
+  new Date(value.includes('T') ? value : value.replace(' ', 'T') + 'Z').toLocaleString()
+const readable = (value: unknown) =>
+  typeof value === 'string' ? value : JSON.stringify(value, null, 2)
 
-/**
- * POST JSON payloads to the backend and return the parsed response.
- * @param url API endpoint to call.
- * @param body Serializable request body.
- * @param options Optional fetch overrides such as headers.
- */
-async function postJSON<T>(
-  url: string,
-  body: unknown,
-  options: { headers?: Record<string, string> } = {},
-): Promise<T> {
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...(options.headers ?? {}) },
-    body: JSON.stringify(body),
-  })
-  if (!response.ok) {
-    const detail = await response.json().catch(() => ({ detail: response.statusText || 'Unexpected error' }))
-    throw new Error(detail.detail ?? response.statusText)
-  }
-  return response.json() as Promise<T>
-}
-
-/**
- * Root application component coordinating ask and ingest flows.
- */
 export default function App() {
-  const [messages, setMessages] = useState<Message[]>([])
-  const [loading, setLoading] = useState(false)
-  const [recentQuestions, setRecentQuestions] = useState<string[]>([])
+  const [ticket, setTicket] = useState('')
+  const [active, setActive] = useState<Case | null>(null)
+  const [cases, setCases] = useState<Case[]>([])
+  const [events, setEvents] = useState<Event[]>([])
+  const [answer, setAnswer] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
   const [ingestMode, setIngestMode] = useState<'paste' | 'pdf' | 'url'>('paste')
-  const [pasteTitle, setPasteTitle] = useState('')
-  const [pasteText, setPasteText] = useState('')
-  const [pdfFile, setPdfFile] = useState<File | null>(null)
-  const [urlTarget, setUrlTarget] = useState('')
-  const [urlDepth, setUrlDepth] = useState('1')
-  const [urlMaxPages, setUrlMaxPages] = useState('5')
-  const [indexStatus, setIndexStatus] = useState<IngestResult | null>(null)
-  const [indexError, setIndexError] = useState<string | null>(null)
-  const [indexedSource, setIndexedSource] = useState<IndexedSource | null>(null)
-  const [urlProgress, setUrlProgress] = useState<{ pages: number; chunks: number; entities: number } | null>(null)
-  const [health, setHealth] = useState<HealthResponse | null>(null)
-  const [healthError, setHealthError] = useState<string | null>(null)
-  const [isPurgeModalOpen, setIsPurgeModalOpen] = useState(false)
-  const [purgeConfirmation, setPurgeConfirmation] = useState('')
-  const [purgeError, setPurgeError] = useState<string | null>(null)
-  const [providerChoice, setProviderChoice] = useState<ProviderOption>('groq')
-  const [providerSaving, setProviderSaving] = useState(false)
-  const [providerError, setProviderError] = useState<string | null>(null)
-  const [attemptedRestore, setAttemptedRestore] = useState(false)
-  const [showSystemStatus, setShowSystemStatus] = useState(false)
-  const [expandedRightPanel, setExpandedRightPanel] = useState(false)
-  const threadRef = useRef<HTMLDivElement | null>(null)
-  const healthFailureMessage = `We’re having trouble reaching the backend at ${API_BASE}. Make sure it’s running (try “make dev”) and that VITE_API_BASE points to it.`
-
-  const fetchHealthData = useCallback(async (): Promise<HealthResponse> => {
-    const response = await fetch(`${API_BASE}/health`)
-    if (!response.ok) throw new Error(response.statusText || 'Health check failed')
-    return (await response.json()) as HealthResponse
-  }, [API_BASE])
-
-  const refreshHealth = useCallback(async () => {
-    try {
-      const data = await fetchHealthData()
-      setHealth(data)
-      setHealthError(null)
-      return data
-    } catch (error) {
-      setHealth(null)
-      setHealthError(healthFailureMessage)
-      throw error
-    }
-  }, [fetchHealthData, healthFailureMessage])
-
-  const applyProvider = useCallback(
-    async (target: ProviderOption, options: { restore?: boolean } = {}) => {
-      if (!health) return
-      if (health.active_provider === target) {
-        setProviderChoice(target)
-        if (typeof window !== 'undefined') {
-          window.localStorage.setItem(PROVIDER_STORAGE_KEY, target)
-        }
-        return
-      }
-      if (providerSaving) return
-      setProviderChoice(target)
-      setProviderSaving(true)
-      setProviderError(null)
-      const headers: Record<string, string> = ADMIN_SECRET ? { 'x-admin-secret': ADMIN_SECRET } : {}
-      try {
-        await postJSON<ProviderAdminResponse>(`${API_BASE}/admin/provider`, { provider: target }, { headers })
-        if (typeof window !== 'undefined') {
-          window.localStorage.setItem(PROVIDER_STORAGE_KEY, target)
-        }
-        await refreshHealth()
-      } catch (error) {
-        const message = error instanceof Error ? error.message : 'Failed to switch provider'
-        setProviderError(message)
-        if (typeof window !== 'undefined' && options.restore) {
-          window.localStorage.removeItem(PROVIDER_STORAGE_KEY)
-        }
-        await refreshHealth().catch(() => undefined)
-      } finally {
-        setProviderSaving(false)
-      }
-    },
-    [ADMIN_SECRET, health, providerSaving, refreshHealth],
-  )
+  const [knowledge, setKnowledge] = useState('')
+  const [title, setTitle] = useState('')
+  const [file, setFile] = useState<File | null>(null)
+  const [ingestMessage, setIngestMessage] = useState('')
+  const [ingesting, setIngesting] = useState(false)
 
   useEffect(() => {
-    if (!health) return
-    const activeKey: ProviderOption = health.active_provider === 'groq' ? 'groq' : 'stub'
-    setProviderChoice(activeKey)
-    if (!attemptedRestore) {
-      const saved =
-        typeof window !== 'undefined'
-          ? (window.localStorage.getItem(PROVIDER_STORAGE_KEY) as ProviderOption | null)
-          : null
-      if (saved && saved !== activeKey) {
-        void applyProvider(saved, { restore: true })
-      }
-      setAttemptedRestore(true)
-    }
-  }, [health, attemptedRestore, applyProvider])
+    request<Case[]>('/cases')
+      .then(setCases)
+      .catch((e) => setError(e.message))
+  }, [])
 
-  const scrollToBottom = () => {
-    requestAnimationFrame(() => {
-      const node = threadRef.current
-      if (node) node.scrollTop = node.scrollHeight
-    })
+  async function display(current: Case) {
+    setActive(current)
+    const [timeline, list] = await Promise.all([
+      request<Event[]>(`/cases/${current.case_id}/events`),
+      request<Case[]>('/cases'),
+    ])
+    setEvents(timeline)
+    setCases(list)
   }
-
-  const handleAsk = async (text: string) => {
-    const trimmed = text.trim()
-    if (!trimmed) return
-
-    const timestamp = Date.now()
-    const userMessage: Message = { id: `u-${timestamp}`, role: 'user', text: trimmed }
-    const assistantPlaceholder: Message = {
-      id: `a-${timestamp}`,
-      role: 'assistant',
-      text: 'Thinking…',
-      pending: true,
-      citations: [],
-    }
-
-    setMessages((prev) => [...prev, userMessage, assistantPlaceholder])
-    setRecentQuestions((prev) => [trimmed, ...prev.filter((q) => q !== trimmed)].slice(0, 5))
-    setLoading(true)
-    scrollToBottom()
-
+  async function start(event: FormEvent) {
+    event.preventDefault()
+    if (!ticket.trim()) return
+    setBusy(true)
+    setError('')
+    setAnswer('')
+    setEvents([])
+    let createdId: string | null = null
     try {
-      const response = await postJSON<AskResponse>(`${API_BASE}/ask`, {
-        question: trimmed,
-        provider_override: providerChoice,
-      })
-      setMessages((prev) =>
-        prev.map((message) =>
-          message.id === assistantPlaceholder.id
-            ? {
-                ...message,
-                text: response.answer,
-                pending: false,
-                citations: response.citations,
-                metadata: { planner: response.planner, latency: response.latency_ms, confidence: response.confidence },
-              }
-            : message,
-        ),
-      )
-    } catch (error) {
-      const fallback = error instanceof Error ? error.message : 'Request failed'
-      setMessages((prev) =>
-        prev.map((message) =>
-          message.id === assistantPlaceholder.id
-            ? {
-                ...message,
-                text: `We’re having trouble connecting to the server. Please check that it’s running on port 8000 and try again. (${fallback})`,
-                pending: false,
-                error: true,
-              }
-            : message,
-        ),
-      )
+      const created = await request<Case>('/cases', post({ summary: ticket.trim() }))
+      createdId = created.case_id
+      await display(created)
+      await display(await request<Case>(`/cases/${created.case_id}/investigate`, post()))
+    } catch (e) {
+      setError((e as Error).message)
+      if (createdId) await refreshAfterFailure(createdId)
     } finally {
-      setLoading(false)
-      scrollToBottom()
+      setBusy(false)
     }
   }
-
-  const handleRecentQuestionClick = (question: string) => {
-    void handleAsk(question)
-  }
-
-  const resetThread = () => {
-    setMessages([])
-  }
-
-  const handlePasteIngest = async () => {
-    setIndexError(null)
-    setUrlProgress(null)
-    const trimmedText = pasteText.trim()
-    if (!trimmedText) {
-      setIndexError('Enter some content to index before uploading.')
-      return
-    }
-    setIndexStatus(null)
+  async function resume(event: FormEvent) {
+    event.preventDefault()
+    if (!active || !answer.trim()) return
+    setBusy(true)
+    setError('')
     try {
-      const title = pasteTitle.trim() || 'Untitled'
-      const result = await postJSON<IngestResult>(`${API_BASE}/ingest/paste`, {
-        title,
-        text: trimmedText,
-      })
-      setIndexStatus(result)
-      setIndexedSource({
-        title,
-        tokens: result.vector_count,
-        chunks: result.chunks,
-        mode: 'paste',
-        content: trimmedText,
-      })
-      setPasteTitle('')
-      setPasteText('')
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'We couldn’t index that content. Please try again.'
-      setIndexError(`We couldn’t index that content. Please try again. (${message})`)
-    }
-  }
-
-  const handlePdfIngest = async () => {
-    setIndexError(null)
-    setUrlProgress(null)
-    if (!pdfFile) {
-      setIndexError('Select a PDF file to upload before indexing.')
-      return
-    }
-    setIndexStatus(null)
-    const formData = new FormData()
-    formData.append('file', pdfFile)
-    try {
-      const title = pdfFile.name || 'Untitled'
-      const response = await fetch(`${API_BASE}/ingest/pdf`, {
-        method: 'POST',
-        body: formData,
-      })
-      if (!response.ok) {
-        const detail = await response.json().catch(() => ({ detail: response.statusText || 'Unexpected error' }))
-        throw new Error(detail.detail ?? response.statusText)
-      }
-      const result = (await response.json()) as IngestResult
-      setIndexStatus(result)
-      setIndexedSource({
-        title,
-        tokens: result.vector_count,
-        chunks: result.chunks,
-        mode: 'pdf',
-        file: pdfFile,
-      })
-      setPdfFile(null)
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'We couldn’t index that PDF. Please try again.'
-      setIndexError(`We couldn’t index that PDF. Please try again. (${message})`)
-    }
-  }
-
-  const handleUrlIngest = async () => {
-    setIndexError(null)
-    const trimmedUrl = urlTarget.trim()
-    if (!trimmedUrl) {
-      setIndexError('Enter a URL to crawl and ingest.')
-      return
-    }
-    setIndexStatus(null)
-    setUrlProgress(null)
-    setLoading(true)
-    try {
-      const depthValue = Number(urlDepth)
-      const pagesValue = Number(urlMaxPages)
-      const payload: Record<string, unknown> = {
-        url: trimmedUrl,
-      }
-      if (!Number.isNaN(depthValue) && depthValue >= 0) payload.max_depth = depthValue
-      if (!Number.isNaN(pagesValue) && pagesValue > 0) payload.max_pages = pagesValue
-
-      const result = await postJSON<IngestResult>(`${API_BASE}/ingest/url`, payload)
-      setIndexStatus(result)
-      const resolvedPages = result.pages ?? (!Number.isNaN(pagesValue) ? pagesValue : 0)
-      setUrlProgress({ pages: resolvedPages, chunks: result.chunks, entities: result.entities })
-      setIndexedSource({
-        title: trimmedUrl,
-        tokens: result.vector_count,
-        chunks: result.chunks,
-        mode: 'url',
-        url: trimmedUrl,
-      })
-      setUrlTarget('')
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'We couldn’t crawl that URL. Please try again.'
-      setIndexError(`We couldn’t crawl that URL. Please try again. (${message})`)
+      await display(
+        await request<Case>(`/cases/${active.case_id}/resume`, post({ answer: answer.trim() })),
+      )
+      setAnswer('')
+    } catch (e) {
+      setError((e as Error).message)
+      await refreshAfterFailure(active.case_id)
     } finally {
-      setLoading(false)
+      setBusy(false)
     }
   }
-
-  const handleIngest = () => {
-    if (ingestMode === 'paste') {
-      handlePasteIngest()
-    } else if (ingestMode === 'pdf') {
-      handlePdfIngest()
-    } else {
-      handleUrlIngest()
+  async function refreshAfterFailure(id: string) {
+    try {
+      await display(await request<Case>(`/cases/${id}`))
+    } catch {
+      // Keep the original actionable error when the API itself is unavailable.
     }
   }
-
-  const clearIngestForm = () => {
-    setPasteTitle('')
-    setPasteText('')
-    setPdfFile(null)
-    setUrlTarget('')
-    setUrlDepth('1')
-    setUrlMaxPages('5')
-    setIndexError(null)
-    setIndexStatus(null)
-    setIndexedSource(null)
-    setUrlProgress(null)
-  }
-
-  const viewIndexedSource = () => {
-    if (!indexedSource) return
-    if (typeof window === 'undefined') return
-    if (indexedSource.mode === 'paste' && indexedSource.content) {
-      const blob = new Blob([indexedSource.content], { type: 'text/plain' })
-      const url = URL.createObjectURL(blob)
-      window.open(url, '_blank', 'noopener')
-      setTimeout(() => URL.revokeObjectURL(url), 2000)
-    } else if (indexedSource.mode === 'pdf' && indexedSource.file) {
-      const url = URL.createObjectURL(indexedSource.file)
-      window.open(url, '_blank', 'noopener')
-      setTimeout(() => URL.revokeObjectURL(url), 2000)
-    } else if (indexedSource.mode === 'url' && indexedSource.url) {
-      window.open(indexedSource.url, '_blank', 'noopener')
+  async function retry() {
+    if (!active) return
+    setBusy(true)
+    setError('')
+    try {
+      await display(await request<Case>(`/cases/${active.case_id}/investigate`, post()))
+    } catch (e) {
+      setError((e as Error).message)
+      await refreshAfterFailure(active.case_id)
+    } finally {
+      setBusy(false)
     }
   }
-
-  useEffect(() => {
-    let cancelled = false
-    const loadHealth = async () => {
-      try {
-        const data = await fetchHealthData()
-        if (!cancelled) {
-          setHealth(data)
-          setHealthError(null)
-        }
-      } catch (error) {
-        if (!cancelled) {
-          setHealth(null)
-          setHealthError(healthFailureMessage)
-        }
-      }
-    }
-
-    void loadHealth()
-    return () => {
-      cancelled = true
-    }
-  }, [fetchHealthData, healthFailureMessage])
-
-  const openPurgeModal = () => {
-    setPurgeConfirmation('')
-    setPurgeError(null)
-    setIsPurgeModalOpen(true)
-  }
-
-  const closePurgeModal = () => {
-    setIsPurgeModalOpen(false)
-    setPurgeConfirmation('')
-    setPurgeError(null)
-  }
-
-  const performPurge = () => {
-    setMessages([])
-    setRecentQuestions([])
-    clearIngestForm()
-    setIndexedSource(null)
-    setUrlProgress(null)
-  }
-
-  const handlePurgeConfirm = () => {
-    if (purgeConfirmation.trim() === 'DELETE') {
-      performPurge()
-      closePurgeModal()
-    } else {
-      setPurgeError('Confirmation text does not match DELETE. Memory purge cancelled.')
+  async function openCase(id: string) {
+    setBusy(true)
+    setError('')
+    setAnswer('')
+    try {
+      await display(await request<Case>(`/cases/${id}`))
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setBusy(false)
     }
   }
-
-  const lastAssistant = [...messages].reverse().find((message) => message.role === 'assistant') ?? null
-  const lastAnswerSummary = lastAssistant?.text ?? null
-  const lastAnswerSourceTitle = lastAssistant?.citations?.[0]?.title ?? 'Knowledge base'
-
-  const providerPill = useMemo(() => {
-    if (!health) return 'Provider · unknown · unknown'
-    const rawKey = (health.active_provider || health.provider || 'unknown').toLowerCase()
-    const typeLabel = rawKey === 'groq' ? 'API' : 'Stub'
-    const preferredModel = (health.active_model || '').trim() || (health.model_name || '').trim()
-    const fallbackModel = preferredModel || health.provider
-    const model = fallbackModel && fallbackModel.length > 0 ? fallbackModel : 'unknown'
-    return `Provider · ${typeLabel} · ${model}`
-  }, [health])
-
-  const providerPillClass = useMemo(() => {
-    if (!health) return 'provider-pill warn'
-    const active = (health.active_provider || health.provider || '').toLowerCase()
-    if (active === 'groq') {
-      return `provider-pill ${health.hosted_reachable ? 'healthy' : 'fail'}`
+  async function ingest(event: FormEvent) {
+    event.preventDefault()
+    setIngesting(true)
+    setIngestMessage('')
+    setError('')
+    try {
+      let options: RequestInit
+      if (ingestMode === 'pdf') {
+        if (!file) throw new Error('Choose a PDF first.')
+        const data = new FormData()
+        data.append('file', file)
+        if (title) data.append('title', title)
+        options = { method: 'POST', body: data }
+      } else
+        options = post(
+          ingestMode === 'paste' ? { title: title || null, text: knowledge } : { url: knowledge },
+        )
+      const result = await request<{ chunks: number; duplicate: boolean }>(
+        `/ingest/${ingestMode}`,
+        options,
+      )
+      setIngestMessage(
+        result.duplicate
+          ? 'This content is already in knowledge.'
+          : `${result.chunks} knowledge chunks ingested.`,
+      )
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setIngesting(false)
     }
-    return 'provider-pill warn'
-  }, [health])
-
-  const graphPill = useMemo(() => {
-    if (!health) return 'Graph · fallback · offline'
-    const backend = (health.graph_backend || 'inmemory').toLowerCase()
-    const backendLabel = backend === 'aura' ? 'Aura' : 'Fallback'
-    const statusLabel = backend === 'aura' ? (health.neo4j_reachable ? 'online' : 'offline') : 'vector-only'
-    return `Graph · ${backendLabel} · ${statusLabel}`
-  }, [health])
-
-  const graphPillClass = useMemo(() => {
-    if (!health) return 'graph-pill warn'
-    if (health.graph_backend !== 'aura') return 'graph-pill fail'
-    if (!health.neo4j_reachable) return 'graph-pill fail'
-    return 'graph-pill healthy'
-  }, [health])
-
-  const providerNotes = useMemo(() => {
-    if (!health) return [] as Array<{ text: string; tone: 'default' | 'warn' }>
-    const notes: Array<{ text: string; tone: 'default' | 'warn' }> = []
-    if (health.operator_message) {
-      notes.push({ text: health.operator_message, tone: health.local_model_available ? 'default' : 'warn' })
-    }
-    if (health.active_provider === 'stub') {
-      notes.push({ text: 'Stub mode is the deterministic fallback for local testing.', tone: 'default' })
-    }
-    if (!health.hosted_reachable) {
-      notes.push({ text: 'Groq endpoint unreachable — hosted calls fall back to stub.', tone: 'warn' })
-    } else if (health.active_provider === 'groq') {
-      notes.push({ text: 'Groq endpoint reachable.', tone: 'default' })
-    }
-    return notes
-  }, [health])
-
-  const providerMeta = useMemo(() => {
-    if (!health) return null
-    const rawModel = (health.active_model || health.model_name || '').trim()
-    const activeModel = rawModel.length > 0 ? rawModel : 'unknown'
-    const groqStatus = health.hosted_reachable ? 'Groq: online' : 'Groq: offline'
-    return `Active: ${activeModel} · ${groqStatus}`
-  }, [health])
-
-  const graphFallbackMessage = useMemo(() => {
-    if (!health) return null
-    if (health.graph_backend !== 'aura') {
-      return 'Graph database unavailable — operating in vector-only mode.'
-    }
-    if (!health.neo4j_reachable) {
-      return 'Neo4j Aura connection down — results will use vector fallback only.'
-    }
-    return null
-  }, [health])
-
-  const ingestBannerSegments = useMemo(() => {
-    if (!indexStatus || !indexedSource) return null
-    const segments: string[] = []
-    if (indexedSource.mode === 'url') {
-      const pageCount = indexStatus.pages ?? 0
-      segments.push(`${pageCount} fetched page${pageCount === 1 ? '' : 's'}`)
-    }
-    segments.push(`${indexStatus.vector_count} vector${indexStatus.vector_count === 1 ? '' : 's'}`)
-    segments.push(`${indexStatus.chunks} chunk${indexStatus.chunks === 1 ? '' : 's'}`)
-    segments.push(`${indexStatus.entities} entit${indexStatus.entities === 1 ? 'y' : 'ies'}`)
-    return segments
-  }, [indexStatus, indexedSource])
+  }
 
   return (
-    <div className="app-page">
-      <div className="app-container">
-        {healthError && <div className="health-banner">{healthError}</div>}
-        <header className="chat-header">
-          <div className="title-stack">
-            <h1>DeskMate</h1>
-            <p className="subtitle">A service desk copilot</p>
-            <p className="tagline">Ingest docs. Ask with citations.</p>
-          </div>
-          <div className="header-actions">
-            <div className="status-pill-group">
-              <span className={providerPillClass}>{providerPill}</span>
-              <span className={graphPillClass}>{graphPill}</span>
-              <button
-                type="button"
-                className={`ghost subtle${showSystemStatus ? ' active' : ''}`}
-                onClick={() => health && setShowSystemStatus((prev) => !prev)}
-                aria-expanded={showSystemStatus}
-                disabled={!health}
-              >
-                {showSystemStatus ? 'Hide status' : 'System status'}
-              </button>
-            </div>
-            {showSystemStatus && health && (
-              <div className="status-popover" role="region" aria-label="System status">
-                {providerMeta && <span className="provider-meta">{providerMeta}</span>}
-                <div className={`provider-toggle${providerSaving ? ' busy' : ''}`} role="group" aria-label="Select provider">
-                  {(['groq', 'stub'] as ProviderOption[]).map((option) => {
-                    const isSelected = providerChoice === option
-                    const isServerActive = health?.active_provider === option
-                    return (
-                      <button
-                        key={option}
-                        type="button"
-                        className={`provider-toggle-option${isSelected ? ' active' : ''}`}
-                        disabled={!health || providerSaving || isServerActive}
-                        onClick={() => applyProvider(option)}
-                        aria-pressed={isSelected}
-                        title={option === 'groq' ? 'Use Groq for responses' : 'Use the deterministic stub'}
-                      >
-                        {option === 'groq' ? 'Groq' : 'Stub'}
-                      </button>
-                    )
-                  })}
-                </div>
-                {providerError && <span className="provider-note warn">{providerError}</span>}
-                {providerNotes.map((note, index) => (
-                  <span key={index} className={`provider-note${note.tone === 'warn' ? ' warn' : ''}`}>
-                    {note.text}
-                  </span>
-                ))}
-              </div>
-            )}
-            <button type="button" className="ghost" onClick={resetThread} disabled={loading}>
-              New thread
-            </button>
-            <button type="button" className="quiet" onClick={openPurgeModal} disabled={loading}>
-              Purge memory
-            </button>
-          </div>
-        </header>
-
-        {graphFallbackMessage && (
-          <div className="inline-banner warn" role="status">
-            <span>{graphFallbackMessage}</span>
-          </div>
-        )}
-
-        <section className="ingest-panel">
-          <div className="panel-header">
-            <h2>Knowledge ingestion</h2>
-            <div className="ingest-tabs" role="tablist" aria-label="Select indexing mode">
-              <button
-                type="button"
-                role="tab"
-                aria-selected={ingestMode === 'paste'}
-                className={ingestMode === 'paste' ? 'active' : ''}
-                onClick={() => setIngestMode('paste')}
-              >
-                Paste
-              </button>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={ingestMode === 'pdf'}
-                className={ingestMode === 'pdf' ? 'active' : ''}
-                onClick={() => setIngestMode('pdf')}
-              >
-                Upload PDF
-              </button>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={ingestMode === 'url'}
-                className={ingestMode === 'url' ? 'active' : ''}
-                onClick={() => setIngestMode('url')}
-              >
-                URL
-              </button>
-            </div>
-          </div>
-
-          {indexStatus && indexedSource && ingestBannerSegments && (
-            <div className="inline-banner success" role="status">
-              <p className="banner-text">
-                <span className="banner-segment">Indexed “{indexedSource.title}”</span>
-                {ingestBannerSegments.map((segment, index) => (
-                  <React.Fragment key={`seg-${index}`}>
-                    <span className="banner-separator" aria-hidden="true">
-                      •
-                    </span>
-                    <span className="banner-segment">{segment}</span>
-                  </React.Fragment>
-                ))}
-              </p>
-              <button type="button" className="link-button banner-link" onClick={viewIndexedSource}>
-                View source
-              </button>
-            </div>
-          )}
-
-          {indexError && (
-            <div className="inline-banner error" role="alert">
-              <span>Indexing failed. Try again.</span>
-              <button type="button" className="link-button" onClick={handleIngest}>
-                Retry
-              </button>
-            </div>
-          )}
-
-          {ingestMode === 'paste' ? (
-            <div className="ingest-form">
-              <label className="input-label" htmlFor="source-title">
-                Name this source optional
-              </label>
-              <input
-                id="source-title"
-                type="text"
-                value={pasteTitle}
-                onChange={(event) => setPasteTitle(event.target.value)}
-              />
-              <label className="input-label" htmlFor="source-text">
-                Paste content
-              </label>
+    <div className="app-shell">
+      <header className="masthead">
+        <div className="brand-mark" aria-hidden="true">
+          D
+        </div>
+        <div>
+          <h1>DeskMate</h1>
+          <p>Service Desk Investigation Assistant</p>
+        </div>
+        <span className="runtime-label">Case investigations</span>
+      </header>
+      {error && (
+        <div className="error-banner" role="alert">
+          {error}
+        </div>
+      )}
+      <main>
+        <aside className="case-panel">
+          <section className="card">
+            <span className="eyebrow">START HERE</span>
+            <h2>New Case</h2>
+            <form onSubmit={start}>
+              <label htmlFor="ticket">Ticket details</label>
               <textarea
-                id="source-text"
-                placeholder="Paste or drop your playbook"
-                value={pasteText}
-                onChange={(event) => setPasteText(event.target.value)}
+                id="ticket"
+                rows={7}
+                placeholder="Describe the user, company, symptoms and error messages…"
+                value={ticket}
+                onChange={(e) => setTicket(e.target.value)}
+                required
               />
-            </div>
-          ) : ingestMode === 'pdf' ? (
-            <div className="ingest-form">
-              <label className="input-label" htmlFor="source-file">
-                Upload a PDF
-              </label>
-              <input
-                id="source-file"
-                type="file"
-                accept="application/pdf"
-                onChange={(event) => setPdfFile(event.target.files?.[0] ?? null)}
-              />
-              {pdfFile && <span className="file-chip">{pdfFile.name}</span>}
-            </div>
-          ) : (
-            <div className="ingest-form">
-              <label className="input-label" htmlFor="source-url">
-                URL to ingest
-              </label>
-              <input
-                id="source-url"
-                type="url"
-                value={urlTarget}
-                onChange={(event) => setUrlTarget(event.target.value)}
-                placeholder="https://example.com"
-              />
-              <div className="url-grid">
-                <div>
-                  <label className="input-label" htmlFor="url-depth">
-                    Max depth
-                  </label>
-                  <input
-                    id="url-depth"
-                    type="number"
-                    min={0}
-                    value={urlDepth}
-                    onChange={(event) => setUrlDepth(event.target.value)}
-                  />
-                </div>
-                <div>
-                  <label className="input-label" htmlFor="url-pages">
-                    Max pages
-                  </label>
-                  <input
-                    id="url-pages"
-                    type="number"
-                    min={1}
-                    value={urlMaxPages}
-                    onChange={(event) => setUrlMaxPages(event.target.value)}
-                  />
-                </div>
-              </div>
-              {urlProgress && (
-                <p className="muted">Fetched {urlProgress.pages} pages · {urlProgress.chunks} chunks · {urlProgress.entities} entities.</p>
-              )}
-            </div>
-          )}
-
-          <div className="ingest-actions">
-            <button type="button" className="primary" onClick={handleIngest} disabled={loading}>
-              Upload and index
-            </button>
-            <button type="button" className="quiet" onClick={clearIngestForm} disabled={loading}>
-              Clear
-            </button>
-          </div>
-        </section>
-
-        <div className={`main-content ${expandedRightPanel ? 'right-expanded' : 'right-collapsed'}`}>
-          <div className="chat-panel">
-            <div className="chat-thread" ref={threadRef}>
-              {messages.length === 0 ? (
-                <div className="placeholder">{INITIAL_PROMPT}</div>
-              ) : (
-                messages.map((message) => <MessageBubble key={message.id} message={message} />)
-              )}
-            </div>
-            <Composer onSend={handleAsk} disabled={loading} />
-          </div>
-
-          <aside className="sidebar" onClick={() => setExpandedRightPanel((prev) => !prev)}>
-            <h2>Recent questions</h2>
-            {recentQuestions.length === 0 ? (
-              <p className="muted">Try “What is the MFA reset policy?” or “How do I create a ticket?”</p>
+              <button className="primary" disabled={busy || !ticket.trim()}>
+                {busy ? 'Investigating…' : 'Start Investigation'}
+              </button>
+            </form>
+          </section>
+          <section className="card">
+            <h2>Cases</h2>
+            {cases.length === 0 ? (
+              <p className="muted">Your investigations will appear here.</p>
             ) : (
-              <ul className="recent-question-list" role="list">
-                {recentQuestions.map((question) => (
-                  <li key={question}>
-                    <span className="timeline-dot" aria-hidden="true" />
+              <ul className="case-list">
+                {cases.map((c) => (
+                  <li key={c.case_id}>
                     <button
-                      type="button"
-                      className="recent-question"
-                      onClick={() => handleRecentQuestionClick(question)}
+                      className={active?.case_id === c.case_id ? 'selected' : ''}
+                      onClick={() => openCase(c.case_id)}
+                      disabled={busy}
                     >
-                      {question}
+                      <span>{c.ticket.summary}</span>
+                      <small>{c.status.replace(/_/g, ' ')}</small>
                     </button>
                   </li>
                 ))}
               </ul>
             )}
-            {lastAssistant && (
-              <div className="sidebar-card last-answer-card">
-                <h3>Last answer</h3>
-                <p className="last-answer-summary">{lastAnswerSummary ?? 'Answer ready.'}</p>
-                <p className="last-answer-source">From: {lastAnswerSourceTitle}</p>
-              </div>
-            )}
-            <button
-              type="button"
-              className="link-button sidebar-link"
-              onClick={() => setRecentQuestions([])}
-              disabled={recentQuestions.length === 0}
-            >
-              Clear history
-            </button>
-          </aside>
-        </div>
-      </div>
-
-      {isPurgeModalOpen && (
-        <div className="modal-backdrop" role="presentation">
-          <div className="modal" role="dialog" aria-modal="true" aria-labelledby="purge-title">
-            <h2 id="purge-title">Purge Memory</h2>
-            <p className="muted">
-              This will erase all current conversation history and ingest state. This action cannot be undone.
-              Type DELETE to confirm.
-            </p>
-            <label className="input-label" htmlFor="purge-confirmation">
-              Confirmation
-            </label>
-            <input
-              id="purge-confirmation"
-              type="text"
-              value={purgeConfirmation}
-              onChange={(event) => setPurgeConfirmation(event.target.value)}
-              autoFocus
-            />
-            {purgeError && <p className="modal-error">{purgeError}</p>}
-            <div className="modal-actions">
-              <button type="button" className="quiet" onClick={closePurgeModal}>
-                Cancel
-              </button>
-              <button type="button" className="danger" onClick={handlePurgeConfirm}>
-                Confirm purge
-              </button>
+          </section>
+          <section className="card">
+            <h2>Knowledge ingestion</h2>
+            <div className="tabs" role="group" aria-label="Ingestion method">
+              {(['paste', 'pdf', 'url'] as const).map((mode) => (
+                <button
+                  key={mode}
+                  aria-pressed={ingestMode === mode}
+                  onClick={() => {
+                    setIngestMode(mode)
+                    setKnowledge('')
+                    setIngestMessage('')
+                  }}
+                >
+                  {mode === 'pdf' ? 'PDF' : mode === 'url' ? 'URL' : 'Paste'}
+                </button>
+              ))}
             </div>
-          </div>
+            <form onSubmit={ingest}>
+              {ingestMode !== 'url' && (
+                <>
+                  <label htmlFor="title">Document title</label>
+                  <input id="title" value={title} onChange={(e) => setTitle(e.target.value)} />
+                </>
+              )}
+              {ingestMode === 'pdf' ? (
+                <>
+                  <label htmlFor="pdf">PDF document</label>
+                  <input
+                    id="pdf"
+                    type="file"
+                    accept="application/pdf"
+                    onChange={(e) => setFile(e.target.files?.[0] || null)}
+                    required
+                  />
+                </>
+              ) : (
+                <>
+                  <label htmlFor="knowledge">
+                    {ingestMode === 'url' ? 'Public page URL' : 'Knowledge text'}
+                  </label>
+                  {ingestMode === 'url' ? (
+                    <input
+                      id="knowledge"
+                      type="url"
+                      value={knowledge}
+                      onChange={(e) => setKnowledge(e.target.value)}
+                      required
+                    />
+                  ) : (
+                    <textarea
+                      id="knowledge"
+                      rows={4}
+                      value={knowledge}
+                      onChange={(e) => setKnowledge(e.target.value)}
+                      required
+                    />
+                  )}
+                </>
+              )}
+              <button className="secondary" disabled={ingesting}>
+                {ingesting ? 'Ingesting…' : 'Add to knowledge'}
+              </button>
+              <p role="status" className="muted">
+                {ingestMessage}
+              </p>
+            </form>
+          </section>
+        </aside>
+        <div className="investigation-panel">
+          {!active ? (
+            <section className="empty-state">
+              <div aria-hidden="true">◎</div>
+              <h2>Start with the incident.</h2>
+              <p>
+                DeskMate gathers evidence, asks for missing details and keeps a durable case record.
+              </p>
+            </section>
+          ) : (
+            <>
+              <div className="case-heading">
+                <div>
+                  <span className="eyebrow">CURRENT CASE</span>
+                  <p className="case-id" data-testid="case-id">
+                    {active.case_id}
+                  </p>
+                </div>
+                <span className={`status-pill ${active.status}`} role="status">
+                  {active.status.replace(/_/g, ' ')}
+                </span>
+              </div>
+              <p className="ticket-summary">{active.ticket.summary}</p>
+              <section className="card">
+                <h2>Investigation Timeline</h2>
+                <ol className="timeline">
+                  {events.map((e) => (
+                    <li key={e.id}>
+                      <span className="event-dot" aria-hidden="true">
+                        {e.tool === 'error' ? '!' : '✓'}
+                      </span>
+                      <div>
+                        <p>{e.content}</p>
+                        <small>
+                          {e.source} · {timestamp(e.created_at)}
+                        </small>
+                      </div>
+                    </li>
+                  ))}
+                </ol>
+                {busy && (
+                  <p className="muted" role="status">
+                    Gathering evidence…
+                  </p>
+                )}
+              </section>
+              {active.status === 'error' && (
+                <section className="card">
+                  <h2>Investigation interrupted by an error</h2>
+                  <p className="muted">
+                    Retry continues this case from its saved investigation state.
+                  </p>
+                  <button className="primary" disabled={busy} onClick={retry}>
+                    Retry Investigation
+                  </button>
+                </section>
+              )}
+              {active.status === 'needs_input' && (
+                <section className="card human-input">
+                  <span className="eyebrow">YOUR INPUT IS NEEDED</span>
+                  <h2>Human Input</h2>
+                  <p className="question">{active.pending_question}</p>
+                  <form onSubmit={resume}>
+                    <label htmlFor="answer">Your answer</label>
+                    <input
+                      id="answer"
+                      value={answer}
+                      onChange={(e) => setAnswer(e.target.value)}
+                      autoComplete="off"
+                      required
+                    />
+                    <button className="primary" disabled={busy || !answer.trim()}>
+                      Continue Investigation
+                    </button>
+                  </form>
+                </section>
+              )}
+              <section className="card assessment">
+                <h2>Current Assessment</h2>
+                <dl>
+                  <dt>Likely issue</dt>
+                  <dd>{active.likely_issue || 'Still gathering information'}</dd>
+                  <dt>Next best action</dt>
+                  <dd className="next-action">
+                    {active.recommended_next_action || 'Await the next investigation step.'}
+                  </dd>
+                  <dt>Confidence</dt>
+                  <dd>
+                    {Math.round(active.confidence * 100)}%{' '}
+                    <small className="muted">Evidence support; resolution is unverified.</small>
+                  </dd>
+                </dl>
+                <h3>Hypotheses</h3>
+                {active.hypotheses.length ? (
+                  <ul>
+                    {active.hypotheses.map((h, i) => (
+                      <li key={i}>{h}</li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="muted">No supported hypothesis yet.</p>
+                )}
+                <h3>Confirmed facts</h3>
+                {active.confirmed_facts.length ? (
+                  <ul>
+                    {active.confirmed_facts.map((f, i) => (
+                      <li key={i}>
+                        {f.subject} · {f.predicate.replace(/_/g, ' ')}: <strong>{f.value}</strong>
+                        <small className="fact-source">
+                          {f.source} · {timestamp(f.observed_at)}
+                        </small>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="muted">No human-confirmed facts in this case yet.</p>
+                )}
+                {active.remembered_facts.length > 0 && (
+                  <div className="remembered">
+                    <h3>Remembered facts from previous cases</h3>
+                    <ul>
+                      {active.remembered_facts.map((f, i) => (
+                        <li key={i}>
+                          {f.subject} · {f.predicate.replace(/_/g, ' ')}: <strong>{f.value}</strong>
+                          <small className="fact-source">
+                            {f.source} · {timestamp(f.observed_at)} · case {f.case_id}
+                          </small>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                <h3>Inferences</h3>
+                {active.inferences.length ? (
+                  <ul>
+                    {active.inferences.map((h, i) => (
+                      <li key={i}>{h}</li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="muted">No additional inference.</p>
+                )}
+                <h3>Uncertainty</h3>
+                {active.uncertainty.length ? (
+                  <ul>
+                    {active.uncertainty.map((u, i) => (
+                      <li key={i}>{u}</li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="muted">Investigation is in progress.</p>
+                )}
+              </section>
+              <section className="card">
+                <h2>
+                  Evidence <span className="count">{active.evidence.length}</span>
+                </h2>
+                {!active.evidence.length && <p className="muted">No evidence collected yet.</p>}
+                <div className="evidence-list">
+                  {active.evidence.map((e, i) => (
+                    <details key={i}>
+                      <summary>
+                        <span>
+                          {e.tool.replace(/_/g, ' ')} · {e.source}
+                        </span>
+                        <span
+                          className={`source-badge ${e.source_system === 'local_fixture' ? 'fixture' : ''}`}
+                        >
+                          {e.source_system === 'local_fixture' ? 'Fixture' : 'Real source'} ·{' '}
+                          {e.source_system}
+                        </span>
+                      </summary>
+                      <small>
+                        {timestamp(e.observed_at)} · {e.tool}
+                      </small>
+                      <pre>{readable(e.content)}</pre>
+                    </details>
+                  ))}
+                </div>
+              </section>
+            </>
+          )}
         </div>
-      )}
+      </main>
+      <footer>Evidence guides the next step. A recommendation does not confirm resolution.</footer>
     </div>
   )
 }

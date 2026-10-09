@@ -47,13 +47,17 @@ def test_ingest_text_stub_pipeline():
         chunk_tokens=32,
         chunk_overlap=8,
         embed_provider="stub",
-        ollama_embed_model="nomic-embed-text",
         embed_model_name="all-MiniLM-L6-v2",
     )
     vector_store = FakeVectorStore()
     graph_repo = FakeGraphRepo()
     embeddings = StubEmbeddingProvider(dim=8)
-    service = IngestService(settings=settings, vector_store=vector_store, graph_repo=graph_repo, embedding_provider=embeddings)
+    service = IngestService(
+        settings=settings,
+        vector_store=vector_store,
+        graph_repo=graph_repo,
+        embedding_provider=embeddings,
+    )
 
     response = service.ingest_text("Manual", "Widget Alpha connects to Widget Beta.")
 

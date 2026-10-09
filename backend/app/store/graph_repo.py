@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Callable, Dict, Iterable, List, MutableMapping, Optional, Sequence, Set, Tuple, TypeVar
+from typing import Any, Callable, Dict, Iterable, List, MutableMapping, Optional, Sequence, Set, TypeVar
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover - import is for type checking only

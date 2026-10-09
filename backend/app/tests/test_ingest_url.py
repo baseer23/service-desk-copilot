@@ -2,18 +2,32 @@
 
 from __future__ import annotations
 
-import json
 from typing import Dict
 
 import pytest
 
+
 class FakeResponse:
-    def __init__(self, url: str, text: str, *, status_code: int = 200, content_type: str = "text/html") -> None:
+    def __init__(
+        self, url: str, text: str, *, status_code: int = 200, content_type: str = "text/html"
+    ) -> None:
         self.url = url
         self.status_code = status_code
         self.text = text
         self.content = text.encode("utf-8")
         self.headers = {"Content-Type": content_type}
+
+    def close(self):
+        pass
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            import requests
+
+            raise requests.HTTPError()
+
+    def iter_content(self, chunk_size):
+        yield self.content
 
 
 class FakeSession:
@@ -22,13 +36,19 @@ class FakeSession:
         self.headers: Dict[str, str] = {}
         self.request_log: list[str] = []
 
-    def get(self, url: str, timeout: float | int = 10):  # noqa: D401 - mimic requests API
+    def get(self, url: str, timeout=10, **kwargs):  # noqa: D401 - mimic requests API
         self.request_log.append(url)
-        return self._responses.get(url, FakeResponse(url, "", status_code=404, content_type="text/plain"))
+        return self._responses.get(
+            url, FakeResponse(url, "", status_code=404, content_type="text/plain")
+        )
 
 
 @pytest.fixture
 def fake_site(monkeypatch):
+    monkeypatch.setattr(
+        "backend.app.services.web.socket.getaddrinfo",
+        lambda *_args, **_kwargs: [(2, 1, 6, "", ("93.184.216.34", 443))],
+    )
     robots = "User-agent: *\nDisallow: /blocked"
     page_root = """
         <html>
@@ -56,10 +76,14 @@ def fake_site(monkeypatch):
         </html>
     """
     responses = {
-        "https://example.com/robots.txt": FakeResponse("https://example.com/robots.txt", robots, content_type="text/plain"),
+        "https://example.com/robots.txt": FakeResponse(
+            "https://example.com/robots.txt", robots, content_type="text/plain"
+        ),
         "https://example.com/start": FakeResponse("https://example.com/start", page_root),
         "https://example.com/guide": FakeResponse("https://example.com/guide", page_guide),
-        "https://example.com/blocked": FakeResponse("https://example.com/blocked", "<html><body>Blocked</body></html>"),
+        "https://example.com/blocked": FakeResponse(
+            "https://example.com/blocked", "<html><body>Blocked</body></html>"
+        ),
     }
     session = FakeSession(responses)
 
@@ -73,7 +97,7 @@ def fake_site(monkeypatch):
 def test_url_ingest_disabled(make_client, tmp_path):
     client = make_client(
         {
-            "MODEL_PROVIDER": "stub",
+            "GENERATION_PROVIDER": "stub",
             "EMBED_PROVIDER": "stub",
             "CHROMA_DIR": tmp_path / "chroma",
             "ALLOW_URL_INGEST": "0",
@@ -93,7 +117,7 @@ def test_url_ingest_disabled(make_client, tmp_path):
 def test_crawl_respects_robots_and_limits(fake_site, make_client, tmp_path):
     client = make_client(
         {
-            "MODEL_PROVIDER": "stub",
+            "GENERATION_PROVIDER": "stub",
             "EMBED_PROVIDER": "stub",
             "CHROMA_DIR": tmp_path / "chroma",
             "ALLOW_URL_INGEST": "1",
@@ -119,7 +143,7 @@ def test_crawl_respects_robots_and_limits(fake_site, make_client, tmp_path):
 def test_main_content_extraction(fake_site, make_client, tmp_path):
     client = make_client(
         {
-            "MODEL_PROVIDER": "stub",
+            "GENERATION_PROVIDER": "stub",
             "EMBED_PROVIDER": "stub",
             "CHROMA_DIR": tmp_path / "chroma",
             "ALLOW_URL_INGEST": "1",
@@ -150,7 +174,7 @@ def test_main_content_extraction(fake_site, make_client, tmp_path):
 def test_url_ingest_end_to_end(fake_site, make_client, tmp_path):
     client = make_client(
         {
-            "MODEL_PROVIDER": "stub",
+            "GENERATION_PROVIDER": "stub",
             "EMBED_PROVIDER": "stub",
             "CHROMA_DIR": tmp_path / "chroma",
             "ALLOW_URL_INGEST": "1",

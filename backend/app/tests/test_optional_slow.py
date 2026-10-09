@@ -1,11 +1,10 @@
-"""Optional slow integration tests for local services."""
+"""Explicitly opted-in integration tests for Neo4j Aura ingestion."""
 
 from __future__ import annotations
 
 import os
 
 import pytest
-import requests
 
 try:  # pragma: no cover - optional dependency in CI
     from neo4j import GraphDatabase
@@ -14,7 +13,9 @@ except ImportError:  # pragma: no cover
 
 
 @pytest.mark.slow
-def test_ask_end_to_end_with_neo4j(make_client, tmp_path):  # pragma: no cover - slow path
+def test_ingestion_with_aura(make_client, tmp_path):  # pragma: no cover - slow path
+    if os.getenv("RUN_AURA_TESTS") != "1":
+        pytest.skip("Set RUN_AURA_TESTS=1 with isolated Aura credentials")
     if GraphDatabase is None:
         pytest.skip("neo4j driver not installed")
 
@@ -33,7 +34,7 @@ def test_ask_end_to_end_with_neo4j(make_client, tmp_path):  # pragma: no cover -
 
     client = make_client(
         {
-            "MODEL_PROVIDER": "stub",
+            "GENERATION_PROVIDER": "stub",
             "EMBED_PROVIDER": "stub",
             "CHROMA_DIR": tmp_path / "chroma",
             "NEO4J_URI": uri,
@@ -48,41 +49,13 @@ def test_ask_end_to_end_with_neo4j(make_client, tmp_path):  # pragma: no cover -
             json={"title": "Neo4j Doc", "text": "Graph upserts should succeed."},
         )
         ingest_resp.raise_for_status()
-        ask_resp = client.post("/ask", json={"question": "Graph upserts question"})
-        ask_resp.raise_for_status()
     finally:
         client.close()
 
     with driver.session() as session:
-        result = session.run("MATCH (d:Document {title: $title}) RETURN count(d) AS c", title="Neo4j Doc")
+        result = session.run(
+            "MATCH (d:Document {title: $title}) RETURN count(d) AS c", title="Neo4j Doc"
+        )
         count = result.single()["c"]
     driver.close()
     assert count >= 1
-
-
-@pytest.mark.slow
-def test_provider_ollama_live(make_client, tmp_path):  # pragma: no cover - slow path
-    host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-    try:
-        response = requests.get(f"{host.rstrip('/')}/api/tags", timeout=2)
-        response.raise_for_status()
-    except Exception as exc:
-        pytest.skip(f"Ollama not reachable: {exc}")
-
-    client = make_client(
-        {
-            "MODEL_PROVIDER": "ollama",
-            "MODEL_NAME": os.getenv("MODEL_NAME", "phi3:mini"),
-            "CHROMA_DIR": tmp_path / "chroma",
-            "EMBED_PROVIDER": "stub",
-        }
-    )
-
-    try:
-        body = client.post("/ask", json={"question": "Say hi"}).json()
-    finally:
-        client.close()
-
-    assert body["provider"] == "ollama"
-    assert body["answer"]
-    assert body["answer"] != "hi, this was a test you pass"

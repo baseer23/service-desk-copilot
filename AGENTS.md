@@ -1,66 +1,29 @@
 # DeskMate architecture
 
-DeskMate is a service-desk RAG application where the application layer calls retrieval through a real MCP protocol boundary.
+DeskMate is a stateful service-desk investigation assistant.
 
-## Runtime architecture
+React → FastAPI Case API → LangGraph → bound LangChain tools → async MCP stdio client → DeskMate MCP server → capabilities.
 
-- React client + FastAPI backend
-- Ask/Application Service receives `/ask`
-- Planner decides retrieval strategy (`VECTOR`, `GRAPH`, `HYBRID`)
-- MCP client calls the DeskMate MCP server over stdio
-- DeskMate MCP server exposes the `search_knowledge` tool
-- MCP server calls the existing Retriever; retrieval logic is not duplicated
-- Existing Retriever uses Chroma and optional Neo4j Aura
-- Responder builds the grounded prompt and calls the hosted model or stub provider
-- Chroma remains the local persistent vector store
-- Neo4j Aura remains optional for graph-enhanced retrieval
-- MCP is a protocol boundary only; it is not the database, the LLM, or Chroma
+LangGraph is the sole orchestrator. Structured Groq outputs use the canonical `TicketAnalysis`, `InvestigationDecision`, and `InvestigationState`. Human questions use `interrupt()` and `Command(resume=...)`, with stable `thread_id=case_id` and SQLite checkpoints that survive restart.
 
-## Actual implementation
+The lifespan owns one MCP client. Its dedicated task enters, uses and exits the SDK stdio/session contexts. LangChain tools call MCP, never repositories directly. Retrieval remains in `backend/app/rag/retrieve.py`, behind the MCP `search_knowledge` tool. Chroma stores semantic knowledge; optional Neo4j Aura enriches retrieval. SQLite stores cases, confirmed facts and actual events. Enterprise context is an explicitly labeled B99 fixture dataset (`source_system=local_fixture`). Public web content is untrusted evidence.
 
-- MCP server: `backend/app/mcp/server.py`
-- MCP client: `backend/app/mcp/client.py`
-- MCP transport: stdio via the official `mcp` Python SDK
-- MCP tool currently exposed: `search_knowledge`
-- `/ask` path: planner → MCP client → MCP server → existing Retriever → Chroma / optional Aura → responder → hosted model
+Live generation is Groq. Live embeddings are SentenceTransformers `all-MiniLM-L6-v2` (384 dimensions). Stub generation/embeddings require `TEST_MODE=true` and are exclusively for isolated tests. Generation and embedding failures must be explicit.
 
-## Supported runtime flow
+Protect `.env`, user SQLite files and Chroma data. Never reset a collection in response to a read/write error. Separate verified embedding collections prevent mixing test and live vectors; legacy `chunks` remains intact. Exact SHA-256 content hashes provide persistent ingestion deduplication.
 
-React
-↓
-FastAPI
-↓
-Planner
-↓
-MCP Client
-↓
-DeskMate MCP Server
-↓
-Existing Retriever
-├── Chroma
-└── optional Neo4j Aura
-↓
-Responder
-↓
-Hosted LLM / stub
-
-## Commands
-
-Start the MCP server:
+Use Python 3.12 and the repository `.venv`:
 
 ```bash
-PYTHONPATH=. python -m backend.app.mcp.server
+python3.12 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m pip check
+.venv/bin/python -m pytest backend/app/tests -q
+npm --prefix frontend test
+npm --prefix frontend run build
+npm --prefix frontend run test:e2e
 ```
 
-Start FastAPI:
+Start the application with `make dev`. To run MCP independently: `PYTHONPATH=. .venv/bin/python -m backend.app.mcp.server`. FastAPI starts and closes its own MCP subprocess; a separate MCP process is unnecessary.
 
-```bash
-PYTHONPATH=. uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
-```
-
-## Notes
-
-- Retrieval behavior remains in the existing Retriever; it is reused through MCP.
-- FastAPI must make a real MCP protocol call.
-- No new infrastructure is introduced beyond the MCP boundary itself.
-- Local or cloud graph behavior remains unchanged: Aura is optional; vector-only mode remains the fallback when Aura is absent.
+Tests use real temporary Chroma and SQLite stores and real MCP stdio. Mock external services explicitly in unit tests. Browser tests use real HTTP against an isolated test stack, with backend-only deterministic providers. Aura integration tests require explicit `RUN_AURA_TESTS=1` and isolated credentials. Do not write live graph data during routine tests.

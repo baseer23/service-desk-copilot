@@ -1,33 +1,34 @@
-from __future__ import annotations
-
-from typing import Any, Dict, List, TypedDict
+from typing import Any, TypedDict
 
 
 class InvestigationState(TypedDict, total=False):
-    """Durable investigation data for a single incident case."""
+    """The sole durable LangGraph case state; all values serialize to JSON."""
 
     case_id: str
-    ticket: Dict[str, Any]
-    conversation: List[Dict[str, Any]]
-    identified_user: Dict[str, Any]
-    identified_company: Dict[str, Any]
-    identified_site: Dict[str, Any]
-    identified_device: Dict[str, Any]
-    extracted_issue: Dict[str, Any]
-    evidence: List[Dict[str, Any]]
-    previous_tickets: List[Dict[str, Any]]
-    knowledge: List[Dict[str, Any]]
-    alerts: List[Dict[str, Any]]
-    changes: List[Dict[str, Any]]
-    web_sources: List[Dict[str, Any]]
-    remembered_facts: List[Dict[str, Any]]
-    hypotheses: List[Dict[str, Any]]
-    missing_information: List[str]
+    ticket: dict[str, Any]
+    status: str
+    analysis: dict[str, Any]
+    decision: dict[str, Any]
+    evidence: list[dict[str, Any]]
+    previous_tickets: list[dict[str, Any]]
+    knowledge: list[dict[str, Any]]
+    alerts: list[dict[str, Any]]
+    changes: list[dict[str, Any]]
+    web_sources: list[dict[str, Any]]
+    remembered_facts: list[dict[str, Any]]
+    confirmed_facts: list[dict[str, Any]]
+    human_answers: list[dict[str, Any]]
+    hypotheses: list[str]
+    inferences: list[str]
+    missing_information: list[str]
     pending_question: str | None
-    human_answers: List[Dict[str, Any]]
-    actions_taken: List[str]
-    tool_events: List[Dict[str, Any]]
+    pending_field: str | None
     research_iteration: int
+    context_site: str | None
+    requested_tools: list[dict[str, Any]]
+    tool_events: list[dict[str, Any]]
     confidence: float
+    likely_issue: str | None
+    recommended_next_action: str | None
     final_answer: str | None
-    uncertainty: List[str]
+    uncertainty: list[str]

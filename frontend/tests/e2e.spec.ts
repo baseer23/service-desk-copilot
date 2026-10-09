@@ -1,130 +1,59 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from '@playwright/test'
+const ticket = 'Jake Peralta from B99 cannot connect to the VPN. Authentication failed.'
 
-const API_BASE = 'http://127.0.0.1:8000';
-
-async function apiPost(path: string, body: any) {
-  const res = await fetch(`${API_BASE}${path}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  return res.json();
-}
-
-async function apiGet(path: string) {
-  const res = await fetch(`${API_BASE}${path}`);
-  return res.json();
-}
-
-test('B99 Jake investigation end-to-end', async ({ page }) => {
-  const consoleErrors: string[] = [];
-  page.on('console', (msg) => {
-    if (msg.type() === 'error') consoleErrors.push(msg.text());
-  });
-
-  // 1. open frontend
-  await page.goto('/');
-  await expect(page.locator('h1')).toHaveText('DeskMate');
-
-  // 2. create case via browser fetch
-  const caseId = 'b99-jake-e2e-1';
-  const ticket = {
-    summary: 'Jake Peralta from B99 cannot connect to the VPN. Authentication failed.',
-    user: 'Jake Peralta',
-    company: 'B99',
-  };
-
-  const create = await page.evaluate(async (caseId, ticket) => {
-    const res = await fetch('http://127.0.0.1:8000/cases', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ case_id: caseId, state: { ticket } }),
-    });
-    return res.json();
-  }, caseId, ticket);
-  expect(create.case_id).toBe(caseId);
-
-  // 3. invoke investigation
-  const investigate = await page.evaluate(async (caseId, ticket) => {
-    const res = await fetch(`http://127.0.0.1:8000/cases/${caseId}/investigate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ticket }),
-    });
-    return res.json();
-  }, caseId, ticket);
-
-  expect(investigate.case_id).toBe(caseId);
-  const result = investigate.result;
-  expect(result).toBeDefined();
-  // expect the agent to ask for missing info (site or device)
-  expect(result.pending_question || result.missing_information).toBeTruthy();
-
-  // 4. supply human answer for site/floor
-  const resume1 = await page.evaluate(async (caseId) => {
-    const res = await fetch(`http://127.0.0.1:8000/cases/${caseId}/resume`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ answer: '2nd floor' }),
-    });
-    return res.json();
-  }, caseId);
-  expect(resume1.case_id).toBe(caseId);
-
-  // If the agent asks another human question, respond accordingly
-  if (resume1.result && resume1.result.pending_question && resume1.result.pending_question.toLowerCase().includes('watchguard')) {
-    const resume2 = await page.evaluate(async (caseId) => {
-      const res = await fetch(`http://127.0.0.1:8000/cases/${caseId}/resume`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ answer: 'Yes' }),
-      });
-      return res.json();
-    }, caseId);
-    expect(resume2.case_id).toBe(caseId);
+test('Jake investigation interrupts twice, resumes one case and remembers facts across cases', async ({
+  page,
+  request,
+}) => {
+  await page.goto('/')
+  await page.getByLabel('Ticket details').fill(ticket)
+  await page.getByRole('button', { name: 'Start Investigation' }).click()
+  await expect(
+    page.getByText('Which site or floor is Jake Peralta currently working from?'),
+  ).toBeVisible()
+  const caseID = (await page.getByTestId('case-id').textContent())!
+  await expect(page.getByText('Ticket analyzed', { exact: true })).toBeVisible()
+  await expect(
+    page.getByText('Previous incidents searched: 1 result(s)', { exact: true }),
+  ).toBeVisible()
+  const first = await request.get(`/cases/${caseID}`)
+  expect((await first.json()).status).toBe('needs_input')
+  await page.getByLabel('Your answer').fill('2nd floor')
+  await page.getByRole('button', { name: 'Continue Investigation' }).click()
+  await expect(
+    page.getByText('Has Jake Peralta installed the required VPN client update?'),
+  ).toBeVisible()
+  await expect(page.getByTestId('case-id')).toHaveText(caseID)
+  await page.getByLabel('Your answer').fill('Yes')
+  await page.getByRole('button', { name: 'Continue Investigation' }).click()
+  await expect(page.locator('.status-pill')).toHaveText('assessment ready')
+  await expect(
+    page.getByText(/The required update is confirmed installed. Refresh the client profile/),
+  ).toBeVisible()
+  await expect(page.getByText('B99 2nd floor', { exact: true })).toBeVisible()
+  await expect(page.getByText('Yes', { exact: true })).toBeVisible()
+  const final = await (await request.get(`/cases/${caseID}`)).json()
+  expect(final.thread_id).toBe(caseID)
+  expect(final.confirmed_facts).toHaveLength(2)
+  for (const tool of ['get_active_alerts', 'get_recent_changes', 'search_previous_tickets']) {
+    expect(
+      final.evidence.some((e: any) => e.tool === tool && e.content.site === 'B99 2nd floor'),
+    ).toBeTruthy()
   }
-
-  // Finally, fetch the case and ensure final_answer exists or status resolved
-  const final = await page.evaluate(async (caseId) => {
-    const res = await fetch(`http://127.0.0.1:8000/cases/${caseId}`);
-    return res.json();
-  }, caseId);
-  expect(final.case_id).toBe(caseId);
-  expect(final.state).toBeDefined();
-  expect(final.state.final_answer || final.state.status).toBeTruthy();
-
-  // 5. start a second case and verify remembered fact from first case is retrievable
-  const case2 = 'b99-jake-e2e-2';
-  const ticket2 = { summary: 'New Jake VPN issue', user: 'Jake Peralta', company: 'B99' };
-  await page.evaluate(async (caseId, ticket) => {
-    await fetch('http://127.0.0.1:8000/cases', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ case_id: caseId, state: { ticket } }),
-    });
-  }, case2, ticket2);
-
-  const inv2 = await page.evaluate(async (caseId, ticket) => {
-    const res = await fetch(`http://127.0.0.1:8000/cases/${caseId}/investigate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ticket }),
-    });
-    return res.json();
-  }, case2, ticket2);
-
-  expect(inv2.case_id).toBe(case2);
-
-  // check memory: query remembered facts for first case via GET /cases/{case_id}
-  const mem1 = await page.evaluate(async (caseId) => {
-    const res = await fetch(`http://127.0.0.1:8000/cases/${caseId}`);
-    return res.json();
-  }, caseId);
-  expect(mem1.state.remembered_facts).toBeInstanceOf(Array);
-  // ensure the remembered '2nd floor' answer appears
-  const hasFloor = mem1.state.remembered_facts.some((f: any) => String(f.value).toLowerCase().includes('2nd'));
-  expect(hasFloor).toBeTruthy();
-
-  // verify no page console errors
-  expect(consoleErrors.length).toBe(0);
-});
+  const events = await (await request.get(`/cases/${caseID}/events`)).json()
+  expect(events.filter((e: any) => e.tool === 'analyze_ticket')).toHaveLength(1)
+  expect(events.filter((e: any) => e.tool === 'remember_fact')).toHaveLength(2)
+  await page.screenshot({ path: 'test-results/jake-assessment.png', fullPage: true })
+  await page.getByLabel('Ticket details').fill(ticket)
+  await page.getByRole('button', { name: 'Start Investigation' }).click()
+  await expect(page.getByTestId('case-id')).not.toHaveText(caseID)
+  await expect(
+    page.getByRole('heading', { name: 'Remembered facts from previous cases' }),
+  ).toBeVisible()
+  await expect(page.locator('.status-pill')).toHaveText('assessment ready')
+  const secondID = (await page.getByTestId('case-id').textContent())!
+  const second = await (await request.get(`/cases/${secondID}`)).json()
+  expect(second.remembered_facts).toHaveLength(2)
+  expect(second.remembered_facts.every((f: any) => f.case_id === caseID)).toBeTruthy()
+  await expect(page.getByLabel('Your answer')).toHaveCount(0)
+})
