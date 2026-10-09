@@ -10,13 +10,13 @@ export default defineConfig({
   timeout: 90_000,
   expect: { timeout: 20_000 },
   workers: 1,
-  use: { baseURL: 'http://127.0.0.1:5174', trace: 'retain-on-failure' },
+  use: { baseURL: 'http://127.0.0.1:5184', trace: 'retain-on-failure' },
   projects: [{ name: 'chromium', use: { browserName: 'chromium' } }],
   webServer: [
     {
-      command: '.venv/bin/python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8001',
+      command: '.venv/bin/python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8011',
       cwd: root,
-      url: 'http://127.0.0.1:8001/health',
+      url: 'http://127.0.0.1:8011/health',
       reuseExistingServer: false,
       timeout: 60_000,
       env: {
@@ -30,11 +30,11 @@ export default defineConfig({
       },
     },
     {
-      command: 'npm run dev -- --host 127.0.0.1 --port 5174 --strictPort',
+      command: 'npm run dev -- --host 127.0.0.1 --port 5184 --strictPort',
       cwd: resolve(root, 'frontend'),
-      url: 'http://127.0.0.1:5174',
+      url: 'http://127.0.0.1:5184',
       reuseExistingServer: false,
-      env: { API_PROXY_TARGET: 'http://127.0.0.1:8001' },
+      env: { API_PROXY_TARGET: 'http://127.0.0.1:8011' },
     },
   ],
 })

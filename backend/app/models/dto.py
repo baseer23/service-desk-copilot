@@ -1,3 +1,4 @@
+from backend.app.agent.models import Hypothesis, FinalResponse, EvidenceItem
 from typing import Any, Literal
 from pydantic import BaseModel, Field, computed_field
 from backend.app.agent.models import MemoryFact
@@ -60,7 +61,7 @@ class CaseResumeRequest(BaseModel):
     answer: str = Field(min_length=1, max_length=2000)
 
 
-class Evidence(BaseModel):
+class LegacyEvidence(BaseModel):
     tool: str
     source: str
     source_system: str
@@ -80,17 +81,21 @@ class CaseResponse(BaseModel):
         "insufficient_information",
         "error",
     ]
+    workflow: str | None = None
+    verification: dict[str, Any] = Field(default_factory=dict)
+    contradictions: list[str] = Field(default_factory=list)
+    final_response: FinalResponse | None = None
     analysis: dict[str, Any] = Field(default_factory=dict)
     pending_question: str | None = None
     likely_issue: str | None = None
-    hypotheses: list[str] = Field(default_factory=list)
+    hypotheses: list[Hypothesis | str] = Field(default_factory=list)
     confirmed_facts: list[MemoryFact] = Field(default_factory=list)
     remembered_facts: list[dict[str, Any]] = Field(default_factory=list)
     inferences: list[str] = Field(default_factory=list)
     recommended_next_action: str | None = None
     confidence: float = Field(default=0, ge=0, le=1)
     uncertainty: list[str] = Field(default_factory=list)
-    evidence: list[Evidence] = Field(default_factory=list)
+    evidence: list[EvidenceItem | LegacyEvidence] = Field(default_factory=list)
     final_answer: str | None = None
     research_iteration: int = 0
 

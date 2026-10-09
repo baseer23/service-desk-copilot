@@ -84,7 +84,8 @@ def test_size_limit_and_canonical_extraction(monkeypatch):
     )
 
 
-def test_search_and_fetch_server_units(monkeypatch):
+@pytest.mark.asyncio
+async def test_search_and_fetch_server_units(monkeypatch):
     import ddgs
 
     monkeypatch.setattr(
@@ -96,13 +97,13 @@ def test_search_and_fetch_server_units(monkeypatch):
             ]
         ),
     )
-    hits = server.search_web("VPN guide")["result"]
+    hits = (await server.search_web("VPN guide")).result
     assert hits[0]["source_system"] == "public_web"
     monkeypatch.setattr(
         "backend.app.services.web.fetch_page",
         lambda *a, **k: {"url": a[0], "title": "Guide", "text": "Body"},
     )
-    assert server.fetch_web_page("https://example.com")["result"]["text"] == "Body"
+    assert (await server.fetch_web_page("https://example.com")).result["text"] == "Body"
 
 
 def test_empty_local_knowledge_research_ingests_and_retrieves(make_client):
@@ -135,8 +136,9 @@ def test_empty_local_knowledge_research_ingests_and_retrieves(make_client):
         e["tool"] == "search_knowledge" and e["content"]["metadata"]["source_type"] == "web"
         for e in body["evidence"]
     )
-    assert c.app.state.vector_store.count() > 0
-    assert any(e["tool"] == "ingest_web" for e in c.get(f"/cases/{cid}/events").json())
+    context = c.portal.call(harness.invoke, "list_available_context", {})
+    assert context["result"]["knowledge_chunks"] > 0
+    assert any(e["tool"] == "ingest_text" for e in c.get(f"/cases/{cid}/events").json())
 
 
 def test_loop_limit_finalizes_without_recursion_failure(make_client):
@@ -145,7 +147,7 @@ def test_loop_limit_finalizes_without_recursion_failure(make_client):
     original = provider.generate_structured
 
     async def loop(stage, context, schema):
-        if stage == "analyze_ticket":
+        if stage != "reason":
             return await original(stage, context, schema)
         return InvestigationDecision(
             evidence_summary="No conclusive evidence",
@@ -161,3 +163,62 @@ def test_loop_limit_finalizes_without_recursion_failure(make_client):
     body = result.json()
     assert body["status"] == "insufficient_information" and body["research_iteration"] == 3
     assert body["confidence"] == 0 and any("cycle limit" in u for u in body["uncertainty"])
+
+
+def test_fetched_irrelevant_page_is_not_ingested(make_client):
+    c = make_client()
+    agent = c.app.state.agent
+    original_invoke = agent.harness.invoke
+    original_generate = agent.provider.generate_structured
+    selections = []
+    calls = []
+
+    async def web(name, arguments):
+        calls.append(name)
+        if name == "search_web":
+            return [{"url": "https://example.com/guide", "title": "Utility guide"}]
+        if name == "fetch_web_page":
+            return {"url": arguments["url"], "text": "Unrelated advertising content. " * 10}
+        return await original_invoke(name, arguments)
+
+    async def select(stage, context, schema):
+        if stage == "evaluate_sources":
+            selections.append(context)
+            if context.get("purpose"):
+                return schema(
+                    selected_urls=[],
+                    evidence_gap="No recovery instructions in the fetched page.",
+                    justification="Actual content is irrelevant despite the search title.",
+                )
+        return await original_generate(stage, context, schema)
+
+    agent.harness.invoke, agent.provider.generate_structured = web, select
+    cid = c.post("/cases", json={"summary": "A newly released utility crashes."}).json()["case_id"]
+    result = c.post(f"/cases/{cid}/investigate")
+    assert result.status_code == 200
+    assert len(selections) == 2 and "text" in selections[1]["results"][0]
+    assert "fetch_web_page" in calls and "ingest_text" not in calls
+    assert calls.index("fetch_web_page") < len(calls) - 1
+    context = c.portal.call(original_invoke, "list_available_context", {})
+    assert context["result"]["knowledge_chunks"] == 0
+
+
+def test_failed_public_research_records_error_evidence(make_client):
+    from backend.app.mcp.client import MCPToolError
+
+    c = make_client()
+    harness = c.app.state.agent.harness
+    original = harness.invoke
+
+    async def unavailable(name, arguments):
+        if name == "search_web":
+            raise MCPToolError("Public search unavailable")
+        return await original(name, arguments)
+
+    harness.invoke = unavailable
+    cid = c.post("/cases", json={"summary": "An unknown utility crashes."}).json()["case_id"]
+    result = c.post(f"/cases/{cid}/investigate")
+    assert result.status_code == 200
+    state = result.json()
+    assert state["status"] == "insufficient_information" and state["confidence"] == 0
+    assert any(e["tool"] == "search_web" and e["source_type"] == "tool_error" for e in state["evidence"])

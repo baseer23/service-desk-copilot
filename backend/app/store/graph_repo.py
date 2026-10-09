@@ -166,6 +166,46 @@ class GraphRepository:
         records = self._execute_read(_tx)
         return records[:limit]
 
+    def upsert_relationships(self, relations):
+        """Store labeled enterprise relationships with explicit fixture provenance."""
+        for item in relations:
+            rel = _safe_rel(item["predicate"])
+
+            def write(tx):
+                tx.run(
+                    f"MERGE (a:Entity {{id: toLower($subject)}}) SET a.name=$subject "
+                    f"MERGE (b:Entity {{id: toLower($object)}}) SET b.name=$object "
+                    f"MERGE (a)-[r:{rel}]->(b) "
+                    'SET r.source_system="local_fixture", r.observed_at=datetime() ',
+                    subject=item["subject"],
+                    object=item["object"],
+                )
+
+            self._execute_write(write)
+
+    def search_relationships(self, entities, limit=12):
+        """Bounded two-hop relationship discovery, with parameterized terms."""
+        terms = [s.casefold() for s in entities if s.strip()][:10]
+        if not terms:
+            return []
+
+        def read(tx):
+            rows = tx.run(
+                "MATCH (seed:Entity) WHERE any(term IN $terms WHERE seed.id CONTAINS term) "
+                "MATCH path=(seed)-[*1..2]-(neighbor:Entity) "
+                "UNWIND relationships(path) AS r "
+                "WITH r "
+                'WHERE type(r) IN ["WORKS_AT","HAS_SITE","USES","AFFECTS","APPLIES_TO","INVOLVES","ASSOCIATED_WITH"] '
+                "RETURN DISTINCT startNode(r).name AS subject, type(r) AS predicate, "
+                "endNode(r).name AS object, r.source_system AS source_system, "
+                "toString(r.observed_at) AS observed_at LIMIT $limit",
+                terms=terms,
+                limit=limit,
+            )
+            return [dict(row) for row in rows]
+
+        return self._execute_read(read)
+
     def ping(self) -> bool:
         """Return True when the database responds to a trivial read."""
 

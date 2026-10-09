@@ -18,7 +18,7 @@ async def test_ten_calls_errors_reuse_and_clean_close(settings):
         await client.call_tool("missing_tool", {})
     with pytest.raises(MCPToolError, match="mode"):
         await client.search_knowledge("VPN", mode="INVALID")
-    assert (await client.call_tool("get_company_context", {"company": "B99"}))["name"] == "B99"
+    assert (await client.call_tool("get_company_context", {"company": "B99"}))["result"]["name"] == "B99"
     await client.close()
     assert client._task is None
     await client.close()
@@ -46,12 +46,12 @@ async def test_fixture_tools_and_shared_memory(settings):
         }
         for name, arguments in inputs.items():
             result = await client.call_tool(name, arguments)
-            rows = result if isinstance(result, list) else [result]
+            rows = result["items"]
             assert rows
             assert all(r["source_system"] == "local_fixture" for r in rows)
         user = await client.call_tool("get_user_context", inputs["get_user_context"])
-        assert user["current_site"] is None and user["required_update_installed"] is None
-        alert = (await client.call_tool("get_active_alerts", inputs["get_active_alerts"]))[0]
+        assert user["result"]["current_site"] is None and user["result"]["required_update_installed"] is None
+        alert = (await client.call_tool("get_active_alerts", inputs["get_active_alerts"]))["items"][0]
         assert alert["status"] == "active" and alert["technician_event"]
         fact = MemoryFact(
             subject="Jake Peralta",
@@ -69,7 +69,7 @@ async def test_fixture_tools_and_shared_memory(settings):
             {"case_id": "unique-test", "text": "A real MCP note", "source": "human_confirmed"},
         )
         found = await client.call_tool("search_remembered_facts", {"subject": "Jake Peralta"})
-        assert found[0]["case_id"] == "unique-test"
+        assert found["items"][0]["case_id"] == "unique-test"
         parent = CaseMemoryStore(settings.case_db_path)
         assert parent.search_facts("Jake Peralta")[0]["value"] == "B99 2nd floor"
         assert parent.list_events("unique-test")[0]["content"] == "A real MCP note"
@@ -106,7 +106,7 @@ async def test_reconnect_after_transport_owner_stops(settings):
         client._task.cancel()
         await asyncio.gather(client._task, return_exceptions=True)
         result = await client.call_tool("get_company_context", {"company": "B99"})
-        assert result["name"] == "B99"
+        assert result["result"]["name"] == "B99"
         assert client.connection_count == 2
     finally:
         await client.close()

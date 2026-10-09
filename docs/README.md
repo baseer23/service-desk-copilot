@@ -1,6 +1,6 @@
 # DeskMate
 
-DeskMate investigates service-desk incidents, gathers evidence and asks for missing facts. A case is durable across requests and process restarts. Recommendations do not claim that a connection or incident has been resolved.
+DeskMate routes document questions and service-desk incidents through a LangGraph supervisor, gathers evidence with model-selected MCP tools, and verifies candidate answers. A case is durable across requests and process restarts. Recommendations do not claim that a connection or incident has been resolved.
 
 ## Setup
 
@@ -22,9 +22,13 @@ make dev
 
 Open **http://127.0.0.1:5173**. The backend runs on port 8000; Vite forwards case, ingestion and health requests. Stop both servers with Ctrl+C. There is no provider switch in the application.
 
+## Requests
+
+Upload a resume using PDF/Paste, then enter `What year did Abdul graduate?` and click **Run DeskMate**. The supervisor uses the knowledge subgraph and returns a document-grounded answer with sources. It does not ask ticket location questions. MFA and printer incidents use relevant identity/device evidence; multi-user outages prioritize shared service health.
+
 ## Investigation
 
-Enter `Jake Peralta from B99 cannot connect to the VPN. Authentication failed.` and start an investigation. The agent extracts ticket details, loads remembered facts and checks independent context, incident, alert and change capabilities. With a fresh case database, it asks Jake's current floor, then whether the required client update was installed. Answer `2nd floor`, then `Yes`. Each answer resumes the existing LangGraph thread and is stored with human provenance. A second Jake case loads those confirmed facts before asking again.
+Enter `Jake Peralta from B99 cannot connect to the VPN. Authentication failed.` and click **Run DeskMate**. The model extracts identifiers, loads remembered facts, and proposes justified context, incident, alert and change calls. Independent plan groups execute concurrently over one MCP session. A verifier checks the candidate before finalization. With a fresh case database, it asks Jake's current floor, then whether the required client update was installed. Answer `2nd floor`, then `Yes`. Each answer resumes the existing LangGraph thread and is stored with human provenance. A second Jake case loads those confirmed facts before asking again.
 
 The B99 enterprise records are **local fixtures**, including the WatchGuard alert and technician acknowledgement. They are never presented as live integrations. The timeline shows actual completed operations. The assessment separates hypotheses, confirmed facts, evidence support and uncertainty.
 
@@ -46,7 +50,7 @@ Missing cases return 404. Model and capability failures return explicit errors. 
 
 ## Persistence and verification
 
-`CASE_DB_PATH` contains cases, confirmed facts and events. LangGraph uses the adjacent `<CASE_DB_PATH>.checkpoints.sqlite3` file to avoid write contention with MCP operational memory. Back up both files together while the application is stopped. Chroma stays at version 0.5.3, preserving the existing storage format.
+`CASE_DB_PATH` contains cases, confirmed facts and events. LangGraph uses the adjacent `<CASE_DB_PATH>.supervisor.checkpoints.sqlite3` file to avoid write contention with MCP operational memory. The previous case-agent checkpoint file is preserved; pre-upgrade paused cases are shown as historical and require a new investigation. Back up operational and checkpoint files together while the application is stopped. Chroma stays at version 0.5.3, preserving the existing storage format.
 
 Verified live embeddings use `chunks_sentence_minilm_v1`; isolated test vectors use `chunks_stub_v1`. Legacy `chunks` lacks reliable embedding provenance and remains untouched. Re-ingest original source documents into the verified collection to make that knowledge available; no automatic destructive migration occurs. SHA-256 hashes and deterministic chunk IDs prevent exact duplicate storage across process restarts.
 
@@ -58,4 +62,4 @@ npm --prefix frontend run test:e2e
 .venv/bin/python -m pip check
 ```
 
-Playwright starts isolated servers on ports 8001/5174 with temporary SQLite/Chroma directories. Its backend uses deterministic test providers; browser requests are real HTTP and are not mocked. Vitest only discovers `src/**/*.test.{ts,tsx}`. Optional Aura tests are skipped unless explicitly enabled with isolated credentials.
+Playwright starts isolated servers on ports 8011/5184 with temporary SQLite/Chroma directories. Its backend uses deterministic test providers; browser requests are real HTTP and are not mocked. Vitest only discovers `src/**/*.test.{ts,tsx}`. Optional Aura tests are skipped unless explicitly enabled with isolated credentials.

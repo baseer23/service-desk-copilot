@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     top_k: int = Field(default=6, ge=1, le=30)
     chunk_tokens: int = Field(default=512, ge=1)
     chunk_overlap: int = Field(default=64, ge=0)
+    max_research_rounds: int = Field(default=2, ge=0, le=3)
     max_investigation_cycles: int = Field(default=8, ge=1, le=20)
     allow_url_ingest: bool = True
     url_max_depth: int = Field(default=1, ge=0, le=3)

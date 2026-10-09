@@ -108,26 +108,47 @@ class DeskMateMCPClient:
                     await session.initialize()
                     self.connection_count += 1
                     self._ready.set_result(None)
-                    while True:
-                        item = await self._queue.get()
-                        if item is None:
-                            break
-                        name, arguments, active = item
-                        result = await session.call_tool(name, arguments)
-                        if not active.done():
-                            if result.isError:
-                                message = " ".join(getattr(c, "text", "") for c in result.content)
-                                active.set_exception(
-                                    MCPToolError(f"MCP tool {name} failed: {message}")
-                                )
+                    pending = set()
+
+                    async def dispatch(name, arguments, future):
+                        try:
+                            if name == "__list_tools__":
+                                result = await session.list_tools()
+                                value = [t.model_dump() for t in result.tools]
                             else:
-                                try:
-                                    active.set_result(self._coerce_tool_result(result))
-                                except ValueError as exc:
-                                    active.set_exception(
-                                        MCPToolError(f"Invalid result from {name}: {exc}")
+                                result = await session.call_tool(name, arguments)
+                                if result.isError:
+                                    message = " ".join(
+                                        getattr(c, "text", "") for c in result.content
                                     )
-                        active = None
+                                    raise MCPToolError(f"MCP tool {name} failed: {message}")
+                                value = self._coerce_tool_result(result)
+                                if isinstance(value, dict) and value.get("status") == "error":
+                                    raise MCPToolError(
+                                        f'MCP tool {name} failed: {value.get("error")}'
+                                    )
+                            if not future.done():
+                                future.set_result(value)
+                        except MCPToolError as exc:
+                            if not future.done():
+                                future.set_exception(exc)
+                        except BaseException:
+                            if not future.done():
+                                future.set_exception(
+                                    MCPConnectionError("DeskMate MCP request failed")
+                                )
+
+                    try:
+                        while True:
+                            item = await self._queue.get()
+                            if item is None:
+                                break
+                            task = asyncio.create_task(dispatch(*item))
+                            pending.add(task)
+                            task.add_done_callback(pending.discard)
+                    finally:
+                        if pending:
+                            await asyncio.gather(*pending, return_exceptions=True)
         except BaseException as exc:
             error = MCPConnectionError("DeskMate MCP connection failed")
             if self._ready is not None and not self._ready.done():
@@ -161,6 +182,9 @@ class DeskMateMCPClient:
                 await asyncio.gather(self._task, return_exceptions=True)
                 self._task = None
 
+    async def list_tools(self):
+        return await self.call_tool("__list_tools__", {})
+
     async def search_knowledge(self, question: str, mode: str = "HYBRID", top_k: int = 6):
         return await self.call_tool(
             "search_knowledge", {"question": question, "mode": mode, "top_k": top_k}
@@ -187,6 +211,8 @@ class DeskMateMCPClient:
                     except json.JSONDecodeError:
                         continue
         if isinstance(payload, dict):
+            if "tool" in payload and "status" in payload:
+                return payload
             return payload.get("result", payload.get("results", payload))
         if isinstance(payload, list):
             return payload

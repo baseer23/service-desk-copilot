@@ -37,7 +37,7 @@ def test_full_case_interrupt_resume_events_and_cross_case_memory(make_client):
         assert any(e["tool"] == name and "B99 2nd floor" in str(e["content"]) for e in evidence)
     events = c.get(f"/cases/{cid}/events").json()
     assert sum(e["tool"] == "analyze_ticket" for e in events) == 1
-    assert sum(e["tool"] == "remember_fact" for e in events) == 2
+    assert sum(e["tool"] == "remember_fact" for e in events) == 3
     assert agent.harness.invocation_count > 10
     other = create(c)
     later = c.post(f"/cases/{other}/investigate").json()
@@ -45,6 +45,7 @@ def test_full_case_interrupt_resume_events_and_cross_case_memory(make_client):
     assert {f["predicate"] for f in later["remembered_facts"]} == {
         "current_site",
         "required_update_installed",
+        "works_at",
     }
     assert all(f["case_id"] == cid for f in later["remembered_facts"])
     assert not later["pending_question"]
@@ -65,6 +66,14 @@ def test_interrupt_survives_application_restart(settings):
         assert final["status"] == "assessment_ready"
         events = c.get(f"/cases/{cid}/events").json()
         assert sum(e["tool"] == "analyze_ticket" for e in events) == 1
+
+
+def test_first_start_creates_checkpoint_directory(settings):
+    nested = settings.model_copy(update={"case_db_path": settings.case_db_path.parent / "new" / "nested" / "cases.db"})
+    assert not nested.case_db_path.parent.exists()
+    with TestClient(create_app(nested)) as client:
+        assert client.get("/cases").status_code == 200
+        assert nested.case_db_path.parent.exists()
 
 
 def test_missing_case_and_validation(make_client):
@@ -110,12 +119,14 @@ def test_historical_case_read_is_safe_without_rewriting_saved_data(make_client):
         "confidence": 0.82,
         "evidence": [],
     }
-    c.app.state.memory.save_case("historical", old)
+    from backend.app.agent.memory import CaseMemoryStore
+    memory = CaseMemoryStore(c.app.state.settings.case_db_path)
+    memory.save_case("historical", old)
     result = c.get("/cases/historical")
     assert result.status_code == 200
     assert result.json()["status"] == "insufficient_information"
     assert result.json()["confidence"] == 0 and result.json()["pending_question"] is None
-    assert c.app.state.memory.load_case("historical") == old
+    assert memory.load_case("historical") == old
     assert c.get("/cases").status_code == 200
 
 

@@ -90,8 +90,35 @@ def fake_site(monkeypatch):
     def fake_session_factory(*_args, **_kwargs):  # noqa: D401
         return session
 
-    monkeypatch.setattr("backend.app.services.url_crawler.requests.Session", fake_session_factory)
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "backend.app.services.url_crawler.requests", SimpleNamespace(Session=fake_session_factory)
+    )
     return session
+
+
+def bind_mocked_url_capability(client, monkeypatch):
+    """Explicit network unit injection; storage remains real temporary Chroma."""
+    from backend.app.mcp import server
+    from backend.app.services.capabilities import knowledge_stores
+    from backend.app.services.ingest_service import IngestService
+    from backend.app.adapters.embeddings import get_embedding_provider
+
+    settings = client.app.state.settings
+    vector, graph, driver = knowledge_stores(settings)
+    ingest = IngestService(settings, vector, graph, get_embedding_provider(settings))
+    monkeypatch.setattr(server, "get_settings", lambda: settings)
+    monkeypatch.setattr(server, "environment", lambda: (vector, graph, driver, ingest, None))
+    original = client.app.state.mcp.call_tool
+
+    async def call(name, arguments):
+        if name == "ingest_url":
+            return (await server.ingest_url(**arguments)).model_dump()
+        return await original(name, arguments)
+
+    monkeypatch.setattr(client.app.state.mcp, "call_tool", call)
+    return graph
 
 
 def test_url_ingest_disabled(make_client, tmp_path):
@@ -114,7 +141,7 @@ def test_url_ingest_disabled(make_client, tmp_path):
     assert body["detail"] == "URL ingestion is disabled"
 
 
-def test_crawl_respects_robots_and_limits(fake_site, make_client, tmp_path):
+def test_crawl_respects_robots_and_limits(fake_site, make_client, tmp_path, monkeypatch):
     client = make_client(
         {
             "GENERATION_PROVIDER": "stub",
@@ -125,6 +152,7 @@ def test_crawl_respects_robots_and_limits(fake_site, make_client, tmp_path):
         }
     )
 
+    bind_mocked_url_capability(client, monkeypatch)
     try:
         response = client.post(
             "/ingest/url",
@@ -140,7 +168,7 @@ def test_crawl_respects_robots_and_limits(fake_site, make_client, tmp_path):
     assert "https://example.com/blocked" not in fake_site.request_log
 
 
-def test_main_content_extraction(fake_site, make_client, tmp_path):
+def test_main_content_extraction(fake_site, make_client, tmp_path, monkeypatch):
     client = make_client(
         {
             "GENERATION_PROVIDER": "stub",
@@ -151,14 +179,14 @@ def test_main_content_extraction(fake_site, make_client, tmp_path):
         }
     )
 
+    local_graph = bind_mocked_url_capability(client, monkeypatch)
     try:
         response = client.post(
             "/ingest/url",
             json={"url": "https://example.com/start", "max_depth": 0, "max_pages": 1},
         )
-        import backend.app.main as main
 
-        chunks = list(main.app.state.graph_repo.chunks.values())
+        chunks = list(local_graph.chunks.values())
     finally:
         client.close()
 
@@ -171,7 +199,7 @@ def test_main_content_extraction(fake_site, make_client, tmp_path):
     assert "Menu" not in combined_text
 
 
-def test_url_ingest_end_to_end(fake_site, make_client, tmp_path):
+def test_url_ingest_end_to_end(fake_site, make_client, tmp_path, monkeypatch):
     client = make_client(
         {
             "GENERATION_PROVIDER": "stub",
@@ -184,15 +212,15 @@ def test_url_ingest_end_to_end(fake_site, make_client, tmp_path):
     )
 
     graph_repo = None
+    local_graph = bind_mocked_url_capability(client, monkeypatch)
     try:
         response = client.post(
             "/ingest/url",
             json={"url": "https://example.com/start", "max_depth": 1, "max_pages": 2},
         )
         body = response.json()
-        import backend.app.main as main
 
-        graph_repo = main.app.state.graph_repo
+        graph_repo = local_graph
     finally:
         client.close()
 

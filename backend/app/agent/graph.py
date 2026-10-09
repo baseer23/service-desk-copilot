@@ -1,459 +1,894 @@
-"""The sole case orchestrator: durable LangGraph, structured reasoning, MCP tools."""
+"""Supervisor and two compiled subgraphs. Every capability invocation uses LangChain→MCP."""
 
-from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
+from hashlib import sha256
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Command, interrupt
-from backend.app.agent.models import TicketAnalysis, InvestigationDecision, MemoryFact
 from backend.app.agent.state import InvestigationState
-from backend.app.agent.tools import AgentToolHarness, READ_TOOLS
-from backend.app.repositories.fixtures import canonical_site
+from backend.app.agent.models import (
+    RequestIntent,
+    TicketAnalysis,
+    InvestigationPlan,
+    InvestigationDecision,
+    EvidenceItem,
+    MemoryFact,
+    VerificationResult,
+    FinalResponse,
+    ResearchSelection,
+)
+from backend.app.agent.tools import AgentToolHarness
+from backend.app.models.provider import LLMError
+from backend.app.mcp.client import MCPToolError
 
 LABELS = {
-    "search_knowledge": "Knowledge searched",
+    "search_memory": "Memory searched",
+    "search_remembered_facts": "Cross-case memory searched",
     "search_previous_tickets": "Previous incidents searched",
     "get_user_context": "User context checked",
     "get_company_context": "Company context checked",
     "get_site_context": "Site context checked",
     "get_device_context": "Device context checked",
-    "get_active_alerts": "Alerts checked",
+    "get_active_alerts": "Active alerts checked",
     "get_recent_changes": "Recent changes checked",
-    "search_remembered_facts": "Cross-case memory searched",
-    "remember_fact": "Confirmed fact saved",
-    "search_web": "Public web searched",
+    "search_knowledge": "Knowledge searched",
+    "search_graph": "Relationships searched",
+    "search_web": "Public sources searched",
     "fetch_web_page": "Public page fetched",
-    "save_case_note": "Case note saved",
 }
 
 
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+
 class ServiceDeskAgent:
-    def __init__(self, settings, mcp_client, memory_store, provider, checkpointer, ingest_service):
-        self.settings, self.memory, self.provider, self.ingest = (
-            settings,
-            memory_store,
-            provider,
-            ingest_service,
-        )
-        self.harness = AgentToolHarness(mcp_client)
+    def __init__(self, settings, mcp, provider, checkpointer):
+        self.settings, self.provider = settings, provider
+        self.harness = AgentToolHarness(mcp)
         self._case_locks = {}
-        graph = StateGraph(InvestigationState)
+        self.knowledge_subgraph = self._subgraph("knowledge")
+        self.case_subgraph = self._subgraph("service_desk")
+        builder = StateGraph(InvestigationState)
         for name in (
-            "analyze_ticket",
-            "load_memory",
-            "investigate",
-            "reason",
+            "classify_intent",
+            "understand_request",
+            "plan",
             "execute_tools",
+            "observe",
+            "reason",
+            "verify",
             "ask_human",
-            "research_web",
+            "research",
+            "remember",
             "finalize",
         ):
-            graph.add_node(name, getattr(self, name))
-        graph.add_edge(START, "analyze_ticket")
-        graph.add_edge("analyze_ticket", "load_memory")
-        graph.add_edge("load_memory", "investigate")
-        graph.add_edge("investigate", "reason")
-        graph.add_conditional_edges("reason", self.route)
-        graph.add_edge("execute_tools", "investigate")
-        graph.add_edge("ask_human", "investigate")
-        graph.add_edge("research_web", "reason")
-        graph.add_edge("finalize", END)
-        self.graph = graph.compile(checkpointer=checkpointer)
+            builder.add_node(name, getattr(self, name))
+        builder.add_node("knowledge_subgraph", self.knowledge_subgraph)
+        builder.add_node("case_subgraph", self.case_subgraph)
+        builder.add_edge(START, "classify_intent")
+        builder.add_edge("classify_intent", "understand_request")
+        builder.add_conditional_edges(
+            "understand_request",
+            lambda s: "knowledge_subgraph" if s["workflow"] == "knowledge" else "case_subgraph",
+        )
+        for sub in ("knowledge_subgraph", "case_subgraph"):
+            builder.add_edge(sub, "reason")
+        builder.add_edge("plan", "execute_tools")
+        builder.add_edge("execute_tools", "observe")
+        builder.add_edge("observe", "reason")
+        builder.add_conditional_edges("reason", self.route)
+        builder.add_edge("ask_human", "plan")
+        builder.add_edge("research", "observe")
+        builder.add_conditional_edges("verify", self.verification_route)
+        builder.add_edge("remember", "finalize")
+        builder.add_edge("finalize", END)
+        self.graph = builder.compile(checkpointer=checkpointer)
 
-    def config(self, case_id):
-        return {"configurable": {"thread_id": case_id}, "recursion_limit": 100}
+    def _subgraph(self, workflow):
+        graph = StateGraph(InvestigationState)
+        if workflow == "knowledge":
+            graph.add_node("understand_question", self.understand_question)
+            graph.add_node("retrieval_context", self.retrieval_context)
+            graph.add_node("formulate_retrieval_plan", self.plan)
+            graph.add_edge(START, "understand_question")
+            graph.add_edge("understand_question", "retrieval_context")
+            graph.add_edge("retrieval_context", "formulate_retrieval_plan")
+            graph.add_edge("formulate_retrieval_plan", "execute_tools")
+        else:
+            for name in (
+                "analyze_ticket",
+                "identify_entities",
+                "load_memory",
+                "formulate_investigation_plan",
+            ):
+                graph.add_node(
+                    name,
+                    self.plan if name == "formulate_investigation_plan" else getattr(self, name),
+                )
+            graph.add_edge(START, "analyze_ticket")
+            graph.add_edge("analyze_ticket", "identify_entities")
+            graph.add_edge("identify_entities", "load_memory")
+            graph.add_edge("load_memory", "formulate_investigation_plan")
+            graph.add_edge("formulate_investigation_plan", "execute_tools")
+        graph.add_node("execute_tools", self.execute_tools)
+        graph.add_node("observe", self.observe)
+        graph.add_edge("execute_tools", "observe")
+        graph.add_edge("observe", END)
+        return graph.compile()
+
+    async def initialize(self):
+        await self.harness.initialize()
+
+    @staticmethod
+    def config(case_id):
+        return {"configurable": {"thread_id": case_id}, "recursion_limit": 180}
+
+    async def note(self, state, tool, text, source="agent", event_key=None):
+        await self.harness.invoke(
+            "save_case_note",
+            {
+                "case_id": state["case_id"],
+                "tool": tool,
+                "text": text,
+                "source": source,
+                "event_key": event_key,
+            },
+        )
+
+    async def _call(self, state, name, arguments):
+        result = await self.harness.invoke(name, arguments)
+        rows = (
+            result.get("items", [])
+            if isinstance(result, dict)
+            else result
+            if isinstance(result, list)
+            else []
+        )
+        await self.note(
+            state,
+            name,
+            f"{LABELS.get(name,name)}: {len(rows)} result(s)",
+            result.get("source_system", "capability") if isinstance(result, dict) else "capability",
+        )
+        return result
 
     async def run_case(self, case_id, answer=None):
         lock = self._case_locks.setdefault(case_id, asyncio.Lock())
         async with lock:
-            stored = self.memory.load_case(case_id)
-            if stored is None:
+            stored = (await self.harness.invoke("get_case", {"case_id": case_id}))["result"]
+            if not stored:
                 raise KeyError(case_id)
-            config = self.config(case_id)
-            checkpoint = await self.graph.aget_state(config)
+            checkpoint = await self.graph.aget_state(self.config(case_id))
             if answer is not None:
                 if not checkpoint.next or stored.get("status") != "needs_input":
                     raise ValueError("This case is not awaiting human input")
                 graph_input = Command(resume=answer)
             elif checkpoint.values:
-                # Retry a failed node using its checkpoint, never START. Paused
-                # human interrupts still require Command(resume=answer).
                 if stored.get("status") == "error" and checkpoint.next:
                     graph_input = None
                 else:
-                    return self._save_snapshot(case_id, checkpoint.values)
+                    return await self._save(case_id, dict(checkpoint.values))
             else:
-                graph_input = {**stored, "status": "investigating", "research_iteration": 0}
+                graph_input = {
+                    **stored,
+                    "status": "investigating",
+                    "evidence": [
+                        EvidenceItem(
+                            id=sha256((case_id + stored["ticket"]["summary"]).encode()).hexdigest()[
+                                :20
+                            ],
+                            source_system="human_input",
+                            source_type="human_report",
+                            tool="user_request",
+                            timestamp=now(),
+                            observed_at=now(),
+                            source="ticket_report",
+                            content={"reported_request": stored["ticket"]["summary"]},
+                            reliability=0.7,
+                            case_id=case_id,
+                        ).model_dump()
+                    ],
+                    "confirmed_facts": [],
+                    "remembered_facts": [],
+                    "human_answers": [],
+                    "contradictions": [],
+                    "actions_already_taken": [],
+                    "research_iteration": 0,
+                    "research_rounds": 0,
+                }
             try:
-                await self.graph.ainvoke(graph_input, config)
-                snapshot = await self.graph.aget_state(config)
-                return self._save_snapshot(case_id, snapshot.values)
+                await self.graph.ainvoke(graph_input, self.config(case_id))
+                snapshot = await self.graph.aget_state(self.config(case_id))
+                return await self._save(case_id, dict(snapshot.values))
             except Exception:
-                snapshot = await self.graph.aget_state(config)
+                snapshot = await self.graph.aget_state(self.config(case_id))
                 state = dict(snapshot.values or stored)
                 state.update(
                     status="error",
-                    uncertainty=["Investigation failed; inspect the explicit API error."],
+                    uncertainty=["Investigation failed; the API error identifies the failure."],
                 )
-                self.memory.save_case(case_id, state)
-                self.memory.record_event(case_id, "error", "application", "Investigation failed")
+                await self._save(case_id, state)
+                await self.note(state, "error", "Investigation failed", "application")
                 raise
 
-    def _save_snapshot(self, case_id, values):
-        state = dict(values)
-        self.memory.save_case(case_id, state)
+    async def _save(self, case_id, state):
+        await self.harness.invoke("save_case", {"case_id": case_id, "state": state})
         return state
 
-    async def _call(self, state, name, arguments):
-        result = await self.harness.invoke(name, arguments)
-        count = len(result) if isinstance(result, list) else int(bool(result))
-        rows = result if isinstance(result, list) else [result] if result else []
-        source = rows[0].get("source_system") if rows else None
-        source = source or ("chroma" if name == "search_knowledge" else "capability")
-        self.memory.record_event(
-            state["case_id"],
-            name,
-            source,
-            f"{LABELS.get(name, name)}: {count} result(s)",
-        )
-        return result
-
-    @staticmethod
-    def _evidence(name, result):
-        rows = result if isinstance(result, list) else [result] if result else []
+    def context(self, state, include_tools=False):
+        # Preserve full evidence in storage/UI; bound the model context, retaining
+        # all human facts, contradictions and the newest source records.
         evidence = []
-        for row in rows:
-            meta = row.get("metadata", {})
+        for row in state.get("evidence", [])[-24:]:
+            content = row["content"]
+            meta = content.get("metadata", {})
+            body = {
+                k: v
+                for k, v in content.items()
+                if k
+                not in {
+                    "source_system",
+                    "source",
+                    "observed_at",
+                    "metadata",
+                    "content_hash",
+                    "id",
+                    "case_id",
+                }
+            }
+            if "text" in body:
+                body["text"] = str(body["text"])[:1600]
+                body["title"] = meta.get("title") or body.get("title")
+                body["url"] = row.get("url")
             evidence.append(
                 {
-                    "tool": name,
-                    "source": row.get("source") or meta.get("source") or row.get("url") or name,
-                    "source_system": row.get("source_system")
-                    or ("chroma" if name == "search_knowledge" else "sqlite_memory"),
-                    "observed_at": row.get("observed_at")
-                    or meta.get("created_at")
-                    or datetime.now(timezone.utc).isoformat(),
-                    "content": row,
+                    k: row[k]
+                    for k in (
+                        "id",
+                        "tool",
+                        "source_system",
+                        "source_type",
+                        "timestamp",
+                        "reliability",
+                    )
                 }
+                | {"content": body}
             )
-        return evidence
+        result = {
+            k: state.get(k)
+            for k in (
+                "ticket",
+                "workflow",
+                "intent",
+                "analysis",
+                "remembered_facts",
+                "confirmed_facts",
+                "human_answers",
+                "contradictions",
+                "decision",
+                "verification",
+                "decision_issues",
+                "research_rounds",
+                "available_context",
+            )
+        }
+        result["evidence"] = evidence
+        if include_tools:
+            result["available_tools"] = self.harness.schemas(state.get("workflow", "service_desk"))
+        return result
+
+    async def classify_intent(self, state):
+        intent = await self.provider.generate_structured(
+            "classify_intent", {"request": state["ticket"]["summary"]}, RequestIntent
+        )
+        await self.note(
+            state, "classify_intent", f"Request classified: {intent.workflow}", self.provider.name()
+        )
+        return {"intent": intent.model_dump(), "workflow": intent.workflow}
+
+    async def understand_request(self, state):
+        await self.note(state, "understand_request", state["intent"]["goal"], self.provider.name())
+        return {"status": "investigating"}
+
+    async def understand_question(self, state):
+        await self.note(
+            state,
+            "understand_question",
+            "Knowledge workflow selected; evidence is required for an answer",
+        )
+        return {"analysis": {"symptoms": state["ticket"]["summary"], "entities": []}}
+
+    async def retrieval_context(self, state):
+        result = await self._call(state, "list_available_context", {})
+        return {"available_context": result["result"]}
 
     async def analyze_ticket(self, state):
         analysis = await self.provider.generate_structured(
             "analyze_ticket", {"ticket": state["ticket"]}, TicketAnalysis
         )
-        self.memory.record_event(
-            state["case_id"], "analyze_ticket", self.provider.name(), "Ticket analyzed"
+        await self.note(state, "analyze_ticket", "Ticket analyzed", self.provider.name())
+        return {"analysis": analysis.model_dump()}
+
+    async def identify_entities(self, state):
+        await self.note(
+            state,
+            "identify_entities",
+            "Request identifiers extracted; unknown operational details remain unknown",
         )
-        return {
-            "analysis": analysis.model_dump(),
-            "hypotheses": analysis.initial_hypotheses,
-            "evidence": [],
-            "confirmed_facts": [],
-            "human_answers": [],
-            "tool_events": [],
-            "web_sources": [],
-        }
+        result = await self._call(state, "list_available_context", {})
+        return {"available_context": result["result"]}
 
     async def load_memory(self, state):
         subject = state["analysis"].get("user_name")
-        facts = (
-            await self._call(state, "search_remembered_facts", {"subject": subject})
-            if subject
-            else []
-        )
-        # Latest confirmed value per predicate; retain provenance and original case ID.
-        useful = {}
-        for fact in facts:
-            if fact.get("reliability") == "confirmed" and fact.get("source") in {
-                "human_confirmed",
-                "trusted_tool",
-                "resolved_outcome",
-            }:
-                useful.setdefault(fact["predicate"], fact)
-        return {"remembered_facts": list(useful.values())}
+        if not subject:
+            return {"remembered_facts": []}
+        result = await self._call(state, "search_memory", {"subject": subject})
+        facts = result["items"]
+        evidence = self._evidence(state, "search_memory", result)
+        return {"remembered_facts": facts, "evidence": state.get("evidence", []) + evidence}
 
-    def _fact_values(self, state):
-        values = {f["predicate"]: f["value"] for f in state.get("remembered_facts", [])}
-        values.update({f["predicate"]: f["value"] for f in state.get("confirmed_facts", [])})
-        return values
-
-    async def investigate(self, state):
-        a = state["analysis"]
-        site = self._fact_values(state).get("current_site") or a.get("site")
-        if "previous_tickets" in state and state.get("context_site") == site:
+    async def plan(self, state):
+        if state.get("plan") and not state.get("plan_executed"):
             return {}
-        calls = [
-            (
-                "search_knowledge",
-                {
-                    "question": state["ticket"]["summary"],
-                    "mode": "HYBRID",
-                    "top_k": self.settings.top_k,
-                },
-            ),
-            (
-                "search_previous_tickets",
-                {
-                    "query": a["symptoms"],
-                    "user": a.get("user_name"),
-                    "company": a.get("company"),
-                    "site": site,
-                },
-            ),
-        ]
-        if a.get("user_name"):
-            calls += [
-                ("get_user_context", {"user_name": a["user_name"], "company": a.get("company")}),
-                ("get_device_context", {"device_or_user": a.get("device") or a["user_name"]}),
-            ]
-        if a.get("company"):
-            calls += [
-                ("get_company_context", {"company": a["company"]}),
-                (
-                    "get_active_alerts",
-                    {"company": a["company"], "site": site, "product": a.get("product")},
-                ),
-                (
-                    "get_recent_changes",
-                    {"company": a["company"], "site": site, "product": a.get("product")},
-                ),
-            ]
-            if site:
-                calls += [("get_site_context", {"company": a["company"], "site": site})]
-        evidence = [e for e in state.get("evidence", []) if e["tool"] not in {n for n, _ in calls}]
-        update = {
-            "context_site": site,
-            "previous_tickets": [],
-            "knowledge": [],
-            "alerts": [],
-            "changes": [],
+        plan = await self.provider.generate_structured(
+            "plan", self.context(state, True), InvestigationPlan
+        )
+        try:
+            self.harness.validate_plan(plan, state["workflow"])
+        except ValueError as exc:
+            raise LLMError("Model plan failed tool permission or argument validation") from exc
+        await self.note(
+            state,
+            "plan",
+            f"Plan: {plan.goal}. " + "; ".join(c.name + ": " + c.reason for c in plan.tool_calls),
+            self.provider.name(),
+        )
+        return {"plan": plan.model_dump(), "plan_executed": False}
+
+    async def execute_tools(self, state):
+        plan = InvestigationPlan.model_validate(state["plan"])
+        try:
+            self.harness.validate_plan(plan, state["workflow"])
+        except ValueError as exc:
+            raise LLMError("Model plan failed tool permission or argument validation") from exc
+        results = [None] * len(plan.tool_calls)
+        web_round = any(c.name == "search_web" for c in plan.tool_calls)
+
+        async def execute(index):
+            call = plan.tool_calls[index]
+            try:
+                if (
+                    call.name in {"search_web", "fetch_web_page"}
+                    and state.get("research_rounds", 0) >= self.settings.max_research_rounds
+                ):
+                    raise MCPToolError("Public research round limit reached")
+                results[index] = {
+                    "name": call.name,
+                    "output": await self._call(state, call.name, call.arguments),
+                }
+            except MCPToolError as exc:
+                await self.note(state, call.name, f"Capability failed: {call.name}", "tool_error")
+                results[index] = {
+                    "name": call.name,
+                    "output": {
+                        "tool": call.name,
+                        "source_system": "tool_error",
+                        "timestamp": now(),
+                        "reliability": 0,
+                        "status": "error",
+                        "error": str(exc),
+                        "items": [],
+                    },
+                }
+
+        grouped = {i for group in plan.parallel_groups for i in group}
+        for group in plan.parallel_groups:
+            await asyncio.gather(*(execute(i) for i in group))
+        for i in range(len(results)):
+            if i not in grouped:
+                await execute(i)
+        return {
+            "tool_results": results,
+            "plan_executed": True,
+            "research_rounds": state.get("research_rounds", 0) + int(web_round),
         }
-        destinations = {
-            "search_knowledge": "knowledge",
-            "search_previous_tickets": "previous_tickets",
-            "get_active_alerts": "alerts",
-            "get_recent_changes": "changes",
-        }
-        for name, arguments in calls:
-            result = await self._call(state, name, arguments)
-            evidence += self._evidence(name, result)
-            if name in destinations:
-                update[destinations[name]] = result
-        update["evidence"] = evidence
-        return update
+
+    def _evidence(self, state, name, result):
+        if not isinstance(result, dict) or "items" not in result:
+            rows = result if isinstance(result, list) else [result] if result else []
+            result = {
+                "items": rows,
+                "timestamp": now(),
+                "source_system": "public_web"
+                if name in {"search_web", "fetch_web_page"}
+                else "capability",
+                "reliability": 0.6,
+            }
+        rows = result["items"]
+        if result.get("status") == "error":
+            rows = [{"error": result.get("error")}]
+        items = []
+        for row in rows:
+            meta = row.get("metadata", {})
+            system = row.get("source_system") or result["source_system"]
+            stamp = row.get("observed_at") or meta.get("created_at") or result["timestamp"]
+            kind = (
+                "tool_error"
+                if system == "tool_error"
+                else "confirmed_fact"
+                if name in {"search_memory", "remember_fact"}
+                else "public_documentation"
+                if system == "public_web" or meta.get("source_type") == "web"
+                else "document"
+                if name == "search_knowledge"
+                else "system_record"
+            )
+            eid = sha256((name + str(row)).encode()).hexdigest()[:20]
+            items.append(
+                EvidenceItem(
+                    id=eid,
+                    source_system=system,
+                    source_type=kind,
+                    tool=name,
+                    timestamp=stamp,
+                    observed_at=stamp,
+                    source=row.get("source") or meta.get("source") or row.get("url") or name,
+                    content=row,
+                    entities=state.get("analysis", {}).get("entities", []),
+                    reliability=result["reliability"],
+                    relevance=1 / (1 + max(float(row.get("score", 0)), 0)),
+                    case_id=state["case_id"],
+                    url=row.get("url") or meta.get("url") or None,
+                    doc_id=meta.get("doc_id"),
+                ).model_dump()
+            )
+        return items
+
+    async def observe(self, state):
+        evidence = list(state.get("evidence", []))
+        seen = {e["id"] for e in evidence}
+        for item in state.get("tool_results", []):
+            for row in self._evidence(state, item["name"], item["output"]):
+                if row["id"] not in seen:
+                    evidence.append(row)
+                    seen.add(row["id"])
+        contradictions = list(state.get("contradictions", []))
+        by_predicate = {}
+        for fact in state.get("remembered_facts", []) + state.get("confirmed_facts", []):
+            key = (fact["subject"], fact["predicate"])
+            old = by_predicate.get(key)
+            if old and old["value"] != fact["value"]:
+                message = f"Conflicting {key[1]} for {key[0]}: {old['value']} ({old['source']}, {old['observed_at']}) versus {fact['value']} ({fact['source']}, {fact['observed_at']}). Evaluate freshness before reuse."
+                if message not in contradictions:
+                    contradictions.append(message)
+            by_predicate[key] = fact
+        await self.note(
+            state,
+            "observe",
+            f"Evidence correlated: {len(evidence)} items; {len(contradictions)} contradictions",
+        )
+        return {"evidence": evidence, "contradictions": contradictions, "tool_results": []}
 
     async def reason(self, state):
         iteration = state.get("research_iteration", 0) + 1
-        context = {
-            k: state.get(k, [])
-            for k in (
-                "confirmed_facts",
-                "remembered_facts",
-                "evidence",
-                "previous_tickets",
-                "knowledge",
-                "alerts",
-                "changes",
-                "human_answers",
-                "web_sources",
-            )
-        }
-        context.update(
-            analysis=state["analysis"],
-            available_tools=self.harness.schemas(),
-            web_attempted=bool(state.get("web_sources"))
-            or any(e["tool"] == "search_web" for e in self.memory.list_events(state["case_id"])),
+        decision = await self.provider.generate_structured(
+            "reason", self.context(state, True), InvestigationDecision
         )
-        decision = await self.provider.generate_structured("reason", context, InvestigationDecision)
-        if not state.get("evidence") and decision.enough_information:
+        self._validate_evidence_refs(
+            state, [i for h in decision.hypotheses for i in h.evidence_ids]
+        )
+        issues = []
+        if state["workflow"] == "knowledge" and decision.human_field in {
+            "current_site",
+            "required_update_installed",
+        }:
+            issues.append("A ticket-specific question is not permitted for this knowledge request.")
+        if decision.human_field == "current_site":
+            product = (state.get("analysis", {}).get("product") or "").casefold()
+            import re
+
+            product_terms = set(re.findall(r"\w+", product))
+            relevant_sites = [
+                e
+                for e in state.get("evidence", [])
+                if e["tool"] in {"get_active_alerts", "get_recent_changes", "get_site_context"}
+                and e["content"].get("site")
+                and (
+                    not product_terms
+                    or product_terms
+                    & set(re.findall(r"\w+", str(e["content"].get("product", "")).casefold()))
+                )
+            ]
+            if not relevant_sites:
+                issues.append(
+                    "Location question lacks materially site-specific evidence relevant to this issue. Choose an identity/error/device clarification instead when needed."
+                )
+        if decision.question_for_human and not decision.question_reason:
+            issues.append("Human question lacks a material decision justification.")
+        if not self.usable_evidence(state):
             decision.enough_information = False
             decision.confidence = 0
-            decision.uncertainty.append("No supporting evidence is available.")
-        if iteration >= self.settings.max_investigation_cycles:
-            decision.question_for_human = None
-            decision.human_field = None
-            decision.requested_tools = []
-            decision.needs_web_research = False
-            decision.enough_information = False
-            decision.uncertainty.append(
-                "Investigation cycle limit reached; additional technician evidence is required."
-            )
-        self.memory.record_event(
-            state["case_id"],
+        await self.note(
+            state,
             "reason",
-            self.provider.name(),
             decision.decision_justification or decision.evidence_summary,
+            self.provider.name(),
         )
         return {
             "decision": decision.model_dump(),
+            "decision_issues": issues,
             "research_iteration": iteration,
-            "hypotheses": decision.hypotheses,
+            "hypotheses": [h.model_dump() for h in decision.hypotheses],
             "inferences": decision.inferences,
-            "missing_information": decision.missing_information,
+            "missing_information": [m.model_dump() for m in decision.missing_information],
             "confidence": decision.confidence,
             "uncertainty": decision.uncertainty,
             "likely_issue": decision.likely_issue,
             "recommended_next_action": decision.recommended_next_action,
             "pending_question": decision.question_for_human,
             "pending_field": decision.human_field,
-            "requested_tools": [t.model_dump() for t in decision.requested_tools],
             "status": "needs_input" if decision.question_for_human else "investigating",
         }
 
     @staticmethod
-    def route(state):
-        d = state["decision"]
-        if d.get("question_for_human"):
-            return "ask_human"
-        if d.get("requested_tools"):
-            return "execute_tools"
-        if d.get("needs_web_research"):
-            return "research_web"
-        return "finalize"
+    def usable_evidence(state):
+        return [
+            e
+            for e in state.get("evidence", [])
+            if e["source_type"] != "tool_error"
+            and e["tool"] not in {"list_available_context", "search_web", "user_request"}
+            and not e["content"].get("available") is False
+        ]
 
-    async def execute_tools(self, state):
-        evidence = list(state.get("evidence", []))
-        update = {}
-        destinations = {
-            "search_knowledge": "knowledge",
-            "search_previous_tickets": "previous_tickets",
-            "get_active_alerts": "alerts",
-            "get_recent_changes": "changes",
-        }
-        for request in state["requested_tools"]:
-            if request["name"] not in READ_TOOLS:
-                raise ValueError("Reasoning may only request read capabilities")
-            result = await self._call(state, request["name"], request["arguments"])
-            evidence += self._evidence(request["name"], result)
-            if request["name"] in destinations:
-                update[destinations[request["name"]]] = result
-        return {**update, "evidence": evidence}
+    def route(self, state):
+        if state["research_iteration"] >= self.settings.max_investigation_cycles:
+            return "finalize"
+        d = state["decision"]
+        if d.get("requested_tools"):
+            return "plan"
+        if (
+            d.get("needs_web_research")
+            and state.get("research_rounds", 0) < self.settings.max_research_rounds
+        ):
+            return "research"
+        return "verify"
 
     async def ask_human(self, state):
-        answer = interrupt(
-            {
-                "question": state["pending_question"],
-                "field": state["pending_field"],
-                "case_id": state["case_id"],
-            }
+        # The request event has a stable key, so interrupt replay cannot duplicate it.
+        await self.note(
+            state,
+            "human_input_requested",
+            state["pending_question"],
+            "langgraph",
+            event_key=f"human-question:{state.get('research_iteration')}:{state['pending_field']}",
         )
-        answer = str(answer).strip()
+        answer = str(
+            interrupt(
+                {
+                    "question": state["pending_question"],
+                    "field": state["pending_field"],
+                    "case_id": state["case_id"],
+                }
+            )
+        ).strip()
         if not answer:
             raise ValueError("Human answer cannot be empty")
-        a, field = state["analysis"], state["pending_field"]
-        value = (
-            canonical_site(answer, a.get("company") or "") if field == "current_site" else answer
+        field = state["pending_field"]
+        subject = (
+            state["decision"].get("question_subject")
+            or state["analysis"].get("user_name")
+            or state["case_id"]
         )
-        if field == "required_update_installed":
-            lower = answer.lower()
-            if lower in {"yes", "installed", "yes installed", "yes, installed"}:
-                value = "Yes"
-            elif lower in {"no", "not installed"}:
-                value = "No"
+        value = answer
+        if field == "current_site" and state["analysis"].get("company"):
+            for site in state.get("available_context", {}).get("sites", []):
+                if answer.casefold() in site.casefold():
+                    value = site
+            if answer.casefold() in {"2nd floor", "second floor"}:
+                value = state["analysis"]["company"] + " 2nd floor"
         fact = MemoryFact(
-            subject=a.get("user_name") or state["case_id"],
-            predicate=field or "human_answer",
+            subject=subject,
+            predicate=field,
             value=value,
             source="human_confirmed",
             source_system="human_input",
-            observed_at=datetime.now(timezone.utc).isoformat(),
+            observed_at=now(),
             confidence=1,
             case_id=state["case_id"],
-            metadata={"question": state["pending_question"], "answer": answer},
+            metadata={"question": state["pending_question"]},
         )
-        saved = await self._call(state, "remember_fact", {"fact": fact.model_dump()})
-        await self._call(
-            state,
-            "save_case_note",
-            {
-                "case_id": state["case_id"],
-                "text": f"Human confirmed {field}: {value}",
-                "source": "human_confirmed",
-            },
+        await self._call(state, "remember_fact", {"fact": fact.model_dump()})
+        await self.note(
+            state, "human_response", f"Human response received: {answer}", "human_input"
+        )
+        await self.note(state, "resume", "Investigation resumed from saved checkpoint", "langgraph")
+        item = EvidenceItem(
+            id=sha256((state["case_id"] + field + answer).encode()).hexdigest()[:20],
+            source_system="human_input",
+            source_type="human_confirmation",
+            tool="ask_human",
+            timestamp=fact.observed_at,
+            observed_at=fact.observed_at,
+            source="human_confirmed",
+            content=fact.model_dump(),
+            entities=[subject],
+            reliability=1,
+            case_id=state["case_id"],
         )
         return {
-            "confirmed_facts": state.get("confirmed_facts", []) + [saved],
+            "confirmed_facts": state.get("confirmed_facts", []) + [fact.model_dump()],
+            "evidence": state.get("evidence", []) + [item.model_dump()],
             "human_answers": state.get("human_answers", [])
             + [{"question": state["pending_question"], "answer": answer}],
+            "status": "investigating",
             "pending_question": None,
             "pending_field": None,
-            "status": "investigating",
+            "plan_executed": True,
         }
 
-    async def research_web(self, state):
-        evidence, sources = list(state.get("evidence", [])), list(state.get("web_sources", []))
-        try:
-            results = await self._call(
-                state, "search_web", {"query": state["ticket"]["summary"], "max_results": 3}
+    async def research(self, state):
+        decision = state["decision"]
+        queries = decision.get("research_queries", [])
+        if not queries:
+            raise ValueError(
+                "Public research requires a model-formulated query tied to an evidence gap"
             )
-            for result in results[:2]:
-                try:
-                    page = await self._call(state, "fetch_web_page", {"url": result["url"]})
-                    if not page.get("text") or len(page["text"].strip()) < 80:
-                        continue
-                    # Canonical IngestService is reused; repositories stay out of LangChain tools.
-                    await asyncio.to_thread(
-                        self.ingest.ingest_text,
-                        page["title"],
-                        page["text"],
-                        source=page["url"],
-                        source_type="web",
-                        url=page["url"],
-                    )
-                    sources.append(page)
-                    evidence += self._evidence("fetch_web_page", page)
-                    self.memory.record_event(
-                        state["case_id"],
-                        "ingest_web",
-                        "ingestion",
-                        f"Web knowledge ingested: {page['title']}",
-                    )
-                except Exception:
-                    self.memory.record_event(
-                        state["case_id"],
-                        "fetch_web_page",
-                        "public_web",
-                        "Web page could not be safely fetched or ingested",
-                    )
-            knowledge = await self._call(
-                state,
-                "search_knowledge",
-                {
-                    "question": state["ticket"]["summary"],
-                    "mode": "HYBRID",
-                    "top_k": self.settings.top_k,
+        outputs = []
+        domains = decision.get("preferred_domains", [])
+        from urllib.parse import urlparse
+
+        async def failed(name, error):
+            outputs.append({
+                "name": name,
+                "output": {
+                    "tool": name, "source_system": "tool_error", "timestamp": now(),
+                    "reliability": 0, "status": "error", "error": str(error), "items": [],
                 },
+            })
+            await self.note(state, name, "Public research capability unavailable", "tool_error")
+
+        for query in queries[:2]:
+            try:
+                search = await self._call(state, "search_web", {"query": query, "max_results": 3})
+            except MCPToolError as exc:
+                await failed("search_web", exc)
+                continue
+            outputs.append({"name": "search_web", "output": search})
+            rows = (
+                search.get("items", [])
+                if isinstance(search, dict) and "items" in search
+                else search
             )
-            evidence += self._evidence("search_knowledge", knowledge)
-        except Exception:
-            knowledge = state.get("knowledge", [])
-            self.memory.record_event(
-                state["case_id"], "search_web", "public_web", "Public web research unavailable"
+            rows = sorted(
+                rows,
+                key=lambda r: 0
+                if any(
+                    (urlparse(r.get("url", "")).hostname or "").casefold() == d.casefold()
+                    or (urlparse(r.get("url", "")).hostname or "").casefold().endswith("." + d.casefold())
+                    for d in domains
+                )
+                else 1,
             )
-        return {"web_sources": sources, "knowledge": knowledge, "evidence": evidence}
+            selection = await self.provider.generate_structured(
+                "evaluate_sources",
+                {
+                    "ticket": state["ticket"],
+                    "request": state["ticket"]["summary"],
+                    "query": query,
+                    "results": rows,
+                    "preferred_domains": domains,
+                    "missing_evidence": decision.get("missing_information", []),
+                },
+                ResearchSelection,
+            )
+            available = {r["url"]: r for r in rows}
+            if set(selection.selected_urls) - set(available):
+                raise LLMError("Research selection contains a URL absent from search results")
+            await self.note(
+                state, "evaluate_sources", selection.justification, self.provider.name()
+            )
+            for url in selection.selected_urls:
+                hit = available[url]
+                capability_name = "fetch_web_page"
+                try:
+                    fetched = await self._call(state, "fetch_web_page", {"url": hit["url"]})
+                    outputs.append({"name": "fetch_web_page", "output": fetched})
+                    page = fetched["result"] if "result" in fetched else fetched
+                    text = page.get("text", "")
+                    if len(text.strip()) < 120:
+                        continue
+                    useful = await self.provider.generate_structured(
+                        "evaluate_sources",
+                        {
+                            "request": state["ticket"]["summary"],
+                            "query": query,
+                            "results": [
+                                {"url": page["url"], "title": page.get("title"), "text": text[:6000]}
+                            ],
+                            "preferred_domains": domains,
+                            "missing_evidence": decision.get("missing_information", []),
+                            "purpose": "Assess actual fetched content for usefulness before ingestion.",
+                        },
+                        ResearchSelection,
+                    )
+                    if set(useful.selected_urls) - {page["url"]}:
+                        raise LLMError("Fetched-source evaluation selected an unknown URL")
+                    await self.note(
+                        state, "evaluate_sources", useful.justification, self.provider.name()
+                    )
+                    if not useful.selected_urls:
+                        continue
+                    # Public material stays untrusted, with URL/document provenance.
+                    capability_name = "ingest_text"
+                    await self._call(
+                        state,
+                        "ingest_text",
+                        {
+                            "text": text,
+                            "title": page.get("title"),
+                            "source": page["url"],
+                            "source_type": "web",
+                            "url": page["url"],
+                        },
+                    )
+                except MCPToolError as exc:
+                    await failed(capability_name, exc)
+        knowledge = await self._call(
+            state,
+            "search_knowledge",
+            {"question": state["ticket"]["summary"], "mode": "HYBRID", "top_k": 6},
+        )
+        outputs.append({"name": "search_knowledge", "output": knowledge})
+        return {"tool_results": outputs, "research_rounds": state.get("research_rounds", 0) + 1}
+
+    def _validate_evidence_refs(self, state, ids):
+        if set(ids) - {e["id"] for e in state.get("evidence", [])}:
+            raise LLMError("Structured reasoning cited unknown evidence identifiers")
+
+    async def verify(self, state):
+        # Judge the current candidate independently; prior critic text and
+        # preliminary analysis hypotheses can otherwise anchor the review.
+        context = self.context(state)
+        context = {
+            key: context[key]
+            for key in (
+                "ticket", "workflow", "decision", "evidence", "confirmed_facts",
+                "remembered_facts", "human_answers", "contradictions",
+            )
+        }
+        verification = await self.provider.generate_structured(
+            "verify", context, VerificationResult
+        )
+        self._validate_evidence_refs(state, verification.evidence_ids)
+        if state.get("decision_issues"):
+            verification.unsupported_claims = list(
+                dict.fromkeys(verification.unsupported_claims + state["decision_issues"])
+            )
+            verification.should_continue_research = True
+        if not self.usable_evidence(state) and not state["decision"].get("question_for_human"):
+            verification.confidence = 0
+            verification.unsupported_claims.append("No supporting evidence is available.")
+        await self.note(state, "verify", verification.justification, self.provider.name())
+        return {
+            "verification": verification.model_dump(),
+            "confidence": min(state.get("confidence", 0), verification.confidence),
+            "uncertainty": list(
+                dict.fromkeys(
+                    state.get("uncertainty", [])
+                    + verification.missing_evidence
+                    + verification.unsupported_claims
+                )
+            ),
+            "contradictions": list(
+                dict.fromkeys(state.get("contradictions", []) + verification.contradictions)
+            ),
+        }
+
+    def verification_route(self, state):
+        v = state["verification"]
+        decision = state["decision"]
+        if state["research_iteration"] >= self.settings.max_investigation_cycles:
+            return "finalize"
+        if v["contradictions"] and v["should_continue_research"]:
+            return "reason"
+        if decision.get("question_for_human"):
+            if not v["unsupported_claims"] and not v["contradictions"]:
+                return "ask_human"
+            return "reason" if v["should_continue_research"] else "finalize"
+        if v["should_continue_research"]:
+            return "plan"
+        return "remember" if not v["unsupported_claims"] else "finalize"
+
+    async def remember(self, state):
+        # Only explicit trusted record fields are eligible for reusable facts.
+        for evidence in state.get("evidence", []):
+            row = evidence["content"]
+            if evidence["tool"] == "get_user_context" and row.get("name") and row.get("company"):
+                fact = MemoryFact(
+                    subject=row["name"],
+                    predicate="works_at",
+                    value=row["company"],
+                    source="trusted_tool",
+                    source_system=evidence["source_system"],
+                    observed_at=evidence["timestamp"],
+                    confidence=evidence["reliability"],
+                    case_id=state["case_id"],
+                    metadata={"evidence_id": evidence["id"]},
+                )
+                await self._call(state, "remember_fact", {"fact": fact.model_dump()})
+        await self.note(
+            state, "remember", "Verified assessment recorded; issue resolution remains unconfirmed"
+        )
+        return {}
 
     async def finalize(self, state):
-        enough = state["decision"]["enough_information"] and bool(state.get("evidence"))
-        status = "assessment_ready" if enough else "insufficient_information"
-        action = (
-            state.get("recommended_next_action")
-            or "Collect diagnostic information with the service desk technician."
+        d = InvestigationDecision.model_validate(state["decision"])
+        v = state.get("verification", {})
+        limited = state["research_iteration"] >= self.settings.max_investigation_cycles
+        supported = (
+            bool(v)
+            and not v.get("unsupported_claims")
+            and d.enough_information
+            and bool(self.usable_evidence(state))
+            and not limited
         )
-        uncertainty = state.get("uncertainty", [])
-        if not enough and not uncertainty:
-            uncertainty = ["The available evidence is insufficient to recommend a cause."]
-        self.memory.record_event(
-            state["case_id"],
+        uncertainty = list(
+            dict.fromkeys(
+                d.uncertainty + v.get("missing_evidence", []) + v.get("unsupported_claims", [])
+            )
+        )
+        if limited:
+            uncertainty.append(
+                "Investigation cycle limit reached; additional technician evidence is required."
+            )
+        confidence = min(d.confidence, v.get("confidence", 0)) if supported else 0
+        events = (await self.harness.invoke("get_case_history", {"case_id": state["case_id"]}))[
+            "items"
+        ]
+        response = FinalResponse(
+            issue_summary=state["ticket"]["summary"],
+            answer=d.answer if supported else None,
+            likely_causes=d.hypotheses,
+            confirmed_facts=state.get("confirmed_facts", []),
+            inferences=d.inferences,
+            contradictions=state.get("contradictions", []),
+            evidence=state.get("evidence", []),
+            actions_already_taken=[e["content"] for e in events if e.get("tool") != "error"],
+            recommended_next_action=d.recommended_next_action
+            if not v.get("unsupported_claims")
+            else "Collect missing evidence before accepting the candidate assessment.",
+            troubleshooting_steps=d.troubleshooting_steps
+            if not v.get("unsupported_claims")
+            else [],
+            questions_remaining=[m.description for m in d.missing_information],
+            confidence=confidence,
+            uncertainty=uncertainty,
+            escalation_required=d.escalation_required or not supported,
+            sources=list(
+                dict.fromkeys(
+                    e["url"] or e["source"]
+                    for e in state.get("evidence", [])
+                    if e["source_type"] != "tool_error"
+                )
+            ),
+        )
+        await self.note(
+            state,
             "finalize",
-            "agent",
-            "Assessment ready" if enough else "Insufficient information",
+            "Assessment ready"
+            if supported
+            else "Insufficient information; explicit uncertainty retained",
         )
         return {
-            "status": status,
+            "status": "assessment_ready" if supported else "insufficient_information",
+            "confidence": confidence,
             "pending_question": None,
             "pending_field": None,
-            "final_answer": action,
             "uncertainty": uncertainty,
-            "confidence": state.get("confidence", 0) if state.get("evidence") else 0,
+            "final_response": response.model_dump(),
+            "final_answer": d.answer or d.recommended_next_action if supported else None,
+            "likely_issue": d.likely_issue if not v.get("unsupported_claims") else None,
+            "recommended_next_action": response.recommended_next_action,
+            "actions_already_taken": response.actions_already_taken,
         }

@@ -39,7 +39,7 @@ def test_upsert_entity_and_link(mock_driver):
     assert mock_driver.execute_write.call_count == 2
 
 
-def test_aura_backend_end_to_end(monkeypatch, make_client, tmp_path):
+def test_aura_repository_end_to_end(monkeypatch, tmp_path):
     import sys
     import types
 
@@ -162,28 +162,24 @@ def test_aura_backend_end_to_end(monkeypatch, make_client, tmp_path):
     fake_module.GraphDatabase = FakeGraphDatabase
     monkeypatch.setitem(sys.modules, "neo4j", fake_module)
 
-    client = make_client(
-        {
-            "GENERATION_PROVIDER": "stub",
-            "EMBED_PROVIDER": "stub",
-            "CHROMA_DIR": tmp_path / "chroma",
-            "NEO4J_URI": "neo4j+s://demo.neo4j.io",
-            "NEO4J_USER": "neo4j",
-            "NEO4J_PASSWORD": "secret",
-            "__use_real_repos": True,
-        }
+    from backend.app.core.config import Settings
+    from backend.app.services.capabilities import knowledge_stores
+
+    settings = Settings(
+        _env_file=None,
+        test_mode=True,
+        generation_provider="stub",
+        embed_provider="stub",
+        chroma_dir=tmp_path / "chroma",
+        case_db_path=tmp_path / "cases.db",
+        neo4j_uri="neo4j+s://demo.neo4j.io",
+        neo4j_user="neo4j",
+        neo4j_password="secret",
     )
-
-    import backend.app.main as main
-
+    _, repo, driver = knowledge_stores(settings)
     try:
-        assert isinstance(main.app.state.graph_repo, GraphRepository)
-        health = client.get("/health").json()
-        assert health["aura_configured"] is True
-        assert health["aura_connected"] is True
-
-        repo = main.app.state.graph_repo
-
+        assert isinstance(repo, GraphRepository)
+        assert driver is not None and repo.ping()
         repo.upsert_document("doc-1", title="Aura Doc")
         repo.upsert_chunk("doc-1", "doc-1-0", ord=0, text="Reset MFA instructions", token_count=42)
         repo.link_doc_chunk("doc-1", "doc-1-0")
@@ -198,4 +194,41 @@ def test_aura_backend_end_to_end(monkeypatch, make_client, tmp_path):
         assert records[0]["metadata"]["doc_id"] == "doc-1"
         assert records[0]["metadata"]["title"] == "Aura Doc"
     finally:
-        client.close()
+        driver.close()
+
+
+def test_relationship_discovery_is_bounded_parameterized_and_provenanced():
+    statements = []
+
+    class Tx:
+        def run(self, query, **args):
+            statements.append((query, args))
+            if "RETURN DISTINCT" in query:
+                return [
+                    {
+                        "subject": "B99 2nd floor",
+                        "predicate": "USES",
+                        "object": "WatchGuard VPN",
+                        "source_system": "local_fixture",
+                        "observed_at": "2026-10-08T10:00:00Z",
+                    }
+                ]
+            return []
+
+    class Driver:
+        def execute_write(self, fn):
+            return fn(Tx())
+
+        def execute_read(self, fn):
+            return fn(Tx())
+
+    from backend.app.repositories.fixtures import FixtureRepository
+
+    repo = GraphRepository(Driver())
+    repo.upsert_relationships(FixtureRepository().relationships())
+    rows = repo.search_relationships(["Jake Peralta"], limit=5)
+    assert rows[0]["predicate"] == "USES" and rows[0]["source_system"] == "local_fixture"
+    query, arguments = statements[-1]
+    assert "[*1..2]" in query and "LIMIT $limit" in query
+    assert arguments == {"terms": ["jake peralta"], "limit": 5}
+    assert any("WORKS_AT" in q for q, _ in statements)

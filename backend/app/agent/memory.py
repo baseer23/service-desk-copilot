@@ -60,6 +60,12 @@ class CaseMemoryStore:
                 )
                 """
             )
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+            if "event_key" not in columns:
+                conn.execute("ALTER TABLE events ADD COLUMN event_key TEXT")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS event_key_unique ON events(case_id,event_key) WHERE event_key IS NOT NULL"
+            )
             conn.commit()
 
     def save_case(self, case_id: str, state: dict[str, Any]) -> None:
@@ -154,11 +160,18 @@ class CaseMemoryStore:
                 )
             return results
 
-    def record_event(self, case_id: str, tool: str | None, source: str, content: str) -> None:
+    def record_event(
+        self,
+        case_id: str,
+        tool: str | None,
+        source: str,
+        content: str,
+        event_key: str | None = None,
+    ) -> None:
         with closing(self._connect()) as conn:
             conn.execute(
-                "INSERT INTO events(case_id, tool, source, content) VALUES (?, ?, ?, ?)",
-                (case_id, tool, source, content),
+                "INSERT OR IGNORE INTO events(case_id, tool, source, content, event_key) VALUES (?, ?, ?, ?, ?)",
+                (case_id, tool, source, content, event_key),
             )
             conn.commit()
 

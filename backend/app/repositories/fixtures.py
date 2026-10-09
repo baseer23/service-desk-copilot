@@ -70,9 +70,17 @@ class FixtureRepository:
         }
 
     def get_user_context(self, user_name, company=None):
+        if user_name.casefold() == "sarah":
+            return self._record(
+                name="Sarah",
+                company="B99",
+                product="Microsoft 365",
+                mfa_method="Authenticator",
+                current_site=None,
+            )
         return (
             dict(self.user)
-            if user_name.casefold() == "jake peralta"
+            if user_name.casefold() in {"jake", "jake peralta"}
             and (not company or company.casefold() == "b99")
             else {}
         )
@@ -89,6 +97,16 @@ class FixtureRepository:
         )
 
     def get_device_context(self, device_or_user):
+        if device_or_user.upper() == "PRN-ACCT-02":
+            return self._record(
+                name="PRN-ACCT-02",
+                company="B99",
+                department="Accounting",
+                product="Network printer",
+                queue_status="paused",
+                last_test_page="pending",
+                diagnostic="Queue paused after a paper-jam event; physical jam clearance is unconfirmed",
+            )
         return dict(self.device) if "jake" in device_or_user.lower() else {}
 
     def search_previous_tickets(self, query, user=None, company=None, site=None):
@@ -116,3 +134,16 @@ class FixtureRepository:
 
     def get_recent_changes(self, company, site=None, product=None):
         return [dict(self.change)] if self._matches(self.change, company, site, product) else []
+
+    def get_ticket(self, ticket_id):
+        return dict(self.incident) if ticket_id == self.incident["id"] else {}
+
+    def relationships(self):
+        return [
+            {"subject": "Jake Peralta", "predicate": "WORKS_AT", "object": "B99"},
+            {"subject": "B99", "predicate": "HAS_SITE", "object": "B99 2nd floor"},
+            {"subject": "B99 2nd floor", "predicate": "USES", "object": "WatchGuard VPN"},
+            {"subject": self.alert["id"], "predicate": "AFFECTS", "object": "B99 2nd floor"},
+            {"subject": self.change["id"], "predicate": "APPLIES_TO", "object": "WatchGuard VPN"},
+            {"subject": self.incident["id"], "predicate": "INVOLVES", "object": "WatchGuard VPN"},
+        ]

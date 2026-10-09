@@ -4,22 +4,23 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 
 class StructuredModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+
+class RequestIntent(StructuredModel):
+    workflow: Literal["knowledge", "service_desk"]
+    goal: str
+    justification: str
 
 
 class TicketAnalysis(StructuredModel):
-    user_name: str | None = Field(
-        default=None,
-        description="Full name of the affected user explicitly named in the ticket summary.",
-    )
-    company: str | None = Field(
-        default=None, description="Organization explicitly named in the ticket summary."
-    )
+    user_name: str | None = None
+    company: str | None = None
     site: str | None = None
     device: str | None = None
     product: str | None = None
-    issue_type: str = Field(min_length=1)
-    symptoms: str = Field(min_length=1)
+    issue_type: str
+    symptoms: str
     error_messages: list[str] = Field(default_factory=list)
     affected_scope: str | None = None
     entities: list[str] = Field(default_factory=list)
@@ -30,38 +31,139 @@ class TicketAnalysis(StructuredModel):
 class ToolRequest(StructuredModel):
     name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
+    reason: str = ""
+
+
+class InvestigationPlan(StructuredModel):
+    goal: str
+    known_facts: list[str] = Field(default_factory=list)
+    unknowns: list[str] = Field(default_factory=list)
+    tool_calls: list[ToolRequest] = Field(default_factory=list, max_length=6)
+    parallel_groups: list[list[int]] = Field(default_factory=list)
+    stop_condition: str
+
+    @model_validator(mode="after")
+    def groups_valid(self):
+        indexes = [i for group in self.parallel_groups for i in group]
+        if len(indexes) != len(set(indexes)) or any(
+            i < 0 or i >= len(self.tool_calls) for i in indexes
+        ):
+            raise ValueError("Parallel groups must contain unique valid tool indexes")
+        return self
+
+
+class EvidenceItem(StructuredModel):
+    id: str
+    source_system: str
+    source_type: Literal[
+        "confirmed_fact",
+        "human_confirmation",
+        "human_report",
+        "public_documentation",
+        "document",
+        "system_record",
+        "tool_error",
+    ]
+    tool: str
+    timestamp: str
+    observed_at: str
+    source: str
+    content: dict[str, Any]
+    entities: list[str] = Field(default_factory=list)
+    relevance: float = Field(default=1, ge=0, le=1)
+    reliability: float = Field(ge=0, le=1)
+    case_id: str | None = None
+    url: str | None = None
+    doc_id: str | None = None
+
+
+class Hypothesis(StructuredModel):
+    claim: str
+    evidence_ids: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0, ge=0, le=1)
+    status: Literal["plausible", "supported", "rejected"] = "plausible"
+
+
+class MissingInformation(StructuredModel):
+    description: str
+    affects_decision: bool = True
 
 
 class InvestigationDecision(StructuredModel):
-    hypotheses: list[str] = Field(default_factory=list)
+    hypotheses: list[Hypothesis] = Field(default_factory=list)
     inferences: list[str] = Field(default_factory=list)
     evidence_summary: str
-    missing_information: list[str] = Field(default_factory=list)
-    requested_tools: list[ToolRequest] = Field(default_factory=list, max_length=5)
-    question_for_human: str | None = Field(
-        default=None,
-        description="Question requiring a human answer, or null when no human input is needed.",
-    )
-    human_field: Literal["current_site", "required_update_installed", "other"] | None = Field(
-        default=None,
-        description="The field answered by question_for_human. Null when there is no question.",
-    )
+    missing_information: list[MissingInformation] = Field(default_factory=list)
+    requested_tools: list[ToolRequest] = Field(default_factory=list, max_length=6)
+    question_for_human: str | None = None
+    human_field: str | None = None
+    question_subject: str | None = None
+    question_reason: str | None = None
     needs_web_research: bool = False
+    research_queries: list[str] = Field(default_factory=list, max_length=3)
+    preferred_domains: list[str] = Field(default_factory=list, max_length=5)
     enough_information: bool
     likely_issue: str | None = None
+    answer: str | None = None
     recommended_next_action: str | None = None
+    troubleshooting_steps: list[str] = Field(default_factory=list)
+    escalation_required: bool = False
     confidence: float = Field(ge=0, le=1)
     uncertainty: list[str] = Field(default_factory=list)
     decision_justification: str = ""
 
+    @field_validator("hypotheses", mode="before")
+    @classmethod
+    def hypotheses_typed(cls, v):
+        return [{"claim": x} if isinstance(x, str) else x for x in v]
+
+    @field_validator("missing_information", mode="before")
+    @classmethod
+    def missing_typed(cls, v):
+        return [{"description": x} if isinstance(x, str) else x for x in v]
+
     @model_validator(mode="after")
-    def valid_question(self):
+    def question_valid(self):
         if not self.question_for_human:
-            self.question_for_human = None
-            self.human_field = None
+            self.question_for_human = self.human_field = None
         elif not self.human_field:
             raise ValueError("Human questions require a human_field")
         return self
+
+
+class ResearchSelection(StructuredModel):
+    selected_urls: list[str] = Field(default_factory=list, max_length=2)
+    evidence_gap: str
+    justification: str
+
+
+class VerificationResult(StructuredModel):
+    supported_claims: list[str] = Field(default_factory=list)
+    unsupported_claims: list[str] = Field(default_factory=list)
+    contradictions: list[str] = Field(default_factory=list)
+    missing_evidence: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+    confidence: float = Field(ge=0, le=1)
+    should_continue_research: bool
+    justification: str
+
+
+class FinalResponse(StructuredModel):
+    issue_summary: str
+    answer: str | None = None
+    likely_causes: list[Hypothesis] = Field(default_factory=list)
+    confirmed_facts: list[dict[str, Any]] = Field(default_factory=list)
+    inferences: list[str] = Field(default_factory=list)
+    contradictions: list[str] = Field(default_factory=list)
+    evidence: list[EvidenceItem] = Field(default_factory=list)
+    actions_already_taken: list[str] = Field(default_factory=list)
+    recommended_next_action: str | None = None
+    troubleshooting_steps: list[str] = Field(default_factory=list)
+    questions_remaining: list[str] = Field(default_factory=list)
+    confidence: float = Field(ge=0, le=1)
+    uncertainty: list[str] = Field(default_factory=list)
+    escalation_required: bool = False
+    sources: list[str] = Field(default_factory=list)
 
 
 class MemoryFact(StructuredModel):
@@ -78,6 +180,17 @@ class MemoryFact(StructuredModel):
 
     @field_validator("observed_at")
     @classmethod
-    def valid_timestamp(cls, value):
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return value
+    def timestamp_valid(cls, v):
+        datetime.fromisoformat(v.replace("Z", "+00:00"))
+        return v
+
+
+class CapabilityResult(StructuredModel):
+    tool: str
+    source_system: str
+    timestamp: str
+    reliability: float = Field(ge=0, le=1)
+    status: Literal["ok", "unavailable", "error"] = "ok"
+    error: str | None = None
+    items: list[dict[str, Any]] = Field(default_factory=list)
+    result: Any = None

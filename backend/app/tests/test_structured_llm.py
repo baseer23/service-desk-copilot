@@ -128,3 +128,47 @@ def test_human_question_requires_an_answer_field():
             question_for_human="Which site?",
             human_field=None,
         )
+
+
+@pytest.mark.asyncio
+async def test_format_correction_identifies_missing_human_predicate(monkeypatch):
+    calls = []
+    payload = {
+        "evidence_summary": "Need the reported MFA error.",
+        "enough_information": False,
+        "confidence": 0.5,
+        "question_for_human": "What error does the MFA prompt show?",
+    }
+
+    def post(url, **kwargs):
+        calls.append(kwargs["json"])
+        if len(calls) == 2:
+            assert "Human questions require a human_field" in calls[-1]["messages"][-1]["content"]
+            payload["human_field"] = "mfa_error"
+        return SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: {"choices": [{"message": {"content": json.dumps(payload)}}]},
+        )
+
+    monkeypatch.setattr(requests, "post", post)
+    result = await GroqHostedProvider("test", "test-model").generate_structured(
+        "reason", {}, InvestigationDecision
+    )
+    assert len(calls) == 2 and result.human_field == "mfa_error"
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_reports_quota_without_external_private_details(monkeypatch):
+    response = requests.Response()
+    response.status_code = 429
+    response.headers["retry-after"] = "60"
+    response._content = json.dumps({"error": {
+        "message": "Rate limit for private-org-id on tokens per day (TPD)."
+    }}).encode()
+    monkeypatch.setattr(requests, "post", lambda *a, **k: response)
+    with pytest.raises(LLMError) as failure:
+        await GroqHostedProvider("test", "test-model").generate_structured(
+            "reason", {}, InvestigationDecision
+        )
+    assert "TPD quota limit" in str(failure.value) and "60 seconds" in str(failure.value)
+    assert "private-org-id" not in str(failure.value)

@@ -68,8 +68,8 @@ test('creates a case, shows real event data, resumes human input and renders ass
   })
   vi.stubGlobal('fetch', fetch)
   render(<App />)
-  await user.type(screen.getByLabelText('Ticket details'), initial.ticket.summary)
-  await user.click(screen.getByRole('button', { name: 'Start Investigation' }))
+  await user.type(screen.getByLabelText('Question or ticket'), initial.ticket.summary)
+  await user.click(screen.getByRole('button', { name: 'Run DeskMate' }))
   expect(
     await screen.findByText('Which site or floor is Jake Peralta currently working from?'),
   ).toBeInTheDocument()
@@ -94,10 +94,10 @@ test('renders explicit API errors and restores the submit control', async () => 
     })),
   )
   render(<App />)
-  await user.type(screen.getByLabelText('Ticket details'), 'Incident details')
-  await user.click(screen.getByRole('button', { name: 'Start Investigation' }))
+  await user.type(screen.getByLabelText('Question or ticket'), 'Incident details')
+  await user.click(screen.getByRole('button', { name: 'Run DeskMate' }))
   expect(await screen.findByRole('alert')).toHaveTextContent('Groq request failed')
-  expect(screen.getByRole('button', { name: 'Start Investigation' })).toBeEnabled()
+  expect(screen.getByRole('button', { name: 'Run DeskMate' })).toBeEnabled()
 })
 
 test('shows remembered facts and fixture provenance when reopening a case', async () => {
@@ -174,4 +174,22 @@ test('retries the saved case after a service failure', async () => {
   await user.click(await screen.findByRole('button', { name: 'Retry Investigation' }))
   expect(await screen.findByText('Which site?')).toBeInTheDocument()
   expect(screen.getByTestId('case-id')).toHaveTextContent('case-unit')
+})
+
+test('knowledge answer, contradictions, and activity render without a ticket question', async () => {
+  const user = userEvent.setup()
+  const current: Case = {...initial, workflow:'knowledge', status:'assessment_ready',
+    ticket:{summary:'What year did Abdul graduate?'}, final_answer:'Abdul graduated in 2022.',
+    final_response:{answer:'Abdul graduated in 2022.'}, contradictions:['Two documents give different dates.'],
+    hypotheses:[{claim:'The newer resume supersedes the old version.',confidence:.6,status:'plausible'}]}
+  vi.stubGlobal('fetch',vi.fn(async (url:string)=>({ok:true,json:async()=>url==='/cases'?[current]:url.endsWith('/events')?[{id:1,tool:'search_knowledge',source:'chroma',content:'Knowledge searched',created_at:'2026-10-08T10:00:00Z'}]:current})))
+  render(<App />)
+  await user.click(await screen.findByRole('button',{name:/What year did Abdul graduate/}))
+  expect(await screen.findByRole('heading',{name:'Answer'})).toBeInTheDocument()
+  expect(screen.getByText('Abdul graduated in 2022.')).toBeInTheDocument()
+  expect(screen.getByText('Two documents give different dates.')).toBeInTheDocument()
+  expect(screen.getByText('The newer resume supersedes the old version.')).toBeInTheDocument()
+  expect(screen.queryByLabelText('Your answer')).not.toBeInTheDocument()
+  await user.click(screen.getByText('Agent activity'))
+  expect(screen.getByText('search_knowledge',{exact:true})).toBeInTheDocument()
 })

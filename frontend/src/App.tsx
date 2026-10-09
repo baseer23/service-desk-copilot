@@ -14,6 +14,8 @@ type Evidence = {
   source: string
   source_system: string
   observed_at: string
+  source_type?: string
+  url?: string | null
   content: unknown
 }
 export type Case = {
@@ -23,7 +25,11 @@ export type Case = {
   status: string
   pending_question: string | null
   likely_issue: string | null
-  hypotheses: string[]
+  workflow?: string
+  contradictions?: string[]
+  verification?: { supported_claims?: string[]; unsupported_claims?: string[]; justification?: string }
+  final_response?: { answer?: string; troubleshooting_steps?: string[]; questions_remaining?: string[]; sources?: string[]; escalation_required?: boolean }
+  hypotheses: (string | { claim: string; confidence: number; status: string })[]
   confirmed_facts: Fact[]
   remembered_facts: Fact[]
   inferences: string[]
@@ -58,8 +64,16 @@ const post = (body?: unknown): RequestInit => ({
 })
 const timestamp = (value: string) =>
   new Date(value.includes('T') ? value : value.replace(' ', 'T') + 'Z').toLocaleString()
-const readable = (value: unknown) =>
-  typeof value === 'string' ? value : JSON.stringify(value, null, 2)
+const readable = (value: unknown): string => {
+  if (typeof value === 'string') return value
+  if (!value || typeof value !== 'object') return String(value ?? '')
+  const row = value as Record<string, unknown>
+  if (typeof row.text === 'string') return row.text
+  return Object.entries(row)
+    .filter(([key, val]) => !['metadata', 'source_system', 'observed_at', 'source'].includes(key) && (typeof val === 'string' || typeof val === 'boolean' || typeof val === 'number'))
+    .map(([key, val]) => `${key.replace(/_/g, ' ')}: ${val}`)
+    .join(' · ')
+}
 
 export default function App() {
   const [ticket, setTicket] = useState('')
@@ -214,19 +228,19 @@ export default function App() {
         <aside className="case-panel">
           <section className="card">
             <span className="eyebrow">START HERE</span>
-            <h2>New Case</h2>
+            <h2>New Request</h2>
             <form onSubmit={start}>
-              <label htmlFor="ticket">Ticket details</label>
+              <label htmlFor="ticket">Question or ticket</label>
               <textarea
                 id="ticket"
                 rows={7}
-                placeholder="Describe the user, company, symptoms and error messages…"
+                placeholder="Ask about a document, or describe an incident…"
                 value={ticket}
                 onChange={(e) => setTicket(e.target.value)}
                 required
               />
               <button className="primary" disabled={busy || !ticket.trim()}>
-                {busy ? 'Investigating…' : 'Start Investigation'}
+                {busy ? 'Investigating…' : 'Run DeskMate'}
               </button>
             </form>
           </section>
@@ -323,16 +337,16 @@ export default function App() {
           {!active ? (
             <section className="empty-state">
               <div aria-hidden="true">◎</div>
-              <h2>Start with the incident.</h2>
+              <h2>Start with a question or an incident.</h2>
               <p>
-                DeskMate gathers evidence, asks for missing details and keeps a durable case record.
+                DeskMate chooses a knowledge or investigation workflow, gathers evidence, and verifies its answer.
               </p>
             </section>
           ) : (
             <>
               <div className="case-heading">
                 <div>
-                  <span className="eyebrow">CURRENT CASE</span>
+                  <span className="eyebrow">{active.workflow === 'knowledge' ? 'KNOWLEDGE REQUEST' : 'CURRENT CASE'}</span>
                   <p className="case-id" data-testid="case-id">
                     {active.case_id}
                   </p>
@@ -342,10 +356,16 @@ export default function App() {
                 </span>
               </div>
               <p className="ticket-summary">{active.ticket.summary}</p>
+              {active.workflow === 'knowledge' && (
+                <section className="card knowledge-answer">
+                  <h2>Answer</h2>
+                  <p>{active.final_response?.answer || active.final_answer || (active.status === 'insufficient_information' ? 'The available evidence does not support an answer yet.' : 'Gathering and verifying supporting documents…')}</p>
+                </section>
+              )}
               <section className="card">
-                <h2>Investigation Timeline</h2>
+                <h2>{active.workflow === 'knowledge' ? 'Research summary' : 'Investigation Timeline'}</h2>
                 <ol className="timeline">
-                  {events.map((e) => (
+                  {(active.workflow === 'knowledge' ? events.filter(e => /^(search_|fetch_|ingest_|evaluate_sources$|verify$)/.test(e.tool || '')) : events).map((e) => (
                     <li key={e.id}>
                       <span className="event-dot" aria-hidden="true">
                         {e.tool === 'error' ? '!' : '✓'}
@@ -397,30 +417,35 @@ export default function App() {
                 </section>
               )}
               <section className="card assessment">
-                <h2>Current Assessment</h2>
+                <h2>{active.workflow === 'knowledge' ? 'Evidence assessment' : 'Current Assessment'}</h2>
                 <dl>
+                  {active.workflow !== 'knowledge' && <>
                   <dt>Likely issue</dt>
                   <dd>{active.likely_issue || 'Still gathering information'}</dd>
                   <dt>Next best action</dt>
                   <dd className="next-action">
                     {active.recommended_next_action || 'Await the next investigation step.'}
                   </dd>
+                  </>}
                   <dt>Confidence</dt>
                   <dd>
                     {Math.round(active.confidence * 100)}%{' '}
-                    <small className="muted">Evidence support; resolution is unverified.</small>
+                    <small className="muted">{active.workflow === 'knowledge' ? 'Support for the answer.' : 'Evidence support; resolution is unverified.'}</small>
                   </dd>
                 </dl>
+                {(active.workflow !== 'knowledge' || active.hypotheses.length > 0) && <>
                 <h3>Hypotheses</h3>
                 {active.hypotheses.length ? (
                   <ul>
                     {active.hypotheses.map((h, i) => (
-                      <li key={i}>{h}</li>
+                      <li key={i}>{typeof h === 'string' ? h : h.claim}</li>
                     ))}
                   </ul>
                 ) : (
                   <p className="muted">No supported hypothesis yet.</p>
                 )}
+                </>}
+                {(active.workflow !== 'knowledge' || active.confirmed_facts.length > 0) && <>
                 <h3>Confirmed facts</h3>
                 {active.confirmed_facts.length ? (
                   <ul>
@@ -436,6 +461,7 @@ export default function App() {
                 ) : (
                   <p className="muted">No human-confirmed facts in this case yet.</p>
                 )}
+                </>}
                 {active.remembered_facts.length > 0 && (
                   <div className="remembered">
                     <h3>Remembered facts from previous cases</h3>
@@ -451,6 +477,7 @@ export default function App() {
                     </ul>
                   </div>
                 )}
+                {(active.workflow !== 'knowledge' || active.inferences.length > 0) && <>
                 <h3>Inferences</h3>
                 {active.inferences.length ? (
                   <ul>
@@ -461,6 +488,17 @@ export default function App() {
                 ) : (
                   <p className="muted">No additional inference.</p>
                 )}
+                </>}
+                <h3>Contradictions</h3>
+                {(active.contradictions || []).length ? (
+                  <ul>{active.contradictions!.map((c, i) => <li key={i}>{c}</li>)}</ul>
+                ) : <p className="muted">No conflicting evidence identified.</p>}
+                {active.verification?.justification && (
+                  <details><summary>Evidence verification</summary><p>{active.verification.justification}</p></details>
+                )}
+                {active.final_response?.troubleshooting_steps?.length ? (
+                  <><h3>Troubleshooting steps</h3><ol>{active.final_response.troubleshooting_steps.map((step,i) => <li key={i}>{step}</li>)}</ol></>
+                ) : null}
                 <h3>Uncertainty</h3>
                 {active.uncertainty.length ? (
                   <ul>
@@ -469,12 +507,21 @@ export default function App() {
                     ))}
                   </ul>
                 ) : (
-                  <p className="muted">Investigation is in progress.</p>
+                  <p className="muted">{active.status === 'assessment_ready' ? 'No additional uncertainty reported.' : 'Investigation is in progress.'}</p>
                 )}
               </section>
+              <details className="card agent-activity">
+                <summary>Agent activity</summary>
+                <p>Tools used</p>
+                <ul>{Array.from(new Set(events.map(e => e.tool).filter(t => t && /^(search_|get_|fetch_|ingest_)/.test(t)))).map(t => <li key={t}>{t}</li>)}</ul>
+                {active.workflow === 'knowledge' && <>
+                  <h3>Full request history</h3>
+                  <ol className="timeline">{events.map(e => <li key={e.id}><div><p>{e.content}</p><small>{e.source} · {timestamp(e.created_at)}</small></div></li>)}</ol>
+                </>}
+              </details>
               <section className="card">
                 <h2>
-                  Evidence <span className="count">{active.evidence.length}</span>
+                  Sources <span className="count">{active.evidence.length}</span>
                 </h2>
                 {!active.evidence.length && <p className="muted">No evidence collected yet.</p>}
                 <div className="evidence-list">
@@ -492,9 +539,10 @@ export default function App() {
                         </span>
                       </summary>
                       <small>
-                        {timestamp(e.observed_at)} · {e.tool}
+                        {timestamp(e.observed_at)} · {e.tool}{e.source_type ? ' · ' + e.source_type.replace(/_/g, ' ') : ''}
                       </small>
-                      <pre>{readable(e.content)}</pre>
+                      {e.url && /^https?:\/\//i.test(e.url) && <p><a href={e.url} target="_blank" rel="noreferrer">Open source</a></p>}
+                      <p className="source-content">{readable(e.content)}</p>
                     </details>
                   ))}
                 </div>
