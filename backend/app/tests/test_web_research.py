@@ -7,9 +7,32 @@ from backend.app.services.web import (
     fetch_page,
     UnsafeURL,
     FetchError,
+    extract_html,
+    relevant_excerpt,
 )
 from backend.app.mcp import server
 from backend.app.agent.models import InvestigationDecision
+
+
+def test_documentation_table_cells_are_preserved_without_duplicate_paragraphs():
+    page, _ = extract_html(
+        "<main><h1>Error reference</h1><table><tr><th>Code</th><th>Description</th></tr><tr><td>TEST53003</td><td><p>Policy blocked token issuance.</p></td></tr></table></main>",
+        "https://example.com/errors",
+    )
+    assert "TEST53003 | Policy blocked token issuance." in page["text"]
+    assert page["text"].count("Policy blocked token issuance.") == 1
+
+
+def test_bounded_source_review_keeps_error_definition_deep_in_long_page():
+    text = (
+        "Documentation preface. " * 1000
+        + "TEST53003: Policy blocked token issuance."
+        + " Other entries." * 1000
+    )
+    excerpt = relevant_excerpt(text, "Vendor reference TEST53003", 1600)
+    assert len(excerpt) <= 1600
+    assert "TEST53003: Policy blocked token issuance." in excerpt
+    assert "Documentation preface." in excerpt
 
 
 @pytest.mark.parametrize(
@@ -221,4 +244,6 @@ def test_failed_public_research_records_error_evidence(make_client):
     assert result.status_code == 200
     state = result.json()
     assert state["status"] == "insufficient_information" and state["confidence"] == 0
-    assert any(e["tool"] == "search_web" and e["source_type"] == "tool_error" for e in state["evidence"])
+    assert any(
+        e["tool"] == "search_web" and e["source_type"] == "tool_error" for e in state["evidence"]
+    )

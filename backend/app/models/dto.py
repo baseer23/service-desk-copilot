@@ -69,9 +69,7 @@ class LegacyEvidence(BaseModel):
     content: Any
 
 
-class CaseResponse(BaseModel):
-    case_id: str
-    thread_id: str
+class RequestResult(BaseModel):
     ticket: dict[str, Any]
     status: Literal[
         "new",
@@ -100,12 +98,25 @@ class CaseResponse(BaseModel):
     research_iteration: int = 0
 
 
+class CaseResponse(RequestResult):
+    case_id: str
+    thread_id: str
+
+
 class CaseEvent(BaseModel):
     id: int
     tool: str | None
     source: str
     content: str
     created_at: str
+
+
+class AskResponse(BaseModel):
+    request_id: str
+    intent: Literal["knowledge_question", "service_desk"]
+    case_id: str | None
+    result: RequestResult
+    events: list[CaseEvent]
 
 
 class HealthResponse(BaseModel):

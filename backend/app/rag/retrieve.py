@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, List
+import re
 
 from backend.app.services.entities import extract_entities
 
@@ -9,15 +10,28 @@ from backend.app.services.entities import extract_entities
 @dataclass
 class Retriever:
     """Coordinate vector, graph, and hybrid retrieval strategies."""
+
     settings: object
     vector_store: object
     graph_repo: object
     embedding_provider: object
 
     def vector_search(self, question: str, top_k: int) -> List[Dict[str, object]]:
-        """Return top-k chunks ranked purely by vector similarity."""
+        """Rank semantic chunks, preserving exact identifier hits when present."""
         embedding = self.embedding_provider.embed_texts([question])[0]
-        return self.vector_store.search(embedding, top_k)
+        semantic = self.vector_store.search(embedding, top_k)
+        identifiers = list(
+            dict.fromkeys(re.findall(r"\b[A-Za-z][A-Za-z0-9_-]*\d[A-Za-z0-9_-]*\b", question))
+        )
+        lookup = getattr(self.vector_store, "search_identifiers", None)
+        exact = lookup(identifiers, top_k) if identifiers and lookup else []
+        seen = set()
+        combined = []
+        for row in exact + semantic:
+            if row["id"] not in seen:
+                combined.append(row)
+                seen.add(row["id"])
+        return combined[:top_k]
 
     def graph_search(self, question: str, top_k: int) -> List[Dict[str, object]]:
         """Fetch chunks linked to question entities from the graph store."""
@@ -39,4 +53,11 @@ class Retriever:
         allowed_ids = {item["id"] for item in graph_results}
         vector_results = self.vector_search(question, top_k)
         filtered = [item for item in vector_results if item["id"] in allowed_ids]
+        exact = [item for item in vector_results if item.get("match_type") == "exact_identifier"]
+        if exact:
+            # Broad graph entities must not eliminate an exact reported code.
+            exact_ids = {item["id"] for item in exact}
+            return (exact + [item for item in vector_results if item["id"] not in exact_ids])[
+                :top_k
+            ]
         return filtered or vector_results

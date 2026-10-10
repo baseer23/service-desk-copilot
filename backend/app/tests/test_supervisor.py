@@ -427,6 +427,8 @@ def test_unjustified_mfa_location_question_is_revised_before_interrupt(make_clie
                     enough_information=False,
                     confidence=0.5,
                 )
+            assert context["decision_issues"]
+            assert "verification" not in context
         return await original(stage, context, schema)
 
     c.app.state.agent.provider.generate_structured = generated

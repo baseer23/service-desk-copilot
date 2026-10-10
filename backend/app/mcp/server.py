@@ -96,9 +96,13 @@ def search_knowledge(question: str, mode: str = "HYBRID", top_k: int = 6):
     if not 1 <= top_k <= 30:
         raise ValueError("top_k must be between 1 and 30")
     r = environment()[4]
-    return {"VECTOR": r.vector_search, "GRAPH": r.graph_search, "HYBRID": r.hybrid_search}[
+    rows = {"VECTOR": r.vector_search, "GRAPH": r.graph_search, "HYBRID": r.hybrid_search}[
         mode.upper()
     ](question, top_k)
+    for row in rows:
+        if row.get("metadata", {}).get("source_type") == "local_fixture":
+            row["source_system"] = "local_fixture"
+    return rows
 
 
 @capability("neo4j_aura")
@@ -324,9 +328,7 @@ def list_available_context():
         "knowledge_chunks": vector.count(),
         "chroma": vector.ping(),
         "aura_connected": driver is not None,
-        "fixture_companies": ["B99"],
-        "fixture_users": ["Jake Peralta", "Sarah"],
-        "fixture_devices": ["PRN-ACCT-02", "Jake's laptop"],
+        **fixtures.inventory(),
         "fixture_source_system": "local_fixture",
         "memory": "sqlite_memory",
         "web": "public_web",

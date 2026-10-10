@@ -26,9 +26,20 @@ export type Case = {
   pending_question: string | null
   likely_issue: string | null
   workflow?: string
+  transient?: boolean
   contradictions?: string[]
-  verification?: { supported_claims?: string[]; unsupported_claims?: string[]; justification?: string }
-  final_response?: { answer?: string; troubleshooting_steps?: string[]; questions_remaining?: string[]; sources?: string[]; escalation_required?: boolean }
+  verification?: {
+    supported_claims?: string[]
+    unsupported_claims?: string[]
+    justification?: string
+  }
+  final_response?: {
+    answer?: string
+    troubleshooting_steps?: string[]
+    questions_remaining?: string[]
+    sources?: string[]
+    escalation_required?: boolean
+  }
   hypotheses: (string | { claim: string; confidence: number; status: string })[]
   confirmed_facts: Fact[]
   remembered_facts: Fact[]
@@ -46,14 +57,39 @@ type Event = {
   content: string
   created_at: string
 }
+type AskResponse = {
+  request_id: string
+  case_id: string | null
+  result: Omit<Case, 'case_id' | 'thread_id'>
+  events: Event[]
+}
 const base = import.meta.env.VITE_API_BASE || ''
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(base + path, init)
-  const body = await response.json()
-  if (!response.ok)
+  let response: Response
+  try {
+    response = await fetch(base + path, init)
+  } catch {
+    throw new Error('DeskMate could not connect to the server. Please try again.')
+  }
+  let body
+  try {
+    body = await response.json()
+  } catch {
     throw new Error(
-      typeof body.detail === 'string' ? body.detail : `Request failed (${response.status})`,
+      response.ok
+        ? 'DeskMate received an empty or invalid server response. Reload the page and try again.'
+        : response.status >= 500
+          ? `The DeskMate server is temporarily unavailable (HTTP ${response.status}). Please try again.`
+          : `Request failed (HTTP ${response.status}). The server returned an empty or invalid response.`,
+    )
+  }
+  if (!response.ok)
+    throw Object.assign(
+      new Error(
+        typeof body?.detail === 'string' ? body.detail : `Request failed (${response.status})`,
+      ),
+      { case_id: typeof body?.case_id === 'string' ? body.case_id : undefined },
     )
   return body as T
 }
@@ -70,7 +106,11 @@ const readable = (value: unknown): string => {
   const row = value as Record<string, unknown>
   if (typeof row.text === 'string') return row.text
   return Object.entries(row)
-    .filter(([key, val]) => !['metadata', 'source_system', 'observed_at', 'source'].includes(key) && (typeof val === 'string' || typeof val === 'boolean' || typeof val === 'number'))
+    .filter(
+      ([key, val]) =>
+        !['metadata', 'source_system', 'observed_at', 'source'].includes(key) &&
+        (typeof val === 'string' || typeof val === 'boolean' || typeof val === 'number'),
+    )
     .map(([key, val]) => `${key.replace(/_/g, ' ')}: ${val}`)
     .join(' · ')
 }
@@ -105,6 +145,16 @@ export default function App() {
     setEvents(timeline)
     setCases(list)
   }
+  async function displayRequest(response: AskResponse) {
+    setActive({
+      ...response.result,
+      case_id: response.case_id || response.request_id,
+      thread_id: response.request_id,
+      transient: !response.case_id,
+    })
+    setEvents(response.events)
+    setCases(await request<Case[]>('/cases'))
+  }
   async function start(event: FormEvent) {
     event.preventDefault()
     if (!ticket.trim()) return
@@ -112,15 +162,12 @@ export default function App() {
     setError('')
     setAnswer('')
     setEvents([])
-    let createdId: string | null = null
     try {
-      const created = await request<Case>('/cases', post({ summary: ticket.trim() }))
-      createdId = created.case_id
-      await display(created)
-      await display(await request<Case>(`/cases/${created.case_id}/investigate`, post()))
+      await displayRequest(await request<AskResponse>('/ask', post({ summary: ticket.trim() })))
     } catch (e) {
       setError((e as Error).message)
-      if (createdId) await refreshAfterFailure(createdId)
+      const id = (e as Error & { case_id?: string }).case_id
+      if (id) await refreshAfterFailure(id)
     } finally {
       setBusy(false)
     }
@@ -131,9 +178,17 @@ export default function App() {
     setBusy(true)
     setError('')
     try {
-      await display(
-        await request<Case>(`/cases/${active.case_id}/resume`, post({ answer: answer.trim() })),
-      )
+      if (active.transient) {
+        await displayRequest(
+          await request<AskResponse>(
+            `/requests/${active.case_id}/resume`,
+            post({ answer: answer.trim() }),
+          ),
+        )
+      } else
+        await display(
+          await request<Case>(`/cases/${active.case_id}/resume`, post({ answer: answer.trim() })),
+        )
       setAnswer('')
     } catch (e) {
       setError((e as Error).message)
@@ -339,14 +394,17 @@ export default function App() {
               <div aria-hidden="true">◎</div>
               <h2>Start with a question or an incident.</h2>
               <p>
-                DeskMate chooses a knowledge or investigation workflow, gathers evidence, and verifies its answer.
+                DeskMate chooses a knowledge or investigation workflow, gathers evidence, and
+                verifies its answer.
               </p>
             </section>
           ) : (
             <>
               <div className="case-heading">
                 <div>
-                  <span className="eyebrow">{active.workflow === 'knowledge' ? 'KNOWLEDGE REQUEST' : 'CURRENT CASE'}</span>
+                  <span className="eyebrow">
+                    {active.workflow === 'knowledge' ? 'KNOWLEDGE REQUEST' : 'CURRENT CASE'}
+                  </span>
                   <p className="case-id" data-testid="case-id">
                     {active.case_id}
                   </p>
@@ -359,13 +417,26 @@ export default function App() {
               {active.workflow === 'knowledge' && (
                 <section className="card knowledge-answer">
                   <h2>Answer</h2>
-                  <p>{active.final_response?.answer || active.final_answer || (active.status === 'insufficient_information' ? 'The available evidence does not support an answer yet.' : 'Gathering and verifying supporting documents…')}</p>
+                  <p>
+                    {active.final_response?.answer ||
+                      active.final_answer ||
+                      (active.status === 'insufficient_information'
+                        ? 'The available evidence does not support an answer yet.'
+                        : 'Gathering and verifying supporting documents…')}
+                  </p>
                 </section>
               )}
               <section className="card">
-                <h2>{active.workflow === 'knowledge' ? 'Research summary' : 'Investigation Timeline'}</h2>
+                <h2>
+                  {active.workflow === 'knowledge' ? 'Research summary' : 'Investigation Timeline'}
+                </h2>
                 <ol className="timeline">
-                  {(active.workflow === 'knowledge' ? events.filter(e => /^(search_|fetch_|ingest_|evaluate_sources$|verify$)/.test(e.tool || '')) : events).map((e) => (
+                  {(active.workflow === 'knowledge'
+                    ? events.filter((e) =>
+                        /^(search_|fetch_|ingest_|evaluate_sources$|verify$)/.test(e.tool || ''),
+                      )
+                    : events
+                  ).map((e) => (
                     <li key={e.id}>
                       <span className="event-dot" aria-hidden="true">
                         {e.tool === 'error' ? '!' : '✓'}
@@ -417,51 +488,64 @@ export default function App() {
                 </section>
               )}
               <section className="card assessment">
-                <h2>{active.workflow === 'knowledge' ? 'Evidence assessment' : 'Current Assessment'}</h2>
+                <h2>
+                  {active.workflow === 'knowledge' ? 'Evidence assessment' : 'Current Assessment'}
+                </h2>
                 <dl>
-                  {active.workflow !== 'knowledge' && <>
-                  <dt>Likely issue</dt>
-                  <dd>{active.likely_issue || 'Still gathering information'}</dd>
-                  <dt>Next best action</dt>
-                  <dd className="next-action">
-                    {active.recommended_next_action || 'Await the next investigation step.'}
-                  </dd>
-                  </>}
+                  {active.workflow !== 'knowledge' && (
+                    <>
+                      <dt>Likely issue</dt>
+                      <dd>{active.likely_issue || 'Still gathering information'}</dd>
+                      <dt>Next best action</dt>
+                      <dd className="next-action">
+                        {active.recommended_next_action || 'Await the next investigation step.'}
+                      </dd>
+                    </>
+                  )}
                   <dt>Confidence</dt>
                   <dd>
                     {Math.round(active.confidence * 100)}%{' '}
-                    <small className="muted">{active.workflow === 'knowledge' ? 'Support for the answer.' : 'Evidence support; resolution is unverified.'}</small>
+                    <small className="muted">
+                      {active.workflow === 'knowledge'
+                        ? 'Support for the answer.'
+                        : 'Evidence support; resolution is unverified.'}
+                    </small>
                   </dd>
                 </dl>
-                {(active.workflow !== 'knowledge' || active.hypotheses.length > 0) && <>
-                <h3>Hypotheses</h3>
-                {active.hypotheses.length ? (
-                  <ul>
-                    {active.hypotheses.map((h, i) => (
-                      <li key={i}>{typeof h === 'string' ? h : h.claim}</li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p className="muted">No supported hypothesis yet.</p>
+                {(active.workflow !== 'knowledge' || active.hypotheses.length > 0) && (
+                  <>
+                    <h3>Hypotheses</h3>
+                    {active.hypotheses.length ? (
+                      <ul>
+                        {active.hypotheses.map((h, i) => (
+                          <li key={i}>{typeof h === 'string' ? h : h.claim}</li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p className="muted">No supported hypothesis yet.</p>
+                    )}
+                  </>
                 )}
-                </>}
-                {(active.workflow !== 'knowledge' || active.confirmed_facts.length > 0) && <>
-                <h3>Confirmed facts</h3>
-                {active.confirmed_facts.length ? (
-                  <ul>
-                    {active.confirmed_facts.map((f, i) => (
-                      <li key={i}>
-                        {f.subject} · {f.predicate.replace(/_/g, ' ')}: <strong>{f.value}</strong>
-                        <small className="fact-source">
-                          {f.source} · {timestamp(f.observed_at)}
-                        </small>
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p className="muted">No human-confirmed facts in this case yet.</p>
+                {(active.workflow !== 'knowledge' || active.confirmed_facts.length > 0) && (
+                  <>
+                    <h3>Confirmed facts</h3>
+                    {active.confirmed_facts.length ? (
+                      <ul>
+                        {active.confirmed_facts.map((f, i) => (
+                          <li key={i}>
+                            {f.subject} · {f.predicate.replace(/_/g, ' ')}:{' '}
+                            <strong>{f.value}</strong>
+                            <small className="fact-source">
+                              {f.source} · {timestamp(f.observed_at)}
+                            </small>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p className="muted">No human-confirmed facts in this case yet.</p>
+                    )}
+                  </>
                 )}
-                </>}
                 {active.remembered_facts.length > 0 && (
                   <div className="remembered">
                     <h3>Remembered facts from previous cases</h3>
@@ -477,27 +561,45 @@ export default function App() {
                     </ul>
                   </div>
                 )}
-                {(active.workflow !== 'knowledge' || active.inferences.length > 0) && <>
-                <h3>Inferences</h3>
-                {active.inferences.length ? (
+                {(active.workflow !== 'knowledge' || active.inferences.length > 0) && (
+                  <>
+                    <h3>Inferences</h3>
+                    {active.inferences.length ? (
+                      <ul>
+                        {active.inferences.map((h, i) => (
+                          <li key={i}>{h}</li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p className="muted">No additional inference.</p>
+                    )}
+                  </>
+                )}
+                <h3>Contradictions</h3>
+                {(active.contradictions || []).length ? (
                   <ul>
-                    {active.inferences.map((h, i) => (
-                      <li key={i}>{h}</li>
+                    {active.contradictions!.map((c, i) => (
+                      <li key={i}>{c}</li>
                     ))}
                   </ul>
                 ) : (
-                  <p className="muted">No additional inference.</p>
+                  <p className="muted">No conflicting evidence identified.</p>
                 )}
-                </>}
-                <h3>Contradictions</h3>
-                {(active.contradictions || []).length ? (
-                  <ul>{active.contradictions!.map((c, i) => <li key={i}>{c}</li>)}</ul>
-                ) : <p className="muted">No conflicting evidence identified.</p>}
                 {active.verification?.justification && (
-                  <details><summary>Evidence verification</summary><p>{active.verification.justification}</p></details>
+                  <details>
+                    <summary>Evidence verification</summary>
+                    <p>{active.verification.justification}</p>
+                  </details>
                 )}
                 {active.final_response?.troubleshooting_steps?.length ? (
-                  <><h3>Troubleshooting steps</h3><ol>{active.final_response.troubleshooting_steps.map((step,i) => <li key={i}>{step}</li>)}</ol></>
+                  <>
+                    <h3>Troubleshooting steps</h3>
+                    <ol>
+                      {active.final_response.troubleshooting_steps.map((step, i) => (
+                        <li key={i}>{step}</li>
+                      ))}
+                    </ol>
+                  </>
                 ) : null}
                 <h3>Uncertainty</h3>
                 {active.uncertainty.length ? (
@@ -507,17 +609,44 @@ export default function App() {
                     ))}
                   </ul>
                 ) : (
-                  <p className="muted">{active.status === 'assessment_ready' ? 'No additional uncertainty reported.' : 'Investigation is in progress.'}</p>
+                  <p className="muted">
+                    {active.status === 'assessment_ready'
+                      ? 'No additional uncertainty reported.'
+                      : 'Investigation is in progress.'}
+                  </p>
                 )}
               </section>
               <details className="card agent-activity">
                 <summary>Agent activity</summary>
                 <p>Tools used</p>
-                <ul>{Array.from(new Set(events.map(e => e.tool).filter(t => t && /^(search_|get_|fetch_|ingest_)/.test(t)))).map(t => <li key={t}>{t}</li>)}</ul>
-                {active.workflow === 'knowledge' && <>
-                  <h3>Full request history</h3>
-                  <ol className="timeline">{events.map(e => <li key={e.id}><div><p>{e.content}</p><small>{e.source} · {timestamp(e.created_at)}</small></div></li>)}</ol>
-                </>}
+                <ul>
+                  {Array.from(
+                    new Set(
+                      events
+                        .map((e) => e.tool)
+                        .filter((t) => t && /^(search_|get_|fetch_|ingest_)/.test(t)),
+                    ),
+                  ).map((t) => (
+                    <li key={t}>{t}</li>
+                  ))}
+                </ul>
+                {active.workflow === 'knowledge' && (
+                  <>
+                    <h3>Full request history</h3>
+                    <ol className="timeline">
+                      {events.map((e) => (
+                        <li key={e.id}>
+                          <div>
+                            <p>{e.content}</p>
+                            <small>
+                              {e.source} · {timestamp(e.created_at)}
+                            </small>
+                          </div>
+                        </li>
+                      ))}
+                    </ol>
+                  </>
+                )}
               </details>
               <section className="card">
                 <h2>
@@ -539,9 +668,16 @@ export default function App() {
                         </span>
                       </summary>
                       <small>
-                        {timestamp(e.observed_at)} · {e.tool}{e.source_type ? ' · ' + e.source_type.replace(/_/g, ' ') : ''}
+                        {timestamp(e.observed_at)} · {e.tool}
+                        {e.source_type ? ' · ' + e.source_type.replace(/_/g, ' ') : ''}
                       </small>
-                      {e.url && /^https?:\/\//i.test(e.url) && <p><a href={e.url} target="_blank" rel="noreferrer">Open source</a></p>}
+                      {e.url && /^https?:\/\//i.test(e.url) && (
+                        <p>
+                          <a href={e.url} target="_blank" rel="noreferrer">
+                            Open source
+                          </a>
+                        </p>
+                      )}
                       <p className="source-content">{readable(e.content)}</p>
                     </details>
                   ))}

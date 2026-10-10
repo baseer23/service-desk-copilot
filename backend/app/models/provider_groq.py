@@ -40,6 +40,15 @@ class GroqHostedProvider:
         instructions = INSTRUCTIONS[stage]
         if stage == "reason":
             instructions += " If question_for_human is nonempty, human_field MUST be a nonempty semantic predicate naming the requested fact (for example mfa_error). If no question is needed, set both to null."
+            instructions += " When operational evidence supports a diagnostic hypothesis, include at least one evidence-cited hypothesis and explicitly label it plausible and unconfirmed; do not hide an implicit cause only in the recommendation or justification. Record the corresponding inference separately. A system record's uncertainty (such as unconfirmed physical clearance) must be retained."
+            if context.get("decision_issues"):
+                instructions += (
+                    "\nREQUIRED REVISION: Application validation rejected the previous candidate: "
+                    + json.dumps(context["decision_issues"])
+                    + ". Correct these issues before proposing a new candidate. Do not repeat the rejected question or invent evidence to justify it. The prior critic cannot override application validation."
+                )
+        if stage == "plan":
+            instructions += " Use available_context.knowledge_chunks to assess whether indexed internal guidance can address a diagnostic gap, and consider a relevant search_knowledge query before public research."
         payload = {
             "model": self._model_name,
             "temperature": 0,

@@ -21,6 +21,7 @@ from backend.app.models.dto import (
     IngestPdfResponse,
     IngestUrlRequest,
     IngestUrlResponse,
+    AskResponse,
 )
 from backend.app.models.provider import LLMError
 from backend.app.models.provider_factory import get_provider
@@ -140,6 +141,37 @@ def create_app(settings: Settings | None = None):
         if state is None:
             raise HTTPException(404, "Case not found")
         return state
+
+    async def request_result(request_id, summary=None, answer=None):
+        try:
+            state, events = await app.state.agent.run_request(request_id, summary, answer)
+            return AskResponse(
+                request_id=request_id,
+                intent="knowledge_question" if state["workflow"] == "knowledge" else "service_desk",
+                case_id=request_id if state.get("persist_case") else None,
+                result=state,
+                events=events,
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except (LLMError, MCPToolError, MCPConnectionError, StorageError) as exc:
+            from fastapi.responses import JSONResponse
+
+            stored = (await app.state.agent.harness.invoke("get_case", {"case_id": request_id}))[
+                "result"
+            ]
+            return JSONResponse(
+                status_code=502,
+                content={"detail": str(exc), "case_id": request_id if stored else None},
+            )
+
+    @app.post("/ask", response_model=AskResponse)
+    async def ask(body: CaseCreateRequest):
+        return await request_result(uuid.uuid4().hex, body.summary)
+
+    @app.post("/requests/{request_id}/resume", response_model=AskResponse)
+    async def resume_request(request_id: str, body: CaseResumeRequest):
+        return await request_result(request_id, answer=body.answer)
 
     @app.get("/cases", response_model=list[CaseResponse])
     async def list_cases():

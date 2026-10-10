@@ -1,0 +1,392 @@
+{
+  "description": "Fictional service-desk validation data; never a live enterprise integration.",
+  "companies": [
+    {
+      "name": "B99",
+      "sites": [
+        "B99 1st floor",
+        "B99 2nd floor"
+      ],
+      "product": "WatchGuard VPN"
+    },
+    {
+      "name": "Northwind",
+      "sites": [
+        "Northwind HQ"
+      ],
+      "services": [
+        "Microsoft 365",
+        "SharePoint",
+        "Autotask"
+      ]
+    },
+    {
+      "name": "Contoso",
+      "sites": [
+        "Contoso HQ"
+      ],
+      "services": [
+        "Windows domain",
+        "Cisco Secure Client VPN",
+        "Microsoft Entra"
+      ]
+    },
+    {
+      "name": "Fabrikam",
+      "sites": [
+        "Fabrikam Office"
+      ],
+      "services": [
+        "Windows endpoints",
+        "Microsoft 365"
+      ]
+    }
+  ],
+  "users": [
+    {
+      "name": "Jake Peralta",
+      "aliases": [
+        "Jake"
+      ],
+      "company": "B99",
+      "current_site": null,
+      "required_update_installed": null
+    },
+    {
+      "name": "Sarah Ahmed",
+      "aliases": [
+        "Sarah"
+      ],
+      "company": "Northwind",
+      "product": "Microsoft 365",
+      "mfa_method": "Authenticator",
+      "authentication_method_status": "Old phone registered; replacement phone not registered",
+      "identity_verification_status": "Technician must verify identity under the approved procedure",
+      "current_site": null
+    },
+    {
+      "name": "Michael",
+      "company": "Contoso",
+      "product": "Windows domain",
+      "account_status": "Repeated lockouts after password reset",
+      "device": "WIN-MICHAEL-01"
+    },
+    {
+      "name": "Priya",
+      "company": "Northwind",
+      "product": "Microsoft 365 Outlook",
+      "account_status": "Enabled",
+      "mailbox_quota": "Below limit",
+      "webmail_receives_mail": null
+    },
+    {
+      "name": "David",
+      "company": "Fabrikam",
+      "product": "Windows 11",
+      "device": "LAP-DAVID-01"
+    },
+    {
+      "name": "Maria",
+      "company": "Northwind",
+      "product": "SharePoint",
+      "groups": [
+        "Finance Site Readers"
+      ],
+      "device": "LAP-MARIA-01"
+    },
+    {
+      "name": "Kevin",
+      "company": "Northwind",
+      "product": "Autotask",
+      "device": "LAP-KEVIN-01",
+      "account_status": "Enabled"
+    }
+  ],
+  "sites": [
+    {
+      "name": "B99 1st floor",
+      "aliases": [
+        "1st floor",
+        "first floor"
+      ],
+      "company": "B99",
+      "product": "WatchGuard VPN"
+    },
+    {
+      "name": "B99 2nd floor",
+      "aliases": [
+        "2nd floor",
+        "second floor"
+      ],
+      "company": "B99",
+      "product": "WatchGuard VPN"
+    },
+    {
+      "name": "Northwind HQ",
+      "company": "Northwind",
+      "services": [
+        "Microsoft 365",
+        "SharePoint",
+        "Autotask"
+      ]
+    },
+    {
+      "name": "Contoso HQ",
+      "company": "Contoso",
+      "product": "Cisco Secure Client VPN"
+    },
+    {
+      "name": "Fabrikam Office",
+      "company": "Fabrikam",
+      "product": "Windows 11"
+    }
+  ],
+  "devices": [
+    {
+      "name": "Jake's laptop",
+      "aliases": [
+        "Jake",
+        "Jake Peralta"
+      ],
+      "user": "Jake Peralta",
+      "company": "B99",
+      "product": "WatchGuard VPN",
+      "required_update_installed": null
+    },
+    {
+      "name": "PRN-ACCT-02",
+      "company": "B99",
+      "department": "Accounting",
+      "product": "Network printer",
+      "queue_status": "paused",
+      "last_test_page": "pending",
+      "diagnostic": "Queue paused after a paper-jam event; physical jam clearance is unconfirmed",
+      "other_printers": "Working"
+    },
+    {
+      "name": "WIN-MICHAEL-01",
+      "aliases": [
+        "Michael"
+      ],
+      "user": "Michael",
+      "company": "Contoso",
+      "product": "Windows",
+      "mapped_drives": [
+        "Finance share"
+      ],
+      "saved_credentials": "Credential entry exists; credential freshness is unverified",
+      "lockout_event_source": "WIN-MICHAEL-01"
+    },
+    {
+      "name": "LAP-DAVID-01",
+      "aliases": [
+        "David"
+      ],
+      "user": "David",
+      "company": "Fabrikam",
+      "product": "Windows 11",
+      "disk_usage_percent": 99,
+      "update_status": "Installing cumulative update",
+      "active_process": "Windows Modules Installer Worker",
+      "disk_health": "No reported SMART warning",
+      "restart_pending": true
+    },
+    {
+      "name": "LAP-MARIA-01",
+      "aliases": [
+        "Maria"
+      ],
+      "user": "Maria",
+      "company": "Northwind",
+      "product": "Windows 11"
+    },
+    {
+      "name": "LAP-KEVIN-01",
+      "aliases": [
+        "Kevin"
+      ],
+      "user": "Kevin",
+      "company": "Northwind",
+      "product": "Browser",
+      "browser": "Edge",
+      "extension": "Content filtering extension enabled",
+      "private_session_test": "Not yet performed",
+      "application_scope": "Autotask blank page; other users report normal operation"
+    }
+  ],
+  "tickets": [
+    {
+      "id": "B99-previous-vpn",
+      "tags": [
+        "vpn",
+        "authentication",
+        "auth",
+        "jake"
+      ],
+      "user": "Jake Peralta",
+      "company": "B99",
+      "site": "B99 2nd floor",
+      "product": "WatchGuard VPN",
+      "issue": "VPN authentication failed",
+      "outcome": "Client profile refreshed after the VPN configuration change; verify required client update before retrying."
+    },
+    {
+      "id": "NW-MFA-14",
+      "tags": [
+        "mfa",
+        "phone",
+        "authenticator"
+      ],
+      "user": "Sarah Ahmed",
+      "company": "Northwind",
+      "product": "Microsoft 365",
+      "issue": "MFA unavailable after replacing a phone",
+      "outcome": "Identity verified, approved authentication-method reset completed and Authenticator re-registered."
+    },
+    {
+      "id": "B99-PRINT-08",
+      "tags": [
+        "print",
+        "printer",
+        "invoices",
+        "prn-acct-02"
+      ],
+      "company": "B99",
+      "device": "PRN-ACCT-02",
+      "product": "Network printer",
+      "issue": "Accounting printer queue paused after paper jam",
+      "outcome": "Technician confirmed physical clearance, resumed queue and printed a test page."
+    },
+    {
+      "id": "CT-VPN-22",
+      "tags": [
+        "vpn",
+        "users",
+        "outage"
+      ],
+      "company": "Contoso",
+      "product": "Cisco Secure Client VPN",
+      "issue": "Multiple VPN users disconnected together",
+      "outcome": "Network team investigated the shared gateway incident; endpoint reinstallation was not the first step."
+    },
+    {
+      "id": "CT-LOCK-07",
+      "tags": [
+        "lockout",
+        "locking",
+        "password",
+        "credentials"
+      ],
+      "user": "Michael",
+      "company": "Contoso",
+      "product": "Windows domain",
+      "issue": "Account relocked after password reset",
+      "outcome": "Lockout logs identified a stale mapped-drive credential. Updating that credential stopped repeated attempts in this historical incident."
+    },
+    {
+      "id": "NW-MAIL-11",
+      "tags": [
+        "outlook",
+        "email",
+        "messages",
+        "mail"
+      ],
+      "user": "Priya",
+      "company": "Northwind",
+      "product": "Microsoft 365 Outlook",
+      "issue": "Outlook missing new messages while webmail received them",
+      "outcome": "Client view/filter and synchronization settings were checked before rebuilding the profile."
+    },
+    {
+      "id": "FB-DISK-03",
+      "tags": [
+        "slow",
+        "disk",
+        "updates",
+        "performance"
+      ],
+      "user": "David",
+      "company": "Fabrikam",
+      "product": "Windows 11",
+      "issue": "High disk use during cumulative update",
+      "outcome": "Update progress monitored and approved restart completed after installation. Timing alone did not establish a defective update."
+    },
+    {
+      "id": "NW-ACCESS-09",
+      "tags": [
+        "sharepoint",
+        "budget",
+        "access",
+        "permissions"
+      ],
+      "user": "Maria",
+      "company": "Northwind",
+      "product": "SharePoint",
+      "issue": "Finance site accessible but Budget folder denied",
+      "outcome": "Folder owner verified unique permissions and approved Budget Readers membership."
+    },
+    {
+      "id": "NW-APP-05",
+      "tags": [
+        "autotask",
+        "blank",
+        "browser",
+        "application"
+      ],
+      "user": "Kevin",
+      "company": "Northwind",
+      "product": "Autotask",
+      "issue": "Blank page for one browser session",
+      "outcome": "Clean browser session reproduced normal operation; extension and site storage were then isolated under the approved procedure."
+    }
+  ],
+  "alerts": [
+    {
+      "id": "B99-alert-vpn",
+      "company": "B99",
+      "site": "B99 2nd floor",
+      "product": "WatchGuard VPN",
+      "status": "active",
+      "message": "Elevated VPN authentication failures",
+      "acknowledged_by": "Amy Santiago",
+      "technician_event": "Alert acknowledged by a technician"
+    },
+    {
+      "id": "CT-VPN-ALERT",
+      "company": "Contoso",
+      "product": "Cisco Secure Client VPN",
+      "status": "active",
+      "scope": "Company-wide",
+      "message": "Multiple users report gateway authentication degradation",
+      "acknowledged_by": "Network on-call",
+      "technician_event": "Shared service incident acknowledged"
+    }
+  ],
+  "changes": [
+    {
+      "id": "B99-change-vpn",
+      "company": "B99",
+      "site": "B99 2nd floor",
+      "product": "WatchGuard VPN",
+      "hours_ago": 2,
+      "summary": "WatchGuard VPN configuration updated earlier today",
+      "required_action": "Install the required VPN client update and refresh the client profile"
+    },
+    {
+      "id": "CT-VPN-CHANGE",
+      "company": "Contoso",
+      "product": "Cisco Secure Client VPN",
+      "hours_ago": 1,
+      "summary": "VPN gateway certificate rotation",
+      "required_action": "Network team must compare authentication logs and certificate trust; causation is unconfirmed"
+    },
+    {
+      "id": "FB-WINDOWS-CHANGE",
+      "company": "Fabrikam",
+      "product": "Windows 11",
+      "hours_ago": 3,
+      "summary": "Approved Windows cumulative update rollout",
+      "required_action": "Monitor installation, retain diagnostics and restart only after update completion under policy"
+    }
+  ]
+}

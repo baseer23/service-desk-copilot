@@ -2,6 +2,7 @@
 
 import ipaddress
 import socket
+import re
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlsplit, urlunsplit
 import requests
@@ -14,6 +15,27 @@ class UnsafeURL(ValueError):
 
 class FetchError(RuntimeError):
     pass
+
+
+def relevant_excerpt(text, query, limit):
+    """Bound model input while retaining a passage matching the evidence gap."""
+    if len(text) <= limit:
+        return text
+    needles = set(re.findall(r"[a-zA-Z][a-zA-Z0-9-]{3,}", query))
+    needles = sorted(
+        needles, key=lambda token: (any(c.isdigit() for c in token), len(token)), reverse=True
+    )
+    folded = text.casefold()
+    position = next(
+        (folded.find(token.casefold()) for token in needles if token.casefold() in folded), 0
+    )
+    if position < limit // 2:
+        return text[:limit]
+    prefix = text[: min(400, limit // 4)]
+    separator = "\n[…]\n"
+    width = limit - len(prefix) - len(separator)
+    start = max(0, min(position - width // 3, len(text) - width))
+    return prefix + separator + text[start : start + width]
 
 
 def validate_public_url(url):
@@ -90,9 +112,17 @@ def extract_html(html, url):
     ):
         tag.decompose()
     article = soup.find("article") or soup.find("main") or soup.body or soup
-    blocks = article.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "pre"])
+    blocks = article.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "pre", "tr"])
+    blocks = [b for b in blocks if not b.find_parent(["p", "li", "pre", "tr"])]
     text = (
-        "\n\n".join(b.get_text(" ", strip=True) for b in blocks)
+        "\n\n".join(
+            " | ".join(
+                cell.get_text(" ", strip=True) for cell in b.find_all(["th", "td"], recursive=False)
+            )
+            if b.name == "tr"
+            else b.get_text(" ", strip=True)
+            for b in blocks
+        )
         if blocks
         else article.get_text(" ", strip=True)
     )

@@ -113,6 +113,44 @@ class VectorChromaStore:
         except Exception as exc:
             raise StorageError("Chroma search failed; stored data was preserved") from exc
 
+    def search_identifiers(self, identifiers, top_k=5):
+        """Recover exact opaque codes/device identifiers that embeddings may blur."""
+        import re
+
+        variants = list(
+            dict.fromkeys(
+                value
+                for identifier in identifiers
+                for value in (identifier, identifier.upper(), identifier.lower())
+            )
+        )
+        filters = [{"$contains": value} for value in variants]
+        where = filters[0] if len(filters) == 1 else {"$or": filters}
+        try:
+            result = self._collection.get(where_document=where, limit=min(top_k * 5, 150))
+            rows = []
+            for i, identifier in enumerate(result["ids"]):
+                text = result["documents"][i]
+                if not any(
+                    re.search(r"(?<!\w)" + re.escape(value) + r"(?!\w)", text, re.I)
+                    for value in identifiers
+                ):
+                    continue
+                rows.append(
+                    {
+                        "id": identifier,
+                        "text": text,
+                        "metadata": result["metadatas"][i],
+                        "score": 0,
+                        "match_type": "exact_identifier",
+                    }
+                )
+            return rows[:top_k]
+        except Exception as exc:
+            raise StorageError(
+                "Chroma identifier lookup failed; stored data was preserved"
+            ) from exc
+
     def count(self):
         try:
             return self._collection.count()

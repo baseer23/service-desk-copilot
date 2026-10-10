@@ -7,7 +7,7 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: Object.fromEntries(
-      ['/cases', '/health', '/ingest'].map((path) => [
+      ['/ask', '/requests', '/cases', '/health', '/ingest'].map((path) => [
         path,
         process.env.API_PROXY_TARGET || 'http://127.0.0.1:8000',
       ]),

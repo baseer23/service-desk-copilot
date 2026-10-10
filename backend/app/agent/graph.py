@@ -20,6 +20,7 @@ from backend.app.agent.models import (
 from backend.app.agent.tools import AgentToolHarness
 from backend.app.models.provider import LLMError
 from backend.app.mcp.client import MCPToolError
+from backend.app.services.web import relevant_excerpt
 
 LABELS = {
     "search_memory": "Memory searched",
@@ -47,6 +48,7 @@ class ServiceDeskAgent:
         self.settings, self.provider = settings, provider
         self.harness = AgentToolHarness(mcp)
         self._case_locks = {}
+        self._request_events = {}
         self.knowledge_subgraph = self._subgraph("knowledge")
         self.case_subgraph = self._subgraph("service_desk")
         builder = StateGraph(InvestigationState)
@@ -125,6 +127,22 @@ class ServiceDeskAgent:
         return {"configurable": {"thread_id": case_id}, "recursion_limit": 180}
 
     async def note(self, state, tool, text, source="agent", event_key=None):
+        if state.get("persist_case") is False:
+            # Knowledge-request activity is application logging, not case memory.
+            events = self._request_events.setdefault(state["case_id"], [])
+            if event_key and any(e.get("event_key") == event_key for e in events):
+                return
+            events.append(
+                {
+                    "id": len(events) + 1,
+                    "tool": tool,
+                    "source": source,
+                    "content": text,
+                    "created_at": now(),
+                    "event_key": event_key,
+                }
+            )
+            return
         await self.harness.invoke(
             "save_case_note",
             {
@@ -216,6 +234,69 @@ class ServiceDeskAgent:
         await self.harness.invoke("save_case", {"case_id": case_id, "state": state})
         return state
 
+    async def run_request(self, request_id, summary=None, answer=None):
+        lock = self._case_locks.setdefault(request_id, asyncio.Lock())
+        async with lock:
+            return await self._run_request(request_id, summary, answer)
+
+    async def _run_request(self, request_id, summary=None, answer=None):
+        """Classify before creating operational state; knowledge never creates a case."""
+        if answer is None:
+            graph_input = {
+                "case_id": request_id,
+                "ticket": {"summary": summary},
+                "persist_case": False,
+                "route_request": True,
+                "status": "investigating",
+                "evidence": [
+                    EvidenceItem(
+                        id=sha256((request_id + summary).encode()).hexdigest()[:20],
+                        source_system="human_input",
+                        source_type="human_report",
+                        tool="user_request",
+                        timestamp=now(),
+                        observed_at=now(),
+                        source="request_report",
+                        content={"reported_request": summary},
+                        reliability=0.7,
+                    ).model_dump()
+                ],
+                "confirmed_facts": [],
+                "remembered_facts": [],
+                "human_answers": [],
+                "contradictions": [],
+                "research_iteration": 0,
+                "research_rounds": 0,
+            }
+            self._request_events[request_id] = []
+        else:
+            snapshot = await self.graph.aget_state(self.config(request_id))
+            if not snapshot.next or snapshot.values.get("status") != "needs_input":
+                raise ValueError("This request is not awaiting human input")
+            graph_input = Command(resume=answer)
+        try:
+            await self.graph.ainvoke(graph_input, self.config(request_id))
+            state = dict((await self.graph.aget_state(self.config(request_id))).values)
+            if state.get("persist_case"):
+                await self._save(request_id, state)
+                events = (await self.harness.invoke("get_case_history", {"case_id": request_id}))[
+                    "items"
+                ]
+            else:
+                events = list(self._request_events.get(request_id, []))
+            return state, events
+        except Exception:
+            state = dict((await self.graph.aget_state(self.config(request_id))).values)
+            if state.get("persist_case"):
+                state.update(status="error", uncertainty=["Request failed; retry this saved case."])
+                await self._save(request_id, state)
+                await self.note(state, "error", "Investigation failed", "application")
+            raise
+        finally:
+            snapshot = await self.graph.aget_state(self.config(request_id))
+            if snapshot.values.get("status") != "needs_input":
+                self._request_events.pop(request_id, None)
+
     def context(self, state, include_tools=False):
         # Preserve full evidence in storage/UI; bound the model context, retaining
         # all human facts, contradictions and the newest source records.
@@ -238,7 +319,7 @@ class ServiceDeskAgent:
                 }
             }
             if "text" in body:
-                body["text"] = str(body["text"])[:1600]
+                body["text"] = relevant_excerpt(str(body["text"]), state["ticket"]["summary"], 1600)
                 body["title"] = meta.get("title") or body.get("title")
                 body["url"] = row.get("url")
             evidence.append(
@@ -288,8 +369,23 @@ class ServiceDeskAgent:
         return {"intent": intent.model_dump(), "workflow": intent.workflow}
 
     async def understand_request(self, state):
+        update = {"status": "investigating"}
+        if state.get("route_request") and state["workflow"] == "service_desk":
+            evidence = [{**row, "case_id": state["case_id"]} for row in state.get("evidence", [])]
+            state = {**state, "persist_case": True, "evidence": evidence}
+            await self._save(state["case_id"], state)
+            for event in self._request_events.pop(state["case_id"], []):
+                await self.note(state, event["tool"], event["content"], event["source"])
+            await self.note(
+                state,
+                "create_case",
+                "Case created after service-desk classification",
+                "application",
+            )
+            update["persist_case"] = True
+            update["evidence"] = evidence
         await self.note(state, "understand_request", state["intent"]["goal"], self.provider.name())
-        return {"status": "investigating"}
+        return update
 
     async def understand_question(self, state):
         await self.note(
@@ -438,7 +534,7 @@ class ServiceDeskAgent:
                     entities=state.get("analysis", {}).get("entities", []),
                     reliability=result["reliability"],
                     relevance=1 / (1 + max(float(row.get("score", 0)), 0)),
-                    case_id=state["case_id"],
+                    case_id=state["case_id"] if state.get("persist_case") is not False else None,
                     url=row.get("url") or meta.get("url") or None,
                     doc_id=meta.get("doc_id"),
                 ).model_dump()
@@ -455,7 +551,24 @@ class ServiceDeskAgent:
                     seen.add(row["id"])
         contradictions = list(state.get("contradictions", []))
         by_predicate = {}
-        for fact in state.get("remembered_facts", []) + state.get("confirmed_facts", []):
+        trusted_facts = []
+        for item in evidence:
+            row = item["content"]
+            if item["tool"] == "get_user_context" and row.get("name"):
+                for predicate, field in (("works_at", "company"), ("current_site", "current_site")):
+                    if row.get(field):
+                        trusted_facts.append(
+                            {
+                                "subject": row["name"],
+                                "predicate": predicate,
+                                "value": row[field],
+                                "source": "trusted_tool",
+                                "observed_at": item["timestamp"],
+                            }
+                        )
+        for fact in (
+            state.get("remembered_facts", []) + trusted_facts + state.get("confirmed_facts", [])
+        ):
             key = (fact["subject"], fact["predicate"])
             old = by_predicate.get(key)
             if old and old["value"] != fact["value"]:
@@ -472,9 +585,12 @@ class ServiceDeskAgent:
 
     async def reason(self, state):
         iteration = state.get("research_iteration", 0) + 1
-        decision = await self.provider.generate_structured(
-            "reason", self.context(state, True), InvestigationDecision
-        )
+        context = self.context(state, True)
+        if state.get("decision_issues"):
+            # An erroneous critic can repeat the invalid premise it was asked
+            # to judge. Application validation takes priority during revision.
+            context.pop("verification", None)
+        decision = await self.provider.generate_structured("reason", context, InvestigationDecision)
         self._validate_evidence_refs(
             state, [i for h in decision.hypotheses for i in h.evidence_ids]
         )
@@ -598,7 +714,8 @@ class ServiceDeskAgent:
             case_id=state["case_id"],
             metadata={"question": state["pending_question"]},
         )
-        await self._call(state, "remember_fact", {"fact": fact.model_dump()})
+        if state.get("persist_case") is not False:
+            await self._call(state, "remember_fact", {"fact": fact.model_dump()})
         await self.note(
             state, "human_response", f"Human response received: {answer}", "human_input"
         )
@@ -639,13 +756,20 @@ class ServiceDeskAgent:
         from urllib.parse import urlparse
 
         async def failed(name, error):
-            outputs.append({
-                "name": name,
-                "output": {
-                    "tool": name, "source_system": "tool_error", "timestamp": now(),
-                    "reliability": 0, "status": "error", "error": str(error), "items": [],
-                },
-            })
+            outputs.append(
+                {
+                    "name": name,
+                    "output": {
+                        "tool": name,
+                        "source_system": "tool_error",
+                        "timestamp": now(),
+                        "reliability": 0,
+                        "status": "error",
+                        "error": str(error),
+                        "items": [],
+                    },
+                }
+            )
             await self.note(state, name, "Public research capability unavailable", "tool_error")
 
         for query in queries[:2]:
@@ -665,7 +789,9 @@ class ServiceDeskAgent:
                 key=lambda r: 0
                 if any(
                     (urlparse(r.get("url", "")).hostname or "").casefold() == d.casefold()
-                    or (urlparse(r.get("url", "")).hostname or "").casefold().endswith("." + d.casefold())
+                    or (urlparse(r.get("url", "")).hostname or "")
+                    .casefold()
+                    .endswith("." + d.casefold())
                     for d in domains
                 )
                 else 1,
@@ -704,7 +830,11 @@ class ServiceDeskAgent:
                             "request": state["ticket"]["summary"],
                             "query": query,
                             "results": [
-                                {"url": page["url"], "title": page.get("title"), "text": text[:6000]}
+                                {
+                                    "url": page["url"],
+                                    "title": page.get("title"),
+                                    "text": relevant_excerpt(text, query, 6000),
+                                }
                             ],
                             "preferred_domains": domains,
                             "missing_evidence": decision.get("missing_information", []),
@@ -753,8 +883,14 @@ class ServiceDeskAgent:
         context = {
             key: context[key]
             for key in (
-                "ticket", "workflow", "decision", "evidence", "confirmed_facts",
-                "remembered_facts", "human_answers", "contradictions",
+                "ticket",
+                "workflow",
+                "decision",
+                "evidence",
+                "confirmed_facts",
+                "remembered_facts",
+                "human_answers",
+                "contradictions",
             )
         }
         verification = await self.provider.generate_structured(
@@ -842,10 +978,20 @@ class ServiceDeskAgent:
             uncertainty.append(
                 "Investigation cycle limit reached; additional technician evidence is required."
             )
+        if not supported:
+            uncertainty += [
+                f"{e['tool']} unavailable: {e['content'].get('error', 'Capability failed')}"
+                for e in state.get("evidence", [])
+                if e["source_type"] == "tool_error"
+            ]
         confidence = min(d.confidence, v.get("confidence", 0)) if supported else 0
-        events = (await self.harness.invoke("get_case_history", {"case_id": state["case_id"]}))[
-            "items"
-        ]
+        events = (
+            list(self._request_events.get(state["case_id"], []))
+            if state.get("persist_case") is False
+            else (await self.harness.invoke("get_case_history", {"case_id": state["case_id"]}))[
+                "items"
+            ]
+        )
         response = FinalResponse(
             issue_summary=state["ticket"]["summary"],
             answer=d.answer if supported else None,
