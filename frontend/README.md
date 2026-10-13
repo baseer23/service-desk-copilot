@@ -1,15 +1,14 @@
 # DeskMate frontend
 
-React and TypeScript knowledge and case-investigation interface for the DeskMate FastAPI Case API.
+React/Vite supports existing text investigations and browser Voice Support.
+`npm run dev` proxies HTTP and WebSocket routes to FastAPI; `API_PROXY_TARGET` may
+change that server-side development target. Deploy the built UI and API under the
+same HTTPS origin. No permanent Azure key belongs in a VITE environment variable.
 
-```bash
-npm ci
-npm run dev -- --host 127.0.0.1
-```
-
-Open http://127.0.0.1:5173 with the backend running on port 8000. Vite proxies `/cases`, `/health` and `/ingest`; `API_PROXY_TARGET` changes its backend target. `VITE_API_BASE` sets an explicit API origin when building for another hosting arrangement.
-
-Enter a question or ticket and click **Run DeskMate**. The supervisor chooses the workflow. Knowledge requests show an answer, sources and research summary. Cases show hypotheses, confirmed facts, inferences, contradictions, a material human question, next action and evidence support. Agent activity is collapsible, with actual tools used; source content is readable instead of raw JSON. The interface creates cases, renders actual events, asks for missing human input, resumes the same case and displays assessment, confirmed facts, remembered facts and source provenance. Text, PDF and public URL ingestion remain available. Fixture evidence is labeled visibly.
+Voice capture requires an explicit click, browser permission and a secure context
+(HTTPS or localhost). It uses a 24 kHz AudioWorklet with mono PCM16, bounded ordered
+playback, mute, interruption, stop, reconnect through text and text fallback.
+The transcript scrolls within a fixed panel. Activity contains operational labels.
 
 ```bash
 npm test
@@ -17,4 +16,18 @@ npm run build
 npm run test:e2e
 ```
 
-Vitest discovers only source unit tests. Playwright starts isolated backend/frontend servers on 8011/5184 with fresh temporary storage and test providers. It exercises the complete Jake flow and a second case with cross-case facts using real HTTP. Ports must be free; it will not reuse unrelated servers. Backend setup uses the repository `.venv` described in `../docs/README.md`.
+See [voice setup](../docs/VOICE.md). Browser tests use synthetic/fake services and
+never access a real microphone or Azure. Voice-specific unit tests cover cleanup,
+permission rejection, playback order, interruption and 1,000-message scrolling.
+
+`/readiness` gates support controls by capability; configuration is distinct from
+Azure authentication/reachability. The isolated demo has a prominent badge and
+**Test microphone**, which does not recognize or speak. Capture shows permission,
+audio initialization and connection stages, with safe error codes. Azure text
+support uses structured reasoning without a Voice Live connection.
+
+Timeline, Sources, Voice transcript and Activity scroll independently. Source
+previews are limited to 600 characters; **Show full evidence** preserves access to
+the original content. Buttons have bordered/filled variants, busy/disabled states
+and focus rings. See [Azure portal setup](../docs/AZURE_LIVE_SETUP.md) and
+[runtime review](../docs/READINESS_REVIEW.md).

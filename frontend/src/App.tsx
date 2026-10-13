@@ -1,4 +1,8 @@
 import { FormEvent, useEffect, useState } from 'react'
+import VoiceSupport from './VoiceSupport'
+import { post, request } from './api'
+import { useReadiness } from './readiness'
+import { InvestigationTimeline, EvidenceList, timestamp } from './InvestigationPanels'
 
 type Fact = {
   subject: string
@@ -63,59 +67,8 @@ type AskResponse = {
   result: Omit<Case, 'case_id' | 'thread_id'>
   events: Event[]
 }
-const base = import.meta.env.VITE_API_BASE || ''
-
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  let response: Response
-  try {
-    response = await fetch(base + path, init)
-  } catch {
-    throw new Error('DeskMate could not connect to the server. Please try again.')
-  }
-  let body
-  try {
-    body = await response.json()
-  } catch {
-    throw new Error(
-      response.ok
-        ? 'DeskMate received an empty or invalid server response. Reload the page and try again.'
-        : response.status >= 500
-          ? `The DeskMate server is temporarily unavailable (HTTP ${response.status}). Please try again.`
-          : `Request failed (HTTP ${response.status}). The server returned an empty or invalid response.`,
-    )
-  }
-  if (!response.ok)
-    throw Object.assign(
-      new Error(
-        typeof body?.detail === 'string' ? body.detail : `Request failed (${response.status})`,
-      ),
-      { case_id: typeof body?.case_id === 'string' ? body.case_id : undefined },
-    )
-  return body as T
-}
-const post = (body?: unknown): RequestInit => ({
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-})
-const timestamp = (value: string) =>
-  new Date(value.includes('T') ? value : value.replace(' ', 'T') + 'Z').toLocaleString()
-const readable = (value: unknown): string => {
-  if (typeof value === 'string') return value
-  if (!value || typeof value !== 'object') return String(value ?? '')
-  const row = value as Record<string, unknown>
-  if (typeof row.text === 'string') return row.text
-  return Object.entries(row)
-    .filter(
-      ([key, val]) =>
-        !['metadata', 'source_system', 'observed_at', 'source'].includes(key) &&
-        (typeof val === 'string' || typeof val === 'boolean' || typeof val === 'number'),
-    )
-    .map(([key, val]) => `${key.replace(/_/g, ' ')}: ${val}`)
-    .join(' · ')
-}
-
 export default function App() {
+  const { readiness } = useReadiness()
   const [ticket, setTicket] = useState('')
   const [active, setActive] = useState<Case | null>(null)
   const [cases, setCases] = useState<Case[]>([])
@@ -272,8 +225,9 @@ export default function App() {
           <h1>DeskMate</h1>
           <p>Service Desk Investigation Assistant</p>
         </div>
-        <span className="runtime-label">Case investigations</span>
+        <span className="runtime-label">{readiness?.runtime_mode==='isolated_demo' ? 'Isolated demo' : 'Case investigations'}</span>
       </header>
+      {readiness?.runtime_mode === 'isolated_demo' && <div className="demo-banner runtime-banner"><strong>ISOLATED DEMO</strong><p>Responses and audio are simulated. Azure is not being used.</p></div>}
       {error && (
         <div className="error-banner" role="alert">
           {error}
@@ -294,7 +248,7 @@ export default function App() {
                 onChange={(e) => setTicket(e.target.value)}
                 required
               />
-              <button className="primary" disabled={busy || !ticket.trim()}>
+              <button className="primary" disabled={busy || !ticket.trim() || (readiness !== null && !readiness.text_ready)}>
                 {busy ? 'Investigating…' : 'Run DeskMate'}
               </button>
             </form>
@@ -430,26 +384,7 @@ export default function App() {
                 <h2>
                   {active.workflow === 'knowledge' ? 'Research summary' : 'Investigation Timeline'}
                 </h2>
-                <ol className="timeline">
-                  {(active.workflow === 'knowledge'
-                    ? events.filter((e) =>
-                        /^(search_|fetch_|ingest_|evaluate_sources$|verify$)/.test(e.tool || ''),
-                      )
-                    : events
-                  ).map((e) => (
-                    <li key={e.id}>
-                      <span className="event-dot" aria-hidden="true">
-                        {e.tool === 'error' ? '!' : '✓'}
-                      </span>
-                      <div>
-                        <p>{e.content}</p>
-                        <small>
-                          {e.source} · {timestamp(e.created_at)}
-                        </small>
-                      </div>
-                    </li>
-                  ))}
-                </ol>
+                <InvestigationTimeline events={active.workflow==='knowledge' ? events.filter(event=>/^(search_|fetch_|ingest_|evaluate_sources$|verify$)/.test(event.tool ?? '')) : events} />
                 {busy && (
                   <p className="muted" role="status">
                     Gathering evidence…
@@ -588,7 +523,7 @@ export default function App() {
                 {active.verification?.justification && (
                   <details>
                     <summary>Evidence verification</summary>
-                    <p>{active.verification.justification}</p>
+                    <p>Evidence verification complete. Review the sources and uncertainty above.</p>
                   </details>
                 )}
                 {active.final_response?.troubleshooting_steps?.length ? (
@@ -632,19 +567,8 @@ export default function App() {
                 </ul>
                 {active.workflow === 'knowledge' && (
                   <>
-                    <h3>Full request history</h3>
-                    <ol className="timeline">
-                      {events.map((e) => (
-                        <li key={e.id}>
-                          <div>
-                            <p>{e.content}</p>
-                            <small>
-                              {e.source} · {timestamp(e.created_at)}
-                            </small>
-                          </div>
-                        </li>
-                      ))}
-                    </ol>
+                    <h3>Request activity</h3>
+                    <InvestigationTimeline events={events} />
                   </>
                 )}
               </details>
@@ -653,40 +577,13 @@ export default function App() {
                   Sources <span className="count">{active.evidence.length}</span>
                 </h2>
                 {!active.evidence.length && <p className="muted">No evidence collected yet.</p>}
-                <div className="evidence-list">
-                  {active.evidence.map((e, i) => (
-                    <details key={i}>
-                      <summary>
-                        <span>
-                          {e.tool.replace(/_/g, ' ')} · {e.source}
-                        </span>
-                        <span
-                          className={`source-badge ${e.source_system === 'local_fixture' ? 'fixture' : ''}`}
-                        >
-                          {e.source_system === 'local_fixture' ? 'Fixture' : 'Real source'} ·{' '}
-                          {e.source_system}
-                        </span>
-                      </summary>
-                      <small>
-                        {timestamp(e.observed_at)} · {e.tool}
-                        {e.source_type ? ' · ' + e.source_type.replace(/_/g, ' ') : ''}
-                      </small>
-                      {e.url && /^https?:\/\//i.test(e.url) && (
-                        <p>
-                          <a href={e.url} target="_blank" rel="noreferrer">
-                            Open source
-                          </a>
-                        </p>
-                      )}
-                      <p className="source-content">{readable(e.content)}</p>
-                    </details>
-                  ))}
-                </div>
+                <EvidenceList evidence={active.evidence} />
               </section>
             </>
           )}
         </div>
       </main>
+      <VoiceSupport onCaseCreated={openCase} readiness={readiness} />
       <footer>Evidence guides the next step. A recommendation does not confirm resolution.</footer>
     </div>
   )

@@ -17,18 +17,23 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 class MCPToolError(RuntimeError):
     """Server tool failure; the connection remains usable."""
 
+    def __init__(self, message: str, status_code: int = 502) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
 
 class MCPConnectionError(RuntimeError):
     """Transport or initialization failed."""
 
 
 class DeskMateMCPClient:
-    def __init__(self, settings=None, *, server_command=None, cwd=None):
+    def __init__(self, settings=None, *, server_command=None, cwd=None, stderr=None):
         from backend.app.core.config import get_settings
 
         self.settings = settings or get_settings()
         self.server_command = server_command or sys.executable
         self.cwd = cwd or str(PROJECT_ROOT)
+        self.stderr = stderr
         self._lock = asyncio.Lock()
         self._task = None
         self._queue = asyncio.Queue()
@@ -49,10 +54,16 @@ class DeskMateMCPClient:
                 "SHELL",
                 "TMPDIR",
                 "SYSTEMROOT",
-                "HF_HOME",
-                "HF_HUB_CACHE",
-                "SENTENCE_TRANSFORMERS_HOME",
                 "SSL_CERT_FILE",
+                "AZURE_CLIENT_ID",
+                "AZURE_TENANT_ID",
+                "AZURE_CLIENT_SECRET",
+                "AZURE_FEDERATED_TOKEN_FILE",
+                "AZURE_CONFIG_DIR",
+                "IDENTITY_ENDPOINT",
+                "IDENTITY_HEADER",
+                "MSI_ENDPOINT",
+                "MSI_SECRET",
             }
         }
         env.update(
@@ -64,7 +75,7 @@ class DeskMateMCPClient:
                 "EMBED_MODEL_NAME": s.embed_model_name,
                 "NEO4J_URI": s.neo4j_uri,
                 "NEO4J_USER": s.neo4j_user,
-                "NEO4J_PASSWORD": s.neo4j_password,
+                "NEO4J_PASSWORD": s.neo4j_password.get_secret_value(),
                 "TEST_MODE": str(s.test_mode).lower(),
                 "GENERATION_PROVIDER": s.generation_provider,
                 "CHUNK_TOKENS": str(s.chunk_tokens),
@@ -72,8 +83,28 @@ class DeskMateMCPClient:
                 "WEB_MAX_BYTES": str(s.web_max_bytes),
                 "MODEL_TIMEOUT_SEC": str(s.model_timeout_sec),
                 "ANONYMIZED_TELEMETRY": "false",
+                "KNOWLEDGE_SCOPE": s.knowledge_scope,
+                "RESEARCH_SOURCE_POLICY": s.research_source_policy,
+                "RESEARCH_PREFERRED_DOMAINS": json.dumps(s.research_preferred_domains),
+                "MAX_RESEARCH_ROUNDS": str(s.max_research_rounds),
+                "ALLOW_URL_INGEST": str(s.allow_url_ingest).lower(),
             }
         )
+        # Forward all voice configuration explicitly; never log this environment.
+        for name in type(s).model_fields:
+            if name.startswith(("voice_", "azure_")):
+                value = getattr(s, name)
+                if hasattr(value, "get_secret_value"):
+                    value = value.get_secret_value()
+                elif isinstance(value, list):
+                    value = json.dumps(value)
+                elif isinstance(value, bool):
+                    value = str(value).lower()
+                if name == "azure_openai_api_key" and s.azure_use_entra_id and not value:
+                    # The SDK treats an exported empty key differently from an absent
+                    # key and fails before using its Entra token provider.
+                    continue
+                env[name.upper()] = str(value) if value is not None else ""
         return env
 
     async def start(self):
@@ -101,7 +132,7 @@ class DeskMateMCPClient:
                 cwd=self.cwd,
                 env=self.subprocess_env(),
             )
-            async with stdio_client(params) as (read, write):
+            async with stdio_client(params, errlog=self.stderr or sys.stderr) as (read, write):
                 async with ClientSession(
                     read, write, read_timeout_seconds=timedelta(seconds=60)
                 ) as session:
@@ -125,7 +156,8 @@ class DeskMateMCPClient:
                                 value = self._coerce_tool_result(result)
                                 if isinstance(value, dict) and value.get("status") == "error":
                                     raise MCPToolError(
-                                        f'MCP tool {name} failed: {value.get("error")}'
+                                        f'MCP tool {name} failed: {value.get("error")}',
+                                        (value.get("result") or {}).get("http_status", 502),
                                     )
                             if not future.done():
                                 future.set_result(value)
@@ -172,7 +204,10 @@ class DeskMateMCPClient:
                 return await future
             except MCPConnectionError:
                 await self.close()
-                if attempt:
+                # Do not repeat a write after an ambiguous transport failure.
+                if attempt or tool_name in {
+                    "create_case_from_voice_session",
+                }:
                     raise
 
     async def close(self):

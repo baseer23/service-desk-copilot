@@ -143,7 +143,7 @@ def test_explicit_service_failure_can_retry_the_saved_node(make_client):
         if stage == "reason":
             attempts += 1
             if attempts == 1:
-                raise LLMError("Groq rate limit reached")
+                raise LLMError("previous hosted provider rate limit reached")
         return await original(stage, context, schema)
 
     provider.generate_structured = once

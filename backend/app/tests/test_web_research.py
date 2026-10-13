@@ -188,7 +188,8 @@ def test_loop_limit_finalizes_without_recursion_failure(make_client):
     assert body["confidence"] == 0 and any("cycle limit" in u for u in body["uncertainty"])
 
 
-def test_fetched_irrelevant_page_is_not_ingested(make_client):
+@pytest.mark.parametrize("selected_irrelevant", [False, True])
+def test_fetched_irrelevant_page_is_not_ingested(make_client, selected_irrelevant):
     c = make_client()
     agent = c.app.state.agent
     original_invoke = agent.harness.invoke
@@ -209,7 +210,8 @@ def test_fetched_irrelevant_page_is_not_ingested(make_client):
             selections.append(context)
             if context.get("purpose"):
                 return schema(
-                    selected_urls=[],
+                    selected_urls=["https://example.com/guide"] if selected_irrelevant else [],
+                    directly_relevant=False,
                     evidence_gap="No recovery instructions in the fetched page.",
                     justification="Actual content is irrelevant despite the search title.",
                 )

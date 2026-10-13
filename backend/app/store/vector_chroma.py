@@ -16,12 +16,18 @@ class VectorStore(Protocol):
 
 class VectorChromaStore:
     def __init__(
-        self, path: str, collection_name="chunks", embedding_provider=None, embedding_model=None
+        self,
+        path: str,
+        collection_name="chunks",
+        embedding_provider=None,
+        embedding_model=None,
+        embedding_dimensions=384,
     ):
         import chromadb
         from chromadb.config import Settings
 
         self.path, self.collection_name = path, collection_name
+        self.embedding_dimensions = embedding_dimensions
         self.embedding_provider, self.embedding_model = embedding_provider, embedding_model
         try:
             self._client = chromadb.PersistentClient(
@@ -79,8 +85,8 @@ class VectorChromaStore:
                 or meta.get("embedding_model") != self.embedding_model
             ):
                 raise StorageError("Chunk embedding provenance does not match this collection")
-            if self.embedding_provider and len(c["embedding"]) != 384:
-                raise StorageError("Expected 384-dimensional embeddings")
+            if self.embedding_provider and len(c["embedding"]) != self.embedding_dimensions:
+                raise StorageError(f"Expected {self.embedding_dimensions}-dimensional embeddings")
         try:
             self._collection.upsert(
                 ids=[c["id"] for c in chunks],

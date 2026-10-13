@@ -1,10 +1,28 @@
 """Lifespan-aware clients using installed packages and isolated persistent stores."""
 
 import sys
+import os
 from contextlib import ExitStack
 from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
+
+# Collection imports the application before fixtures run. Explicit isolated test mode
+# prevents local .env settings from selecting any live generation/speech/embeddings.
+for key, value in {
+    "TEST_MODE": "true",
+    "GENERATION_PROVIDER": "stub",
+    "EMBED_PROVIDER": "stub",
+    "VOICE_ENABLED": "false",
+    "VOICE_PROVIDER": "fake",
+    "AZURE_USAGE_GUARD_ENABLED": "false",
+    "AZURE_EMERGENCY_DISABLE": "false",
+    "AZURE_LIVE_TEST_MODE": "false",
+    "AZURE_SETUP_VALIDATION_MODE": "false",
+    "AZURE_USAGE_DB_PATH": "",
+    "NEO4J_URI": "",
+}.items():
+    os.environ[key] = value
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:

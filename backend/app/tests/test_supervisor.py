@@ -122,6 +122,8 @@ def test_all_agent_capabilities_cross_structured_tool_and_real_mcp(make_client, 
 
     monkeypatch.setattr(StructuredTool, "ainvoke", traced)
     c = make_client()
+    assert invoked == ["get_local_storage_status"]
+    invoked.clear()  # Compare investigation calls after startup readiness finished.
     protocol = []
     original_protocol = c.app.state.mcp.call_tool
 

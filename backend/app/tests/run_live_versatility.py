@@ -1,6 +1,6 @@
-"""Opt-in validation with configured Groq and/or the actual public network.
+"""Opt-in validation with configured Azure OpenAI and/or the actual public network.
 
-python -m backend.app.tests.run_live_versatility --mode groq --report /tmp/live.json
+python -m backend.app.tests.run_live_versatility --mode azure_openai --report /tmp/live.json
 Never run automatically in pytest; uses fictional tickets and isolated stores.
 """
 
@@ -20,7 +20,7 @@ from backend.app.tests.test_service_desk_scenarios import ScenarioProvider
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["groq", "web"], required=True)
+    parser.add_argument("--mode", choices=["azure_openai", "web"], required=True)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument(
         "--resume", action="store_true", help="Resume the cases/checkpoints in an existing report"
@@ -40,8 +40,8 @@ def main():
     )
     settings = Settings(
         test_mode=False,
-        generation_provider="groq",
-        embed_provider="sentence",
+        generation_provider="azure_openai",
+        embed_provider="azure_openai",
         neo4j_uri="",
         case_db_path=root / "cases.db",
         chroma_dir=root / "chroma",
@@ -55,7 +55,9 @@ def main():
 
     with TestClient(create_app(settings)) as client:
         for scenario in (
-            [SCENARIOS[0], SCENARIOS[1], SCENARIOS[2]] if args.mode == "groq" else [SCENARIOS[9]]
+            [SCENARIOS[0], SCENARIOS[1], SCENARIOS[2]]
+            if args.mode == "azure_openai"
+            else [SCENARIOS[9]]
         ):
             old = next(
                 (r for r in previous.get("scenarios", []) if r["scenario"] == scenario.name), {}
@@ -64,7 +66,7 @@ def main():
                 rows.append(old)
                 save()
                 continue
-            # Normal MCP ingestion, actual sentence embeddings and temporary Chroma.
+            # Normal MCP ingestion, Azure embeddings and temporary Chroma.
             client.portal.call(
                 client.app.state.agent.harness.invoke,
                 "ingest_text",
@@ -94,7 +96,7 @@ def main():
                 return result
 
             async def track_model(stage, context, schema):
-                if args.mode == "groq" and args.pace_seconds:
+                if args.mode == "azure_openai" and args.pace_seconds:
                     import asyncio
 
                     print(f"{scenario.name}: pacing before {stage}", flush=True)
@@ -201,11 +203,11 @@ def main():
                 row["result"] = result
                 assert result["status"] == "assessment_ready", result["uncertainty"]
                 assert result["recommended_next_action"] and result["confidence"] > 0
-                if args.mode == "groq":
+                if args.mode == "azure_openai":
                     assert {"classify_intent", "plan", "reason", "verify"} <= {
                         s["stage"] for s in model_stages
                     }
-                    assert all(s["provider"] == "groq" for s in model_stages)
+                    assert all(s["provider"] == "azure_openai" for s in model_stages)
                     assert result["hypotheses"]
                     assert all(
                         h["status"] == "plausible" and h["evidence_ids"]

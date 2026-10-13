@@ -8,6 +8,7 @@ class StructuredModel(BaseModel):
 
 
 class RequestIntent(StructuredModel):
+    in_scope: bool = True
     workflow: Literal["knowledge", "service_desk"]
     goal: str
     justification: str
@@ -53,6 +54,9 @@ class InvestigationPlan(StructuredModel):
 
 
 class EvidenceItem(StructuredModel):
+    source_quality: Literal["primary", "third_party", "internal", "fixture", "unclassified"] = (
+        "unclassified"
+    )
     id: str
     source_system: str
     source_type: Literal[
@@ -132,6 +136,7 @@ class InvestigationDecision(StructuredModel):
 
 
 class ResearchSelection(StructuredModel):
+    directly_relevant: bool = False
     selected_urls: list[str] = Field(default_factory=list, max_length=2)
     evidence_gap: str
     justification: str

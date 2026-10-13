@@ -3,23 +3,27 @@
 import asyncio
 from datetime import datetime, timezone
 from hashlib import sha256
-from langgraph.graph import StateGraph, START, END
+
+from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
-from backend.app.agent.state import InvestigationState
+
 from backend.app.agent.models import (
-    RequestIntent,
-    TicketAnalysis,
-    InvestigationPlan,
-    InvestigationDecision,
     EvidenceItem,
-    MemoryFact,
-    VerificationResult,
     FinalResponse,
+    InvestigationDecision,
+    InvestigationPlan,
+    MemoryFact,
+    RequestIntent,
     ResearchSelection,
+    TicketAnalysis,
+    VerificationResult,
 )
+from backend.app.agent.scope import SCOPE_MESSAGE
+from backend.app.agent.state import InvestigationState
 from backend.app.agent.tools import AgentToolHarness
-from backend.app.models.provider import LLMError
 from backend.app.mcp.client import MCPToolError
+from backend.app.models.provider import LLMError
+from backend.app.services.source_policy import permits, quality, rank_sources
 from backend.app.services.web import relevant_excerpt
 
 LABELS = {
@@ -66,10 +70,19 @@ class ServiceDeskAgent:
             "finalize",
         ):
             builder.add_node(name, getattr(self, name))
+        builder.add_node("reject_scope", self.reject_scope)
+        builder.add_edge("reject_scope", END)
         builder.add_node("knowledge_subgraph", self.knowledge_subgraph)
         builder.add_node("case_subgraph", self.case_subgraph)
         builder.add_edge(START, "classify_intent")
-        builder.add_edge("classify_intent", "understand_request")
+        builder.add_conditional_edges(
+            "classify_intent",
+            lambda state: (
+                "understand_request"
+                if state["intent"].get("in_scope", True) or self.settings.knowledge_scope == "broad"
+                else "reject_scope"
+            ),
+        )
         builder.add_conditional_edges(
             "understand_request",
             lambda s: "knowledge_subgraph" if s["workflow"] == "knowledge" else "case_subgraph",
@@ -155,7 +168,17 @@ class ServiceDeskAgent:
         )
 
     async def _call(self, state, name, arguments):
+        if (
+            name in {"fetch_web_page", "ingest_text"}
+            and arguments.get("url")
+            and not permits(arguments["url"], self.settings)
+        ):
+            raise MCPToolError("Public source excluded by configured policy")
         result = await self.harness.invoke(name, arguments)
+        if name == "fetch_web_page" and isinstance(result, dict):
+            page = result.get("result") or result
+            if not permits(page.get("url", arguments.get("url", "")), self.settings):
+                raise MCPToolError("Redirected public source excluded by configured policy")
         rows = (
             result.get("items", [])
             if isinstance(result, dict)
@@ -361,12 +384,31 @@ class ServiceDeskAgent:
 
     async def classify_intent(self, state):
         intent = await self.provider.generate_structured(
-            "classify_intent", {"request": state["ticket"]["summary"]}, RequestIntent
+            "classify_intent",
+            {
+                "request": state["ticket"]["summary"],
+                "knowledge_scope": self.settings.knowledge_scope,
+            },
+            RequestIntent,
         )
         await self.note(
             state, "classify_intent", f"Request classified: {intent.workflow}", self.provider.name()
         )
         return {"intent": intent.model_dump(), "workflow": intent.workflow}
+
+    async def reject_scope(self, state):
+        return {
+            "workflow": "knowledge",
+            "status": "insufficient_information",
+            "final_answer": SCOPE_MESSAGE,
+            "final_response": FinalResponse(
+                issue_summary=state["ticket"]["summary"], answer=SCOPE_MESSAGE, confidence=0
+            ).model_dump(),
+            "evidence": [],
+            "confidence": 0,
+            "uncertainty": [],
+            "pending_question": None,
+        }
 
     async def understand_request(self, state):
         update = {"status": "investigating"}
@@ -537,6 +579,11 @@ class ServiceDeskAgent:
                     case_id=state["case_id"] if state.get("persist_case") is not False else None,
                     url=row.get("url") or meta.get("url") or None,
                     doc_id=meta.get("doc_id"),
+                    source_quality=(
+                        quality(row.get("url") or meta.get("url") or "", self.settings)
+                        if kind == "public_documentation"
+                        else "fixture" if system == "local_fixture" else "internal"
+                    ),
                 ).model_dump()
             )
         return items
@@ -752,8 +799,6 @@ class ServiceDeskAgent:
                 "Public research requires a model-formulated query tied to an evidence gap"
             )
         outputs = []
-        domains = decision.get("preferred_domains", [])
-        from urllib.parse import urlparse
 
         async def failed(name, error):
             outputs.append(
@@ -784,18 +829,7 @@ class ServiceDeskAgent:
                 if isinstance(search, dict) and "items" in search
                 else search
             )
-            rows = sorted(
-                rows,
-                key=lambda r: 0
-                if any(
-                    (urlparse(r.get("url", "")).hostname or "").casefold() == d.casefold()
-                    or (urlparse(r.get("url", "")).hostname or "")
-                    .casefold()
-                    .endswith("." + d.casefold())
-                    for d in domains
-                )
-                else 1,
-            )
+            rows = rank_sources(rows, self.settings)
             selection = await self.provider.generate_structured(
                 "evaluate_sources",
                 {
@@ -803,7 +837,8 @@ class ServiceDeskAgent:
                     "request": state["ticket"]["summary"],
                     "query": query,
                     "results": rows,
-                    "preferred_domains": domains,
+                    "preferred_domains": self.settings.research_preferred_domains,
+                    "source_policy": self.settings.research_source_policy,
                     "missing_evidence": decision.get("missing_information", []),
                 },
                 ResearchSelection,
@@ -819,8 +854,11 @@ class ServiceDeskAgent:
                 capability_name = "fetch_web_page"
                 try:
                     fetched = await self._call(state, "fetch_web_page", {"url": hit["url"]})
-                    outputs.append({"name": "fetch_web_page", "output": fetched})
                     page = fetched["result"] if "result" in fetched else fetched
+                    if not permits(page.get("url", ""), self.settings):
+                        continue
+                    page["source_quality"] = quality(page.get("url", ""), self.settings)
+                    outputs.append({"name": "fetch_web_page", "output": fetched})
                     text = page.get("text", "")
                     if len(text.strip()) < 120:
                         continue
@@ -836,7 +874,8 @@ class ServiceDeskAgent:
                                     "text": relevant_excerpt(text, query, 6000),
                                 }
                             ],
-                            "preferred_domains": domains,
+                            "preferred_domains": self.settings.research_preferred_domains,
+                            "source_policy": self.settings.research_source_policy,
                             "missing_evidence": decision.get("missing_information", []),
                             "purpose": "Assess actual fetched content for usefulness before ingestion.",
                         },
@@ -847,7 +886,7 @@ class ServiceDeskAgent:
                     await self.note(
                         state, "evaluate_sources", useful.justification, self.provider.name()
                     )
-                    if not useful.selected_urls:
+                    if not useful.selected_urls or not useful.directly_relevant:
                         continue
                     # Public material stays untrusted, with URL/document provenance.
                     capability_name = "ingest_text"

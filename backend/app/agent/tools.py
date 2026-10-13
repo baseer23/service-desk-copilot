@@ -33,6 +33,11 @@ KNOWLEDGE_TOOLS = {
 }
 
 
+# Session inspection and write tools are application-controlled, never model-planned.
+def allowed_tools(workflow: str) -> set[str]:
+    return KNOWLEDGE_TOOLS if workflow == "knowledge" else READ_TOOLS
+
+
 def annotation(spec):
     if "anyOf" in spec:
         types = [annotation(s) for s in spec["anyOf"]]
@@ -89,14 +94,14 @@ class AgentToolHarness:
         return await self.tools[name].ainvoke(arguments)
 
     def validate_plan(self, plan, workflow):
-        allowed = KNOWLEDGE_TOOLS if workflow == "knowledge" else READ_TOOLS
+        allowed = allowed_tools(workflow)
         for call in plan.tool_calls:
             if call.name not in allowed or call.name not in self.tools:
                 raise ValueError(f"Capability not permitted in {workflow}: {call.name}")
             self.tools[call.name].args_schema.model_validate(call.arguments)
 
     def schemas(self, workflow="service_desk"):
-        allowed = KNOWLEDGE_TOOLS if workflow == "knowledge" else READ_TOOLS
+        allowed = allowed_tools(workflow)
         results = []
         for name, item in self.descriptors.items():
             if name not in allowed:

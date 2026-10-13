@@ -1,7 +1,7 @@
 import hashlib
 from unittest.mock import Mock
 import pytest
-from backend.app.adapters.embeddings import StubEmbeddingProvider
+from backend.app.testing.embeddings import StubEmbeddingProvider
 from backend.app.services.ingest_service import IngestService
 from backend.app.services.capabilities import knowledge_stores
 from backend.app.store.graph_repo import InMemoryGraphRepository

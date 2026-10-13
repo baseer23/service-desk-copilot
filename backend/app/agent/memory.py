@@ -81,6 +81,57 @@ class CaseMemoryStore:
             )
             conn.commit()
 
+    def insert_voice_case(
+        self, conn: sqlite3.Connection, case_id: str, intake: Any, summary: str | None
+    ) -> None:
+        """Use the voice repository's transaction; never overwrite an existing case."""
+        state = {
+            "case_id": case_id,
+            "ticket": {"summary": summary or intake.final_summary or intake.issue_summary},
+            "status": "new",
+            "confidence": 0,
+            "tenant_id": intake.tenant_id,
+            "voice_intake": {
+                "session_id": intake.session_id,
+                "contact": intake.confirmed_profile,
+                "confirmed": True,
+                "resolution_status": intake.resolution_status,
+                "evidence_ids": [e.id for e in intake.evidence],
+                "actions": [a.model_dump() for a in intake.actions],
+            },
+        }
+        existing = conn.execute(
+            "SELECT state_json FROM cases WHERE case_id=?", (case_id,)
+        ).fetchone()
+        if existing:
+            prior = json.loads(existing[0])
+            if (
+                prior.get("voice_intake", {}).get("session_id") != intake.session_id
+                or prior.get("tenant_id") != intake.tenant_id
+            ):
+                raise ValueError("Linked case provenance does not match the voice session")
+            prior["voice_intake"] = state["voice_intake"]
+            prior["voice_intake"]["final_summary"] = intake.final_summary
+            if prior.get("status") == "new":
+                prior["ticket"] = state["ticket"]
+            conn.execute(
+                "UPDATE cases SET state_json=? WHERE case_id=?", (json.dumps(prior), case_id)
+            )
+        conn.execute(
+            "INSERT OR IGNORE INTO cases(case_id,state_json) VALUES(?,?)",
+            (case_id, json.dumps(state)),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO events(case_id,tool,source,content,event_key) VALUES(?,?,?,?,?)",
+            (
+                case_id,
+                "voice_intake",
+                "human_confirmed",
+                "Contact details explicitly confirmed during voice intake.",
+                "voice-intake:" + intake.session_id,
+            ),
+        )
+
     def load_case(self, case_id: str) -> dict[str, Any] | None:
         with closing(self._connect()) as conn:
             row = conn.execute(

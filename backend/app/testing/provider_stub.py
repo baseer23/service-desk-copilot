@@ -1,22 +1,29 @@
-"""Deterministic test fixtures; production planning/reasoning uses only Groq."""
+"""Deterministic test fixtures; live reasoning uses Azure."""
 
 import re
+from typing import Any
 
 
 class StubProvider:
-    def name(self):
+    def name(self) -> str:
         return "stub"
 
-    async def generate_structured(self, stage, context, schema):
+    async def generate_structured(self, stage: str, context: dict[str, Any], schema: Any) -> Any:
+        if stage.startswith("voice_"):
+            from backend.app.testing.voice_reasoning import generate
+
+            return generate(stage, context, schema)
         text = context.get("request") or context.get("ticket", {}).get("summary", "")
         lower = text.lower()
         if stage == "classify_intent":
+            unrelated = any(term in lower for term in ("immigration", "sports score", "restaurant recommendation", "political news", "election news"))
             knowledge = any(
-                t in lower for t in ("graduate", "resume", "skills", "summarize", "guidance")
+                t in lower for t in ("graduate", "resume", "skills", "summarize", "guidance", "document", "policy")
             )
             return schema.model_validate(
                 {
-                    "workflow": "knowledge" if knowledge else "service_desk",
+                    "workflow": "knowledge" if knowledge or unrelated else "service_desk",
+                    "in_scope": not unrelated,
                     "goal": text,
                     "justification": "Explicit test intent fixture",
                 }
@@ -26,11 +33,7 @@ class StubProvider:
             user = (
                 match[1]
                 if match
-                else "Sarah"
-                if "sarah" in lower
-                else "Jake"
-                if "jake" in lower
-                else None
+                else "Sarah" if "sarah" in lower else "Jake" if "jake" in lower else None
             )
             company = match[2] if match else "B99" if "b99" in lower else None
             device = "PRN-ACCT-02" if "prn-acct-02" in lower else None
@@ -39,18 +42,16 @@ class StubProvider:
                     "user_name": user,
                     "company": company,
                     "device": device,
-                    "product": "VPN"
-                    if "vpn" in lower
-                    else "Microsoft 365"
-                    if "mfa" in lower
-                    else "Printer"
-                    if device
-                    else None,
-                    "issue_type": "authentication"
-                    if "vpn" in lower or "mfa" in lower
-                    else "printing"
-                    if device
-                    else "unknown",
+                    "product": (
+                        "VPN"
+                        if "vpn" in lower
+                        else "Microsoft 365" if "mfa" in lower else "Printer" if device else None
+                    ),
+                    "issue_type": (
+                        "authentication"
+                        if "vpn" in lower or "mfa" in lower
+                        else "printing" if device else "unknown"
+                    ),
                     "symptoms": text,
                     "affected_scope": "multiple users" if "five" in lower else "individual",
                     "entities": [x for x in (user, company, device) if x],
@@ -63,7 +64,7 @@ class StubProvider:
         }
         facts.update({f["predicate"]: f["value"] for f in context.get("confirmed_facts") or []})
 
-        def call(name, **args):
+        def call(name: str, **args: Any) -> dict[str, Any]:
             return {
                 "name": name,
                 "arguments": args,
@@ -127,13 +128,16 @@ class StubProvider:
                     "goal": text,
                     "tool_calls": calls,
                     "parallel_groups": [list(range(len(calls)))],
-                    "stop_condition": "Enough evidence to form a candidate answer or material question",
+                    "stop_condition": (
+                        "Enough evidence to form a candidate answer or material question"
+                    ),
                 }
             )
         if stage == "evaluate_sources":
             return schema.model_validate(
                 {
                     "selected_urls": [r["url"] for r in context["results"][:2]],
+                    "directly_relevant": True,
                     "evidence_gap": text,
                     "justification": "Explicit test source selection",
                 }
@@ -150,18 +154,22 @@ class StubProvider:
                 ids = [e["id"] for e in evidence if e["tool"] == "user_request"]
             return schema.model_validate(
                 {
-                    "supported_claims": [
-                        decision.get("answer")
-                        or decision.get("recommended_next_action")
-                        or "No supported claim"
-                    ]
-                    if ids
-                    else [],
+                    "supported_claims": (
+                        [
+                            decision.get("answer")
+                            or decision.get("recommended_next_action")
+                            or "No supported claim"
+                        ]
+                        if ids
+                        else []
+                    ),
                     "unsupported_claims": [] if ids else ["No supporting evidence"],
                     "evidence_ids": ids,
                     "confidence": 0.75 if ids else 0,
                     "should_continue_research": False,
-                    "justification": "Independent test verification checked the supplied evidence identifiers",
+                    "justification": (
+                        "Independent test verification checked the supplied evidence identifiers"
+                    ),
                 }
             )
         base = {
@@ -228,21 +236,29 @@ class StubProvider:
             ]
             base["hypotheses"] = [
                 {
-                    "claim": "Recent WatchGuard configuration change is a plausible cause, supported by the site-specific alert and previous incident, but it is not yet confirmed.",
+                    "claim": (
+                        "Recent WatchGuard configuration change is a plausible cause, supported by"
+                        " the site-specific alert and previous incident, but it is not yet"
+                        " confirmed."
+                    ),
                     "evidence_ids": ids,
                     "confidence": 0.6,
                 }
             ]
             if not facts.get("current_site"):
                 base.update(
-                    question_for_human=f"Which site or floor is {analysis['user_name']} currently working from?",
+                    question_for_human=(
+                        f"Which site or floor is {analysis['user_name']} currently working from?"
+                    ),
                     human_field="current_site",
                     question_reason="The active alert affects only the second floor.",
                     question_subject=analysis["user_name"],
                 )
             elif not facts.get("required_update_installed"):
                 base.update(
-                    question_for_human=f"Has {analysis['user_name']} installed the required VPN client update?",
+                    question_for_human=(
+                        f"Has {analysis['user_name']} installed the required VPN client update?"
+                    ),
                     human_field="required_update_installed",
                     question_reason="The site configuration change requires a client update.",
                     question_subject=analysis["user_name"],
@@ -251,8 +267,13 @@ class StubProvider:
                 base.update(
                     enough_information=True,
                     confidence=0.75,
-                    likely_issue="A stale client profile is plausible; root cause remains unconfirmed.",
-                    recommended_next_action="The required update is confirmed installed. Refresh the client profile and retry VPN authentication; inspect logs if failure continues.",
+                    likely_issue=(
+                        "A stale client profile is plausible; root cause remains unconfirmed."
+                    ),
+                    recommended_next_action=(
+                        "The required update is confirmed installed. Refresh the client profile and"
+                        " retry VPN authentication; inspect logs if failure continues."
+                    ),
                     troubleshooting_steps=[
                         "Refresh the client profile",
                         "Retry authentication",
@@ -264,26 +285,37 @@ class StubProvider:
                 enough_information=True,
                 confidence=0.75,
                 likely_issue="The printer queue is paused.",
-                recommended_next_action="Verify the physical jam is cleared, resume the paused queue, and print a test page.",
+                recommended_next_action=(
+                    "Verify the physical jam is cleared, resume the paused queue, and print a test"
+                    " page."
+                ),
             )
         elif analysis.get("product") == "Microsoft 365":
             base.update(
                 enough_information=True,
                 confidence=0.6,
-                recommended_next_action="Check the Microsoft Entra sign-in failure code and registered authentication method; verify Authenticator enrollment before changing policy.",
+                recommended_next_action=(
+                    "Check the Microsoft Entra sign-in failure code and registered authentication"
+                    " method; verify Authenticator enrollment before changing policy."
+                ),
                 likely_issue="MFA enrollment or policy failure remains unconfirmed.",
             )
         elif analysis.get("affected_scope") == "multiple users" and evidence:
             base.update(
                 enough_information=True,
                 confidence=0.6,
-                recommended_next_action="Correlate the shared service alert with the recent VPN change; check service health before individual devices.",
+                recommended_next_action=(
+                    "Correlate the shared service alert with the recent VPN change; check service"
+                    " health before individual devices."
+                ),
             )
         elif documents or any(e["tool"] == "fetch_web_page" for e in evidence):
             base.update(
                 enough_information=True,
                 confidence=0.6,
-                recommended_next_action="Review diagnostic logs and verify the documented supported configuration.",
+                recommended_next_action=(
+                    "Review diagnostic logs and verify the documented supported configuration."
+                ),
             )
         elif not context.get("research_rounds"):
             base.update(needs_web_research=True, research_queries=[text])

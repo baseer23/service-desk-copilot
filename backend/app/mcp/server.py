@@ -8,6 +8,8 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 from backend.app.agent.memory import CaseMemoryStore
 from backend.app.agent.models import CapabilityResult, MemoryFact
+from backend.app.voice.auth import Actor
+from backend.app.voice.repository import SQLiteVoiceConversationRepository
 from backend.app.core.config import get_settings
 from backend.app.repositories.fixtures import FixtureRepository
 
@@ -43,6 +45,11 @@ def capability(source_system, reliability=0.9):
                     if isinstance(exc, ValueError)
                     else f"{fn.__name__} failed ({type(exc).__name__})"
                 )
+                from backend.app.core.azure_errors import azure_error_code
+
+                code = azure_error_code(exc)
+                if code != "REQUEST_FAILED":
+                    message += " [" + code + "]"
                 return CapabilityResult(
                     tool=fn.__name__,
                     source_system=source_system,
@@ -50,6 +57,9 @@ def capability(source_system, reliability=0.9):
                     reliability=0,
                     status="error",
                     error=message,
+                    result=(
+                        {"http_status": exc.status_code} if hasattr(exc, "status_code") else None
+                    ),
                 )
 
         invoke.__annotations__ = {**fn.__annotations__, "return": CapabilityResult}
@@ -172,6 +182,8 @@ def get_recent_changes(company: str, site: str | None = None, product: str | Non
 @capability("public_web", 0.6)
 def search_web(query: str, max_results: int = 3):
     """Public research for a specific evidence gap; prefer vendor/authoritative documentation. Search snippets are not verified facts."""
+    if get_settings().azure_live_test_mode:
+        raise ValueError("Public web research is disabled during Azure live acceptance")
     from ddgs import DDGS
 
     if not 1 <= max_results <= 10:
@@ -191,6 +203,8 @@ def search_web(query: str, max_results: int = 3):
 @capability("public_web", 0.7)
 def fetch_web_page(url: str):
     """Fetch/extract a bounded public HTML page with SSRF and redirect validation."""
+    if get_settings().azure_live_test_mode:
+        raise ValueError("Public web research is disabled during Azure live acceptance")
     from backend.app.services.web import fetch_page
 
     return fetch_page(url, max_bytes=get_settings().web_max_bytes)
@@ -205,6 +219,14 @@ def ingest_text(
     url: str = "",
 ):
     """Normalize, SHA256 deduplicate, chunk/embed and persist text with provenance; available to searches immediately."""
+    if get_settings().azure_live_test_mode and (
+        source != "paste" or source_type != "paste" or url or len(text.encode()) > 1024
+    ):
+        raise ValueError("Azure acceptance allows only a tiny pasted fictional document")
+    if get_settings().azure_live_test_mode:
+        from backend.app.core.azure_usage import AzureUsageGuard
+
+        AzureUsageGuard(get_settings()).claim_fixture(text)
     return (
         environment()[3]
         .ingest_text(title, text, source=source, source_type=source_type, url=url)
@@ -217,6 +239,8 @@ def ingest_document(
     data_base64: str, title: str | None = None, media_type: str = "application/pdf"
 ):
     """Extract and ingest an uploaded PDF, limited to 5 MB. Input bytes are base64, never a filesystem path."""
+    if get_settings().azure_live_test_mode:
+        raise ValueError("Azure acceptance allows only a tiny pasted fictional document")
     if media_type != "application/pdf" or len(data_base64) > 6_666_672:
         raise ValueError("A PDF of at most 5 MB is required")
     data = base64.b64decode(data_base64, validate=True)
@@ -332,6 +356,68 @@ def list_available_context():
         "fixture_source_system": "local_fixture",
         "memory": "sqlite_memory",
         "web": "public_web",
+    }
+
+
+@capability("local_storage", 1)
+def get_local_storage_status() -> dict[str, bool]:
+    """Probe local SQLite/Chroma only; no embedding, identity, Azure or Aura requests."""
+    from contextlib import closing
+    from backend.app.services.capabilities import knowledge_stores
+
+    vector, _, _ = knowledge_stores(get_settings(), connect_graph=False)
+    with closing(memory()._connect()) as connection:
+        sqlite_ready = connection.execute("SELECT 1").fetchone()[0] == 1
+    return {
+        "chroma": vector.ping(),
+        "sqlite": sqlite_ready,
+        "aura_connected": bool(environment()[2]) if environment.cache_info().currsize else False,
+    }
+
+
+@lru_cache(maxsize=1)
+def voice_repository() -> SQLiteVoiceConversationRepository:
+    from backend.app.voice.repository import SQLiteVoiceConversationRepository
+
+    return SQLiteVoiceConversationRepository(get_settings().case_db_path)
+
+
+def voice_actor(identity_token: str) -> Actor:
+    from backend.app.voice.auth import verify_actor
+
+    return verify_actor(get_settings(), identity_token)
+
+
+@capability("voice_support", 1)
+def get_voice_session(session_id: str, identity_token: str) -> dict[str, Any]:
+    """Owner-scoped conversation; application-controlled identity is mandatory."""
+    return voice_repository().get(session_id, voice_actor(identity_token)).public()
+
+
+@capability("voice_support", 1)
+def get_voice_session_summary(session_id: str, identity_token: str) -> dict[str, Any]:
+    """Read the authenticated owner’s concise support summary."""
+    state = voice_repository().get(session_id, voice_actor(identity_token))
+    return {
+        "session_id": session_id,
+        "summary": state.final_summary or state.issue_summary,
+        "resolution_status": state.resolution_status,
+        "case_id": state.case_id,
+    }
+
+
+@capability("voice_support", 1)
+def list_voice_session_evidence(session_id: str, identity_token: str) -> list[dict[str, Any]]:
+    """Read canonical evidence linked to an owned browser support session."""
+    state = voice_repository().get(session_id, voice_actor(identity_token))
+    return [e.model_dump(mode="json") for e in state.evidence]
+
+
+@capability("voice_support", 1)
+def create_case_from_voice_session(session_id: str, identity_token: str) -> dict[str, str]:
+    """Explicit user action; graph plans cannot select this write capability."""
+    return {
+        "case_id": voice_repository().create_case(session_id, voice_actor(identity_token), memory())
     }
 
 

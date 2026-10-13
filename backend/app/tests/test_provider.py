@@ -16,9 +16,17 @@ def test_health_returns_status_and_provider(make_client):
 
 def test_stub_requires_explicit_test_mode():
     with pytest.raises(ValidationError, match="TEST_MODE"):
-        Settings(_env_file=None, generation_provider="stub")
+        Settings(_env_file=None, test_mode=False, generation_provider="stub")
 
 
 def test_live_provider_does_not_fall_back():
-    with pytest.raises(LLMError, match="GROQ_API_KEY"):
-        get_provider(Settings(_env_file=None, groq_api_key=None, neo4j_uri=""))
+    with pytest.raises(LLMError, match="endpoint and deployment"):
+        get_provider(
+            Settings(
+                _env_file=None,
+                generation_provider="azure_openai",
+                azure_foundry_endpoint="",
+                azure_model_deployment="",
+                neo4j_uri="",
+            )
+        )

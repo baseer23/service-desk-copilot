@@ -1,57 +1,79 @@
-from __future__ import annotations
-import hashlib
-import math
-import random
-from typing import Iterable, Protocol
+"""Azure-only live embeddings; each deployment has a verified vector namespace."""
+
+import time
+from collections.abc import Iterable
+from typing import Any, Protocol
+
+from backend.app.core.azure_errors import AzureOperationError, azure_error_code
+from backend.app.core.azure_usage import AzureUsageGuard
+from backend.app.core.config import Settings
 
 
 class EmbeddingProvider(Protocol):
     def embed_texts(self, texts: Iterable[str]) -> list[list[float]]: ...
 
 
-class SentenceTransformersEmbeddingProvider:
-    provider = "sentence"
-    model_name = "all-MiniLM-L6-v2"
-    dim = 384
+class AzureEmbeddingProvider:
+    provider = "azure_openai"
 
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
-        if model_name != self.model_name:
-            raise ValueError("Only all-MiniLM-L6-v2 embeddings are supported")
-        self._model = None
+    def __init__(self, settings: Settings, client: Any = None) -> None:
+        if not settings.azure_embedding_deployment:
+            raise ValueError("AZURE_EMBEDDING_DEPLOYMENT is required for live embeddings")
+        self.settings = settings
+        self.usage_guard = AzureUsageGuard(settings)
+        self.model_name = settings.embed_model_name
+        self.dim = settings.azure_embedding_dimensions
+        if client is None:
+            from backend.app.models.provider_azure_openai import AzureOpenAIProvider
 
-    def embed_texts(self, texts):
-        if self._model is None:
-            from sentence_transformers import SentenceTransformer
+            client = AzureOpenAIProvider(settings).client
+        self.client = client
 
-            self._model = SentenceTransformer(self.model_name)
+    def embed_texts(self, texts: Iterable[str]) -> list[list[float]]:
+        values = list(texts)
+        if not values:
+            return []
+        if len(values) > 4 or any(not isinstance(v, str) for v in values):
+            raise ValueError("Azure embedding demo accepts at most four text chunks per request")
+        while delay := self.usage_guard.request_delay("embedding"):
+            time.sleep(min(delay, 1))
+        reservation = self.usage_guard.reserve(
+            "embedding", sum(len(v.encode()) + 32 for v in values)
+        )
+        response = None
         try:
-            return self._model.encode(list(texts), convert_to_numpy=True).tolist()
-        except Exception as exc:
-            raise RuntimeError("SentenceTransformers embedding failed") from exc
+            self.usage_guard.require_enabled()
+            response = self.client.embeddings.create(
+                model=self.settings.azure_embedding_deployment,
+                input=values,
+                dimensions=self.dim,
+                timeout=self.settings.model_timeout_sec,
+            )
+            rows = sorted(response.data, key=lambda row: row.index)
+            if len(rows) != len(values) or [row.index for row in rows] != list(range(len(values))):
+                raise ValueError("Embedding index mismatch")
+            vectors = [row.embedding for row in rows]
+            import math
+
+            if any(
+                len(vector) != self.dim or not all(math.isfinite(v) for v in vector)
+                for vector in vectors
+            ):
+                raise ValueError("Embedding dimensions or values are invalid")
+            return vectors
+        except Exception as exc:  # noqa: BLE001 - do not leak credentials or source texts
+            code = azure_error_code(exc)
+            self.usage_guard.record_check("embeddings", False, code)
+            raise AzureOperationError("Azure embedding generation failed", code) from None
+        finally:
+            self.usage_guard.finish(reservation, getattr(response, "usage", None))
 
 
-class StubEmbeddingProvider:
-    """Deterministic vectors for explicitly isolated tests."""
-
-    provider = "stub"
-    model_name = "sha256-unit-vector-v1"
-
-    def __init__(self, dim: int = 384):
-        self.dim = dim
-
-    def embed_texts(self, texts):
-        results = []
-        for text in texts:
-            rnd = random.Random(hashlib.sha256(text.encode()).digest())
-            vector = [rnd.uniform(-1, 1) for _ in range(self.dim)]
-            norm = math.sqrt(sum(v * v for v in vector)) or 1
-            results.append([v / norm for v in vector])
-        return results
-
-
-def get_embedding_provider(settings):
-    if settings.embed_provider == "sentence":
-        return SentenceTransformersEmbeddingProvider(settings.embed_model_name)
+def get_embedding_provider(settings: Settings) -> EmbeddingProvider:
     if settings.embed_provider == "stub" and settings.test_mode:
+        from backend.app.testing.embeddings import StubEmbeddingProvider
+
         return StubEmbeddingProvider()
-    raise ValueError("Unsupported embedding provider or test mode is disabled")
+    if settings.embed_provider != "azure_openai":
+        raise ValueError("Only Azure embeddings are supported outside isolated tests")
+    return AzureEmbeddingProvider(settings)

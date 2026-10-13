@@ -3,6 +3,8 @@ from typing import Any, TypedDict
 
 class InvestigationState(TypedDict, total=False):
     case_id: str
+    tenant_id: str
+    voice_intake: dict[str, Any]
     persist_case: bool
     route_request: bool
     ticket: dict[str, Any]

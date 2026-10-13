@@ -1,7 +1,7 @@
 """Fictional tickets and canned model responses, confined to validation.
 
 These are test data, not production routing rules. The deterministic suite proves
-execution/provenance/guards; the separate Groq run evaluates model selection.
+execution/provenance/guards; the separate previous hosted provider run evaluates model selection.
 """
 
 from dataclasses import dataclass

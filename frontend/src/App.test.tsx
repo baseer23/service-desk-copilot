@@ -37,7 +37,7 @@ test('creates a case, shows real event data, resumes human input and renders ass
           {
             id: 1,
             tool: 'analyze_ticket',
-            source: 'groq',
+            source: 'azure_openai',
             content: 'Ticket analyzed',
             created_at: '2026-10-08T10:00:00Z',
           },
@@ -60,7 +60,7 @@ test('creates a case, shows real event data, resumes human input and renders ass
             {
               id: 1,
               tool: 'analyze_ticket',
-              source: 'groq',
+              source: 'azure_openai',
               content: 'Ticket analyzed',
               created_at: '2026-10-08T10:00:00Z',
             },
@@ -111,13 +111,13 @@ test('renders explicit API errors and restores the submit control', async () => 
     'fetch',
     vi.fn(async (_url, init) => ({
       ok: !init,
-      json: async () => (init ? { detail: 'Groq request failed' } : []),
+      json: async () => (init ? { detail: 'Azure OpenAI request failed' } : []),
     })),
   )
   render(<App />)
   await user.type(screen.getByLabelText('Question or ticket'), 'Incident details')
   await user.click(screen.getByRole('button', { name: 'Run DeskMate' }))
-  expect(await screen.findByRole('alert')).toHaveTextContent('Groq request failed')
+  expect(await screen.findByRole('alert')).toHaveTextContent('Azure OpenAI request failed')
   expect(screen.getByRole('button', { name: 'Run DeskMate' })).toBeEnabled()
 })
 
@@ -153,6 +153,7 @@ test('can submit again after an empty proxy response', async () => {
     'fetch',
     vi.fn(async (url: string) => {
       if (url === '/cases') return Response.json([])
+      if (url === '/readiness') return Response.json({})
       if (++calls === 1) return new Response('', { status: 502 })
       return Response.json({
         request_id: 'knowledge-request',
@@ -202,7 +203,7 @@ test('preserves the provider error and restores its saved case for retry', async
     vi.fn(async (url: string) => {
       if (url === '/ask')
         return Response.json(
-          { detail: 'Groq request failed (HTTP 429, TPD quota limit)', case_id: current.case_id },
+          { detail: 'Azure OpenAI request failed (HTTP 429, TPD quota limit)', case_id: current.case_id },
           { status: 502 },
         )
       if (url.endsWith('/events')) return Response.json([])
@@ -214,7 +215,7 @@ test('preserves the provider error and restores its saved case for retry', async
   await user.type(screen.getByLabelText('Question or ticket'), 'An incident')
   await user.click(screen.getByRole('button', { name: 'Run DeskMate' }))
   expect(await screen.findByRole('alert')).toHaveTextContent(
-    'Groq request failed (HTTP 429, TPD quota limit)',
+    'Azure OpenAI request failed (HTTP 429, TPD quota limit)',
   )
   expect(await screen.findByRole('button', { name: 'Retry Investigation' })).toBeEnabled()
   expect(screen.getByTestId('case-id')).toHaveTextContent(current.case_id)
@@ -257,7 +258,7 @@ test('shows remembered facts and fixture provenance when reopening a case', asyn
   await user.click(await screen.findByRole('button', { name: /Jake Peralta from B99/ }))
   expect(await screen.findByText('Remembered facts from previous cases')).toBeInTheDocument()
   expect(screen.getByText('B99 2nd floor')).toBeInTheDocument()
-  expect(screen.getByText('Fixture · local_fixture')).toBeInTheDocument()
+  expect(screen.getByText('Fictional fixture · local_fixture')).toBeInTheDocument()
 })
 
 test('ingests pasted knowledge and shows duplicate feedback', async () => {
@@ -306,6 +307,7 @@ test('knowledge answer, contradictions, and activity render without a ticket que
     final_answer: 'Abdul graduated in 2022.',
     final_response: { answer: 'Abdul graduated in 2022.' },
     contradictions: ['Two documents give different dates.'],
+    verification: { justification: 'Private internal draft' },
     hypotheses: [
       {
         claim: 'The newer resume supersedes the old version.',
@@ -327,7 +329,7 @@ test('knowledge answer, contradictions, and activity render without a ticket que
                   id: 1,
                   tool: 'search_knowledge',
                   source: 'chroma',
-                  content: 'Knowledge searched',
+                  content: 'Private internal draft',
                   created_at: '2026-10-08T10:00:00Z',
                 },
               ]
@@ -343,4 +345,5 @@ test('knowledge answer, contradictions, and activity render without a ticket que
   expect(screen.queryByLabelText('Your answer')).not.toBeInTheDocument()
   await user.click(screen.getByText('Agent activity'))
   expect(screen.getByText('search_knowledge', { exact: true })).toBeInTheDocument()
+  expect(screen.queryByText('Private internal draft')).not.toBeInTheDocument()
 })

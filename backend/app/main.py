@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 import uuid
+import asyncio
+from typing import Any
+from collections.abc import Awaitable, Callable
+from starlette.responses import Response
 import base64
+import secrets
+from pydantic import SecretStr
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from backend.app.agent.graph import ServiceDeskAgent
 from backend.app.core.config import Settings, get_settings
+from backend.app.diagnostics.readiness import ReadinessReport
 from backend.app.mcp.client import DeskMateMCPClient, MCPToolError, MCPConnectionError
 from backend.app.models.dto import (
     CaseCreateRequest,
@@ -58,13 +65,22 @@ def case_response(state):
 
 def create_app(settings: Settings | None = None):
     s = settings or get_settings()
+    if s.voice_session_signing_key is None:
+        s = s.model_copy(update={"voice_session_signing_key": SecretStr(secrets.token_urlsafe(48))})
 
     @asynccontextmanager
     async def lifespan(app):
         mcp = DeskMateMCPClient(s)
         app.state.settings, app.state.mcp = s, mcp
+        voice_manager = None
+        provider = None
         try:
-            provider = get_provider(s)
+            try:
+                provider = get_provider(s)
+            except LLMError:
+                # Readiness remains available; generation routes reject configuration
+                # errors explicitly. No fake provider is constructed as a fallback.
+                provider = None
             await mcp.start()
             # Checkpoint infrastructure may precede the first MCP storage call.
             s.case_db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -74,30 +90,108 @@ def create_app(settings: Settings | None = None):
                 await saver.setup()
                 app.state.agent = ServiceDeskAgent(s, mcp, provider, saver)
                 await app.state.agent.initialize()
+                from backend.app.voice.service import VoiceManager
+
+                voice_manager = VoiceManager(s, app.state.agent.harness, provider)
+                app.state.voice = voice_manager
+                app.state.provider_initialized = provider is not None
+                try:
+                    local = await app.state.agent.harness.invoke("get_local_storage_status", {})
+                    app.state.local_storage = local["result"]
+                except (MCPToolError, MCPConnectionError, StorageError):
+                    app.state.local_storage = {
+                        "chroma": False,
+                        "sqlite": False,
+                        "aura_connected": False,
+                    }
                 yield
         finally:
+            if voice_manager:
+                await voice_manager.close()
             await mcp.close()
+            if provider and hasattr(provider, "close"):
+                await asyncio.wait_for(asyncio.to_thread(provider.close), 5)
 
     app = FastAPI(title="DeskMate Case API", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=s.allowed_origins,
+        allow_credentials=True,
         allow_methods=["GET", "POST"],
-        allow_headers=["Content-Type"],
+        allow_headers=["Content-Type", "Authorization"],
     )
+    from backend.app.voice.api import register_voice_routes
+
+    register_voice_routes(app)
+
+    @app.middleware("http")
+    async def protect_voice_cases(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        if request.url.path.startswith(("/cases/voice-", "/requests/voice-")):
+            from backend.app.voice.auth import COOKIE_NAME, VoiceError, verify_actor
+            from fastapi.responses import JSONResponse
+
+            try:
+                from backend.app.voice.api import browser_guard
+
+                browser_guard(request, s)
+                actor = verify_actor(s, request.cookies.get(COOKIE_NAME))
+                session_id = request.url.path.split("/")[2].removeprefix("voice-")
+                app.state.voice.repository.get(session_id, actor)
+            except VoiceError as exc:
+                return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
+        return await call_next(request)
+
+    def readiness() -> ReadinessReport:
+        from backend.app.diagnostics.readiness import configuration_readiness
+
+        mcp = app.state.mcp
+        connected = mcp._task is not None and not mcp._task.done()
+        stores = app.state.local_storage
+        return configuration_readiness(
+            s,
+            reasoning_initialized=app.state.provider_initialized,
+            local_mcp="READY" if connected else "ERROR",
+            private_stores="READY" if stores["chroma"] and stores["sqlite"] else "ERROR",
+        )
+
+    @app.get("/readiness")
+    async def get_readiness() -> dict[str, Any]:
+        # No token acquisition/network probe; statuses and missing variable names only.
+        return readiness().model_dump()
 
     @app.get("/health", response_model=HealthResponse)
     async def health():
-        environment = (await app.state.agent.harness.invoke("list_available_context", {}))["result"]
+        report = readiness()
+        environment = app.state.local_storage
         return HealthResponse(
-            status="ok",
+            status="ok" if report.text_ready else "degraded",
             generation_provider=s.generation_provider,
             test_mode=s.test_mode,
-            mcp_connected=app.state.mcp._task is not None and not app.state.mcp._task.done(),
+            mcp_connected=report.local_mcp == "READY",
             chroma=environment["chroma"],
             aura_configured=bool(s.neo4j_uri),
             aura_connected=environment["aura_connected"],
+            voice_enabled=s.voice_enabled,
+            voice_provider=s.voice_provider,
+            voicelive_configured=s.voice_provider == "azure_voicelive" and report.voice.configured,
+            embedding_provider=s.embed_provider,
+            azure_openai_configured=(
+                s.generation_provider == "azure_openai" and report.reasoning.configured
+            ),
+            readiness=report.model_dump(),
         )
+
+    def require_reasoning() -> None:
+        if not readiness().text_ready:
+            raise HTTPException(
+                503,
+                {
+                    "code": "AZURE_REASONING_NOT_READY",
+                    "message": "Azure reasoning or local storage is not configured. Check /readiness.",
+                },
+            )
 
     @app.post("/ingest/paste", response_model=IngestPasteResponse)
     async def ingest_paste(body: IngestPasteRequest):
@@ -143,6 +237,7 @@ def create_app(settings: Settings | None = None):
         return state
 
     async def request_result(request_id, summary=None, answer=None):
+        require_reasoning()
         try:
             state, events = await app.state.agent.run_request(request_id, summary, answer)
             return AskResponse(
@@ -174,10 +269,23 @@ def create_app(settings: Settings | None = None):
         return await request_result(request_id, answer=body.answer)
 
     @app.get("/cases", response_model=list[CaseResponse])
-    async def list_cases():
+    async def list_cases(request: Request) -> list[CaseResponse]:
+        from backend.app.voice.auth import COOKIE_NAME, VoiceError, verify_actor
+
+        def visible(state: dict[str, Any]) -> bool:
+            if not state["case_id"].startswith("voice-"):
+                return True
+            try:
+                actor = verify_actor(s, request.cookies.get(COOKIE_NAME))
+                app.state.voice.repository.get(state["case_id"].removeprefix("voice-"), actor)
+                return True
+            except VoiceError:
+                return False
+
         return [
             case_response(state)
             for state in (await app.state.agent.harness.invoke("list_cases", {}))["items"]
+            if visible(state)
         ]
 
     @app.post("/cases", response_model=CaseResponse, status_code=201)
@@ -198,6 +306,7 @@ def create_app(settings: Settings | None = None):
         return case_response(await load(case_id))
 
     async def run(case_id, answer=None):
+        require_reasoning()
         await load(case_id)
         try:
             return case_response(await app.state.agent.run_case(case_id, answer))

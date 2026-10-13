@@ -1,10 +1,13 @@
 # DeskMate versatility validation
 
+Historical results below predate the Azure-only browser voice migration. They do
+not establish live Azure acceptance. Current results are in [VOICE_REVIEW.md](VOICE_REVIEW.md).
+
 Validation date: 2026-10-09.
 
 Baseline commit: `1b767b18577de45b76fde911aa8e9359ef16b9f2` (`Generalize DeskMate MCP investigation platform`), pushed to GitHub main after the later request to save on GitHub.
 
-**Overall verdict: FAIL / live model validation incomplete.** The deterministic platform suite passes and the real public-network smoke passes. All three final Groq attempts encounter HTTP 429 TPD limits; they are not counted as successful live scenarios. Earlier live attempts also exposed weak hypotheses and repeated rejected MFA location questions. The revision fix is covered by a regression test but cannot be fully revalidated on Groq under the exhausted quota.
+**Overall verdict: FAIL / live model validation incomplete.** The deterministic platform suite passes and the real public-network smoke passes. All three final previous hosted provider attempts encounter HTTP 429 TPD limits; they are not counted as successful live scenarios. Earlier live attempts also exposed weak hypotheses and repeated rejected MFA location questions. The revision fix is covered by a regression test but cannot be fully revalidated on previous hosted provider under the exhausted quota.
 
 ## Scenario scorecard
 
@@ -44,17 +47,17 @@ Each operational result has plausible evidence-cited hypotheses, separate infere
 - Unknown Contoso production domain-controller address: PASS under controlled model responses. Empty internal evidence produces insufficient information, confidence 0, no address and no fabricated source.
 - Failed web fetch: PASS. Actual MCP tool failure is retained, no public document is indexed/cited as fetched evidence, and the final answer is withheld with confidence 0.
 
-## Live configured Groq
+## Live configured previous hosted provider
 
-Model: configured `openai/gpt-oss-20b`; temporary runtime: `/var/folders/22/x12ctqgx7hjc76z7v_7ryxn00000gn/T/deskmate-live-groq-7rv5xhx7`. Final attempts use the configured provider with no stub fallback. Validation-only pacing and durable checkpoint retries were used for TPM limits; TPD limits remain external blockers.
+Model: configured `previous configured model`; temporary runtime: `/var/folders/22/x12ctqgx7hjc76z7v_7ryxn00000gn/T/deskmate-live-previous_hosted_provider-7rv5xhx7`. Final attempts use the configured provider with no stub fallback. Validation-only pacing and durable checkpoint retries were used for TPM limits; TPD limits remain external blockers.
 
 | Scenario | Result | Evidence |
 |---|---|---|
-| VPN | FAIL / UNAVAILABLE | classify_intent, analyze_ticket; Groq request failed or returned no message (HTTP 429, model openai/gpt-oss-20b) (TPD quota limit); retry after 552 seconds |
-| MFA | FAIL / UNAVAILABLE | classify_intent; Groq request failed or returned no message (HTTP 429, model openai/gpt-oss-20b) (TPD quota limit); retry after 86 seconds |
-| PRINTER | FAIL / UNAVAILABLE | classify_intent; Groq request failed or returned no message (HTTP 429, model openai/gpt-oss-20b) (TPD quota limit); retry after 211 seconds |
+| VPN | FAIL / UNAVAILABLE | classify_intent, analyze_ticket; previous hosted provider request failed or returned no message (HTTP 429, model previous configured model) (TPD quota limit); retry after 552 seconds |
+| MFA | FAIL / UNAVAILABLE | classify_intent; previous hosted provider request failed or returned no message (HTTP 429, model previous configured model) (TPD quota limit); retry after 86 seconds |
+| PRINTER | FAIL / UNAVAILABLE | classify_intent; previous hosted provider request failed or returned no message (HTTP 429, model previous configured model) (TPD quota limit); retry after 211 seconds |
 
-Earlier Groq runs genuinely executed planning/reasoning/verifying but did not satisfy the quality checks: VPN returned a next action without a hypothesis/KB retrieval, MFA repeated a rejected location premise, and the printer asked a bundled question and asserted uncertain jam causation. These results are retained as failures, not counted as proofs of intelligence. Provider revision instructions now explicitly prioritize application validation and preserve plausible hypotheses; the post-fix live pass is still outstanding.
+Earlier previous hosted provider runs genuinely executed planning/reasoning/verifying but did not satisfy the quality checks: VPN returned a next action without a hypothesis/KB retrieval, MFA repeated a rejected location premise, and the printer asked a bundled question and asserted uncertain jam causation. These results are retained as failures, not counted as proofs of intelligence. Provider revision instructions now explicitly prioritize application validation and preserve plausible hypotheses; the post-fix live pass is still outstanding.
 
 ## Real public web
 
@@ -88,8 +91,8 @@ SCENARIO_REPORT=/private/tmp/deskmate-scenario-report.json .venv/bin/python -m p
 npm --prefix frontend test
 npm --prefix frontend run build
 npm --prefix frontend run test:e2e
-.venv/bin/python -m backend.app.tests.run_live_versatility --mode groq --report /private/tmp/deskmate-live-groq.json --pace-seconds 30
-.venv/bin/python -m backend.app.tests.run_live_versatility --mode groq --report /private/tmp/deskmate-live-groq.json --resume --pace-seconds 30
+.venv/bin/python -m backend.app.tests.run_live_versatility --mode azure_openai --report /private/tmp/deskmate-live-previous_hosted_provider.json --pace-seconds 30
+.venv/bin/python -m backend.app.tests.run_live_versatility --mode azure_openai --report /private/tmp/deskmate-live-previous_hosted_provider.json --resume --pace-seconds 30
 .venv/bin/python -m backend.app.tests.run_live_versatility --mode web --report /private/tmp/deskmate-live-web.json
 ```
 
@@ -98,7 +101,7 @@ Runtime data, logs and artifacts are excluded from Git. The scenario suite, fixt
 ## Evidence artifacts
 
 - `/private/tmp/deskmate-scenario-report.json` and `/private/tmp/deskmate-scenarios.log`
-- `/private/tmp/deskmate-live-groq.json` (earlier quality failures) and `/private/tmp/deskmate-live-groq-final.json` (post-fix quota blockers)
+- `/private/tmp/deskmate-live-previous_hosted_provider.json` (earlier quality failures) and `/private/tmp/deskmate-live-previous_hosted_provider-final.json` (post-fix quota blockers)
 - `/private/tmp/deskmate-live-web-passed.json` and `/private/tmp/deskmate-live-web-passed.log`
 - `/private/tmp/deskmate-backend-full.log`, `/private/tmp/deskmate-frontend-tests.log`, `/private/tmp/deskmate-frontend-build.log`, `/private/tmp/deskmate-e2e.log`
 - Latest response-error regression: `/private/tmp/deskmate-response-tests.log`, `/private/tmp/deskmate-response-build.log`, `/private/tmp/deskmate-response-e2e.log`
@@ -107,4 +110,4 @@ Runtime data, logs and artifacts are excluded from Git. The scenario suite, fixt
 
 - Frontend: http://127.0.0.1:5174
 - Backend: http://127.0.0.1:8000
-- Generation remains configured Groq; new investigations may return its daily quota error until capacity is available. MCP and Chroma health are independent of hosted generation quota.
+- Generation remains configured previous hosted provider; new investigations may return its daily quota error until capacity is available. MCP and Chroma health are independent of hosted generation quota.

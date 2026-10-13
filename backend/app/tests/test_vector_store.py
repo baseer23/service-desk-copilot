@@ -1,5 +1,5 @@
 from backend.app.store.vector_chroma import VectorChromaStore
-from backend.app.adapters.embeddings import StubEmbeddingProvider
+from backend.app.testing.embeddings import StubEmbeddingProvider
 
 
 def test_chroma_upsert_and_search(tmp_path):

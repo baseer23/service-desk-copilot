@@ -178,6 +178,7 @@ class ScenarioProvider:
                 and ("text" not in r or "AADSTS53003" in r["text"])
             ][:1]
             return ResearchSelection(
+                directly_relevant=bool(selected),
                 selected_urls=selected,
                 evidence_gap="Public error definition",
                 justification="Select a supplied authoritative URL only when its fetched content addresses the reported error",

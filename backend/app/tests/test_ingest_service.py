@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from backend.app.adapters.embeddings import StubEmbeddingProvider
+from backend.app.testing.embeddings import StubEmbeddingProvider
 from backend.app.services.ingest_service import IngestService
 
 

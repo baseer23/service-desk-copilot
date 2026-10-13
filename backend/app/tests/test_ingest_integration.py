@@ -2,7 +2,7 @@ import os
 
 import pytest
 
-from backend.app.adapters.embeddings import StubEmbeddingProvider
+from backend.app.testing.embeddings import StubEmbeddingProvider
 from backend.app.core.config import Settings
 from backend.app.services.ingest_service import IngestService
 from backend.app.store.graph_repo import GraphRepository
