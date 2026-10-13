@@ -15,6 +15,18 @@ class Retriever:
     vector_store: object
     graph_repo: object
     embedding_provider: object
+    document_repository: object = None
+
+    def keyword_search(self, question: str, top_k: int) -> List[Dict[str, object]]:
+        """Explicit local excerpts, with provenance; no semantic or generated-answer claim."""
+        local = self.document_repository.search(question, top_k) if self.document_repository else []
+        indexed = self.vector_store.search_keywords(question, top_k)
+        rows, seen = [], set()
+        for row in local + indexed:
+            if row["id"] not in seen:
+                rows.append(row)
+                seen.add(row["id"])
+        return rows[:top_k]
 
     def vector_search(self, question: str, top_k: int) -> List[Dict[str, object]]:
         """Rank semantic chunks, preserving exact identifier hits when present."""

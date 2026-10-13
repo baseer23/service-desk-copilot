@@ -163,6 +163,43 @@ class VectorChromaStore:
         except Exception as exc:
             raise StorageError("Chroma count failed") from exc
 
+    def search_keywords(self, question, top_k=6):
+        """Read existing document text without generating a query embedding."""
+        from backend.app.repositories.documents import query_terms
+        import re
+
+        terms = query_terms(question)
+        if not terms:
+            return []
+        variants = list(
+            dict.fromkeys(
+                re.findall(r"[\w-]+", question)[:16]
+                + [v for term in terms for v in (term, term.upper(), term.title())]
+            )
+        )
+        filters = [{"$contains": value} for value in variants]
+        where = filters[0] if len(filters) == 1 else {"$or": filters}
+        try:
+            found = self._collection.get(where_document=where, limit=200)
+            rows = []
+            for index, identifier in enumerate(found["ids"]):
+                text = found["documents"][index]
+                score = sum(term in text.casefold() for term in terms)
+                if score:
+                    rows.append(
+                        {
+                            "id": identifier,
+                            "text": text,
+                            "metadata": found["metadatas"][index],
+                            "score": score,
+                            "match_type": "keyword",
+                            "storage": "chroma",
+                        }
+                    )
+            return sorted(rows, key=lambda row: (-row["score"], row["id"]))[:top_k]
+        except Exception as exc:
+            raise StorageError("Chroma keyword lookup failed; stored data preserved") from exc
+
     def ping(self):
         try:
             self.count()

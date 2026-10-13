@@ -593,3 +593,15 @@ footer {
   .voice-transcript { min-height: 230px; height: 42vh; }
 }
 @media (prefers-reduced-motion: reduce) { .button { transition: none; }.button[aria-busy='true']::before { animation: none; } }
+/* Source text and extraction previews remain scrollable within the knowledge panel. */
+.document-preview {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 24rem;
+  overflow: auto;
+}
+[aria-label="Knowledge search results"] {
+  overflow-wrap: anywhere;
+  max-height: 32rem;
+  overflow: auto;
+}

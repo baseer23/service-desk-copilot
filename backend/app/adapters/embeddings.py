@@ -33,10 +33,29 @@ class AzureEmbeddingProvider:
         values = list(texts)
         if not values:
             return []
-        if len(values) > 4 or any(not isinstance(v, str) for v in values):
-            raise ValueError("Azure embedding demo accepts at most four text chunks per request")
-        while delay := self.usage_guard.request_delay("embedding"):
-            time.sleep(min(delay, 1))
+        if any(not isinstance(v, str) for v in values):
+            raise ValueError("Embedding input must contain text chunks")
+        # Keep the entire document operation below the MCP transport deadline.
+        # Never continue paid batches indefinitely after an API caller times out.
+        deadline = time.monotonic() + min(self.settings.model_timeout_sec, 45)
+        vectors = []
+        for start in range(0, len(values), 4):
+            while delay := self.usage_guard.request_delay("embedding"):
+                if time.monotonic() + delay >= deadline:
+                    raise AzureOperationError(
+                        "Document embedding deadline exceeded; split the document before indexing",
+                        "DOCUMENT_TIMEOUT",
+                    )
+                time.sleep(min(delay, 1))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AzureOperationError(
+                    "Document embedding deadline exceeded", "DOCUMENT_TIMEOUT"
+                )
+            vectors.extend(self._embed_batch(values[start : start + 4], remaining))
+        return vectors
+
+    def _embed_batch(self, values: list[str], timeout: float) -> list[list[float]]:
         reservation = self.usage_guard.reserve(
             "embedding", sum(len(v.encode()) + 32 for v in values)
         )
@@ -47,7 +66,7 @@ class AzureEmbeddingProvider:
                 model=self.settings.azure_embedding_deployment,
                 input=values,
                 dimensions=self.dim,
-                timeout=self.settings.model_timeout_sec,
+                timeout=min(self.settings.model_timeout_sec, timeout),
             )
             rows = sorted(response.data, key=lambda row: row.index)
             if len(rows) != len(values) or [row.index for row in rows] != list(range(len(values))):

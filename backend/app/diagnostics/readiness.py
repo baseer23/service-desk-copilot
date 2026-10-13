@@ -34,6 +34,11 @@ class ReadinessReport(BaseModel):
     azure_usage: dict[str, Any] = Field(default_factory=dict)
     azure_validation: dict[str, Any] = Field(default_factory=dict)
     voice_validation_scope: Literal["not_checked", "configuration", "transport"] = "not_checked"
+    local_documents_ready: bool = False
+    local_ocr_available: bool = False
+    semantic_ingestion_ready: bool = False
+    semantic_ingestion_blocker: str | None = None
+    url_ingestion_enabled: bool = False
 
 
 def auth_method(settings: Settings, voice: bool = False) -> Literal["ENTRA", "API_KEY", "MISSING"]:
@@ -110,6 +115,21 @@ def configuration_readiness(
         and settings.voice_session_signing_key
     )
     local_ready = local_mcp == "READY" and private_stores == "READY"
+    from backend.app.services.document_extract import ocr_available
+
+    indexing_blocker = None
+    if not demo and settings.azure_live_test_mode:
+        indexing_blocker = (
+            "The Azure acceptance policy only permits its original tiny pasted fixture. "
+            "Save documents locally and use keyword search."
+        )
+    elif embedding_missing:
+        indexing_blocker = (
+            "Azure embeddings are unavailable or disabled by the usage guard. "
+            "Local extraction and keyword search remain available."
+        )
+    elif not local_ready:
+        indexing_blocker = "Local MCP or knowledge storage is unavailable."
     reason = CapabilityReadiness(
         configured=not reasoning_missing,
         locally_initialized=reasoning_initialized,
@@ -138,6 +158,11 @@ def configuration_readiness(
         runtime_mode="isolated_demo" if demo else "azure",
         azure_usage=allowance,
         azure_validation=checks,
+        local_documents_ready=local_mcp == "READY",
+        local_ocr_available=ocr_available(),
+        semantic_ingestion_ready=indexing_blocker is None,
+        semantic_ingestion_blocker=indexing_blocker,
+        url_ingestion_enabled=settings.allow_url_ingest and not settings.azure_live_test_mode,
         voice_validation_scope=(
             "transport"
             if checks.get("voice", {}).get("passed")

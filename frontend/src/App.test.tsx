@@ -154,6 +154,7 @@ test('can submit again after an empty proxy response', async () => {
     vi.fn(async (url: string) => {
       if (url === '/cases') return Response.json([])
       if (url === '/readiness') return Response.json({})
+      if (url === '/documents') return Response.json([])
       if (++calls === 1) return new Response('', { status: 502 })
       return Response.json({
         request_id: 'knowledge-request',

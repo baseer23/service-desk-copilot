@@ -25,6 +25,69 @@ TOKEN_LIMITS = {
 }
 
 
+def compact_schema(value: Any) -> Any:
+    """Remove display-only schema metadata; preserve constraints and field names."""
+    if isinstance(value, list):
+        return [compact_schema(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: (
+                {name: compact_schema(child) for name, child in item.items()}
+                if key in {"properties", "$defs", "definitions"}
+                else compact_schema(item)
+            )
+            for key, item in value.items()
+            if key not in {"title", "description", "examples", "default"}
+        }
+    return value
+
+
+def compact_context(value: Any) -> Any:
+    """Omit empty context, retaining false/zero and all actual evidence/provenance."""
+    if isinstance(value, list):
+        return [compact_context(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: compact_context(item)
+            for key, item in value.items()
+            if item is not None and item != [] and item != {} and item != ""
+        }
+    return value
+
+
+def structured_request(
+    settings: Settings, stage: str, context: dict, schema: type[BaseModel]
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    """Construct requests once for execution and offline throughput measurement."""
+    instructions = stage_instructions(stage, context)
+    raw_schema = compact_schema(schema.model_json_schema())
+    supported = strict_schema(raw_schema) if settings.azure_structured_outputs else None
+    response_format: dict[str, Any]
+    if supported:
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": schema.__name__,
+                "strict": True,
+                "schema": supported,
+            },
+        }
+        # The response format already supplies the schema. Duplicating it in a
+        # system message wastes quota and still does not strengthen validation.
+        instructions += "\nReturn the required JSON object. Keep explanations concise."
+    else:
+        response_format = {"type": "json_object"}
+        instructions += "\nRequired JSON schema:\n" + json.dumps(raw_schema, separators=(",", ":"))
+    messages = [
+        {"role": "system", "content": instructions},
+        {
+            "role": "user",
+            "content": json.dumps(compact_context(context), default=str, separators=(",", ":")),
+        },
+    ]
+    return messages, response_format
+
+
 def strict_schema(value: dict[str, Any]) -> dict[str, Any] | None:
     """Azure strict schemas cannot represent our unconstrained tool-argument maps."""
     schema = json.loads(json.dumps(value))
@@ -50,7 +113,14 @@ def strict_schema(value: dict[str, Any]) -> dict[str, Any] | None:
             "format",
         ):
             node.pop(key, None)
-        return all(convert(item) for item in node.values())
+        return all(
+            (
+                all(convert(child) for child in item.values())
+                if key in {"properties", "$defs", "definitions"}
+                else convert(item)
+            )
+            for key, item in node.items()
+        )
 
     return schema if convert(schema) else None
 
@@ -103,24 +173,7 @@ class AzureOpenAIProvider:
         return "azure_openai"
 
     async def generate_structured(self, stage: str, context: dict, schema: type[T]) -> T:
-        instructions = stage_instructions(stage, context)
-        raw_schema = schema.model_json_schema()
-        supported = strict_schema(raw_schema) if self.settings.azure_structured_outputs else None
-        response_format = (
-            {
-                "type": "json_schema",
-                "json_schema": {"name": schema.__name__, "strict": True, "schema": supported},
-            }
-            if supported
-            else {"type": "json_object"}
-        )
-        messages = [
-            {
-                "role": "system",
-                "content": instructions + "\nRequired JSON schema:\n" + json.dumps(raw_schema),
-            },
-            {"role": "user", "content": json.dumps(context, default=str)},
-        ]
+        messages, response_format = structured_request(self.settings, stage, context, schema)
         attempts = 1 if stage == "readiness" or self.settings.azure_setup_validation_mode else 2
         for attempt in range(attempts):
             try:

@@ -1,7 +1,8 @@
 import { FormEvent, useEffect, useState } from 'react'
 import VoiceSupport from './VoiceSupport'
+import KnowledgePanel from './KnowledgePanel'
 import { post, request } from './api'
-import { useReadiness } from './readiness'
+import { reasoningBlocker, useReadiness } from './readiness'
 import { InvestigationTimeline, EvidenceList, timestamp } from './InvestigationPanels'
 
 type Fact = {
@@ -68,7 +69,8 @@ type AskResponse = {
   events: Event[]
 }
 export default function App() {
-  const { readiness } = useReadiness()
+  const { readiness, refresh, checking } = useReadiness()
+  const blocker = reasoningBlocker(readiness)
   const [ticket, setTicket] = useState('')
   const [active, setActive] = useState<Case | null>(null)
   const [cases, setCases] = useState<Case[]>([])
@@ -76,12 +78,7 @@ export default function App() {
   const [answer, setAnswer] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  const [ingestMode, setIngestMode] = useState<'paste' | 'pdf' | 'url'>('paste')
-  const [knowledge, setKnowledge] = useState('')
-  const [title, setTitle] = useState('')
-  const [file, setFile] = useState<File | null>(null)
-  const [ingestMessage, setIngestMessage] = useState('')
-  const [ingesting, setIngesting] = useState(false)
+
 
   useEffect(() => {
     request<Case[]>('/cases')
@@ -182,37 +179,13 @@ export default function App() {
       setBusy(false)
     }
   }
-  async function ingest(event: FormEvent) {
-    event.preventDefault()
-    setIngesting(true)
-    setIngestMessage('')
+  async function saveRequest() {
+    if (!ticket.trim()) return
+    setBusy(true)
     setError('')
-    try {
-      let options: RequestInit
-      if (ingestMode === 'pdf') {
-        if (!file) throw new Error('Choose a PDF first.')
-        const data = new FormData()
-        data.append('file', file)
-        if (title) data.append('title', title)
-        options = { method: 'POST', body: data }
-      } else
-        options = post(
-          ingestMode === 'paste' ? { title: title || null, text: knowledge } : { url: knowledge },
-        )
-      const result = await request<{ chunks: number; duplicate: boolean }>(
-        `/ingest/${ingestMode}`,
-        options,
-      )
-      setIngestMessage(
-        result.duplicate
-          ? 'This content is already in knowledge.'
-          : `${result.chunks} knowledge chunks ingested.`,
-      )
-    } catch (e) {
-      setError((e as Error).message)
-    } finally {
-      setIngesting(false)
-    }
+    try { await display(await request<Case>('/cases', post({ summary: ticket.trim() }))) }
+    catch (caught) { setError((caught as Error).message) }
+    finally { setBusy(false) }
   }
 
   return (
@@ -251,6 +224,9 @@ export default function App() {
               <button className="primary" disabled={busy || !ticket.trim() || (readiness !== null && !readiness.text_ready)}>
                 {busy ? 'Investigating…' : 'Run DeskMate'}
               </button>
+              {blocker && <p className="muted" role="status">{blocker}</p>}
+              <button type="button" className="secondary" disabled={busy || !ticket.trim()} onClick={() => void saveRequest()}>Save request locally</button>
+              <button type="button" className="secondary" disabled={checking || busy} onClick={() => void refresh()}>{checking ? 'Checking app status…' : 'Refresh app status'}</button>
             </form>
           </section>
           <section className="card">
@@ -274,73 +250,7 @@ export default function App() {
               </ul>
             )}
           </section>
-          <section className="card">
-            <h2>Knowledge ingestion</h2>
-            <div className="tabs" role="group" aria-label="Ingestion method">
-              {(['paste', 'pdf', 'url'] as const).map((mode) => (
-                <button
-                  key={mode}
-                  aria-pressed={ingestMode === mode}
-                  onClick={() => {
-                    setIngestMode(mode)
-                    setKnowledge('')
-                    setIngestMessage('')
-                  }}
-                >
-                  {mode === 'pdf' ? 'PDF' : mode === 'url' ? 'URL' : 'Paste'}
-                </button>
-              ))}
-            </div>
-            <form onSubmit={ingest}>
-              {ingestMode !== 'url' && (
-                <>
-                  <label htmlFor="title">Document title</label>
-                  <input id="title" value={title} onChange={(e) => setTitle(e.target.value)} />
-                </>
-              )}
-              {ingestMode === 'pdf' ? (
-                <>
-                  <label htmlFor="pdf">PDF document</label>
-                  <input
-                    id="pdf"
-                    type="file"
-                    accept="application/pdf"
-                    onChange={(e) => setFile(e.target.files?.[0] || null)}
-                    required
-                  />
-                </>
-              ) : (
-                <>
-                  <label htmlFor="knowledge">
-                    {ingestMode === 'url' ? 'Public page URL' : 'Knowledge text'}
-                  </label>
-                  {ingestMode === 'url' ? (
-                    <input
-                      id="knowledge"
-                      type="url"
-                      value={knowledge}
-                      onChange={(e) => setKnowledge(e.target.value)}
-                      required
-                    />
-                  ) : (
-                    <textarea
-                      id="knowledge"
-                      rows={4}
-                      value={knowledge}
-                      onChange={(e) => setKnowledge(e.target.value)}
-                      required
-                    />
-                  )}
-                </>
-              )}
-              <button className="secondary" disabled={ingesting}>
-                {ingesting ? 'Ingesting…' : 'Add to knowledge'}
-              </button>
-              <p role="status" className="muted">
-                {ingestMessage}
-              </p>
-            </form>
-          </section>
+          <KnowledgePanel readiness={readiness} />
         </aside>
         <div className="investigation-panel">
           {!active ? (
@@ -391,6 +301,12 @@ export default function App() {
                   </p>
                 )}
               </section>
+              {active.status === 'new' && <section className="card">
+                <h2>Saved request</h2>
+                <p>Saved locally. Automated investigation has not started.</p>
+                <button className="primary" disabled={busy || !!blocker} onClick={() => void retry()}>Investigate saved case</button>
+                {blocker && <p className="muted">{blocker}</p>}
+              </section>}
               {active.status === 'error' && (
                 <section className="card">
                   <h2>Investigation interrupted by an error</h2>
@@ -547,7 +463,7 @@ export default function App() {
                   <p className="muted">
                     {active.status === 'assessment_ready'
                       ? 'No additional uncertainty reported.'
-                      : 'Investigation is in progress.'}
+                      : active.status === 'new' ? 'Investigation has not started.' : 'Investigation is in progress.'}
                   </p>
                 )}
               </section>

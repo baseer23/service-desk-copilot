@@ -178,3 +178,44 @@ def test_azure_provider_closes_owned_client_and_credential(settings):
     model.close()
     client.close.assert_called_once()
     credential.close.assert_called_once()
+
+
+def test_schema_sent_once_context_compaction_preserves_false_and_evidence(settings):
+    from backend.app.models.provider_azure_openai import structured_request
+
+    evidence = [
+        {"id": "e1", "source_system": "local_fixture", "content": {"confirmed": False, "count": 0}}
+    ]
+    messages, response_format = structured_request(
+        settings,
+        "classify_intent",
+        {
+            "request": "Fictional MFA failure",
+            "evidence": evidence,
+            "empty": [],
+            "missing": None,
+        },
+        RequestIntent,
+    )
+    assert "Required JSON schema" not in messages[0]["content"]
+    assert '"title"' not in json.dumps(response_format)
+    assert response_format["json_schema"]["schema"]["additionalProperties"] is False
+    context = json.loads(messages[1]["content"])
+    assert context["evidence"] == evidence and "empty" not in context and "missing" not in context
+    messages, response_format = structured_request(settings, "plan", {}, InvestigationPlan)
+    assert response_format == {"type": "json_object"}
+    assert "Required JSON schema" in messages[0]["content"]
+
+
+def test_schema_compaction_keeps_real_fields_named_like_schema_metadata():
+    from backend.app.models.provider_azure_openai import compact_schema, strict_schema
+    from pydantic import BaseModel
+
+    class NamedFields(BaseModel):
+        title: str
+        description: str
+        default: int
+
+    schema = strict_schema(compact_schema(NamedFields.model_json_schema()))
+    assert set(schema["properties"]) == {"title", "description", "default"}
+    assert set(schema["required"]) == {"title", "description", "default"}

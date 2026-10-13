@@ -5,10 +5,9 @@ import time
 import hashlib
 from datetime import datetime, timezone
 from dataclasses import dataclass
-from io import BytesIO
 from typing import List, Mapping, Optional
 
-from pdfminer.high_level import extract_text
+from backend.app.services.document_extract import extract_document
 
 from backend.app.models.dto import IngestPasteResponse, IngestPdfResponse
 from backend.app.services.chunking import approx_tokens, split_text
@@ -129,8 +128,8 @@ class IngestService:
         """Ingest a PDF document by extracting text then delegating to ingest_text."""
 
         started = time.perf_counter()
-        text = extract_text(BytesIO(data))
-        page_count = max(1, text.count("\f")) if text else 0
+        document = extract_document(data, "application/pdf")
+        text, page_count = document["text"], document["pages"]
         result = self.ingest_text(title=title, text=text, source="pdf", source_type="pdf")
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         return IngestPdfResponse(

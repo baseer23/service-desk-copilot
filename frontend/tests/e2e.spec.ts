@@ -2,6 +2,62 @@ import { test, expect } from '@playwright/test'
 import { resumePDF } from './pdf'
 const ticket = 'Jake Peralta from B99 cannot connect to the VPN. Authentication failed.'
 
+for (const summary of [
+  'Fictional test: Microsoft 365 MFA fails for Amy Santiago from B99.',
+  'Fictional test: VPN authentication fails for Charles Boyle from B99.',
+  'Fictional test: the printer is offline for Rosa Diaz from B99.',
+  'Fictional test: Outlook is not opening for Terry Jeffords from B99.',
+]) {
+  test(`simulated reasoning through real browser and MCP: ${summary}`, async ({ page }) => {
+    const errors: string[] = []
+    page.on('pageerror', error => errors.push(error.name))
+    await page.goto('/')
+    await page.getByLabel('Question or ticket').fill(summary)
+    await page.getByRole('button', { name: 'Run DeskMate' }).click()
+    await expect(page.locator('.status-pill')).toHaveText(/needs input|assessment ready|insufficient information/)
+    await expect(page.getByRole('alert')).toHaveCount(0)
+    await expect(page.getByText('ISOLATED DEMO', { exact: true }).first()).toBeVisible()
+    expect(errors).toEqual([])
+  })
+}
+
+test('local PDF extraction, staging, dedup and cited keyword search use real HTTP/MCP', async ({ page }) => {
+  const errors: string[] = []
+  page.on('pageerror', error => errors.push(error.name))
+  await page.goto('/')
+  await page.getByRole('button', { name: 'PDF', exact: true }).click()
+  await page.getByLabel('Document title').fill('Fictional local PDF')
+  await page.getByLabel('PDF document').setInputFiles({ name: 'fictional.pdf', mimeType: 'application/pdf', buffer: resumePDF() })
+  await page.getByRole('button', { name: 'Extract text', exact: true }).click()
+  await expect(page.locator('.document-preview')).toContainText('2022')
+  await expect(page.getByText(/No Azure request was made/)).toBeVisible()
+  await page.getByRole('button', { name: 'Save document locally' }).click()
+  await expect(page.getByText(/chunks saved locally/)).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Locally saved documents' })).toBeVisible()
+  await page.getByRole('button', { name: 'Save document locally' }).click()
+  await expect(page.getByText('This document is already saved locally.')).toBeVisible()
+  await page.getByRole('textbox', { name: 'Knowledge search', exact: true }).fill('graduated')
+  await page.getByRole('button', { name: 'Search knowledge' }).click()
+  await expect(page.getByLabel('Knowledge search results')).toContainText('2022')
+  await expect(page.getByLabel('Knowledge search results')).toContainText('Source:')
+  expect(errors).toEqual([])
+})
+
+test('save and reopen an uninvestigated local case then explicitly investigate', async ({ page }) => {
+  await page.goto('/')
+  const summary = 'Fictional printer offline request for local saving'
+  await page.getByLabel('Question or ticket').fill(summary)
+  await page.getByRole('button', { name: 'Save request locally' }).click()
+  await expect(page.locator('.status-pill')).toHaveText('new')
+  await expect(page.getByText('Saved locally. Automated investigation has not started.')).toBeVisible()
+  const id = await page.getByTestId('case-id').textContent()
+  await page.reload()
+  await page.getByRole('button', { name: `${summary} new`, exact: true }).click()
+  await expect(page.getByTestId('case-id')).toHaveText(id!)
+  await page.getByRole('button', { name: 'Investigate saved case' }).click()
+  await expect(page.locator('.status-pill')).not.toHaveText('new')
+})
+
 test('Jake investigation interrupts twice, resumes one case and remembers facts across cases', async ({
   page,
   request,

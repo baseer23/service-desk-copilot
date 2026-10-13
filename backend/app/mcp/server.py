@@ -98,17 +98,34 @@ def environment():
     )
 
 
+@lru_cache
+def documents():
+    from backend.app.repositories.documents import DocumentRepository
+
+    return DocumentRepository(get_settings().case_db_path)
+
+
 @capability("chroma")
 def search_knowledge(question: str, mode: str = "HYBRID", top_k: int = 6):
     """Semantic document/KB retrieval. Use for factual questions, resumes, PDFs and troubleshooting documentation."""
-    if mode.upper() not in {"VECTOR", "GRAPH", "HYBRID"}:
-        raise ValueError("mode must be VECTOR, GRAPH or HYBRID")
+    if mode.upper() not in {"VECTOR", "GRAPH", "HYBRID", "KEYWORD"}:
+        raise ValueError("mode must be VECTOR, GRAPH, HYBRID or KEYWORD")
     if not 1 <= top_k <= 30:
         raise ValueError("top_k must be between 1 and 30")
-    r = environment()[4]
-    rows = {"VECTOR": r.vector_search, "GRAPH": r.graph_search, "HYBRID": r.hybrid_search}[
-        mode.upper()
-    ](question, top_k)
+    if mode.upper() == "KEYWORD":
+        from backend.app.rag.retrieve import Retriever
+        from backend.app.services.capabilities import knowledge_stores
+
+        # Local extraction/search remains usable even without Azure credentials.
+        vector, graph, _ = knowledge_stores(get_settings(), connect_graph=False)
+        rows = Retriever(get_settings(), vector, graph, None, documents()).keyword_search(
+            question, top_k
+        )
+    else:
+        r = environment()[4]
+        rows = {"VECTOR": r.vector_search, "GRAPH": r.graph_search, "HYBRID": r.hybrid_search}[
+            mode.upper()
+        ](question, top_k)
     for row in rows:
         if row.get("metadata", {}).get("source_type") == "local_fixture":
             row["source_system"] = "local_fixture"
@@ -247,6 +264,70 @@ def ingest_document(
     if len(data) > 5_000_000 or not data.startswith(b"%PDF-"):
         raise ValueError("A valid PDF of at most 5 MB is required")
     return environment()[3].ingest_pdf(title, data).model_dump()
+
+
+def _extract_upload(data_base64: str, media_type: str):
+    from backend.app.services.document_extract import DocumentError, extract_document
+
+    if len(data_base64) > 6_666_672:
+        raise DocumentError("Document exceeds 5 MB", 413)
+    try:
+        data = base64.b64decode(data_base64, validate=True)
+    except ValueError:
+        raise DocumentError("Invalid document encoding", 400) from None
+    return extract_document(data, media_type)
+
+
+@capability("local_document")
+def extract_document(data_base64: str, media_type: str = "application/pdf"):
+    """Bounded local PDF/text extraction without Azure requests or persistence."""
+    return _extract_upload(data_base64, media_type)
+
+
+@capability("local_document")
+def save_document(data_base64: str, title: str | None = None, media_type: str = "application/pdf"):
+    """Operator-controlled extraction and local staging; never creates fake semantic vectors."""
+    result = _extract_upload(data_base64, media_type)
+    return {
+        **documents().save(
+            result["text"],
+            title,
+            "pdf" if media_type == "application/pdf" else "text",
+            result["pages"],
+        ),
+        "pages": result["pages"],
+        "method": result["method"],
+    }
+
+
+@capability("local_document")
+def list_documents():
+    """List locally saved document metadata without source text."""
+    return documents().list_documents()
+
+
+@capability("chroma")
+def index_document(document_id: str):
+    """Explicit operator write: embed a staged document into the configured verified collection."""
+    record = documents().get(document_id)
+    if get_settings().azure_live_test_mode:
+        raise ValueError(
+            "Semantic indexing of saved documents is blocked by the single-document Azure acceptance policy"
+        )
+    if get_settings().embed_provider != "stub":
+        from backend.app.core.azure_usage import AzureUsageGuard
+
+        AzureUsageGuard(get_settings()).require_enabled()
+    return (
+        environment()[3]
+        .ingest_text(
+            record["title"],
+            record["text"],
+            source=record["source_type"],
+            source_type=record["source_type"],
+        )
+        .model_dump()
+    )
 
 
 @capability("chroma")

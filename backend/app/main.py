@@ -184,12 +184,19 @@ def create_app(settings: Settings | None = None):
         )
 
     def require_reasoning() -> None:
-        if not readiness().text_ready:
+        report = readiness()
+        if not report.text_ready:
+            message = "Azure reasoning is not ready. Local case saving, document extraction and keyword search remain available."
+            if report.azure_usage and not report.azure_usage["enabled"]:
+                message = "Azure requests are disabled by the usage guard or emergency shutdown. Local case saving, document extraction and keyword search remain available."
+            failure = report.azure_validation.get("text_workflow", {})
+            if failure and not failure["passed"]:
+                message += " Last Azure workflow failure: " + failure["code"] + "."
             raise HTTPException(
                 503,
                 {
                     "code": "AZURE_REASONING_NOT_READY",
-                    "message": "Azure reasoning or local storage is not configured. Check /readiness.",
+                    "message": message,
                 },
             )
 
@@ -220,7 +227,74 @@ def create_app(settings: Settings | None = None):
                 )
             )["result"]
         except MCPToolError as exc:
-            raise HTTPException(400, "PDF could not be parsed") from exc
+            # Distinguish parsing, policy and embedding failures.
+            raise HTTPException(exc.status_code, str(exc)) from exc
+
+    async def document_upload(file: UploadFile, title: str | None, tool: str):
+        from pathlib import Path
+
+        data = await file.read(5_000_001)
+        if len(data) > 5_000_000:
+            raise HTTPException(413, "Document exceeds 5 MB")
+        suffix = Path(file.filename or "").suffix.lower()
+        media_type = {".pdf": "application/pdf", ".txt": "text/plain", ".md": "text/markdown"}.get(
+            suffix
+        )
+        if media_type is None:
+            raise HTTPException(400, "Choose a PDF, .txt or .md document")
+        arguments = {"data_base64": base64.b64encode(data).decode(), "media_type": media_type}
+        if tool == "save_document":
+            arguments["title"] = title or file.filename
+        return (await app.state.agent.harness.invoke(tool, arguments))["result"]
+
+    @app.post("/documents/extract")
+    async def extract_upload(file: UploadFile = File(...)):
+        return await document_upload(file, None, "extract_document")
+
+    @app.post("/documents/upload")
+    async def save_upload(file: UploadFile = File(...), title: str | None = Form(None)):
+        return await document_upload(file, title, "save_document")
+
+    @app.post("/documents/paste")
+    async def save_pasted_document(body: IngestPasteRequest):
+        return (
+            await app.state.agent.harness.invoke(
+                "save_document",
+                {
+                    "data_base64": base64.b64encode(body.text.encode()).decode(),
+                    "title": body.title,
+                    "media_type": "text/plain",
+                },
+            )
+        )["result"]
+
+    @app.get("/documents")
+    async def list_local_documents():
+        return (await app.state.agent.harness.invoke("list_documents", {}))["items"]
+
+    @app.post("/documents/{document_id}/index")
+    async def index_local_document(document_id: str):
+        report = readiness()
+        if not report.semantic_ingestion_ready:
+            raise HTTPException(
+                503,
+                {
+                    "code": "AZURE_EMBEDDINGS_NOT_READY",
+                    "message": report.semantic_ingestion_blocker,
+                },
+            )
+        return (
+            await app.state.agent.harness.invoke("index_document", {"document_id": document_id})
+        )["result"]
+
+    @app.get("/knowledge/search")
+    async def search_local_knowledge(question: str):
+        if not question.strip() or len(question) > 2000:
+            raise HTTPException(422, "Search text must contain 1 to 2000 characters")
+        result = await app.state.agent.harness.invoke(
+            "search_knowledge", {"question": question, "mode": "KEYWORD", "top_k": 6}
+        )
+        return {"mode": "keyword", "generated_answer": False, "items": result["items"]}
 
     @app.post("/ingest/url", response_model=IngestUrlResponse)
     async def ingest_url(body: IngestUrlRequest):
@@ -336,7 +410,7 @@ def create_app(settings: Settings | None = None):
     async def storage_error(request, exc):
         from fastapi.responses import JSONResponse
 
-        return JSONResponse(status_code=502, content={"detail": str(exc)})
+        return JSONResponse(status_code=getattr(exc, "status_code", 502), content={"detail": str(exc)})
 
     @app.exception_handler(UnsafeURL)
     @app.exception_handler(FetchError)

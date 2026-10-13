@@ -1,5 +1,11 @@
 # Browser Voice Support
 
+For the latest repair results and the still-blocked Azure activation, see
+[REPAIR_REVIEW.md](REPAIR_REVIEW.md). Local PDF/text extraction, document saving,
+case saving and cited keyword retrieval work independently of Azure reasoning.
+Semantic indexing and generated answers retain the cost guard and acceptance
+policy; local documents do not create substitute vectors.
+
 DeskMate uses React microphone/output ↔ authenticated FastAPI WebSocket ↔ Azure Voice
 Live's official async SDK. A separate compiled LangGraph proposes extraction,
 validates application confirmations, plans read capabilities through discovered MCP

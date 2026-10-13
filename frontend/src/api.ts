@@ -21,13 +21,34 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (!response.ok) {
     const error = body as { detail?: unknown; case_id?: unknown; code?: unknown } | null
+    const detail = error?.detail
+    const structured =
+      detail && typeof detail === 'object'
+        ? (detail as { message?: unknown; code?: unknown })
+        : null
+    const validation = Array.isArray(detail)
+      ? detail
+          .map((item) => (typeof item?.msg === 'string' ? item.msg : 'Invalid input'))
+          .join('; ')
+      : null
     throw Object.assign(
       new Error(
-        typeof error?.detail === 'string' ? error.detail : `Request failed (${response.status})`,
+        typeof detail === 'string'
+          ? detail
+          : typeof structured?.message === 'string'
+            ? structured.message
+            : validation
+              ? validation
+              : `Request failed (${response.status})`,
       ),
       {
         status: response.status,
-        code: typeof error?.code === 'string' ? error.code : undefined,
+        code:
+          typeof structured?.code === 'string'
+            ? structured.code
+            : typeof error?.code === 'string'
+              ? error.code
+              : undefined,
         case_id: typeof error?.case_id === 'string' ? error.case_id : undefined,
       },
     )
