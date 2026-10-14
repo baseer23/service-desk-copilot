@@ -68,8 +68,8 @@ budget alerts remain. Estimates are not an Azure invoice cap.
 
 Validation exhausted most of the application estimate. Voice sessions were
 tightened to two minutes so a demo can fit the remaining allowance; the normal
-ten-minute reservation requires CAD 5. A proposed CAD 175 total allowance has not
-been applied without separate approval. Use protected `/admin/readiness` to
+ten-minute reservation requires CAD 5. The user declined the proposed CAD 175
+allowance and confirmed retaining CAD 150 with shorter sessions. Use protected `/admin/readiness` to
 inspect current estimates before the demo.
 
 Production uses these existing resources in subscription
