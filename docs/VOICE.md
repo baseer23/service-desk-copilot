@@ -9,9 +9,11 @@ The user explicitly authorized live demo activation on 2026-10-13, superseding t
 earlier shutdown and CAD 8 restriction. The activated profile retains a persistent
 CAD 150 estimated application allowance including a CAD 90 monthly infrastructure
 forecast, CAD 10 Azure budget alerts, one concurrent
-session, twenty daily sessions, ten-minute sessions and twenty turns per session.
+session, twenty daily sessions, two-minute sessions and twenty turns per session.
 Historical charges and emergency controls remain intact. See
 [DEMO_READINESS.md](DEMO_READINESS.md) for current evidence and remaining gates.
+The current conversation-latency repair and its live acceptance blocker are recorded
+in [VOICE_REALTIME_REVIEW.md](VOICE_REALTIME_REVIEW.md).
 
 For historical repair results, see [REPAIR_REVIEW.md](REPAIR_REVIEW.md).
 Current live acceptance is recorded in [DEMO_READINESS.md](DEMO_READINESS.md).
@@ -21,9 +23,11 @@ Semantic indexing and generated answers retain the cost guard and acceptance
 policy; local documents do not create substitute vectors.
 
 DeskMate uses React microphone/output ↔ authenticated FastAPI WebSocket ↔ Azure Voice
-Live's official async SDK. A separate compiled LangGraph proposes extraction,
-validates application confirmations, plans read capabilities through discovered MCP
-schemas, gathers evidence and returns one grounded action or question. Azure OpenAI
+Live's official async SDK. A separate compiled LangGraph combines extraction and
+read planning into one proposal, validates application confirmations and discovered MCP
+schemas, gathers evidence and returns one grounded action or question. A basic
+clarification takes one reasoning request; an evidence-backed action takes a second
+request after MCP retrieval. Azure OpenAI
 supplies structured reasoning, including the live greeting; a canned greeting exists
 only in TEST_MODE. Azure text support delivers the same graph-approved responses
 without opening Voice Live. Voice Live transcribes input and speaks the approved
@@ -119,6 +123,14 @@ Browser send buffer cap 256 KiB, pending audio queue 64 chunks, playback cap 128
 sources/15 seconds. Saturation
 fails explicitly and closes both directions. No automatic retry of ambiguous audio
 operations. Reasoning has a 30-second SDK deadline and one schema correction.
+Transient VAD/progress and transcript deltas do not wait for state writes. Managed
+runtime reads use an owner-specific copy of the last committed conversation; all
+mutations still reread and verify the lease/ETag. Interruption drops queued audio,
+invalidates older turn epochs and flushes interrupted transcript state with the next
+checkpoint or teardown. Muting disables the physical track and sends silence,
+allowing VAD to finish a sentence without forwarding muted samples. The speech
+watchdog polls policy every 250 ms; PCM uses a successful check for at most one
+second, blocks when stale and fails closed on a completed failed check.
 
 SQLite tables: voice_sessions, voice_transcript_turns, voice_session_events. Audio
 is never stored. Raw transcripts/candidate quotes expire after configured retention

@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypedDict
 
@@ -20,11 +21,10 @@ from .models import (
     PendingConfirmation,
     TroubleshootingAction,
     VoiceConversation,
-    VoiceExtraction,
     VoiceGreeting,
-    VoicePlan,
     VoiceReply,
     VoiceStatus,
+    VoiceTurnProposal,
 )
 from .normalization import (
     action_result,
@@ -51,11 +51,17 @@ class TurnState(TypedDict, total=False):
     context: dict[str, Any]
     reply: str
     skip: bool
+    proposal: VoiceTurnProposal
+
+
+class VoiceTurnSuperseded(Exception):
+    """User speech superseded this turn; abandon further paid work and output."""
 
 
 class VoiceSupportGraph:
     def __init__(
-        self, settings: Any, harness: Any, provider: CaseReasoningProvider, activity: Any = None
+        self, settings: Any, harness: Any, provider: CaseReasoningProvider, activity: Any = None,
+        is_current: Callable[[], bool] = lambda: True,
     ):
         self.settings, self.harness, self.provider, self.activity = (
             settings,
@@ -63,6 +69,7 @@ class VoiceSupportGraph:
             provider,
             activity,
         )
+        self.is_current = is_current
         graph = StateGraph(TurnState)
         for name, fn in [
             ("extract", self.extract),
@@ -77,12 +84,21 @@ class VoiceSupportGraph:
         self.compiled = graph.compile()
 
     async def generate(self, stage: str, context: dict[str, Any], schema: Any) -> Any:
-        return await asyncio.wait_for(
+        if stage != "voice_greeting":
+            self.ensure_current()
+        result = await asyncio.wait_for(
             self.provider.generate_structured(stage, {"instructions": PROMPT, **context}, schema),
             self.settings.model_timeout_sec * 2
             + self.settings.azure_reasoning_min_interval_seconds
             + 5,
         )
+        if stage != "voice_greeting":
+            self.ensure_current()
+        return result
+
+    def ensure_current(self) -> None:
+        if not self.is_current():
+            raise VoiceTurnSuperseded()
 
     async def greeting(self) -> str:
         response = await self.generate("voice_greeting", {}, VoiceGreeting)
@@ -162,11 +178,8 @@ class VoiceSupportGraph:
             )
             if not intent.in_scope:
                 return {"conversation": c, "skip": True, "reply": SCOPE_MESSAGE}
-        extraction = await self.generate(
-            "voice_extract",
-            {key: value for key, value in context.items() if key != "permitted_tools"},
-            VoiceExtraction,
-        )
+        turn_proposal = await self.generate("voice_turn", context, VoiceTurnProposal)
+        extraction = turn_proposal.extraction
         if (
             extraction.region
             and extraction.region.upper() in __import__("phonenumbers").SUPPORTED_REGIONS
@@ -284,18 +297,20 @@ class VoiceSupportGraph:
                     + spoken
                     + ". Is that correct?",
                 }
-        return {"conversation": c, "context": context, "skip": False}
+        return {"conversation": c, "context": context, "skip": False, "proposal": turn_proposal}
 
     async def investigate(self, state: TurnState) -> dict[str, Any]:
+        self.ensure_current()
         if state.get("skip"):
             return {}
         c = state["conversation"]
-        plan = await self.generate("voice_plan", state["context"], VoicePlan)
         validated = InvestigationPlan(
-            goal="Voice support evidence", tool_calls=plan.tool_calls, stop_condition="One response"
+            goal="Voice support evidence", tool_calls=state["proposal"].tool_calls,
+            stop_condition="One response"
         )
         self.harness.validate_plan(validated, "voice")
-        for call in plan.tool_calls:
+        for call in validated.tool_calls:
+            self.ensure_current()
             if call.name == "fetch_web_page" and not permits(
                 str(call.arguments.get("url", "")), self.settings
             ):
@@ -351,28 +366,41 @@ class VoiceSupportGraph:
             except Exception:  # noqa: BLE001 - sanitize external failures at the boundary
                 if self.activity:
                     await self.activity("Evidence source unavailable")
+        self.ensure_current()
         c.evidence = c.evidence[-40:]
         return {"conversation": c}
 
     async def respond(self, state: TurnState) -> dict[str, Any]:
+        self.ensure_current()
         if state.get("skip"):
             return {}
         c = state["conversation"]
-        if self.activity:
-            await self.activity("Verifying evidence")
-        response = await self.generate(
-            "voice_reply",
-            {
-                **{key: value for key, value in state["context"].items() if key != "permitted_tools"},
-                "evidence": [e.model_dump() for e in c.evidence],
-                "missing_contact": [
-                    f
-                    for f in ("name", "email", "callback_number")
-                    if f not in c.confirmed_profile and f not in c.manual_contact_fields
-                ],
-            },
-            VoiceReply,
-        )
+        proposal = state["proposal"]
+        if not proposal.tool_calls and proposal.clarification_question:
+            # A question supplies no technical action or resolution. It still
+            # passes the same application safety checks as a researched reply.
+            response = VoiceReply(
+                reply=proposal.clarification_question, question=proposal.clarification_question
+            )
+        else:
+            if self.activity:
+                await self.activity("Verifying evidence")
+            response = await self.generate(
+                "voice_reply",
+                {
+                    **{
+                        key: value for key, value in state["context"].items()
+                        if key != "permitted_tools"
+                    },
+                    "evidence": [e.model_dump() for e in c.evidence],
+                    "missing_contact": [
+                        f
+                        for f in ("name", "email", "callback_number")
+                        if f not in c.confirmed_profile and f not in c.manual_contact_fields
+                    ],
+                },
+                VoiceReply,
+            )
         ids = {e.id for e in c.evidence if e.reliability >= 0.5 and e.source_type != "tool_error"}
         unsafe = bool(
             (response.action or response.question)
@@ -382,6 +410,12 @@ class VoiceSupportGraph:
                 re.I,
             )
         )
+        question_action = bool(response.question and re.search(
+            r"\b(?:please|can you|could you|would you|will you|try|if you)\s+"
+            r"(?:please\s+)?(?:restart|reboot|reset|change|run|execute|remove|download|"
+            r"update|upgrade|click|open|check|disconnect|reconnect)\b",
+            response.question, re.I,
+        ))
         repeated = bool(
             response.action
             and any(a.instruction.casefold() == response.action.casefold() for a in c.actions)
@@ -390,6 +424,7 @@ class VoiceSupportGraph:
             response.requires_authorization
             or response.escalation_required
             or unsafe
+            or question_action
             or repeated
             or (
                 response.action
@@ -414,7 +449,9 @@ class VoiceSupportGraph:
             # Ungrounded prose cannot become a technical claim or a resolution.
             reply = SAFE_FAILURE
             c.resolution_status = "escalation_required"
-        if reply.count("?") > 1 or "\n" in reply:
+        if reply.count("?") > 1 or "\n" in reply or (
+            response.question and not reply.rstrip().endswith("?")
+        ):
             reply = "What is the exact error message you see?"
         c.status = VoiceStatus.LISTENING
         return {"conversation": c, "reply": reply}

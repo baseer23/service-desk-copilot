@@ -163,7 +163,17 @@ class AzureVoiceLiveProvider:
         self.check_duration()
 
     async def send_audio(self, audio: str) -> None:
-        await self.ensure_active_async()
+        if self.settings.data_platform == "azure":
+            self.check_duration()
+            if self.guard_check_task and self.guard_check_task.done():
+                self.guard_check_task.result()  # Fail closed on a completed failed policy check.
+            # The watchdog refreshes policy every 250 ms. A reserved session's
+            # 20 ms PCM frames need not wait for that same database round trip.
+            # Older/missing successful checks still block dispatch.
+            if time.monotonic() - self.guard_checked_at >= 1:
+                await self.ensure_active_async()
+        else:
+            await self.ensure_active_async()
         await self.connection.input_audio_buffer.append(audio=audio)
 
     async def commit_audio(self) -> None:
@@ -180,11 +190,11 @@ class AzureVoiceLiveProvider:
             item=UserMessageItem(content=[InputTextContentPart(text=text)])
         )
 
-    async def respond(self, approved_text: str) -> None:
+    async def respond(self, approved_text: str) -> bool:
         epoch = self.reply_epoch
         await self.ensure_active_async()
         if epoch != self.reply_epoch or self.connection is None:
-            return
+            return False
         if len(approved_text.encode()) + 128 > self.settings.azure_max_input_tokens:
             raise RuntimeError("Azure voice reply input limit reached")
         self.response_pending = True
@@ -200,6 +210,7 @@ class AzureVoiceLiveProvider:
                 },
             }
         )
+        return True
 
     async def interrupt(self) -> None:
         self.reply_epoch += 1

@@ -175,6 +175,16 @@ def stage_instructions(stage: str, context: dict) -> str:
                 "Return one grounded safe action with evidence IDs or one useful question. Never"
                 " claim resolution. JSON."
             ),
+            "voice_turn": (
+                "In one JSON object, extract contact raw quotes and issue details ONLY from the "
+                "current turn, and select at most four permitted read MCP calls if evidence is "
+                "needed now. For a missing diagnostic fact or contact detail, return an empty "
+                "tool_calls list and one short clarification_question instead. Do not retrieve "
+                "knowledge just to ask a basic question. Questions must ask for information, "
+                "never prescribe a technical step, assert a diagnosis, or claim resolution. "
+                "Use recent turns and confirmed details; never greet again or repeat a question "
+                "the user already answered. Do not answer the issue in this proposal."
+            ),
         }
         return context.get("instructions", "") + "\n" + purpose.get(stage, "Return JSON.")
     if stage == "verify" and context.get("verification_target") == "clarification":

@@ -4,11 +4,18 @@ import re
 from typing import Any
 
 from backend.app.agent.models import ToolRequest
-from backend.app.voice.models import ContactCandidate, VoiceExtraction, VoicePlan, VoiceReply
+from backend.app.voice.models import (
+    ContactCandidate, VoiceExtraction, VoicePlan, VoiceReply, VoiceTurnProposal,
+)
 
 
 def generate(stage: str, context: dict[str, Any], schema: Any) -> Any:
     text = context.get("current_turn", "")
+    if stage == "voice_turn":
+        extraction = generate("voice_extract", context, VoiceExtraction)
+        planning_context = {**context, "issue_summary": extraction.issue_summary or context.get("issue_summary")}
+        plan = generate("voice_plan", planning_context, VoicePlan)
+        return VoiceTurnProposal(extraction=extraction, tool_calls=plan.tool_calls)
     if stage == "voice_extract":
         profile = {}
         for field, pattern in [

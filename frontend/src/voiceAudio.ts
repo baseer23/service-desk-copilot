@@ -96,8 +96,10 @@ export class VoiceAudio {
       this.capture.port.onmessage = (event) => {
         this.frames++
         activity(this.muted || this.closed ? 0 : Number(event.data.level ?? 0))
-        if (this.muted || this.closed) return
-        const bytes = new Uint8Array(event.data.audio ?? event.data)
+        if (this.closed) return
+        // Keep the PCM clock moving while muted, so server VAD can finish a
+        // sentence. Never forward captured samples from a muted microphone.
+        const bytes = this.muted ? new Uint8Array(960) : new Uint8Array(event.data.audio ?? event.data)
         let value = ''
         for (const byte of bytes) value += String.fromCharCode(byte)
         send(btoa(value))

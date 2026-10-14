@@ -23,6 +23,9 @@ TOKEN_LIMITS = {
     "reason": 1500,
     "verify": 800,
     "evaluate_sources": 350,
+    "voice_greeting": 100,
+    "voice_turn": 700,
+    "voice_reply": 350,
 }
 
 
@@ -83,7 +86,12 @@ def structured_request(
         {"role": "system", "content": instructions},
         {
             "role": "user",
-            "content": json.dumps(compact_context(context), default=str, separators=(",", ":")),
+            "content": json.dumps(
+                compact_context(
+                    {key: value for key, value in context.items() if key != "instructions"}
+                    if stage.startswith("voice_") else context
+                ), default=str, separators=(",", ":"),
+            ),
         },
     ]
     return messages, response_format
@@ -132,6 +140,7 @@ class AzureOpenAIProvider:
             raise LLMError("Azure OpenAI endpoint and deployment must be configured")
         self.settings = settings
         self.usage_guard = AzureUsageGuard(settings)
+        self.request_lock = asyncio.Lock()
         self.credential: Any = None
         if client is not None:
             self.client = client
@@ -174,6 +183,13 @@ class AzureOpenAIProvider:
         return "azure_openai"
 
     async def generate_structured(self, stage: str, context: dict, schema: type[T]) -> T:
+        # The live greeting and first recognized turn may overlap. The durable
+        # guard permits one paid operation; queue locally instead of failing a
+        # valid conversation when its own greeting holds that reservation.
+        async with self.request_lock:
+            return await self._generate_structured(stage, context, schema)
+
+    async def _generate_structured(self, stage: str, context: dict, schema: type[T]) -> T:
         messages, response_format = structured_request(self.settings, stage, context, schema)
         attempts = 1 if stage == "readiness" or self.settings.azure_setup_validation_mode else 2
         for attempt in range(attempts):

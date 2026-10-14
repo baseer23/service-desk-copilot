@@ -77,6 +77,7 @@ async def test_managed_voice_heartbeat_and_state_writes_are_serialized(settings)
     )
     runtime.repository_lock = asyncio.Lock()
     runtime.stop = asyncio.Event()
+    runtime.interrupted_assistant_ids = set()
     runtime.session_id, runtime.actor, runtime.lease = "fictional", None, "owned"
     await asyncio.gather(runtime.update(lambda state: None), runtime.renew_lease())
     assert sorted(calls) == ["lease", "state"]
@@ -108,12 +109,14 @@ async def test_barge_in_during_final_greeting_read_suppresses_the_stale_greeting
 
 
 @pytest.mark.asyncio
-async def test_barge_in_clears_playback_and_cancels_before_managed_state_write():
+async def test_barge_in_does_not_wait_for_managed_state_write():
     runtime = object.__new__(VoiceRuntime)
     runtime.epoch = 0
     runtime.response_id, runtime.assistant_id = "old-response", "old-assistant"
     runtime.pending_response = True
     runtime.cancelled = set()
+    runtime.interrupted_assistant_ids = set()
+    runtime.outgoing = asyncio.Queue()
     calls = []
 
     async def send(*args): calls.append("clear")
@@ -125,8 +128,9 @@ async def test_barge_in_clears_playback_and_cancels_before_managed_state_write()
     runtime.send, runtime.update = send, update
     runtime.provider = SimpleNamespace(interrupt=interrupt)
     await runtime.interrupt()
-    assert calls == ["clear", "cancel", "write"]
+    assert calls == ["clear", "cancel"]
     assert runtime.cancelled == {"old-response"}
+    assert runtime.interrupted_assistant_ids == {"old-assistant"}
 
 
 @pytest.mark.asyncio
@@ -177,3 +181,43 @@ async def test_managed_session_inspection_does_not_pause_audio_processing(settin
     await asyncio.sleep(0.01)
     assert not operation.done()
     assert await operation == "Owned session"
+
+
+@pytest.mark.asyncio
+async def test_fresh_reserved_audio_does_not_wait_for_policy_refresh_and_fails_closed(settings, monkeypatch):
+    entered, release = asyncio.Event(), asyncio.Event()
+    monkeypatch.setattr(azure_voicelive, "AzureUsageGuard", lambda config: object())
+    provider = AzureVoiceLiveProvider(settings.model_copy(update={"data_platform": "azure"}))
+    provider.started = provider.guard_checked_at = time.monotonic()
+    append = AsyncMock()
+    provider.connection = SimpleNamespace(input_audio_buffer=SimpleNamespace(append=append))
+
+    async def refresh():
+        entered.set()
+        await release.wait()
+        raise RuntimeError("Emergency shutdown")
+
+    provider.guard_check_task = asyncio.create_task(refresh())
+    await entered.wait()
+    await asyncio.wait_for(provider.send_audio("AAA="), 0.05)
+    append.assert_awaited_once()
+    release.set()
+    with pytest.raises(RuntimeError, match="Emergency shutdown"):
+        await provider.guard_check_task
+    with pytest.raises(RuntimeError, match="Emergency shutdown"):
+        await provider.send_audio("AAA=")
+    append.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_stale_audio_policy_stops_pcm_until_successful_refresh(settings, monkeypatch):
+    monkeypatch.setattr(azure_voicelive, "AzureUsageGuard", lambda config: object())
+    provider = AzureVoiceLiveProvider(settings.model_copy(update={"data_platform": "azure"}))
+    provider.started = time.monotonic()
+    provider.guard_checked_at = time.monotonic() - 2
+    provider.ensure_active_async = AsyncMock(side_effect=RuntimeError("Policy unavailable"))
+    append = AsyncMock()
+    provider.connection = SimpleNamespace(input_audio_buffer=SimpleNamespace(append=append))
+    with pytest.raises(RuntimeError, match="Policy unavailable"):
+        await provider.send_audio("AAA=")
+    append.assert_not_awaited()

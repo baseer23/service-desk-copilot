@@ -12,9 +12,9 @@ from backend.app.voice.models import (
     TranscriptTurn,
     VoiceConversation,
     VoiceExtraction,
-    VoicePlan,
     VoiceReply,
     VoiceStatus,
+    VoiceTurnProposal,
 )
 from backend.app.voice.normalization import normalize_email, normalize_name, normalize_phone
 from backend.app.voice.repository import SQLiteVoiceConversationRepository
@@ -292,16 +292,12 @@ async def test_real_mcp_evidence_grounding_result_and_failure(settings):
 async def test_no_invented_contact_or_write_action(settings):
     class Bad:
         async def generate_structured(self, stage, context, schema):
-            if stage == "voice_extract":
-                return VoiceExtraction(
-                    profile={
-                        "email": ContactCandidate(value="invented@example.com", raw_quote="Alex")
-                    }
-                )
-            if stage == "voice_plan":
+            if stage == "voice_turn":
                 from backend.app.agent.models import ToolRequest
 
-                return VoicePlan(tool_calls=[ToolRequest(name="save_case")])
+                return VoiceTurnProposal(extraction=VoiceExtraction(profile={
+                        "email": ContactCandidate(value="invented@example.com", raw_quote="Alex")
+                    }), tool_calls=[ToolRequest(name="save_case")])
 
     graph = VoiceSupportGraph(
         settings.model_copy(update={"knowledge_scope": "broad"}), Harness(), Bad()
@@ -621,10 +617,8 @@ async def test_rejected_ungrounded_elevated_and_repeated_actions(settings):
             self.action = action
 
         async def generate_structured(self, stage, context, schema):
-            if stage == "voice_extract":
-                return VoiceExtraction()
-            if stage == "voice_plan":
-                return VoicePlan()
+            if stage == "voice_turn":
+                return VoiceTurnProposal(extraction=VoiceExtraction())
             return VoiceReply(reply="Unverified", action=self.action, evidence_ids=["invented"])
 
     for action in ["Delete the registry", "Check a service", "Repeat a failed step"]:
@@ -795,7 +789,7 @@ async def test_audio_flows_and_speech_supersedes_a_slow_live_greeting(settings):
 
 
 @pytest.mark.asyncio
-async def test_only_voice_planning_receives_the_read_tool_schemas(settings):
+async def test_combined_voice_planning_omits_tool_schemas_from_the_reply(settings):
     contexts = {}
 
     class Model(StubProvider):
@@ -809,8 +803,8 @@ async def test_only_voice_planning_receives_the_read_tool_schemas(settings):
     await VoiceSupportGraph(settings, Harness(), Model()).run(
         conversation, "My VPN is broken", "spoken-1"
     )
-    assert "permitted_tools" in contexts["voice_plan"]
-    assert "permitted_tools" not in contexts["voice_extract"]
+    assert "permitted_tools" in contexts["voice_turn"]
+    assert "voice_plan" not in contexts and "voice_extract" not in contexts
     assert "permitted_tools" not in contexts["voice_reply"]
 
 

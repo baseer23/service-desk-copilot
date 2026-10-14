@@ -138,6 +138,12 @@ class VoicePlan(StrictModel):
     tool_calls: list[ToolRequest] = Field(default_factory=list, max_length=4)
 
 
+class VoiceTurnProposal(StrictModel):
+    extraction: VoiceExtraction
+    tool_calls: list[ToolRequest] = Field(default_factory=list, max_length=4)
+    clarification_question: str | None = Field(default=None, max_length=300)
+
+
 class VoiceReply(StrictModel):
     reply: str = Field(min_length=1, max_length=1000)
     question: str | None = Field(default=None, max_length=300)
