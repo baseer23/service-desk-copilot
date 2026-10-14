@@ -1,19 +1,17 @@
 # Browser Voice Support
 
-The Azure-native production implementation and current acceptance limits are in
-[AZURE_ENTERPRISE.md](AZURE_ENTERPRISE.md). Production requires Entra authentication,
-tenant-partitioned managed state and persistent Key Vault signing material. Detailed
-readiness and emergency controls are operator-only at `/admin/readiness` and
-`/admin/azure/usage/disable`; ordinary `/readiness` returns product availability.
-The user explicitly authorized live demo activation on 2026-10-13, superseding the
-earlier shutdown and CAD 8 restriction. The activated profile retains a persistent
-CAD 150 estimated application allowance including a CAD 90 monthly infrastructure
-forecast, CAD 10 Azure budget alerts, one concurrent
-session, twenty daily sessions, two-minute sessions and twenty turns per session.
-Historical charges and emergency controls remain intact. See
-[DEMO_READINESS.md](DEMO_READINESS.md) for current evidence and remaining gates.
-The current conversation-latency repair and its live acceptance blocker are recorded
-in [VOICE_REALTIME_REVIEW.md](VOICE_REALTIME_REVIEW.md).
+The current Mac profile stores data locally and uses Azure for AI processing only.
+See [LOCAL_STORAGE_VOICE.md](LOCAL_STORAGE_VOICE.md) for the verified migration,
+backup paths, restart checks and rollback. Earlier Azure-native deployment notes
+are historical; do not use them to re-enable cloud persistence for this profile.
+
+Sessions are limited to two minutes. Normal expiry stops capture/playback, saves
+state and releases the session lease; it does not disable Azure usage. The Mac
+configuration sets `AZURE_MAX_LIVE_SESSIONS_PER_DAY=0`, removing the daily counter
+limit while retaining spending reservations, emergency shutdown and one concurrent
+session. New sessions still require enough remaining approved allowance. The last
+approved limit is CAD 155. Historical charges, the CAD 90 infrastructure forecast
+and emergency controls are preserved.
 
 For historical repair results, see [REPAIR_REVIEW.md](REPAIR_REVIEW.md).
 Current live acceptance is recorded in [DEMO_READINESS.md](DEMO_READINESS.md).
@@ -132,8 +130,11 @@ allowing VAD to finish a sentence without forwarding muted samples. The speech
 watchdog polls policy every 250 ms; PCM uses a successful check for at most one
 second, blocks when stale and fails closed on a completed failed check.
 
-SQLite tables: voice_sessions, voice_transcript_turns, voice_session_events. Audio
-is never stored. Raw transcripts/candidate quotes expire after configured retention
+The active transactional `local_records` SQLite table preserves tenant and owner
+authority, complete transcripts, leases and checkpoint history. Legacy local mode
+uses voice_sessions, voice_transcript_turns and voice_session_events. Audio is never
+stored. With `VOICE_TRANSCRIPT_RETENTION_HOURS=0`, transcript expiry is disabled on
+this private Mac. For nonzero retention, raw transcripts/candidate quotes expire
 on the next new-session maintenance pass. Confirmed contact details, issue summaries,
 evidence and saved cases remain; establish a tenant deletion/retention policy before
 production. Expiry is lazy, not a guaranteed scheduled deletion service.

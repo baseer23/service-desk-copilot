@@ -116,7 +116,7 @@ def capability(source_system, reliability=0.9):
 
 @lru_cache
 def memory():
-    if get_settings().data_platform == "azure":
+    if get_settings().uses_record_store:
         from backend.app.repositories.azure_memory import CosmosCaseMemoryStore
 
         return CosmosCaseMemoryStore(managed_records())
@@ -125,9 +125,9 @@ def memory():
 
 @lru_cache
 def managed_records():
-    from backend.app.store.azure_records import CosmosRecords
+    from backend.app.store.local_records import record_store
 
-    return CosmosRecords(get_settings())
+    return record_store(get_settings())
 
 
 @lru_cache
@@ -153,7 +153,11 @@ def environment():
 
 @lru_cache
 def documents():
-    if get_settings().data_platform == "azure":
+    if get_settings().local_persistence_enabled and get_settings().data_platform == "local":
+        from backend.app.services.local_documents import LocalDocumentRepository
+
+        return LocalDocumentRepository(get_settings(), records=managed_records())
+    if get_settings().uses_record_store:
         from backend.app.services.azure_documents import AzureDocumentRepository
 
         return AzureDocumentRepository(get_settings(), records=managed_records())
@@ -324,6 +328,17 @@ def ingest_document(
     data = base64.b64decode(data_base64, validate=True)
     if len(data) > 5_000_000 or not data.startswith(b"%PDF-"):
         raise ValueError("A valid PDF of at most 5 MB is required")
+    if get_settings().uses_record_store:
+        from time import perf_counter
+
+        started = perf_counter()
+        uploaded = documents().upload(data, title, media_type)
+        processed = documents().process(uploaded["id"])
+        return {
+            "pages": processed["pages"], "chunks": processed["chunks"], "entities": 0,
+            "vector_count": processed["chunks"], "ms": int((perf_counter() - started) * 1000),
+            "duplicate": uploaded["duplicate"], "content_hash": uploaded["id"],
+        }
     return environment()[3].ingest_pdf(title, data).model_dump()
 
 
@@ -348,7 +363,7 @@ def extract_document(data_base64: str, media_type: str = "application/pdf"):
 @capability("local_document")
 def save_document(data_base64: str, title: str | None = None, media_type: str = "application/pdf"):
     """Operator-controlled extraction and local staging; never creates fake semantic vectors."""
-    if get_settings().data_platform == "azure":
+    if get_settings().uses_record_store:
         data = base64.b64decode(data_base64, validate=True)
         if len(data) > 5_000_000:
             raise ValueError("Document exceeds 5 MB")
@@ -375,7 +390,7 @@ def list_documents():
 @capability("chroma")
 def index_document(document_id: str):
     """Explicit operator write: embed a staged document into the configured verified collection."""
-    if get_settings().data_platform == "azure":
+    if get_settings().uses_record_store:
         return documents().process(document_id)
     record = documents().get(document_id)
     if get_settings().azure_live_test_mode:
@@ -407,7 +422,7 @@ def get_document(document_id: str):
 @capability("document_store")
 def get_document_original(document_id: str):
     """Authorized immutable source download; no SAS URLs or storage credentials."""
-    if get_settings().data_platform != "azure":
+    if not get_settings().uses_record_store:
         raise ValueError("Original-file download is unavailable for locally extracted text")
     record = documents().get(document_id)
     data = documents().blobs.get(document_id, "original")
@@ -536,7 +551,7 @@ def get_local_storage_status() -> dict[str, bool]:
     from backend.app.services.capabilities import knowledge_stores
 
     vector, _, _ = knowledge_stores(get_settings(), connect_graph=False)
-    if get_settings().data_platform == "azure":
+    if get_settings().uses_record_store:
         managed_records().query("case", limit=1)
         return {"chroma": vector.ping(), "sqlite": True, "aura_connected": False}
     with closing(memory()._connect()) as connection:
@@ -550,7 +565,7 @@ def get_local_storage_status() -> dict[str, bool]:
 
 @lru_cache(maxsize=1)
 def voice_repository():
-    if get_settings().data_platform == "azure":
+    if get_settings().uses_record_store:
         from backend.app.voice.azure_repository import CosmosVoiceConversationRepository
 
         return CosmosVoiceConversationRepository(managed_records())

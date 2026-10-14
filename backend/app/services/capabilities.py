@@ -6,7 +6,7 @@ from backend.app.store.graph_repo import GraphRepository, InMemoryGraphRepositor
 from backend.app.store.vector_chroma import VectorChromaStore
 
 
-def knowledge_stores(settings, *, connect_graph=True):
+def knowledge_stores(settings, *, connect_graph=True, records=None):
     if settings.data_platform == "azure":
         from backend.app.store.azure_knowledge import AzureSearchStore
 
@@ -39,6 +39,11 @@ def knowledge_stores(settings, *, connect_graph=True):
             384 if settings.embed_provider == "stub" else settings.azure_embedding_dimensions
         ),
     )
+    if settings.local_persistence_enabled:
+        from backend.app.store.local_knowledge import LocalKnowledgeStore
+        from backend.app.store.local_records import LocalRecords
+
+        vector = LocalKnowledgeStore(vector, records or LocalRecords(settings))
     graph, driver = InMemoryGraphRepository(), None
     if connect_graph and settings.neo4j_uri:
         try:

@@ -22,6 +22,8 @@ export default defineConfig({
       env: {
         TEST_MODE: 'true',
         DATA_PLATFORM: 'local',
+        LOCAL_PERSISTENCE_ENABLED: 'false',
+        LOCAL_DOCUMENTS_DIR: join(runtime, 'documents'),
         DEPLOYMENT_MODE: 'local',
         ENABLE_LOCAL_FIXTURES: 'true',
         AZURE_USAGE_GUARD_ENABLED: 'false',

@@ -21,6 +21,8 @@ frontend/dist/
 venv/
 .vscode/
 store/chroma/
+store/local/
+store/backups/
 
 # Operational memory and test artifacts
 store/*.db

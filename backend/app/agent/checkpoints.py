@@ -7,11 +7,11 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 @asynccontextmanager
 async def checkpoint_store(settings):
-    if settings.data_platform == "azure":
+    if settings.uses_record_store:
         from backend.app.agent.azure_checkpoints import CosmosCheckpointSaver
-        from backend.app.store.azure_records import CosmosRecords
+        from backend.app.store.local_records import record_store
 
-        records = CosmosRecords(settings)
+        records = record_store(settings)
         try:
             yield CosmosCheckpointSaver(records)
         finally:

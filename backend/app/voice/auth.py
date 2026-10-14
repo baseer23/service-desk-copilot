@@ -68,7 +68,7 @@ def verify_actor(settings: Settings, token: str | None) -> Actor:
             payload["exp"] < time.time()
             or (
                 payload["tid"] not in settings.auth_allowed_tenants
-                if settings.data_platform == "azure"
+                if settings.uses_record_store and settings.auth_allowed_tenants
                 else payload["tid"] != settings.voice_tenant_id
             )
             or not isinstance(payload["uid"], str)

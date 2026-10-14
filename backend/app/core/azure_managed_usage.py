@@ -1,7 +1,8 @@
-"""Existing guard semantics over a managed, leased Cosmos ledger.
+"""Guard semantics over a tenant-scoped transactional record ledger.
 
-SQLite is a transient transaction engine in memory. Cosmos is the sole persistent
-authority; a failed/stale lease never commits a reservation or enables dispatch.
+SQLite evaluates policy tables in memory. The record adapter provides persistence
+and atomic locking: local SQLite on the Mac, or leased Cosmos in legacy deployments.
+A failed transaction never commits a reservation or enables dispatch.
 """
 
 import sqlite3
@@ -10,7 +11,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 
 from backend.app.core.azure_usage import AzureUsageBlocked, AzureUsageGuard
-from backend.app.store.azure_records import CosmosRecords, ManagedStoreError
+from backend.app.store.azure_records import ManagedStoreError
 
 TABLES = {
     "azure_policy": "id INTEGER PRIMARY KEY,disabled INTEGER NOT NULL",
@@ -40,6 +41,9 @@ _clients_lock = threading.Lock()
 
 def shared_records(settings):
     key = (
+        str(settings.case_db_path.resolve()),
+        settings.local_persistence_enabled,
+        settings.data_platform,
         settings.azure_cosmos_endpoint,
         settings.azure_cosmos_database,
         settings.azure_cosmos_container,
@@ -47,7 +51,9 @@ def shared_records(settings):
     )
     with _clients_lock:
         if key not in _clients:
-            _clients[key] = CosmosRecords(settings)
+            from backend.app.store.local_records import record_store
+
+            _clients[key] = record_store(settings)
         return _clients[key]
 
 

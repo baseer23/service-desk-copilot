@@ -28,7 +28,7 @@ class AzureUsageBlocked(RuntimeError):
 
 class AzureUsageGuard:
     def __new__(cls, settings: Settings, *args, **kwargs):
-        if cls is AzureUsageGuard and settings.data_platform == "azure":
+        if cls is AzureUsageGuard and settings.uses_record_store:
             from backend.app.core.azure_managed_usage import CosmosUsageGuard
 
             return object.__new__(CosmosUsageGuard)
@@ -296,7 +296,10 @@ class AzureUsageGuard:
                 ).fetchone()[0]
                 if active >= s.azure_max_concurrent_sessions:
                     raise AzureUsageBlocked("Only one live Azure support session may run at a time")
-                if daily >= s.azure_max_live_sessions_per_day:
+                if (
+                    s.azure_max_live_sessions_per_day > 0
+                    and daily >= s.azure_max_live_sessions_per_day
+                ):
                     raise AzureUsageBlocked("Daily live Azure support session limit reached")
             elif db.execute(
                 "SELECT COUNT(*) FROM azure_usage WHERE active=1 "

@@ -4,6 +4,7 @@ import hashlib
 import json
 import shutil
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 from backend.app.store.azure_records import ManagedStoreError
@@ -29,9 +30,11 @@ def digest(payload):
 def snapshot_sqlite(source: Path, target: Path):
     """SQLite online backup includes committed WAL state without modifying the source."""
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with sqlite3.connect(source.as_uri() + "?mode=ro", uri=True) as original:
-        with sqlite3.connect(target) as backup:
+    with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as original:
+        with closing(sqlite3.connect(target)) as backup:
             original.backup(backup)
+            backup.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            backup.execute("PRAGMA journal_mode=DELETE")
             if backup.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                 raise RuntimeError("Backup integrity check failed")
     target.chmod(0o600)

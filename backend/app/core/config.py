@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     test_mode: bool = False
     deployment_mode: Literal["local", "production"] = "local"
     data_platform: Literal["local", "azure"] = "local"
+    local_persistence_enabled: bool = False
+    local_documents_dir: Path = PROJECT_ROOT / "store/local/documents"
     azure_cosmos_endpoint: str = ""
     azure_cosmos_database: str = "deskmate"
     azure_cosmos_container: str = "state"
@@ -70,9 +72,9 @@ class Settings(BaseSettings):
     azure_estimated_infrastructure_cad: float = Field(default=0.25, ge=0, le=200)
     azure_usage_db_path: Path | None = None
     azure_max_concurrent_sessions: int = Field(default=1, ge=1, le=1)
-    azure_max_voice_session_minutes: int = Field(default=10, ge=1, le=10)
+    azure_max_voice_session_minutes: int = Field(default=2, ge=1, le=10)
     azure_max_turns_per_session: int = Field(default=20, ge=1, le=20)
-    azure_max_live_sessions_per_day: int = Field(default=2, ge=1, le=20)
+    azure_max_live_sessions_per_day: int = Field(default=2, ge=0, le=20)
     azure_max_input_tokens: int = Field(default=32768, ge=256, le=32768)
     azure_max_output_tokens: int = Field(default=1500, ge=80, le=1500)
     # Deliberately conservative assumptions in CAD, not published Azure prices.
@@ -98,7 +100,7 @@ class Settings(BaseSettings):
     voice_session_timeout_sec: int = Field(default=900, ge=30, le=3600)
     voice_max_turns: int = Field(default=1000, ge=20, le=2000)
     voice_max_confirmation_retries: int = Field(default=3, ge=1, le=5)
-    voice_transcript_retention_hours: int = Field(default=24, ge=1, le=168)
+    voice_transcript_retention_hours: int = Field(default=24, ge=0, le=168)
     neo4j_uri: str = ""
     neo4j_user: str = "neo4j"
     neo4j_password: SecretStr = Field(default=SecretStr(""), repr=False)
@@ -139,6 +141,10 @@ class Settings(BaseSettings):
         env_file=PROJECT_ROOT / ".env", extra="ignore", hide_input_in_errors=True
     )
 
+    @property
+    def uses_record_store(self) -> bool:
+        return self.data_platform == "azure" or self.local_persistence_enabled
+
     @field_validator(
         "allowed_origins",
         "research_preferred_domains",
@@ -175,7 +181,7 @@ class Settings(BaseSettings):
     def validate_runtime(self) -> "Settings":
         if len(self.auth_allowed_tenants) > 8:
             raise ValueError("The pilot supports at most eight authorized tenants")
-        if self.data_platform == "azure" and not self.azure_document_free_tier:
+        if self.uses_record_store and not self.azure_document_free_tier:
             raise ValueError("Paid document analysis requires an explicitly approved cost policy")
         if self.deployment_mode == "production":
             if self.data_platform != "azure":

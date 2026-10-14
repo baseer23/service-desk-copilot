@@ -196,7 +196,7 @@ class AzureOpenAIProvider:
             try:
                 while True:
                     delay = (await asyncio.to_thread(self.usage_guard.request_delay, "reasoning")
-                             if self.settings.data_platform == "azure"
+                             if self.settings.uses_record_store
                              else self.usage_guard.request_delay("reasoning"))
                     if not delay:
                         break

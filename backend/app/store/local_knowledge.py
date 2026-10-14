@@ -1,0 +1,225 @@
+"""Tenant-scoped persistent Chroma knowledge and immutable private local sources."""
+
+import hashlib
+import json
+import os
+import re
+import tempfile
+from pathlib import Path
+
+from backend.app.store.azure_records import ManagedStoreError
+
+
+class LocalDocuments:
+    def __init__(self, settings, records):
+        self.root = settings.local_documents_dir.resolve()
+        self.records = records
+        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    def path(self, document_id, artifact):
+        if not re.fullmatch(r"[a-f0-9]{64}", document_id) or artifact not in {
+            "original",
+            "extraction.json",
+            "vectors.json",
+        }:
+            raise ValueError("Unsupported document artifact")
+        return (
+            hashlib.sha256(self.records.tenant().encode()).hexdigest()
+            + "/"
+            + document_id
+            + "/"
+            + artifact
+        )
+
+    def location(self, document_id, artifact):
+        path = self.root / self.path(document_id, artifact)
+        if not path.resolve().is_relative_to(self.root):
+            raise ManagedStoreError("Invalid document location")
+        return path
+
+    def put(self, document_id, artifact, data, media_type):
+        path = self.location(document_id, artifact)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(dir=path.parent)
+        try:
+            with os.fdopen(descriptor, "wb") as target:
+                target.write(data)
+                target.flush()
+                os.fsync(target.fileno())
+            try:
+                os.link(temporary, path)  # Atomic publication, never overwrite an original.
+            except FileExistsError:
+                if hashlib.sha256(path.read_bytes()).digest() != hashlib.sha256(data).digest():
+                    raise ManagedStoreError("Document artifact integrity mismatch") from None
+            directory = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+        return self.path(document_id, artifact)
+
+    def get(self, document_id, artifact):
+        path = self.location(document_id, artifact)
+        try:
+            if path.stat().st_size > 25_000_000:
+                raise ManagedStoreError("Document artifact exceeds the safe download limit")
+            return path.read_bytes()
+        except OSError:
+            raise ManagedStoreError("Document could not be read securely") from None
+
+
+class LocalKnowledgeStore:
+    def __init__(self, vector, records):
+        self.vector, self.records = vector, records
+
+    def physical_id(self, identifier):
+        return hashlib.sha256((self.records.tenant() + ":" + identifier).encode()).hexdigest()
+
+    def upsert(self, chunks):
+        ready = []
+        for chunk in chunks:
+            if chunk.get("embedding") is None:
+                # Transactional staging belongs to the resumable ingestion job.
+                self.records.write("knowledge_pending", chunk["id"], chunk)
+                continue
+            metadata = chunk["metadata"]
+            ready.append(
+                {
+                    **chunk,
+                    "id": self.physical_id(chunk["id"]),
+                    "metadata": {
+                        **{
+                            k: v
+                            for k, v in metadata.items()
+                            if isinstance(v, str | int | float | bool)
+                        },
+                        "tenant_id": self.records.tenant(),
+                        "chunk_id": chunk["id"],
+                        "metadata_json": json.dumps(metadata),
+                    },
+                }
+            )
+        self.vector.upsert(ready)
+        if ready:
+            with self.records.transaction() as db:
+                for chunk in chunks:
+                    if chunk.get("embedding") is not None:
+                        db.execute(
+                            "DELETE FROM local_records WHERE tenant=? "
+                            "AND kind='knowledge_pending' AND record_key=?",
+                            (self.records.tenant(), chunk["id"]),
+                        )
+
+    def row(self, identifier, text, metadata, score=0, **extra):
+        meta = json.loads(metadata["metadata_json"])
+        if meta.get("family"):
+            family = self.records.read("document_family", meta["family"])
+            if family and family["payload"].get("published") not in {None, meta.get("doc_id")}:
+                return None
+        return {
+            "id": metadata.get("chunk_id", identifier),
+            "text": text,
+            "metadata": meta,
+            "score": score,
+            "storage": "chroma",
+            **extra,
+        }
+
+    def search(self, query_embedding, top_k=6):
+        if not self.count():
+            return []
+        found = self.vector._collection.query(
+            query_embeddings=[query_embedding],
+            where={"tenant_id": self.records.tenant()},
+            n_results=min(self.count(), top_k * 3),
+        )
+        rows = [
+            self.row(
+                identifier,
+                found["documents"][0][i],
+                found["metadatas"][0][i],
+                found["distances"][0][i],
+            )
+            for i, identifier in enumerate(found["ids"][0])
+        ]
+        return [row for row in rows if row][:top_k]
+
+    def search_keywords(self, question, top_k=6):
+        from backend.app.repositories.documents import query_terms
+
+        terms = query_terms(question)
+        if not terms:
+            return []
+        rows = {}
+        # Old embedding spaces remain separate, and are searched lexically only.
+        collections = [self.vector._collection] + [
+            c for c in self.vector._client.list_collections() if c.name.startswith("archive_")
+        ]
+        for collection in collections:
+            offset = 0
+            while True:
+                found = collection.get(
+                    where={"tenant_id": self.records.tenant()}, limit=200, offset=offset
+                )
+                for i, identifier in enumerate(found["ids"]):
+                    text = found["documents"][i]
+                    score = sum(term in text.casefold() for term in terms)
+                    row = self.row(
+                        identifier, text, found["metadatas"][i], score, match_type="keyword"
+                    )
+                    if score and row:
+                        rows.setdefault(row["id"], row)
+                if len(found["ids"]) < 200:
+                    break
+                offset += 200
+        for entry in self.records.query("knowledge_pending", limit=10000):
+            chunk = entry["payload"]
+            score = sum(term in chunk["text"].casefold() for term in terms)
+            if score and chunk["id"] not in rows:
+                row = self.row(
+                    chunk["id"],
+                    chunk["text"],
+                    {"metadata_json": json.dumps(chunk["metadata"])},
+                    score,
+                    match_type="keyword",
+                )
+                if row:
+                    rows[chunk["id"]] = row
+        return sorted(rows.values(), key=lambda row: (-row["score"], row["id"]))[:top_k]
+
+    def search_identifiers(self, identifiers, top_k=6):
+        rows = self.search_keywords(" ".join(identifiers), max(top_k * 5, 30))
+        return [
+            row
+            for row in rows
+            if any(
+                re.search(r"(?<!\w)" + re.escape(value) + r"(?!\w)", row["text"], re.I)
+                for value in identifiers
+            )
+        ][:top_k]
+
+    def hybrid(self, question, query_embedding, top_k=6):
+        rows = {r["id"]: r for r in self.search_keywords(question, top_k)}
+        for row in self.search(query_embedding, top_k):
+            rows.setdefault(row["id"], row)
+        return list(rows.values())[:top_k]
+
+    def contains_hash(self, digest):
+        return bool(self.records.read("indexed_hash", digest)) or bool(
+            self.vector._collection.get(
+                where={"$and": [{"tenant_id": self.records.tenant()}, {"content_hash": digest}]},
+                limit=1,
+            )["ids"]
+        )
+
+    def count(self):
+        return len(
+            self.vector._collection.get(where={"tenant_id": self.records.tenant()}, include=[])[
+                "ids"
+            ]
+        )
+
+    def ping(self):
+        return self.vector.ping()

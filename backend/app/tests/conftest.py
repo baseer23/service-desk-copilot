@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 for key, value in {
     "TEST_MODE": "true",
     "DATA_PLATFORM": "local",
+    "LOCAL_PERSISTENCE_ENABLED": "false",
     "DEPLOYMENT_MODE": "local",
     "ENABLE_LOCAL_FIXTURES": "true",
     "GENERATION_PROVIDER": "stub",
@@ -60,6 +61,7 @@ def make_client(monkeypatch, tmp_path):
                 "NEO4J_URI": "",
                 "CHROMA_DIR": str(tmp_path / "chroma"),
                 "CASE_DB_PATH": str(tmp_path / "cases.db"),
+                "LOCAL_DOCUMENTS_DIR": str(tmp_path / "documents"),
             }
             defaults.update({k: v for k, v in (env or {}).items() if not k.startswith("__")})
             for key, value in defaults.items():

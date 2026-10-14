@@ -124,7 +124,7 @@ def create_app(settings: Settings | None = None):
                             "sqlite": False,
                             "aura_connected": False,
                         }
-                    if s.data_platform == "azure":
+                    if s.uses_record_store:
                         from backend.app.services.document_worker import document_worker
 
                         ingestion_task = asyncio.create_task(
@@ -140,7 +140,7 @@ def create_app(settings: Settings | None = None):
             await mcp.close()
             if provider and hasattr(provider, "close"):
                 await asyncio.wait_for(asyncio.to_thread(provider.close), 5)
-            if s.data_platform == "azure":
+            if s.uses_record_store:
                 from backend.app.core.azure_managed_usage import close_usage_clients
 
                 await asyncio.to_thread(close_usage_clients)
@@ -186,7 +186,7 @@ def create_app(settings: Settings | None = None):
                     actor = verify_actor(s, request.cookies.get(COOKIE_NAME))
                 session_id = request.url.path.split("/")[2].removeprefix("voice-")
                 await app.state.voice.store(app.state.voice.repository.get, session_id, actor)
-                if s.data_platform == "azure" and s.deployment_mode == "local":
+                if s.uses_record_store and s.deployment_mode == "local":
                     from backend.app.core.principal import Principal, principal_scope
 
                     with principal_scope(Principal(actor.tenant_id, actor.owner_id)):
@@ -262,7 +262,7 @@ def create_app(settings: Settings | None = None):
             "local_ocr_available": report.local_ocr_available,
             "semantic_ingestion_ready": report.semantic_ingestion_ready,
             "url_ingestion_enabled": report.url_ingestion_enabled,
-            "managed_documents": s.data_platform == "azure",
+            "managed_documents": s.uses_record_store,
         }
 
     @app.get("/health")
@@ -520,7 +520,7 @@ def create_app(settings: Settings | None = None):
             except VoiceError:
                 return False
 
-        if s.data_platform == "azure" and s.deployment_mode == "local":
+        if s.uses_record_store and s.deployment_mode == "local":
             from backend.app.core.principal import Principal, principal_scope
 
             try:

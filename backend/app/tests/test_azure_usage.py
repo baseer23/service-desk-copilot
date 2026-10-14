@@ -299,7 +299,7 @@ async def test_sdk_voice_limits_usage_duplicates_and_emergency_close(settings):
     context.__aexit__.assert_awaited_once()
     connection.input_audio_buffer.append.assert_not_called()
     await provider.close_session()
-    assert provider.usage_guard.snapshot()["estimated_used_cad"] == 5
+    assert provider.usage_guard.snapshot()["estimated_used_cad"] == 1
 
 
 @pytest.mark.asyncio
@@ -371,7 +371,7 @@ def test_acceptance_pins_one_operator_without_persisting_identity(settings):
 
 
 @pytest.mark.asyncio
-async def test_actual_sdk_usage_event_is_recorded_and_acceptance_disables_after_close(settings):
+async def test_actual_sdk_usage_event_is_recorded_and_normal_close_keeps_guard_enabled(settings):
     from azure.ai.voicelive.models import ServerEvent
     from backend.app.voice.azure_voicelive import AzureVoiceLiveProvider
 
@@ -422,9 +422,9 @@ async def test_actual_sdk_usage_event_is_recorded_and_acceptance_disables_after_
         provider.usage_guard.snapshot()["reported_tokens"]["input_token_details_audio_tokens"] == 5
     )
     await provider.close_session()
-    assert not AzureUsageGuard(config).snapshot()["enabled"]
-    with pytest.raises(AzureUsageBlocked, match="disabled"):
-        AzureUsageGuard(config).reserve("reasoning", 100, 80)
+    assert AzureUsageGuard(config).snapshot()["enabled"]
+    token = AzureUsageGuard(config).reserve("reasoning", 100, 80)
+    AzureUsageGuard(config).finish(token)
 
 
 def test_setup_ceiling_is_shared_and_independent_of_monthly_ceiling(settings):

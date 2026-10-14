@@ -38,6 +38,7 @@ class AzureVoiceLiveProvider:
         self.watchdog_task: asyncio.Task[Any] | None = None
         self.close_lock = asyncio.Lock()
         self.last_error_code = ""
+        self.close_reason = ""
         self.guard_checked_at = 0.0
         self.guard_check_task: asyncio.Task[None] | None = None
         self.reply_epoch = 0
@@ -136,7 +137,7 @@ class AzureVoiceLiveProvider:
         self.check_duration()
 
     async def guard(self, function: Any, *args: Any, **kwargs: Any) -> Any:
-        if self.settings.data_platform == "azure":
+        if self.settings.uses_record_store:
             return await asyncio.to_thread(function, *args, **kwargs)
         return function(*args, **kwargs)
 
@@ -147,10 +148,11 @@ class AzureVoiceLiveProvider:
             else self.settings.azure_max_voice_session_minutes * 60
         )
         if time.monotonic() - self.started >= seconds:
+            self.close_reason = "duration_limit"
             raise RuntimeError("Azure voice session duration limit reached")
 
     async def ensure_active_async(self) -> None:
-        if self.settings.data_platform != "azure":
+        if not self.settings.uses_record_store:
             self.ensure_active()
             return
         if time.monotonic() - self.guard_checked_at >= 0.25:
@@ -163,7 +165,7 @@ class AzureVoiceLiveProvider:
         self.check_duration()
 
     async def send_audio(self, audio: str) -> None:
-        if self.settings.data_platform == "azure":
+        if self.settings.uses_record_store:
             self.check_duration()
             if self.guard_check_task and self.guard_check_task.done():
                 self.guard_check_task.result()  # Fail closed on a completed failed policy check.
@@ -329,5 +331,3 @@ class AzureVoiceLiveProvider:
             await self.guard(
                 self.usage_guard.finish, token, seconds=time.monotonic() - self.started
             )
-            if self.settings.azure_live_test_mode and not self.settings.azure_setup_validation_mode:
-                await self.guard(self.usage_guard.disable)

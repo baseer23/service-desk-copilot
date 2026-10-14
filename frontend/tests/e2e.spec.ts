@@ -217,6 +217,11 @@ test('empty proxy response shows a readable error and a retry reaches the real a
 })
 
 test('browser support uses isolated real HTTP/MCP, confirmations and case save', async ({ page }) => {
+  const knowledge = await page.request.post('/ingest/paste', { data: {
+    title: 'Fictional voice VPN fixture',
+    text: 'Fictional VPN support: check whether the VPN client shows connected before retrying sign-in.',
+  } })
+  expect(knowledge.status()).toBe(200)
   await page.goto('/')
   await page.getByRole('button', { name: 'Voice', exact: true }).click()
   await page.getByRole('button', { name: 'Start text support' }).click()

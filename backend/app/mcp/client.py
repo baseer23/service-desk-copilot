@@ -108,7 +108,7 @@ class DeskMateMCPClient:
         )
         # Forward all voice configuration explicitly; never log this environment.
         for name in type(s).model_fields:
-            if name.startswith(("voice_", "azure_")):
+            if name.startswith(("voice_", "azure_", "local_")):
                 value = getattr(s, name)
                 if hasattr(value, "get_secret_value"):
                     value = value.get_secret_value()
@@ -153,7 +153,7 @@ class DeskMateMCPClient:
                     read,
                     write,
                     read_timeout_seconds=timedelta(
-                        seconds=180 if self.settings.data_platform == "azure" else 60
+                        seconds=180 if self.settings.uses_record_store else 60
                     ),
                 ) as session:
                     await session.initialize()

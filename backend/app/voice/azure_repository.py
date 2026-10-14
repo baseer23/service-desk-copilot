@@ -281,10 +281,12 @@ class CosmosVoiceConversationRepository:
                     raise VoiceError("Managed data allowance is full")
                 sizes[document["id"]] = max(size, sizes.get(document["id"], 0))
         try:
-            self.records.container.execute_item_batch(
-                operations,
-                partition_key=actor.tenant_id,
-            )
+            if getattr(self.records, "is_local", False):
+                self.records.atomic_batch(operations, tenant=actor.tenant_id)
+            else:
+                self.records.container.execute_item_batch(
+                    operations, partition_key=actor.tenant_id,
+                )
         except Exception:  # noqa: BLE001 - Sanitize SDK/auth failures without disclosing response bodies.
             raise VoiceError("The conversation and case could not be saved atomically") from None
         return case_id

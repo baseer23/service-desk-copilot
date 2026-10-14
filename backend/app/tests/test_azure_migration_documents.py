@@ -144,8 +144,16 @@ def test_word_segmentation_preserves_all_paragraphs_and_tables():
     assert combined.count("Fictional VPN") == 480
 
 
-def test_cloud_voice_case_event_and_intake_are_atomic_and_owner_scoped(settings, monkeypatch):
-    records = CosmosRecords(settings, FakeCosmosContainer())
+@pytest.mark.parametrize("local", [False, True])
+def test_cloud_voice_case_event_and_intake_are_atomic_and_owner_scoped(
+    settings, monkeypatch, local
+):
+    if local:
+        from backend.app.store.local_records import LocalRecords
+
+        records = LocalRecords(settings)
+    else:
+        records = CosmosRecords(settings, FakeCosmosContainer())
     repo = CosmosVoiceConversationRepository(records)
     actor = Actor("user-a", "tenant-a")
     with principal_scope(Principal("tenant-a", "user-a")):

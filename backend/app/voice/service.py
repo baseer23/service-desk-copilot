@@ -44,6 +44,7 @@ class VoiceRuntime:
         self.audio: asyncio.Queue[str] = asyncio.Queue(maxsize=128)
         self.turns: asyncio.Queue[tuple[str, str, int]] = asyncio.Queue(maxsize=4)
         self.sequence = 0
+        self.socket_lock = asyncio.Lock()
         self.client_sequence = 0
         self.started = time.monotonic()
         self.stop = asyncio.Event()
@@ -77,14 +78,14 @@ class VoiceRuntime:
         return self.manager.repository.get(self.session_id, self.actor)
 
     async def state_async(self) -> VoiceConversation:
-        if self.manager.settings.data_platform == "azure":
+        if self.manager.settings.uses_record_store:
             # The single owner runtime caches only its committed state. Every
             # mutation still rereads and verifies the persistent lease/ETag.
             return self.conversation.model_copy(deep=True)
         return await self.store(self.manager.repository.get, self.session_id, self.actor)
 
     async def store(self, function, *arguments, **keywords):
-        if self.manager.settings.data_platform == "azure":
+        if self.manager.settings.uses_record_store:
             return await asyncio.to_thread(function, *arguments, **keywords)
         return function(*arguments, **keywords)
 
@@ -136,12 +137,27 @@ class VoiceRuntime:
     async def sender(self) -> None:
         while True:
             kind, payload = await self.outgoing.get()
-            self.sequence += 1
-            envelope = ServerEnvelope(
-                type=kind, session_id=self.session_id, sequence=self.sequence, payload=payload
-            )
-            await asyncio.wait_for(self.socket.send_json(envelope.model_dump()), 5)
+            await self.send_envelope(kind, payload)
             self.outgoing.task_done()
+
+    async def send_envelope(self, kind: str, payload: dict[str, Any]) -> None:
+        async def emit() -> None:
+            async with self.socket_lock:
+                envelope = ServerEnvelope(
+                    type=kind, session_id=self.session_id, sequence=self.sequence + 1,
+                    payload=payload,
+                )
+                await asyncio.wait_for(self.socket.send_json(envelope.model_dump()), 5)
+                self.sequence = envelope.sequence
+
+        # Complete an in-flight frame before terminal envelopes, so cancellation
+        # cannot leave a sequence gap and make a normal expiry look like an error.
+        task = asyncio.create_task(emit())
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await task
+            raise
 
     async def publish_state(self) -> None:
         await self.send("session.snapshot", conversation=(await self.state_async()).public())
@@ -435,6 +451,10 @@ class VoiceRuntime:
             elif event.type == "error":
                 raise VoiceError("Voice provider failed", 502)
             # Only a verified renderer transcript reaches the stable assistant bubble.
+        if getattr(self.provider, "close_reason", "") == "duration_limit":
+            self.reason = "duration_limit"
+            self.stop.set()
+            return
         raise VoiceError("Voice provider disconnected", 502)
 
     async def turn_worker(self) -> None:
@@ -495,7 +515,7 @@ class VoiceRuntime:
                 self.stop.set()
                 return
             if time.monotonic() - self.started > self.manager.settings.voice_session_timeout_sec:
-                self.reason = "session_timeout"
+                self.reason = "duration_limit"
                 self.stop.set()
                 return
             if not self.manager.settings.test_mode:
@@ -504,10 +524,21 @@ class VoiceRuntime:
                     time.monotonic() - self.started
                     >= self.manager.settings.azure_max_voice_session_minutes * 60
                 ):
-                    self.reason = "session_timeout"
+                    self.reason = "duration_limit"
                     self.stop.set()
                     return
             await self.renew_lease()
+
+    def session_limit(self) -> float:
+        seconds = self.manager.settings.voice_session_timeout_sec
+        if not self.manager.settings.test_mode:
+            seconds = min(seconds, self.manager.settings.azure_max_voice_session_minutes * 60)
+        return seconds
+
+    async def deadline(self) -> None:
+        await asyncio.sleep(max(0, self.session_limit() - (time.monotonic() - self.started)))
+        self.reason = "duration_limit"
+        self.stop.set()
 
     async def run(self) -> None:
         await self.store(self.manager.repository.claim, self.session_id, self.actor, self.lease)
@@ -542,7 +573,7 @@ class VoiceRuntime:
             opening = asyncio.create_task(prepare())
             waiter = asyncio.create_task(self.stop.wait())
             watchdog = asyncio.create_task(self.watchdog())
-            tasks = [opening, waiter, watchdog]
+            tasks = [opening, waiter, watchdog, asyncio.create_task(self.deadline())]
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 task.result()
@@ -577,6 +608,9 @@ class VoiceRuntime:
         except asyncio.CancelledError:
             self.reason = "client_disconnected"
         except Exception as exc:  # noqa: BLE001 - sanitize external failures at the boundary
+            if getattr(self.provider, "close_reason", "") == "duration_limit":
+                self.reason = "duration_limit"
+                return
             self.reason = "connection_failed"
             error_code = exc.code if isinstance(exc, VoiceError) else "VOICE_CONNECTION_FAILED"
             logging.getLogger(__name__).warning(
@@ -584,17 +618,10 @@ class VoiceRuntime:
                 type(exc).__name__, error_code, getattr(self.provider, "last_error_code", ""),
             )
             try:
-                await self.socket.send_json(
-                    ServerEnvelope(
-                        type="error",
-                        session_id=self.session_id,
-                        sequence=self.sequence + 1,
-                        payload={
-                            "message": "Voice connection ended. Reconnect or use text support.",
-                            "code": error_code,
-                        },
-                    ).model_dump()
-                )
+                await self.send_envelope("error", {
+                    "message": "Voice connection ended. Reconnect or use text support.",
+                    "code": error_code,
+                })
             except Exception:  # noqa: BLE001, S110
                 pass  # Close is best-effort; no raw SDK errors in logs.
         finally:
@@ -617,22 +644,31 @@ class VoiceRuntime:
                         c.status = (
                             VoiceStatus.STOPPED
                             if self.reason
-                            in {"explicit_stop", "client_disconnected", "server_shutdown"}
+                            in {
+                                "explicit_stop", "client_disconnected", "server_shutdown",
+                                "duration_limit",
+                            }
                             else VoiceStatus.FAILED
                         )
                         c.failure_category = self.reason
 
                 async with self.repository_lock:
                     try:
-                        await self.store(self.manager.repository.update,
+                        final_state = await self.store(self.manager.repository.update,
                             self.session_id, self.actor, end, self.lease, "end:" + self.lease
                         )
                     except VoiceError:
-                        pass  # Close is best-effort; no raw SDK errors in logs.
+                        final_state = None
                     await self.store(
                         self.manager.repository.release, self.session_id, self.actor, self.lease
                     )
                 try:
+                    if final_state is not None:
+                        for kind, payload in (
+                            ("playback.clear", {}),
+                            ("session.snapshot", {"conversation": final_state.public()}),
+                        ):
+                            await self.send_envelope(kind, payload)
                     await self.socket.close()
                 except Exception:  # noqa: BLE001, S110
                     pass  # Close is best-effort; no raw SDK errors in logs.
@@ -644,19 +680,19 @@ class VoiceManager:
     ) -> None:
         self.settings, self.harness, self.reasoning = settings, harness, reasoning
         self.usage_guard = AzureUsageGuard(settings)
-        if settings.data_platform == "azure":
-            from backend.app.store.azure_records import CosmosRecords
+        if settings.uses_record_store:
+            from backend.app.store.local_records import record_store
 
             from .azure_repository import CosmosVoiceConversationRepository
 
-            self.repository = CosmosVoiceConversationRepository(CosmosRecords(settings))
+            self.repository = CosmosVoiceConversationRepository(record_store(settings))
         else:
             self.repository = SQLiteVoiceConversationRepository(settings.case_db_path)
         self.provider_factory = provider_factory
         self.active: dict[str, VoiceRuntime] = {}
 
     async def store(self, function: Callable, *args: Any) -> Any:
-        if self.settings.data_platform == "azure":
+        if self.settings.uses_record_store:
             return await asyncio.to_thread(function, *args)
         return function(*args)
 
@@ -710,7 +746,8 @@ class VoiceManager:
         cutoff = (
             datetime.now(UTC) - timedelta(hours=self.settings.voice_transcript_retention_hours)
         ).isoformat()
-        self.repository.purge(actor.tenant_id, cutoff)
+        if self.settings.voice_transcript_retention_hours:
+            self.repository.purge(actor.tenant_id, cutoff)
         state = self.repository.create(actor)
         return self.repository.update(state.session_id, actor, lambda c: setattr(c, "mode", mode))
 
