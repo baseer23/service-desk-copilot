@@ -7,7 +7,7 @@ import json
 from langgraph.checkpoint.base import WRITES_IDX_MAP, BaseCheckpointSaver, CheckpointTuple
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
-from backend.app.store.azure_records import CosmosRecords, ManagedStoreError
+from backend.app.store.azure_records import CosmosRecords
 
 
 class CosmosCheckpointSaver(BaseCheckpointSaver):
@@ -85,6 +85,12 @@ class CosmosCheckpointSaver(BaseCheckpointSaver):
                 "checkpoint_id": row["checkpoint_id"],
             },
         )
+        pending = {}
+        for row in writes:
+            for entry in row["payload"].get("writes", [row["payload"]]):
+                # Queries return newest records first. Mixed legacy/new task
+                # records must not replay the same channel twice after restart.
+                pending.setdefault((entry["task_id"], entry["index"]), entry)
         return CheckpointTuple(
             actual,
             self._load(saved["checkpoint"]),
@@ -92,11 +98,14 @@ class CosmosCheckpointSaver(BaseCheckpointSaver):
             saved.get("parent_config"),
             [
                 (
-                    item["payload"]["task_id"],
-                    item["payload"]["channel"],
-                    self._load(item["payload"]["value"]),
+                    item["task_id"],
+                    item["channel"],
+                    self._load(item["value"]),
                 )
-                for item in sorted(writes, key=lambda row: row["payload"]["index"])
+                for item in sorted(
+                    pending.values(),
+                    key=lambda entry: entry["index"],
+                )
             ],
         )
 
@@ -136,34 +145,30 @@ class CosmosCheckpointSaver(BaseCheckpointSaver):
             "namespace": values.get("checkpoint_ns", ""),
             "checkpoint_id": values["checkpoint_id"],
         }
+        # One conditional record per task, rather than a quota lease and document
+        # write for every state channel. Existing per-channel records remain readable.
+        key = self._key(config, values["checkpoint_id"]) + ":" + task_id + ":batch"
+        previous = await asyncio.to_thread(self.records.read, "checkpoint_write", key)
+        saved = {
+            entry["index"]: entry
+            for entry in previous["payload"]["writes"]
+        } if previous else {}
+        changed = False
         for index, (channel, value) in enumerate(writes):
             position = WRITES_IDX_MAP.get(channel, index)
-            key = self._key(config, values["checkpoint_id"]) + ":" + task_id + ":" + str(position)
-            if position >= 0 and await asyncio.to_thread(
-                self.records.read, "checkpoint_write", key
-            ):
+            if position >= 0 and position in saved:
                 continue
-            try:
-                await asyncio.to_thread(
-                    self.records.write,
-                    "checkpoint_write",
-                    key,
-                    {
-                        "task_id": task_id,
-                        "task_path": task_path,
-                        "index": position,
-                        "channel": channel,
-                        "value": self._dump(value),
-                    },
-                    fields=fields,
-                    create_only=position >= 0,
-                )
-            except ManagedStoreError:
-                if position >= 0 and await asyncio.to_thread(
-                    self.records.read, "checkpoint_write", key
-                ):
-                    continue
-                raise
+            saved[position] = {
+                "task_id": task_id, "task_path": task_path, "index": position,
+                "channel": channel, "value": self._dump(value),
+            }
+            changed = True
+        if changed:
+            await asyncio.to_thread(
+                self.records.write, "checkpoint_write", key,
+                {"writes": list(saved.values())}, fields=fields,
+                previous=previous, create_only=previous is None,
+            )
 
     async def alist(self, config, *, filter=None, before=None, limit=None):  # noqa: A002 - LangGraph override uses the canonical API parameter.
         if config is None:

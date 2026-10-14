@@ -14,6 +14,10 @@ from backend.app.store.azure_records import CosmosRecords, ManagedStoreError
 
 TABLES = {
     "azure_policy": "id INTEGER PRIMARY KEY,disabled INTEGER NOT NULL",
+    "azure_demo_policy": (
+        "id INTEGER PRIMARY KEY,limit_micros INTEGER NOT NULL,authorized_at REAL NOT NULL,"
+        "authorization_reference TEXT NOT NULL"
+    ),
     "azure_usage": (
         "id TEXT PRIMARY KEY,month TEXT NOT NULL,day TEXT NOT NULL,kind TEXT NOT NULL,"
         "estimate INTEGER NOT NULL,active INTEGER NOT NULL,usage TEXT NOT NULL DEFAULT '{}',"
@@ -62,6 +66,48 @@ class CosmosUsageGuard(AzureUsageGuard):
     def ledger_exists(self):
         return True
 
+    @contextmanager
+    def inspection(self):
+        """Read committed diagnostics without competing with paid reservations."""
+        db = sqlite3.connect(":memory:")
+        try:
+            row = self.records.read("usage_policy", "subscription", tenant="system:usage")
+            tables = (
+                row["payload"]["tables"]
+                if row
+                else {"azure_policy": [{"id": 1, "disabled": 1}]}
+            )
+            for name, schema in TABLES.items():
+                db.execute(f"CREATE TABLE {name}({schema})")
+                for entry in tables.get(name, []):
+                    columns = [column[1] for column in db.execute(f"PRAGMA table_info({name})")]
+                    if set(entry) != set(columns):
+                        raise AzureUsageBlocked("Managed usage ledger schema is invalid")
+                    db.execute(
+                        f"INSERT INTO {name} VALUES({','.join('?' for _ in columns)})",
+                        [entry[column] for column in columns],
+                    )
+            if not self.settings.test_mode:
+                now = datetime.now(UTC)
+                db.execute(
+                    "INSERT OR IGNORE INTO azure_usage "
+                    "(id,month,day,kind,estimate,active,phase) VALUES(?,?,?,?,?,0,'demo') "
+                    "ON CONFLICT(id) DO UPDATE SET estimate=MAX(estimate,excluded.estimate)",
+                    (
+                        "infrastructure-" + now.strftime("%Y-%m") + "-azure-native-foundation",
+                        now.strftime("%Y-%m"), now.strftime("%Y-%m-%d"),
+                        "infrastructure",
+                        int(self.settings.azure_estimated_infrastructure_cad * 1_000_000),
+                    ),
+                )
+            yield db
+        except (ManagedStoreError, sqlite3.Error, KeyError, TypeError):
+            raise AzureUsageBlocked(
+                "Managed usage ledger unavailable; paid operations blocked"
+            ) from None
+        finally:
+            db.close()
+
     def require_enabled(self):
         # A speech heartbeat reads committed policy; it must not acquire a writer
         # lease for every 20 ms audio frame. Paid reservations still use the full
@@ -81,11 +127,19 @@ class CosmosUsageGuard(AzureUsageGuard):
             month = datetime.now(UTC).strftime("%Y-%m")
             charges = [entry for entry in tables["azure_usage"] if entry["month"] == month]
             used = sum(entry["estimate"] for entry in charges)
-            if not self.settings.test_mode and not any(
-                entry["kind"] == "infrastructure" for entry in charges
-            ):
-                used += 250_000
-            if used >= self.limit:
+            if not self.settings.test_mode:
+                reserved = sum(
+                    entry["estimate"] for entry in charges if entry["kind"] == "infrastructure"
+                )
+                forecast = int(self.settings.azure_estimated_infrastructure_cad * 1_000_000)
+                used += max(0, forecast - reserved)
+            limits = [
+                policy["limit_micros"]
+                for policy in tables.get("azure_demo_policy", [])
+                if policy.get("id") == 1
+            ]
+            limit = min(self.limit, *limits) if limits else self.limit
+            if used >= limit:
                 raise AzureUsageBlocked("Estimated monthly Azure application allowance exhausted")
             if (
                 self.settings.azure_setup_validation_mode
@@ -128,10 +182,14 @@ class CosmosUsageGuard(AzureUsageGuard):
                     month = now.strftime("%Y-%m")
                     reference = "infrastructure-" + month + "-azure-native-foundation"
                     db.execute(
-                        "INSERT OR IGNORE INTO azure_usage "
+                        "INSERT INTO azure_usage "
                         "(id,month,day,kind,estimate,active,phase) "
-                        "VALUES(?,?,?,?,?,0,'demo')",
-                        (reference, month, now.strftime("%Y-%m-%d"), "infrastructure", 250_000),
+                        "VALUES(?,?,?,?,?,0,'demo') "
+                        "ON CONFLICT(id) DO UPDATE SET estimate=MAX(estimate,excluded.estimate)",
+                        (
+                            reference, month, now.strftime("%Y-%m-%d"), "infrastructure",
+                            int(self.settings.azure_estimated_infrastructure_cad * 1_000_000),
+                        ),
                     )
                 yield db
                 db.commit()

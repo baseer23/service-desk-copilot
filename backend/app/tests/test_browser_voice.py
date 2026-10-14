@@ -24,6 +24,15 @@ ORIGIN = {"Origin": "http://testserver"}
 ACTOR = Actor("owner", "local-demo")
 
 
+@pytest.mark.parametrize("text,expected", [
+    ("Yes, that is correct.", True), ("Yes, that's right!", True),
+    ("No, that's not correct.", False), ("Yes, but that email is wrong.", None),
+])
+def test_natural_contact_confirmations_remain_explicit(text, expected):
+    from backend.app.voice.normalization import confirmation
+    assert confirmation(text) is expected
+
+
 @pytest.fixture
 def voice_client(make_client):
     return make_client(
@@ -443,11 +452,37 @@ async def test_pending_response_cancel_before_created_and_audio_queue_order(sett
     receive = asyncio.create_task(runtime.receiver())
     await fake.emit("response.created", response_id="late")
     await fake.emit("audio", audio="AAA=", response_id="late")
+    await fake.emit("response.done", response_id="late", status="cancelled")
     await asyncio.sleep(0.01)
+    assert not receive.done()
     assert "late" in runtime.cancelled and ("cancel", "") in fake.actions
     receive.cancel()
     await asyncio.gather(receive, return_exceptions=True)
     await fake.close_session()
+
+
+@pytest.mark.asyncio
+async def test_real_audio_latency_buffer_is_bounded_and_reports_backlog(settings):
+    import base64
+    from backend.app.testing.voice import FakeVoiceLiveProvider
+    from backend.app.voice.service import VoiceManager, VoiceRuntime
+    fake = FakeVoiceLiveProvider()
+    manager = VoiceManager(settings, Harness(), StubProvider(), provider_factory=lambda: fake)
+    sid = manager.repository.create(ACTOR).session_id
+    frame = base64.b64encode(bytes(960)).decode()
+    messages = [json.dumps({"type": "audio.append", "session_id": sid, "sequence": index + 1, "payload": {"audio": frame}}) for index in range(128)]
+    messages.append(json.dumps({"type": "session.stop", "session_id": sid, "sequence": 129}))
+    socket = AsyncMock()
+    socket.receive_text.side_effect = messages
+    runtime = VoiceRuntime(manager, socket, sid, ACTOR)
+    await runtime.reader()
+    assert runtime.audio.qsize() == runtime.audio.maxsize == 128
+    runtime.stop.clear()
+    socket.receive_text.side_effect = [json.dumps({"type": "audio.append", "session_id": sid, "sequence": 130, "payload": {"audio": frame}})]
+    with pytest.raises(VoiceError) as failure:
+        await runtime.reader()
+    assert failure.value.code == "AUDIO_QUEUE_FULL"
+    assert runtime.audio.qsize() == 128
 
 
 @pytest.mark.asyncio
@@ -627,7 +662,7 @@ async def test_provider_and_tool_deadlines_are_explicit(settings):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cancel", [False, True])
-async def test_live_greeting_finishes_before_listening_and_stop_cancels_preparation(
+async def test_listening_does_not_wait_for_greeting_and_stop_cancels_generation(
     settings, cancel
 ):
     from backend.app.testing.voice import FakeVoiceLiveProvider
@@ -663,8 +698,9 @@ async def test_live_greeting_finishes_before_listening_and_stop_cancels_preparat
     fake.respond = respond
     task = asyncio.create_task(runtime.run())
     await asyncio.wait_for(started.wait(), 2)
-    assert runtime.state().status == VoiceStatus.CONNECTING
-    assert not socket.send_json.called and not fake.actions
+    assert runtime.state().status == VoiceStatus.LISTENING
+    assert any(call.args[0]["type"] == "session.snapshot" for call in socket.send_json.call_args_list)
+    assert not fake.actions
     if not cancel:
         release.set()
         await asyncio.wait_for(rendered.wait(), 2)
@@ -701,6 +737,81 @@ async def test_rejected_provider_configuration_never_generates_greeting_or_liste
     runtime.graph.greeting.assert_not_called()
     assert runtime.state().status == VoiceStatus.FAILED and fake.closed
     assert "VOICE_CONFIGURATION_REJECTED" in str(socket.send_json.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_audio_flows_and_speech_supersedes_a_slow_live_greeting(settings):
+    import base64
+    import json
+
+    from backend.app.testing.voice import FakeVoiceLiveProvider
+    from backend.app.voice.service import VoiceManager, VoiceRuntime
+
+    fake = FakeVoiceLiveProvider()
+    manager = VoiceManager(
+        settings.model_copy(update={"test_mode": False}), Harness(), StubProvider(),
+        provider_factory=lambda: fake,
+    )
+    sid = manager.repository.create(ACTOR).session_id
+    incoming = asyncio.Queue()
+    socket = AsyncMock()
+    socket.receive_text.side_effect = incoming.get
+    runtime = VoiceRuntime(manager, socket, sid, ACTOR)
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def greeting():
+        started.set()
+        await release.wait()
+        return "This opening must never overtake user speech"
+
+    runtime.graph.greeting = greeting
+    task = asyncio.create_task(runtime.run())
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        await incoming.put(json.dumps({
+            "version": 1, "type": "audio.append", "session_id": sid, "sequence": 1,
+            "payload": {"audio": base64.b64encode(b"\x00\x10" * 480).decode()},
+        }))
+        for _ in range(100):
+            if runtime.delivered_frames:
+                break
+            await asyncio.sleep(0.01)
+        assert runtime.delivered_frames == 1
+        assert any(action == "audio" for action, _ in fake.actions)
+        await fake.emit("speech.started")
+        for _ in range(100):
+            if runtime.epoch:
+                break
+            await asyncio.sleep(0.01)
+        assert runtime.epoch == 1
+        release.set()
+        await asyncio.sleep(0.03)
+        assert not any(action == "respond" for action, _ in fake.actions)
+        assert any(call.args[0]["type"] == "audio.delivery" for call in socket.send_json.call_args_list)
+    finally:
+        manager.end(sid, ACTOR)
+        await asyncio.wait_for(task, 2)
+    assert fake.closed
+
+
+@pytest.mark.asyncio
+async def test_only_voice_planning_receives_the_read_tool_schemas(settings):
+    contexts = {}
+
+    class Model(StubProvider):
+        async def generate_structured(self, stage, context, schema):
+            contexts[stage] = context
+            return await super().generate_structured(stage, context, schema)
+
+    conversation = VoiceConversation(
+        session_id="f" * 32, tenant_id=ACTOR.tenant_id, owner_id=ACTOR.owner_id
+    )
+    await VoiceSupportGraph(settings, Harness(), Model()).run(
+        conversation, "My VPN is broken", "spoken-1"
+    )
+    assert "permitted_tools" in contexts["voice_plan"]
+    assert "permitted_tools" not in contexts["voice_extract"]
+    assert "permitted_tools" not in contexts["voice_reply"]
 
 
 @pytest.mark.asyncio

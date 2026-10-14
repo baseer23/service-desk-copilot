@@ -66,12 +66,13 @@ class Settings(BaseSettings):
     azure_reasoning_min_interval_seconds: float = Field(default=0, ge=0, le=120)
     azure_embedding_min_interval_seconds: float = Field(default=0, ge=0, le=60)
     azure_live_test_mode: bool = False
-    azure_estimated_monthly_app_limit_cad: float = Field(default=8.0, gt=0, le=8)
+    azure_estimated_monthly_app_limit_cad: float = Field(default=8.0, gt=0, le=250)
+    azure_estimated_infrastructure_cad: float = Field(default=0.25, ge=0, le=200)
     azure_usage_db_path: Path | None = None
     azure_max_concurrent_sessions: int = Field(default=1, ge=1, le=1)
     azure_max_voice_session_minutes: int = Field(default=10, ge=1, le=10)
     azure_max_turns_per_session: int = Field(default=20, ge=1, le=20)
-    azure_max_live_sessions_per_day: int = Field(default=2, ge=1, le=2)
+    azure_max_live_sessions_per_day: int = Field(default=2, ge=1, le=20)
     azure_max_input_tokens: int = Field(default=32768, ge=256, le=32768)
     azure_max_output_tokens: int = Field(default=1500, ge=80, le=1500)
     # Deliberately conservative assumptions in CAD, not published Azure prices.

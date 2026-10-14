@@ -57,6 +57,85 @@ def test_managed_case_tenant_isolation_cas_and_facts(settings):
         assert memory.load_case("same-id")["ticket"]["summary"] == "Updated fictional issue"
 
 
+def test_failed_managed_transaction_discards_changes_and_releases_own_lease(settings):
+    data = records(settings)
+    data.write("usage_policy", "subscription", {"value": "preserved"}, tenant="system:usage")
+    with pytest.raises(ValueError):
+        with data.locked("usage_policy", "subscription", tenant="system:usage") as payload:
+            payload["value"] = "discard-me"
+            raise ValueError("Rejected operation")
+    with data.locked("usage_policy", "subscription", tenant="system:usage") as payload:
+        assert payload["value"] == "preserved"
+    policy = data.read("usage_policy", "subscription", tenant="system:usage")
+    assert policy["payload"]["lock_until"] == 0
+
+
+def test_cloud_usage_diagnostics_do_not_acquire_writer_lease(settings, monkeypatch):
+    config = settings.model_copy(update={"azure_usage_guard_enabled": True})
+    data = records(config)
+    guard = CosmosUsageGuard(config, data)
+    guard.enable_demo(8, "authorized-test")
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Diagnostics must only read committed state")
+    monkeypatch.setattr(data, "locked", forbidden)
+    assert guard.snapshot()["enabled"]
+    assert guard.checks() == {}
+
+
+def test_managed_lease_waits_for_normal_network_latency(settings):
+    import concurrent.futures
+    import threading
+    import time
+    data = records(settings)
+    acquired = threading.Event()
+    def holder():
+        with data.locked("usage_policy", "subscription", tenant="system:usage"):
+            acquired.set()
+            time.sleep(0.4)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(holder)
+        assert acquired.wait(2)
+        with data.locked("usage_policy", "subscription", tenant="system:usage") as payload:
+            payload["verified"] = True
+        future.result()
+    assert data.read("usage_policy", "subscription", tenant="system:usage")["payload"]["verified"]
+
+
+def test_azure_http_diagnostics_do_not_propagate_to_application_logs(settings):
+    import logging
+
+    from backend.app.store.azure_records import azure_credential
+    credential = azure_credential(settings)
+    logger = logging.getLogger("azure")
+    assert not logger.propagate
+    assert any(isinstance(handler, logging.NullHandler) for handler in logger.handlers)
+    credential.close()
+
+
+def test_managed_point_read_retries_one_transport_timeout_but_writes_do_not(settings):
+    from azure.core.exceptions import ServiceResponseError
+    data = records(settings)
+    data.write("case", "fictional-read", {"saved": True})
+    original = data.container.read_item
+    calls = []
+    def transient(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise ServiceResponseError("private SDK diagnostic")
+        return original(*args, **kwargs)
+    data.container.read_item = transient
+    assert data.read("case", "fictional-read")["payload"]["saved"]
+    assert len(calls) == 2
+    writes = []
+    def failed_write(*args, **kwargs):
+        writes.append(1)
+        raise ServiceResponseError("never log or retry this ambiguous write")
+    data.container.upsert_item = failed_write
+    with pytest.raises(ManagedStoreError, match="could not be saved"):
+        data.write("case", "new", {}, tenant="system:test")
+    assert len(writes) == 1
+
+
 @pytest.mark.asyncio
 async def test_cloud_checkpoint_interrupt_survives_saver_and_graph_restart(settings):
     data = records(settings)
@@ -86,10 +165,64 @@ async def test_cloud_checkpoint_interrupt_survives_saver_and_graph_restart(setti
         assert await CosmosCheckpointSaver(data).aget_tuple(config) is None
 
 
+@pytest.mark.asyncio
+async def test_checkpoint_channels_share_one_record_and_keep_first_write(settings):
+    data = records(settings)
+    saver = CosmosCheckpointSaver(data)
+    config = {"configurable": {"thread_id": "batch-test", "checkpoint_id": "checkpoint-one"}}
+    await saver.aput_writes(config, [("first", "original"), ("second", "retained")], "task-one")
+    await saver.aput_writes(
+        config, [("first", "must-not-overwrite"), ("second", "also-ignore")], "task-one"
+    )
+    rows = data.query("checkpoint_write", fields={"thread_id": "batch-test"})
+    assert len(rows) == 1
+    writes = rows[0]["payload"]["writes"]
+    assert [saver._load(entry["value"]) for entry in writes] == ["original", "retained"]
+    assert {entry["index"] for entry in writes} == {0, 1}
+
+
 def test_checkpoint_keys_do_not_alias_threads_and_namespaces():
     a = {"configurable": {"thread_id": "one:two", "checkpoint_ns": "three"}}
     b = {"configurable": {"thread_id": "one", "checkpoint_ns": "two:three"}}
     assert CosmosCheckpointSaver._key(a, "same") != CosmosCheckpointSaver._key(b, "same")
+
+
+def test_managed_demo_policy_caps_both_fast_checks_and_atomic_reservations(settings):
+    config = settings.model_copy(update={
+        "azure_usage_guard_enabled": True, "azure_estimated_monthly_app_limit_cad": 50,
+    })
+    data = records(config)
+    guard = CosmosUsageGuard(config, data)
+    guard.enable_demo(0.01, "user-authorized-demo")
+    token = guard.reserve("reasoning", 500, 100)
+    guard.finish(token)
+    restored = CosmosUsageGuard(config, data)
+    assert restored.snapshot()["limit_cad"] == 0.01
+    restored.require_enabled()
+    with pytest.raises(AzureUsageBlocked, match="allowance"):
+        restored.reserve("embedding", 2000)
+    with restored.transaction() as db:
+        db.execute("UPDATE azure_usage SET estimate=10000 WHERE id=?", (token,))
+    with pytest.raises(AzureUsageBlocked, match="allowance"):
+        restored.require_enabled()
+
+
+def test_updated_infrastructure_forecast_cannot_bypass_the_persistent_allowance(settings):
+    config = settings.model_copy(update={
+        "azure_usage_guard_enabled": True, "azure_estimated_monthly_app_limit_cad": 150,
+    })
+    data = records(config)
+    initial = CosmosUsageGuard(config, data)
+    initial.enable_demo(50, "approved-original-allowance")
+    expanded = CosmosUsageGuard(
+        config.model_copy(update={"test_mode": False, "azure_estimated_infrastructure_cad": 90}),
+        data,
+    )
+    assert not expanded.snapshot()["enabled"]
+    with pytest.raises(AzureUsageBlocked, match="allowance"):
+        expanded.require_enabled()
+    stored = data.read("usage_policy", "subscription", tenant="system:usage")
+    assert stored["payload"]["tables"]["azure_usage"] == []
 
 
 def test_managed_voice_case_history_remains_owner_scoped_behind_mcp(settings):
@@ -149,6 +282,7 @@ def test_managed_guard_reserves_each_months_infrastructure_without_enabling_disp
     settings, monkeypatch
 ):
     from datetime import UTC, datetime
+
     from backend.app.core import azure_managed_usage
 
     data = records(settings)

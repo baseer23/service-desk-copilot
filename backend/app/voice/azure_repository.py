@@ -5,7 +5,12 @@ import time
 import uuid
 from datetime import datetime
 
-from backend.app.store.azure_records import CosmosRecords, ManagedStoreError, record_id
+from backend.app.store.azure_records import (
+    CosmosRecords,
+    ManagedStateConflict,
+    ManagedStoreError,
+    record_id,
+)
 
 from .auth import Actor, VoiceError
 from .models import TERMINAL, VoiceConversation, VoiceStatus, utcnow
@@ -123,7 +128,7 @@ class CosmosVoiceConversationRepository:
         if lease and (
             payload.get("lease_id") != lease or payload.get("lease_until", 0) < time.time()
         ):
-            raise VoiceError("Stale voice connection")
+            raise VoiceError("Stale voice connection", 409, "VOICE_LEASE_LOST")
         events = list(payload.get("events", []))
         if event_id and any(event["event_id"] == event_id for event in events):
             return state
@@ -155,8 +160,12 @@ class CosmosVoiceConversationRepository:
                 tenant=actor.tenant_id,
                 fields={"owner_id": actor.owner_id},
             )
-        except ManagedStoreError:
-            raise VoiceError("The conversation changed; retry the action") from None
+        except ManagedStoreError as error:
+            raise VoiceError(
+                "The conversation changed; retry the action", 409,
+                "VOICE_STATE_CONFLICT" if isinstance(error, ManagedStateConflict)
+                else "VOICE_STATE_STORE_ERROR",
+            ) from None
         return state
 
     def release(self, session_id, actor, lease):

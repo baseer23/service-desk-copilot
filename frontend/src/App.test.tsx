@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, expect, test, vi } from 'vitest'
 import App, { type Case } from './App'
@@ -23,6 +23,35 @@ const initial: Case = {
 afterEach(() => {
   cleanup()
   vi.unstubAllGlobals()
+})
+
+test('workspace navigation switches focused views without breaking knowledge inputs', async () => {
+  vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json: async () => [] })))
+  const user = userEvent.setup()
+  render(<App />)
+  await user.click(screen.getByRole('button', { name: /^Knowledge$/ }))
+  expect(screen.getByRole('button', { name: /^Knowledge$/ })).toHaveAttribute('aria-current', 'page')
+  expect(screen.getByLabelText('Chat workspace')).not.toBeVisible()
+  expect(screen.getByLabelText('Knowledge workspace')).toBeVisible()
+  expect(screen.getByLabelText('Knowledge text').tagName).toBe('TEXTAREA')
+  vi.restoreAllMocks()
+})
+
+test('general conversation sends follow-ups to the existing request', async () => {
+  const current = { ...initial, workflow: 'knowledge', status: 'assessment_ready', final_answer: 'Toronto is in Ontario.', chat_messages: [{ role: 'user', content: 'Where is Toronto?' }, { role: 'assistant', content: 'Toronto is in Ontario.' }] }
+  const fetch = vi.fn(async (url: string, init?: RequestInit) => {
+    if (url === '/cases') return { ok: true, json: async () => [] }
+    if (url.endsWith('/message')) expect(JSON.parse(init?.body as string)).toEqual({ summary: 'Which country?' })
+    return { ok: true, json: async () => ({ request_id: 'chat-one', case_id: null, result: current, events: [] }) }
+  })
+  vi.stubGlobal('fetch', fetch)
+  const user = userEvent.setup()
+  render(<App />)
+  await user.type(screen.getByLabelText('Question or ticket'), 'Where is Toronto?')
+  await user.click(screen.getByRole('button', { name: 'Send' }))
+  await user.type(await screen.findByLabelText('Reply to this conversation'), 'Which country?')
+  await user.click(within(screen.getByLabelText('Conversation')).getByRole('button', { name: 'Send message' }))
+  await waitFor(() => expect(fetch.mock.calls.some(([url]) => url === '/requests/chat-one/message')).toBe(true))
 })
 
 test('creates a case, shows real event data, resumes human input and renders assessment', async () => {
@@ -90,7 +119,7 @@ test('creates a case, shows real event data, resumes human input and renders ass
   vi.stubGlobal('fetch', fetch)
   render(<App />)
   await user.type(screen.getByLabelText('Question or ticket'), initial.ticket.summary)
-  await user.click(screen.getByRole('button', { name: 'Run DeskMate' }))
+  await user.click(screen.getByRole('button', { name: 'Send' }))
   expect(
     await screen.findByText('Which site or floor is Jake Peralta currently working from?'),
   ).toBeInTheDocument()
@@ -116,9 +145,9 @@ test('renders explicit API errors and restores the submit control', async () => 
   )
   render(<App />)
   await user.type(screen.getByLabelText('Question or ticket'), 'Incident details')
-  await user.click(screen.getByRole('button', { name: 'Run DeskMate' }))
+  await user.click(screen.getByRole('button', { name: 'Send' }))
   expect(await screen.findByRole('alert')).toHaveTextContent('DeskMate cannot complete this request right now')
-  expect(screen.getByRole('button', { name: 'Run DeskMate' })).toBeEnabled()
+  expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
 })
 
 test.each([
@@ -141,9 +170,9 @@ test.each([
   const user = userEvent.setup()
   render(<App />)
   await user.type(screen.getByLabelText('Question or ticket'), 'An incident')
-  await user.click(screen.getByRole('button', { name: 'Run DeskMate' }))
+  await user.click(screen.getByRole('button', { name: 'Send' }))
   expect(await screen.findByRole('alert')).toHaveTextContent(message)
-  expect(screen.getByRole('button', { name: 'Run DeskMate' })).toBeEnabled()
+  expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
   expect(fetch.mock.calls.filter(([url]) => url === '/ask')).toHaveLength(1)
 })
 
@@ -172,9 +201,9 @@ test('can submit again after an empty proxy response', async () => {
   const user = userEvent.setup()
   render(<App />)
   await user.type(screen.getByLabelText('Question or ticket'), 'What year did Abdul graduate?')
-  await user.click(screen.getByRole('button', { name: 'Run DeskMate' }))
+  await user.click(screen.getByRole('button', { name: 'Send' }))
   expect(await screen.findByRole('alert')).toHaveTextContent('temporarily unavailable')
-  await user.click(screen.getByRole('button', { name: 'Run DeskMate' }))
+  await user.click(screen.getByRole('button', { name: 'Send' }))
   expect(await screen.findByText('Abdul graduated in 2022.')).toBeInTheDocument()
   expect(screen.queryByRole('alert')).not.toBeInTheDocument()
 })
@@ -190,11 +219,11 @@ test('shows a connection error when the request service is unreachable', async (
   const user = userEvent.setup()
   render(<App />)
   await user.type(screen.getByLabelText('Question or ticket'), 'An incident')
-  await user.click(screen.getByRole('button', { name: 'Run DeskMate' }))
+  await user.click(screen.getByRole('button', { name: 'Send' }))
   expect(await screen.findByRole('alert')).toHaveTextContent(
     'DeskMate could not connect to the server. Please try again.',
   )
-  expect(screen.getByRole('button', { name: 'Run DeskMate' })).toBeEnabled()
+  expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
 })
 
 test('preserves the provider error and restores its saved case for retry', async () => {
@@ -214,7 +243,7 @@ test('preserves the provider error and restores its saved case for retry', async
   const user = userEvent.setup()
   render(<App />)
   await user.type(screen.getByLabelText('Question or ticket'), 'An incident')
-  await user.click(screen.getByRole('button', { name: 'Run DeskMate' }))
+  await user.click(screen.getByRole('button', { name: 'Send' }))
   expect(await screen.findByRole('alert')).toHaveTextContent(
     'DeskMate cannot complete this request right now',
   )
@@ -256,6 +285,7 @@ test('shows remembered facts and fixture provenance when reopening a case', asyn
   )
   const user = userEvent.setup()
   render(<App />)
+  await user.click(screen.getByRole('button', { name: /^Investigations$/ }))
   await user.click(await screen.findByRole('button', { name: /Jake Peralta from B99/ }))
   expect(await screen.findByText('Remembered facts from previous cases')).toBeInTheDocument()
   expect(screen.getByText('B99 2nd floor')).toBeInTheDocument()
@@ -272,6 +302,7 @@ test('ingests pasted knowledge and shows duplicate feedback', async () => {
   )
   const user = userEvent.setup()
   render(<App />)
+  await user.click(screen.getByRole('button', { name: /^Knowledge$/ }))
   await user.type(screen.getByLabelText('Knowledge text'), 'VPN recovery guide')
   await user.click(screen.getByRole('button', { name: 'Add to knowledge' }))
   await waitFor(() =>
@@ -292,6 +323,8 @@ test('retries the saved case after a service failure', async () => {
   )
   const user = userEvent.setup()
   render(<App />)
+  await user.click(screen.getByRole('button', { name: /^Investigations$/ }))
+  await user.selectOptions(screen.getByLabelText('Status'), 'failed')
   await user.click(await screen.findByRole('button', { name: /Jake Peralta from B99/ }))
   await user.click(await screen.findByRole('button', { name: 'Retry Investigation' }))
   expect(await screen.findByText('Which site?')).toBeInTheDocument()
@@ -338,13 +371,14 @@ test('knowledge answer, contradictions, and activity render without a ticket que
     })),
   )
   render(<App />)
+  await user.click(screen.getByRole('button', { name: /^Investigations$/ }))
   await user.click(await screen.findByRole('button', { name: /What year did Abdul graduate/ }))
   expect(await screen.findByRole('heading', { name: 'Answer' })).toBeInTheDocument()
   expect(screen.getByText('Abdul graduated in 2022.')).toBeInTheDocument()
   expect(screen.getByText('Two documents give different dates.')).toBeInTheDocument()
   expect(screen.getByText('The newer resume supersedes the old version.')).toBeInTheDocument()
   expect(screen.queryByLabelText('Your answer')).not.toBeInTheDocument()
-  await user.click(screen.getByText('Agent activity'))
-  expect(screen.getByText('Search supporting information', { exact: true })).toBeInTheDocument()
+  await user.click(screen.getByText('Investigation progress'))
+  expect(screen.getAllByTestId('investigation-scroll')[0]).toBeVisible()
   expect(screen.queryByText('Private internal draft')).not.toBeInTheDocument()
 })

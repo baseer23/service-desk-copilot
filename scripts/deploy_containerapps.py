@@ -26,6 +26,10 @@ def main():
     parser.add_argument("--image", required=True, help="Reviewed Python 3.12 Linux image digest")
     parser.add_argument("--stage", choices=["roles", "deploy"], required=True)
     parser.add_argument("--startup-diagnostic", action="store_true")
+    parser.add_argument(
+        "--activate-demo", action="store_true",
+        help="Explicitly deploy the authorized finite demo policy",
+    )
     args = parser.parse_args()
     if "@sha256:" not in args.image:
         raise ValueError("Pin the reviewed base image by digest")
@@ -136,6 +140,13 @@ def main():
             "DESKMATE_STARTUP_DIAGNOSTIC": str(args.startup_diagnostic).lower(),
         }
     )
+    if args.activate_demo:
+        allowance = float(config.get("AZURE_ESTIMATED_MONTHLY_APP_LIMIT_CAD", "8"))
+        if not 0 < allowance <= 250:
+            raise ValueError("Demo deployment requires a finite application allowance")
+        config["AZURE_EMERGENCY_DISABLE"] = "false"
+        config["AZURE_LIVE_TEST_MODE"] = "false"
+        config["AZURE_SETUP_VALIDATION_MODE"] = "false"
     bootstrap = base64.b64encode(
         (Path(__file__).parent / "container_bootstrap.py").read_bytes()
     ).decode()
@@ -258,7 +269,7 @@ def main():
         json.dumps(
             {
                 "endpoint": origin,
-                "emergency_disabled": True,
+                "emergency_disabled": not args.activate_demo,
                 "min_replicas": 0,
                 "max_replicas": 1,
                 "bundle_sha256": digest,

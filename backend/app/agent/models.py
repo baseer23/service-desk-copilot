@@ -10,8 +10,14 @@ class StructuredModel(BaseModel):
 class RequestIntent(StructuredModel):
     in_scope: bool = True
     workflow: Literal["knowledge", "service_desk"]
+    knowledge_source: Literal["documents", "general"] = "documents"
     goal: str
     justification: str
+
+
+class GeneralAnswer(StructuredModel):
+    answer: str = Field(min_length=1, max_length=6000)
+    uncertainty: list[str] = Field(default_factory=list)
 
 
 class TicketAnalysis(StructuredModel):

@@ -11,6 +11,9 @@ from fastapi.testclient import TestClient
 # prevents local .env settings from selecting any live generation/speech/embeddings.
 for key, value in {
     "TEST_MODE": "true",
+    "DATA_PLATFORM": "local",
+    "DEPLOYMENT_MODE": "local",
+    "ENABLE_LOCAL_FIXTURES": "true",
     "GENERATION_PROVIDER": "stub",
     "EMBED_PROVIDER": "stub",
     "VOICE_ENABLED": "false",

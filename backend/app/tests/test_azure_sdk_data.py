@@ -118,7 +118,9 @@ def test_real_search_sdk_serializes_vectors_and_enforces_tenant_filter(settings)
             len(json.loads(transport.requests[-1].body)["value"][0]["vector"])
             == settings.azure_embedding_dimensions
         )
-        assert store.hybrid("VPN authentication", chunk["embedding"])[0]["metadata"]["page"] == 2
+        result = store.hybrid("VPN authentication", chunk["embedding"])[0]
+        assert result["metadata"]["page"] == 2
+        assert isinstance(result["score"], int | float)
     client.close()
 
 

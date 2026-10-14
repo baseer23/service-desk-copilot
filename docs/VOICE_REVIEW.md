@@ -3,7 +3,8 @@
 For the subsequent managed-data, Entra, MCP authority and asynchronous voice-I/O
 changes, see [AZURE_ENTERPRISE.md](AZURE_ENTERPRISE.md). These changes add regression
 and SDK checks; they do not establish live microphone or Azure voice acceptance.
-The user's persistent emergency shutdown remains enabled.
+This historical review predates the user's explicit 2026-10-13 demo activation.
+Current activation, fixes and live evidence are in [DEMO_READINESS.md](DEMO_READINESS.md).
 
 This records the earlier browser migration checks. The subsequent readiness/UI/scope
 review, updated test totals and exact runtime traces are in

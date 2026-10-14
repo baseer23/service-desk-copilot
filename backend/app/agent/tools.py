@@ -1,8 +1,9 @@
 """Bound LangChain invocation. Schemas/descriptions come from MCP discovery."""
 
-from typing import Any
-from pydantic import ConfigDict, create_model
+from typing import Any, Literal
+
 from langchain_core.tools import StructuredTool
+from pydantic import ConfigDict, create_model
 
 # Explicit permission boundary: planning may read, while infrastructure/human
 # confirmation owns writes. MCP discovery alone never grants write permission.
@@ -39,6 +40,8 @@ def allowed_tools(workflow: str) -> set[str]:
 
 
 def annotation(spec):
+    if "enum" in spec:
+        return Literal[tuple(spec["enum"])]
     if "anyOf" in spec:
         types = [annotation(s) for s in spec["anyOf"]]
         result = types[0]

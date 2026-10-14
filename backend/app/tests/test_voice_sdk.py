@@ -60,7 +60,7 @@ async def test_actual_sdk_serializes_pcm_vad_commands_and_cancel(settings):
     assert update["input_audio_format"] == "pcm16" and update["input_audio_sampling_rate"] == 24000
     assert update["output_audio_format"] == "pcm16"
     assert update["turn_detection"]["create_response"] is False
-    assert update["turn_detection"]["interrupt_response"] is True
+    assert update["turn_detection"]["interrupt_response"] is False
     assert update["input_audio_transcription"]["model"] == "gpt-4o-transcribe"
     assert update["voice"] == {"type": "azure-standard", "name": "en-US-AvaNeural"}
     assert update["tools"] == []
@@ -74,10 +74,13 @@ async def test_actual_sdk_serializes_pcm_vad_commands_and_cancel(settings):
         "response.cancel",
         "conversation.item.create",
     ]
-    assert captured[4]["response"]["tool_choice"] == "none"
-    assert captured[4]["response"]["max_output_tokens"] == 1500
-    assert captured[4]["response"]["input_items"] == []
-    assert captured[4]["response"]["commit"] is False
+    assert update["tools"] == []
+    assert captured[4]["response"] == {
+        "pre_generated_assistant_message": {
+            "type": "message", "role": "assistant",
+            "content": [{"type": "text", "text": "What error appears?"}],
+        }
+    }
     assert options["api_version"] == "2026-04-10" and options["credential_scopes"] == [
         "https://ai.azure.com/.default"
     ]
@@ -136,6 +139,10 @@ async def test_actual_typed_provider_events_not_fake(settings):
                 "message": "private credential payload",
             },
         },
+        {
+            "type": "response.done", "event_id": "e7",
+            "response": {"id": "r1", "status": "cancelled", "output": []},
+        },
     ]
 
     class Connection:
@@ -156,10 +163,33 @@ async def test_actual_typed_provider_events_not_fake(settings):
         "audio",
         "tool",
         "error",
+        "response.done",
     ]
     assert result[1].text == "VPN broken" and result[2].data["response_id"] == "r1"
     assert result[3].data["audio"] == "AAA="
-    assert "private" not in result[-1].model_dump_json()
+    assert "private" not in result[-2].model_dump_json()
+    assert result[-1].data["response_id"] == "r1"
+
+
+@pytest.mark.asyncio
+async def test_late_sdk_completion_cannot_clear_a_new_active_response(settings):
+    class Connection:
+        def __init__(self, identifier):
+            self.identifier = identifier
+        def __aiter__(self):
+            async def iterate():
+                yield ServerEvent({"type": "response.done", "event_id": self.identifier,
+                    "response": {"id": self.identifier, "status": "cancelled", "output": []}})
+            return iterate()
+    provider = AzureVoiceLiveProvider(settings, credential=object())
+    provider.response_pending = True
+    provider.active_response_id = "new-response"
+    provider.connection = Connection("old-response")
+    assert [event async for event in provider.events()]
+    assert provider.response_pending and provider.active_response_id == "new-response"
+    provider.connection = Connection("new-response")
+    assert [event async for event in provider.events()]
+    assert not provider.response_pending and provider.active_response_id == ""
 
 
 @pytest.mark.asyncio

@@ -55,6 +55,21 @@ def test_configured_is_not_authenticated_or_live_validated(settings):
     )
 
 
+def test_voice_availability_requires_enough_allowance_for_a_full_session(settings):
+    from backend.app.core.azure_usage import AzureUsageGuard
+
+    s = azure_settings(settings, azure_max_voice_session_minutes=10)
+    guard = AzureUsageGuard(s)
+    # A bounded speech reservation consumes CAD 5 from the default CAD 8.
+    token = guard.reserve("session_voice")
+    guard.finish(token, seconds=1)
+    report = configuration_readiness(
+        s, reasoning_initialized=True, local_mcp="READY", private_stores="READY"
+    )
+    assert report.text_ready and not report.voice_ready
+    assert report.azure_usage["remaining_estimated_cad"] < 5
+
+
 def test_readiness_controls_missing_categories(settings):
     s = azure_settings(settings, azure_model_deployment="", azure_voicelive_endpoint="")
     report = configuration_readiness(

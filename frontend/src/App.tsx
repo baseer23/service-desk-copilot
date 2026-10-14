@@ -1,6 +1,7 @@
-import { FormEvent, useEffect, useState } from 'react'
+import { type FormEvent, useEffect, useState } from 'react'
 import VoiceSupport from './VoiceSupport'
 import KnowledgePanel from './KnowledgePanel'
+import InvestigationHistory from './InvestigationHistory'
 import { post, request } from './api'
 import { reasoningBlocker, useReadiness } from './readiness'
 import { InvestigationTimeline, EvidenceList, timestamp } from './InvestigationPanels'
@@ -54,6 +55,9 @@ export type Case = {
   uncertainty: string[]
   evidence: Evidence[]
   final_answer: string | null
+  origin?: 'user' | 'demo' | 'test' | 'unknown'
+  resolution_status?: string
+  chat_messages?: { role: string; content: string }[]
 }
 type Event = {
   id: number
@@ -68,7 +72,7 @@ type AskResponse = {
   result: Omit<Case, 'case_id' | 'thread_id'>
   events: Event[]
 }
-export default function App() {
+export default function App(): JSX.Element {
   const { readiness, refresh, checking } = useReadiness()
   const blocker = reasoningBlocker(readiness)
   const [ticket, setTicket] = useState('')
@@ -78,6 +82,12 @@ export default function App() {
   const [answer, setAnswer] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  const [section, setSection] = useState('Chat')
+
+  function navigate(name: string, id: string) {
+    setSection(name)
+    void id
+  }
 
 
   useEffect(() => {
@@ -168,6 +178,7 @@ export default function App() {
     }
   }
   async function openCase(id: string) {
+    setSection('Investigations')
     setBusy(true)
     setError('')
     setAnswer('')
@@ -188,6 +199,18 @@ export default function App() {
     finally { setBusy(false) }
   }
 
+  async function continueChat(event: FormEvent) {
+    event.preventDefault()
+    if (!active?.transient || !answer.trim()) return
+    setBusy(true)
+    setError('')
+    try {
+      await displayRequest(await request<AskResponse>(`/requests/${active.case_id}/message`, post({ summary: answer.trim() })))
+      setAnswer('')
+    } catch (caught) { setError((caught as Error).message) }
+    finally { setBusy(false) }
+  }
+
   return (
     <div className="app-shell">
       <header className="masthead">
@@ -196,70 +219,49 @@ export default function App() {
         </div>
         <div>
           <h1>DeskMate</h1>
-          <p>Service Desk Investigation Assistant</p>
+          <p>Your support workspace</p>
         </div>
-        <span className="runtime-label">{readiness?.runtime_mode==='isolated_demo' ? 'Isolated demo' : 'Case investigations'}</span>
+        <span className="runtime-label">{readiness?.runtime_mode==='isolated_demo' ? 'Isolated demo' : 'Your workspace'}</span>
       </header>
+      <nav className="workspace-nav" aria-label="Workspace">
+        {([['Chat', 'chat'], ['Investigations', 'investigations'], ['Knowledge', 'knowledge-workspace'], ['Voice', 'voice']] as const).map(([name, id]) => (
+          <button key={name} className={section === name ? 'active' : ''} aria-current={section === name ? 'page' : undefined} onClick={() => navigate(name, id)}>{name}</button>
+        ))}
+      </nav>
       {readiness?.runtime_mode === 'isolated_demo' && <div className="demo-banner runtime-banner"><strong>ISOLATED DEMO</strong><p>Responses and audio are simulated in this sample session.</p></div>}
       {error && (
         <div className="error-banner" role="alert">
           {error}
         </div>
       )}
-      <main>
-        <aside className="case-panel">
-          <section className="card">
-            <span className="eyebrow">START HERE</span>
-            <h2>New Request</h2>
-            <form onSubmit={start}>
-              <label htmlFor="ticket">Question or ticket</label>
-              <textarea
-                id="ticket"
-                rows={7}
-                placeholder="Ask about a document, or describe an incident…"
-                value={ticket}
-                onChange={(e) => setTicket(e.target.value)}
-                required
-              />
-              <button className="primary" disabled={busy || !ticket.trim() || (readiness !== null && !readiness.text_ready)}>
-                {busy ? 'Investigating…' : 'Run DeskMate'}
-              </button>
-              {blocker && <p className="muted" role="status">{blocker}</p>}
-              <button type="button" className="secondary" disabled={busy || !ticket.trim()} onClick={() => void saveRequest()}>Save request</button>
-              <button type="button" className="secondary" disabled={checking || busy} onClick={() => void refresh()}>{checking ? 'Checking app status…' : 'Refresh app status'}</button>
-            </form>
-          </section>
-          <section className="card">
-            <h2>Cases</h2>
-            {cases.length === 0 ? (
-              <p className="muted">Your investigations will appear here.</p>
-            ) : (
-              <ul className="case-list">
-                {cases.map((c) => (
-                  <li key={c.case_id}>
-                    <button
-                      className={active?.case_id === c.case_id ? 'selected' : ''}
-                      onClick={() => openCase(c.case_id)}
-                      disabled={busy}
-                    >
-                      <span>{c.ticket.summary}</span>
-                      <small>{c.status.replace(/_/g, ' ')}</small>
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </section>
-          <KnowledgePanel readiness={readiness} />
-        </aside>
-        <div className="investigation-panel">
+      <main className={`workspace-main ${section.toLowerCase()}`}>
+        <section hidden={section !== 'Chat'} className="chat-workspace" id="chat" aria-label="Chat workspace">
+          <div className="workspace-heading"><div><span className="eyebrow">YOUR AI SERVICE DESK</span><h2>{active ? 'Let’s keep going' : 'How can I help?'}</h2></div>
+            <button type="button" className="button button-neutral" disabled={busy} onClick={() => { setActive(null); setEvents([]); setTicket(''); setAnswer(''); setError('') }}>New conversation</button>
+          </div>
+          {!active && <div className="chat-welcome"><span className="welcome-mark" aria-hidden="true">D</span><h3>A little help, a clearer day.</h3><p>Work through an IT issue, ask a question, or find an answer in your documents.</p><div className="suggestion-row">{['My VPN is not connecting', 'Help with multi-factor sign-in', 'Find an answer in my documents'].map(suggestion => <button type="button" key={suggestion} onClick={() => setTicket(suggestion)}>{suggestion}</button>)}</div></div>}
+          <form onSubmit={start} className="main-composer">
+            <label htmlFor="ticket">Question or ticket</label>
+            <textarea id="ticket" rows={3} placeholder="Message DeskMate…" value={ticket} onChange={e => setTicket(e.target.value)} required />
+            <div className="composer-actions"><button type="button" className="button button-neutral" onClick={() => navigate('Voice', 'voice')} aria-label="Open voice support"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8"/></svg></button>
+              <div><button type="button" className="button button-subtle" disabled={busy || !ticket.trim()} onClick={() => void saveRequest()}>Save request</button><button className="button button-primary" disabled={busy || !ticket.trim() || (readiness !== null && !readiness.text_ready)} aria-busy={busy}>{busy ? 'Thinking…' : 'Send'}</button></div>
+            </div>
+            {blocker && <div className="availability-note"><p role="status">{blocker}</p><button type="button" className="button button-subtle" disabled={checking || busy} onClick={() => void refresh()}>Check availability</button></div>}
+          </form>
+        </section>
+        <section hidden={section !== 'Investigations'} className="history-workspace" id="investigations" aria-label="Investigation history">
+          <InvestigationHistory cases={cases} selected={active?.case_id} busy={busy} onOpen={openCase} />
+        </section>
+        <section hidden={section !== 'Knowledge'} id="knowledge-workspace" className="knowledge-workspace" aria-label="Knowledge workspace"><KnowledgePanel readiness={readiness} /></section>
+        <section hidden={section !== 'Voice'} id="voice" className="voice-workspace"><VoiceSupport onCaseCreated={openCase} readiness={readiness} /></section>
+        <div className="investigation-panel" hidden={!active || !['Chat', 'Investigations'].includes(section)}>
           {!active ? (
             <section className="empty-state">
               <div aria-hidden="true">◎</div>
-              <h2>Start with a question or an incident.</h2>
+              <h2>Let’s work through it together.</h2>
               <p>
-                DeskMate chooses a knowledge or investigation workflow, gathers evidence, and
-                verifies its answer.
+                Ask anything, troubleshoot an issue, or find answers in your documents.
+                Your investigations and confirmed details stay in your workspace.
               </p>
             </section>
           ) : (
@@ -269,7 +271,7 @@ export default function App() {
                   <span className="eyebrow">
                     {active.workflow === 'knowledge' ? 'KNOWLEDGE REQUEST' : 'CURRENT CASE'}
                   </span>
-                  <p className="case-id" data-testid="case-id">
+                  <p hidden className="case-id" data-testid="case-id">
                     {active.case_id}
                   </p>
                 </div>
@@ -278,7 +280,7 @@ export default function App() {
                 </span>
               </div>
               <p className="ticket-summary">{active.ticket.summary}</p>
-              {active.workflow === 'knowledge' && (
+              {active.workflow === 'knowledge' && !active.chat_messages?.length && (
                 <section className="card knowledge-answer">
                   <h2>Answer</h2>
                   <p>
@@ -290,7 +292,18 @@ export default function App() {
                   </p>
                 </section>
               )}
-              <section className="card">
+              {!!active.chat_messages?.length && <section className="card conversation-card" aria-label="Conversation">
+                <h2 className="sr-only">Conversation</h2>
+                <div className="chat-history" role="log" aria-live="polite">
+                  {active.chat_messages.map((message, index) => <div key={index} className={`chat-message ${message.role}`}><strong>{message.role === 'user' ? 'You' : 'DeskMate'}</strong><p>{message.content}</p></div>)}
+                </div>
+                <form onSubmit={continueChat} className="chat-reply">
+                  <label htmlFor="chat-reply">Reply to this conversation</label>
+                  <textarea id="chat-reply" rows={2} value={answer} onChange={event => setAnswer(event.target.value)} required />
+                  <button className="primary" disabled={busy || !answer.trim()}>{busy ? 'Thinking…' : 'Send message'}</button>
+                </form>
+              </section>}
+              {!active.chat_messages?.length && <><details className="card investigation-activity"><summary>Investigation progress</summary>
                 <h2>
                   {active.workflow === 'knowledge' ? 'Research summary' : 'Investigation Timeline'}
                 </h2>
@@ -300,7 +313,7 @@ export default function App() {
                     Gathering evidence…
                   </p>
                 )}
-              </section>
+              </details>
               {active.status === 'new' && <section className="card">
                 <h2>Saved request</h2>
                 <p>Your request is saved. Automated investigation has not started.</p>
@@ -338,8 +351,9 @@ export default function App() {
                   </form>
                 </section>
               )}
-              <section className="card assessment">
-                <h2>
+              <details className="card assessment" open={section === 'Investigations'}>
+                <summary>Investigation details</summary>
+                <h2 className="sr-only">
                   {active.workflow === 'knowledge' ? 'Evidence assessment' : 'Current Assessment'}
                 </h2>
                 <dl>
@@ -466,8 +480,8 @@ export default function App() {
                       : active.status === 'new' ? 'Investigation has not started.' : 'Investigation is in progress.'}
                   </p>
                 )}
-              </section>
-              <details className="card agent-activity">
+              </details>
+              <details className="card agent-activity" hidden>
                 <summary>Agent activity</summary>
                 <p>Tools used</p>
                 <ul>
@@ -495,12 +509,12 @@ export default function App() {
                 {!active.evidence.length && <p className="muted">No evidence collected yet.</p>}
                 <EvidenceList evidence={active.evidence} />
               </section>
+              </>}
             </>
           )}
         </div>
       </main>
-      <VoiceSupport onCaseCreated={openCase} readiness={readiness} />
-      <footer>Evidence guides the next step. A recommendation does not confirm resolution.</footer>
+      <footer>DeskMate · Thoughtful support, one conversation at a time.</footer>
     </div>
   )
 }

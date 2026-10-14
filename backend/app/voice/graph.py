@@ -162,7 +162,11 @@ class VoiceSupportGraph:
             )
             if not intent.in_scope:
                 return {"conversation": c, "skip": True, "reply": SCOPE_MESSAGE}
-        extraction = await self.generate("voice_extract", context, VoiceExtraction)
+        extraction = await self.generate(
+            "voice_extract",
+            {key: value for key, value in context.items() if key != "permitted_tools"},
+            VoiceExtraction,
+        )
         if (
             extraction.region
             and extraction.region.upper() in __import__("phonenumbers").SUPPORTED_REGIONS
@@ -359,7 +363,7 @@ class VoiceSupportGraph:
         response = await self.generate(
             "voice_reply",
             {
-                **state["context"],
+                **{key: value for key, value in state["context"].items() if key != "permitted_tools"},
                 "evidence": [e.model_dump() for e in c.evidence],
                 "missing_contact": [
                     f

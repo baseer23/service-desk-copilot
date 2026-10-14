@@ -189,7 +189,7 @@ class AzureSearchStore:
                         "id": row["chunk_id"],
                         "text": row["text"],
                         "metadata": meta,
-                        "score": row.get("@search.reranker_score", row.get("@search.score", 0)),
+                        "score": row.get("@search.reranker_score") or row.get("@search.score") or 0,
                         "storage": "azure",
                         "source_system": "azure_search",
                     }

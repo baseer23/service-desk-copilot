@@ -21,6 +21,9 @@ export default defineConfig({
       timeout: 60_000,
       env: {
         TEST_MODE: 'true',
+        DATA_PLATFORM: 'local',
+        DEPLOYMENT_MODE: 'local',
+        ENABLE_LOCAL_FIXTURES: 'true',
         AZURE_USAGE_GUARD_ENABLED: 'false',
         AZURE_EMERGENCY_DISABLE: 'true',
         AZURE_LIVE_TEST_MODE: 'false',

@@ -45,7 +45,11 @@ class AzureUsageGuard:
 
     def earmark_infrastructure(self, reference: str, cad_estimate: float) -> None:
         """Reserve a bounded hosting/storage forecast without enabling AI dispatch."""
-        if not 0 <= cad_estimate <= 0.25 or not re.fullmatch(r"[a-z0-9-]{1,64}", reference):
+        if (
+            not math.isfinite(cad_estimate)
+            or not 0 <= cad_estimate <= self.settings.azure_estimated_monthly_app_limit_cad
+            or not re.fullmatch(r"[a-z0-9-]{1,64}", reference)
+        ):
             raise ValueError("Unsupported infrastructure forecast")
         now = datetime.now(UTC)
         month = now.strftime("%Y-%m")
@@ -58,7 +62,7 @@ class AzureUsageGuard:
             ).fetchone()[0]
             previous = existing[0] if existing else 0
             increase = max(0, estimate - previous)
-            if spent + increase > self.limit:
+            if spent + increase > self.effective_limit(db):
                 raise AzureUsageBlocked("Infrastructure forecast exceeds the application allowance")
             if not existing:
                 db.execute(
@@ -83,6 +87,11 @@ class AzureUsageGuard:
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS azure_policy "
                 "(id INTEGER PRIMARY KEY, disabled INTEGER NOT NULL)"
+            )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS azure_demo_policy "
+                "(id INTEGER PRIMARY KEY, limit_micros INTEGER NOT NULL, "
+                "authorized_at REAL NOT NULL, authorization_reference TEXT NOT NULL)"
             )
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS azure_usage "
@@ -142,6 +151,11 @@ class AzureUsageGuard:
         ):
             raise AzureUsageBlocked("Azure usage disabled; explicit local enablement required")
 
+    @contextmanager
+    def inspection(self):
+        with self.transaction() as db:
+            yield db
+
     def require_enabled(self) -> None:
         if not self.settings.azure_usage_guard_enabled:
             raise AzureUsageBlocked("Azure usage disabled; explicit local enablement required")
@@ -151,7 +165,7 @@ class AzureUsageGuard:
             spent = db.execute(
                 "SELECT COALESCE(SUM(estimate),0) FROM azure_usage WHERE month=?", (month,)
             ).fetchone()[0]
-            if spent >= self.limit:
+            if spent >= self.effective_limit(db):
                 raise AzureUsageBlocked("Estimated monthly Azure application allowance exhausted")
             if self.settings.azure_setup_validation_mode:
                 setup = db.execute(
@@ -187,6 +201,33 @@ class AzureUsageGuard:
     @property
     def limit(self) -> int:
         return math.floor(self.settings.azure_estimated_monthly_app_limit_cad * 1_000_000)
+
+    def effective_limit(self, db: sqlite3.Connection) -> int:
+        row = db.execute("SELECT limit_micros FROM azure_demo_policy WHERE id=1").fetchone()
+        return min(self.limit, row[0]) if row else self.limit
+
+    def enable_demo(self, limit_cad: float, authorization_reference: str) -> None:
+        """Explicit operator activation; preserve all charges and active reservations."""
+        if (
+            isinstance(limit_cad, bool)
+            or not math.isfinite(limit_cad)
+            or not 0 < limit_cad <= self.settings.azure_estimated_monthly_app_limit_cad
+            or not re.fullmatch(r"[a-z0-9-]{1,64}", authorization_reference)
+        ):
+            raise ValueError("Invalid authorized demo allowance")
+        if not self.settings.azure_usage_guard_enabled or self.settings.azure_emergency_disable:
+            raise AzureUsageBlocked("Enable the configured guard before operator activation")
+        with self.transaction() as db:
+            db.execute(
+                "INSERT INTO azure_demo_policy VALUES(1,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET limit_micros=excluded.limit_micros, "
+                "authorized_at=excluded.authorized_at, "
+                "authorization_reference=excluded.authorization_reference",
+                (math.floor(limit_cad * 1_000_000), time.time(), authorization_reference),
+            )
+            db.execute(
+                "INSERT INTO azure_policy VALUES(1,0) ON CONFLICT(id) DO UPDATE SET disabled=0"
+            )
 
     def reserve(self, kind: str, input_tokens: int = 0, output_tokens: int = 0) -> str:
         s = self.settings
@@ -236,7 +277,8 @@ class AzureUsageGuard:
             spent = db.execute(
                 "SELECT COALESCE(SUM(estimate),0) FROM azure_usage WHERE month=?", (month,)
             ).fetchone()[0]
-            if spent >= self.limit or spent + estimate > self.limit:
+            limit = self.effective_limit(db)
+            if spent >= limit or spent + estimate > limit:
                 raise AzureUsageBlocked("Estimated monthly Azure application allowance exhausted")
             phase = "setup" if s.azure_setup_validation_mode else "demo"
             if phase == "setup":
@@ -355,7 +397,7 @@ class AzureUsageGuard:
         if not self.ledger_exists():
             return {}
         try:
-            with self.transaction() as db:
+            with self.inspection() as db:
                 return {
                     name: {"passed": bool(passed), "code": code}
                     for name, passed, code in db.execute(
@@ -393,9 +435,11 @@ class AzureUsageGuard:
         usage: dict[str, int] = {}
         error = False
         setup_spent = 0
+        limit = self.limit
         if self.ledger_exists():
             try:
-                with self.transaction() as db:
+                with self.inspection() as db:
+                    limit = self.effective_limit(db)
                     disabled = db.execute("SELECT disabled FROM azure_policy WHERE id=1").fetchone()
                     enabled = enabled and not bool(disabled and disabled[0])
                     rows = db.execute(
@@ -411,7 +455,7 @@ class AzureUsageGuard:
                             usage[key] = usage.get(key, 0) + value
             except (AzureUsageBlocked, ValueError, TypeError):
                 enabled, error = False, True
-        remaining = max(0, (self.limit - spent) / 1_000_000)
+        remaining = max(0, (limit - spent) / 1_000_000)
         if (
             self.settings.azure_setup_validation_mode
             and setup_spent >= self.settings.azure_estimated_setup_limit_cad * 1_000_000
@@ -422,7 +466,7 @@ class AzureUsageGuard:
             "ledger_error": error,
             "currency": "CAD",
             "month": datetime.now(UTC).strftime("%Y-%m"),
-            "limit_cad": self.settings.azure_estimated_monthly_app_limit_cad,
+            "limit_cad": limit / 1_000_000,
             "estimated_used_cad": spent / 1_000_000,
             "remaining_estimated_cad": remaining,
             "reported_tokens": usage,

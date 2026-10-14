@@ -41,6 +41,19 @@ from backend.app.store.vector_chroma import StorageError
 
 def case_response(state):
     data = {**state, "thread_id": state["case_id"]}
+    resolution = state.get("voice_intake", {}).get("resolution_status", "unconfirmed")
+    if resolution in {"unconfirmed", "user_confirmed_resolved", "escalation_required"}:
+        data.setdefault("resolution_status", resolution)
+    # Only explicit provenance/labels identify sample history. Existing records
+    # remain intact, including rows whose origin is unknown.
+    if data.get("origin") not in {"user", "demo", "test", "unknown"}:
+        data.pop("origin", None)
+    if not data.get("origin"):
+        summary = state.get("ticket", {}).get("summary", "").casefold()
+        data["origin"] = (
+            "test" if summary.startswith(("fictional test:", "acceptance test:"))
+            else "demo" if summary.startswith(("fictional ", "demo:")) else "unknown"
+        )
     if (state.get("status") == "needs_input" and not state.get("workflow")) or state.get(
         "status"
     ) not in {
@@ -172,7 +185,12 @@ def create_app(settings: Settings | None = None):
                 else:
                     actor = verify_actor(s, request.cookies.get(COOKIE_NAME))
                 session_id = request.url.path.split("/")[2].removeprefix("voice-")
-                app.state.voice.repository.get(session_id, actor)
+                await app.state.voice.store(app.state.voice.repository.get, session_id, actor)
+                if s.data_platform == "azure" and s.deployment_mode == "local":
+                    from backend.app.core.principal import Principal, principal_scope
+
+                    with principal_scope(Principal(actor.tenant_id, actor.owner_id)):
+                        return await call_next(request)
             except VoiceError as exc:
                 return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
         return await call_next(request)
@@ -207,13 +225,13 @@ def create_app(settings: Settings | None = None):
     async def operator_readiness():
         if not current_principal(s).operator:
             raise HTTPException(403, "This action requires an administrator.")
-        return readiness().model_dump()
+        return (await app.state.voice.store(readiness)).model_dump()
 
     @app.post("/admin/azure/usage/disable")
     async def operator_disable():
         if not current_principal(s).operator:
             raise HTTPException(403, "This action requires an administrator.")
-        app.state.voice.usage_guard.disable()
+        await app.state.voice.store(app.state.voice.usage_guard.disable)
         await app.state.voice.close()
         return {"disabled": True}
 
@@ -233,7 +251,7 @@ def create_app(settings: Settings | None = None):
     @app.get("/readiness")
     async def get_readiness() -> dict[str, Any]:
         # No token acquisition/network probe; statuses and missing variable names only.
-        report = readiness()
+        report = await app.state.voice.store(readiness)
         return {
             "runtime_mode": "isolated_demo"
             if report.runtime_mode == "isolated_demo"
@@ -255,7 +273,7 @@ def create_app(settings: Settings | None = None):
                 if app.state.local_storage["chroma"] and app.state.local_storage["sqlite"]
                 else "degraded"
             }
-        report = readiness()
+        report = await app.state.voice.store(readiness)
         environment = app.state.local_storage
         return HealthResponse(
             status="ok" if report.text_ready else "degraded",
@@ -275,8 +293,8 @@ def create_app(settings: Settings | None = None):
             readiness=report.model_dump(),
         )
 
-    def require_reasoning() -> None:
-        report = readiness()
+    async def require_reasoning() -> None:
+        report = await app.state.voice.store(readiness)
         if not report.text_ready:
             message = "Azure reasoning is not ready. Local case saving, document extraction and keyword search remain available."
             if s.deployment_mode == "production":
@@ -377,7 +395,7 @@ def create_app(settings: Settings | None = None):
 
     @app.post("/documents/{document_id}/index")
     async def index_local_document(document_id: str):
-        report = readiness()
+        report = await app.state.voice.store(readiness)
         if not report.semantic_ingestion_ready:
             raise HTTPException(
                 503,
@@ -436,10 +454,10 @@ def create_app(settings: Settings | None = None):
             raise HTTPException(404, "Case not found")
         return state
 
-    async def request_result(request_id, summary=None, answer=None):
-        require_reasoning()
+    async def request_result(request_id, summary=None, answer=None, message=None):
+        await require_reasoning()
         try:
-            state, events = await app.state.agent.run_request(request_id, summary, answer)
+            state, events = await app.state.agent.run_request(request_id, summary, answer, message)
             return AskResponse(
                 request_id=request_id,
                 intent="knowledge_question" if state["workflow"] == "knowledge" else "service_desk",
@@ -449,6 +467,8 @@ def create_app(settings: Settings | None = None):
             )
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
+        except KeyError:
+            raise HTTPException(404, "Conversation not found") from None
         except (LLMError, MCPToolError, MCPConnectionError, StorageError) as exc:
             from fastapi.responses import JSONResponse
 
@@ -473,11 +493,15 @@ def create_app(settings: Settings | None = None):
     async def resume_request(request_id: str, body: CaseResumeRequest):
         return await request_result(request_id, answer=body.answer)
 
+    @app.post("/requests/{request_id}/message", response_model=AskResponse)
+    async def conversation_message(request_id: str, body: CaseCreateRequest):
+        return await request_result(request_id, message=body.summary)
+
     @app.get("/cases", response_model=list[CaseResponse])
     async def list_cases(request: Request) -> list[CaseResponse]:
         from backend.app.voice.auth import COOKIE_NAME, VoiceError, verify_actor
 
-        def visible(state: dict[str, Any]) -> bool:
+        async def visible(state: dict[str, Any]) -> bool:
             if not state["case_id"].startswith("voice-"):
                 return True
             try:
@@ -488,15 +512,30 @@ def create_app(settings: Settings | None = None):
                     actor = Actor(principal.owner_id, principal.tenant_id)
                 else:
                     actor = verify_actor(s, request.cookies.get(COOKIE_NAME))
-                app.state.voice.repository.get(state["case_id"].removeprefix("voice-"), actor)
+                await app.state.voice.store(
+                    app.state.voice.repository.get,
+                    state["case_id"].removeprefix("voice-"), actor,
+                )
                 return True
             except VoiceError:
                 return False
 
+        if s.data_platform == "azure" and s.deployment_mode == "local":
+            from backend.app.core.principal import Principal, principal_scope
+
+            try:
+                actor = verify_actor(s, request.cookies.get(COOKIE_NAME))
+            except VoiceError:
+                items = (await app.state.agent.harness.invoke("list_cases", {}))["items"]
+            else:
+                with principal_scope(Principal(actor.tenant_id, actor.owner_id)):
+                    items = (await app.state.agent.harness.invoke("list_cases", {}))["items"]
+        else:
+            items = (await app.state.agent.harness.invoke("list_cases", {}))["items"]
         return [
             case_response(state)
-            for state in (await app.state.agent.harness.invoke("list_cases", {}))["items"]
-            if visible(state)
+            for state in items
+            if await visible(state)
         ]
 
     @app.post("/cases", response_model=CaseResponse, status_code=201)
@@ -507,6 +546,7 @@ def create_app(settings: Settings | None = None):
             "ticket": {"summary": body.summary},
             "status": "new",
             "confidence": 0,
+            "origin": "test" if s.test_mode else "user",
         }
         await app.state.agent.harness.invoke("save_case", {"case_id": case_id, "state": state})
         await app.state.agent.note(state, "create_case", "Case created", "human_input")
@@ -517,7 +557,7 @@ def create_app(settings: Settings | None = None):
         return case_response(await load(case_id))
 
     async def run(case_id, answer=None):
-        require_reasoning()
+        await require_reasoning()
         await load(case_id)
         try:
             return case_response(await app.state.agent.run_case(case_id, answer))

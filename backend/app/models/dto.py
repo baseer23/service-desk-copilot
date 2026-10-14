@@ -95,12 +95,17 @@ class RequestResult(BaseModel):
     uncertainty: list[str] = Field(default_factory=list)
     evidence: list[EvidenceItem | LegacyEvidence] = Field(default_factory=list)
     final_answer: str | None = None
+    chat_messages: list[dict[str, str]] = Field(default_factory=list)
     research_iteration: int = 0
 
 
 class CaseResponse(RequestResult):
     case_id: str
     thread_id: str
+    origin: Literal["user", "demo", "test", "unknown"] = "unknown"
+    resolution_status: Literal[
+        "unconfirmed", "user_confirmed_resolved", "escalation_required"
+    ] = "unconfirmed"
 
 
 class CaseEvent(BaseModel):

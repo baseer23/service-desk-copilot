@@ -5,12 +5,17 @@ The Azure-native production implementation and current acceptance limits are in
 tenant-partitioned managed state and persistent Key Vault signing material. Detailed
 readiness and emergency controls are operator-only at `/admin/readiness` and
 `/admin/azure/usage/disable`; ordinary `/readiness` returns product availability.
-Emergency shutdown remains enabled by explicit user instruction. No new live
-reasoning, embedding, document-analysis or microphone acceptance is authorized.
-The historical live procedure below requires separate enablement before use.
+The user explicitly authorized live demo activation on 2026-10-13, superseding the
+earlier shutdown and CAD 8 restriction. The activated profile retains a persistent
+CAD 150 estimated application allowance including a CAD 90 monthly infrastructure
+forecast, CAD 10 Azure budget alerts, one concurrent
+session, twenty daily sessions, ten-minute sessions and twenty turns per session.
+Historical charges and emergency controls remain intact. See
+[DEMO_READINESS.md](DEMO_READINESS.md) for current evidence and remaining gates.
 
-For the latest repair results and the still-blocked Azure activation, see
-[REPAIR_REVIEW.md](REPAIR_REVIEW.md). Local PDF/text extraction, document saving,
+For historical repair results, see [REPAIR_REVIEW.md](REPAIR_REVIEW.md).
+Current live acceptance is recorded in [DEMO_READINESS.md](DEMO_READINESS.md).
+Local PDF/text extraction, document saving,
 case saving and cited keyword retrieval work independently of Azure reasoning.
 Semantic indexing and generated answers retain the cost guard and acceptance
 policy; local documents do not create substitute vectors.
@@ -101,14 +106,15 @@ The lease renews every 5 seconds and expires after 20. Atomic writes use BEGIN
 IMMEDIATE with rollback and lease verification. Case insertion and session linking
 share a transaction and deterministic ID.
 
-Limits: 64 KiB browser messages, 9,600-byte maximum input PCM frame, input queue 16,
+Limits: 64 KiB browser messages, 9,600-byte maximum input PCM frame, input queue 128,
 turn queue 4, output queue 64, 2-second queue wait, SDK handshake 15 seconds/backend
 connect 25, configured acknowledgement 10, SDK close 5, send 5, MCP turn tool call 20,
 default session 900 seconds,
 1,000 transcript turns, 4 read calls/turn and 40 retained canonical evidence items.
-Preparation waits for the configured acknowledgement and generated live greeting
-before listening/user processing, renewing the lease and honoring Stop throughout.
-The UI preparation deadline is 105 seconds for the documented 30-second model timeout.
+Preparation waits for the configured acknowledgement, renewing the lease and
+honoring Stop throughout. Capture begins before live greeting generation finishes;
+incoming speech takes priority over that greeting. The UI only reports Listening
+after recent physical capture and a backend SDK-forwarding acknowledgement.
 Browser send buffer cap 256 KiB, pending audio queue 64 chunks, playback cap 128
 sources/15 seconds. Saturation
 fails explicitly and closes both directions. No automatic retry of ambiguous audio
@@ -121,6 +127,11 @@ evidence and saved cases remain; establish a tenant deletion/retention policy be
 production. Expiry is lazy, not a guaranteed scheduled deletion service.
 
 ## Azure resources and exact configuration
+
+The following list describes a minimal local speech setup. The existing managed
+production resources and current demo configuration are listed in
+[DEMO_READINESS.md](DEMO_READINESS.md); production uses Cosmos, Blob, Search,
+Document Intelligence, Key Vault and Entra sign-in.
 
 Provision in one region that supports the selected model and has quota:
 

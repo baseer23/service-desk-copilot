@@ -6,10 +6,12 @@ from hashlib import sha256
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
+from pydantic import ValidationError
 
 from backend.app.agent.models import (
     EvidenceItem,
     FinalResponse,
+    GeneralAnswer,
     InvestigationDecision,
     InvestigationPlan,
     MemoryFact,
@@ -71,17 +73,15 @@ class ServiceDeskAgent:
         ):
             builder.add_node(name, getattr(self, name))
         builder.add_node("reject_scope", self.reject_scope)
+        builder.add_node("general_chat", self.general_chat)
+        builder.add_edge("general_chat", END)
         builder.add_edge("reject_scope", END)
         builder.add_node("knowledge_subgraph", self.knowledge_subgraph)
         builder.add_node("case_subgraph", self.case_subgraph)
         builder.add_edge(START, "classify_intent")
         builder.add_conditional_edges(
             "classify_intent",
-            lambda state: (
-                "understand_request"
-                if state["intent"].get("in_scope", True) or self.settings.knowledge_scope == "broad"
-                else "reject_scope"
-            ),
+            self.intent_route,
         )
         builder.add_conditional_edges(
             "understand_request",
@@ -257,14 +257,39 @@ class ServiceDeskAgent:
         await self.harness.invoke("save_case", {"case_id": case_id, "state": state})
         return state
 
-    async def run_request(self, request_id, summary=None, answer=None):
+    async def run_request(self, request_id, summary=None, answer=None, message=None):
         lock = self._case_locks.setdefault(request_id, asyncio.Lock())
         async with lock:
-            return await self._run_request(request_id, summary, answer)
+            return await self._run_request(request_id, summary, answer, message)
 
-    async def _run_request(self, request_id, summary=None, answer=None):
+    async def _run_request(self, request_id, summary=None, answer=None, message=None):
         """Classify before creating operational state; knowledge never creates a case."""
-        if answer is None:
+        from backend.app.core.principal import current_principal
+
+        owner = current_principal(self.settings).owner_id
+        if message is not None:
+            snapshot = await self.graph.aget_state(self.config(request_id))
+            if not snapshot.values:
+                raise KeyError(request_id)
+            if snapshot.values.get("request_owner") != owner:
+                raise KeyError(request_id)
+            if snapshot.next or snapshot.values.get("persist_case"):
+                raise ValueError("Continue this investigation using its pending question")
+            graph_input = {
+                "ticket": {"summary": message},
+                "status": "investigating",
+                "intent": {},
+                "evidence": [],
+                "decision": {},
+                "verification": {},
+                "research_rounds": 0,
+                "research_iteration": 0,
+                "final_answer": None,
+                "final_response": {},
+                "pending_question": None,
+            }
+            self._request_events[request_id] = []
+        elif answer is None:
             graph_input = {
                 "case_id": request_id,
                 "ticket": {"summary": summary},
@@ -290,10 +315,17 @@ class ServiceDeskAgent:
                 "contradictions": [],
                 "research_iteration": 0,
                 "research_rounds": 0,
+                "chat_messages": [],
+                "request_owner": owner,
             }
             self._request_events[request_id] = []
         else:
             snapshot = await self.graph.aget_state(self.config(request_id))
+            if (
+                not snapshot.values.get("persist_case")
+                and snapshot.values.get("request_owner") != owner
+            ):
+                raise KeyError(request_id)
             if not snapshot.next or snapshot.values.get("status") != "needs_input":
                 raise ValueError("This request is not awaiting human input")
             graph_input = Command(resume=answer)
@@ -388,13 +420,58 @@ class ServiceDeskAgent:
             {
                 "request": state["ticket"]["summary"],
                 "knowledge_scope": self.settings.knowledge_scope,
+                "conversation": state.get("chat_messages", [])[-8:],
             },
             RequestIntent,
         )
         await self.note(
             state, "classify_intent", f"Request classified: {intent.workflow}", self.provider.name()
         )
-        return {"intent": intent.model_dump(), "workflow": intent.workflow}
+        return {
+            "intent": intent.model_dump(), "workflow": intent.workflow,
+            "chat_messages": (
+                state.get("chat_messages", [])
+                if intent.workflow == "knowledge" and intent.knowledge_source == "general"
+                else []
+            ),
+        }
+
+    def intent_route(self, state):
+        intent = state["intent"]
+        if self.settings.knowledge_scope == "broad":
+            if intent["workflow"] == "knowledge" and intent.get("knowledge_source") == "general":
+                return "general_chat"
+            return "understand_request"
+        return "understand_request" if intent.get("in_scope", True) else "reject_scope"
+
+    async def general_chat(self, state):
+        answer = await self.provider.generate_structured(
+            "general_chat",
+            {
+                "message": state["ticket"]["summary"],
+                "conversation": state.get("chat_messages", [])[-8:],
+            },
+            GeneralAnswer,
+        )
+        messages = [*state.get("chat_messages", []),
+            {"role": "user", "content": state["ticket"]["summary"]},
+            {"role": "assistant", "content": answer.answer},
+        ]
+        return {
+            "persist_case": False,
+            "workflow": "knowledge",
+            "status": "assessment_ready",
+            "final_answer": answer.answer,
+            "final_response": FinalResponse(
+                issue_summary=state["ticket"]["summary"], answer=answer.answer,
+                confidence=0, uncertainty=answer.uncertainty,
+            ).model_dump(),
+            "chat_messages": messages[-16:],
+            "evidence": [],
+            "confidence": 0,
+            "uncertainty": answer.uncertainty,
+            "pending_question": None,
+        }
 
     async def reject_scope(self, state):
         return {
@@ -469,13 +546,22 @@ class ServiceDeskAgent:
     async def plan(self, state):
         if state.get("plan") and not state.get("plan_executed"):
             return {}
-        plan = await self.provider.generate_structured(
-            "plan", self.context(state, True), InvestigationPlan
-        )
-        try:
-            self.harness.validate_plan(plan, state["workflow"])
-        except ValueError as exc:
-            raise LLMError("Model plan failed tool permission or argument validation") from exc
+        context = self.context(state, True)
+        for attempt in range(2):
+            plan = await self.provider.generate_structured("plan", context, InvestigationPlan)
+            try:
+                self.harness.validate_plan(plan, state["workflow"])
+                break
+            except ValueError as exc:
+                if attempt:
+                    raise LLMError(
+                        "Model plan failed tool permission or argument validation"
+                    ) from exc
+                context["plan_validation_feedback"] = (
+                    exc.errors(include_input=False, include_url=False)
+                    if isinstance(exc, ValidationError)
+                    else "Choose only permitted capabilities from available_tools."
+                )
         await self.note(
             state,
             "plan",
@@ -575,7 +661,7 @@ class ServiceDeskAgent:
                     content=row,
                     entities=state.get("analysis", {}).get("entities", []),
                     reliability=result["reliability"],
-                    relevance=1 / (1 + max(float(row.get("score", 0)), 0)),
+                    relevance=1 / (1 + max(float(row.get("score") or 0), 0)),
                     case_id=state["case_id"] if state.get("persist_case") is not False else None,
                     url=row.get("url") or meta.get("url") or None,
                     doc_id=meta.get("doc_id"),
@@ -932,6 +1018,19 @@ class ServiceDeskAgent:
                 "contradictions",
             )
         }
+        clarifying = bool(state["decision"].get("question_for_human"))
+        if clarifying:
+            # Verify the question and its premises before interrupting. A
+            # speculative diagnosis is not a prerequisite for asking a safe
+            # clarification, and remains withheld until full assessment review.
+            context["verification_target"] = "clarification"
+            context["decision"] = {
+                **state["decision"],
+                "hypotheses": [], "inferences": [], "likely_issue": None, "answer": None,
+                "evidence_summary": state["decision"].get("question_reason")
+                or "Review the proposed clarification.",
+                "recommended_next_action": state["decision"]["question_for_human"],
+            }
         verification = await self.provider.generate_structured(
             "verify", context, VerificationResult
         )
@@ -945,7 +1044,7 @@ class ServiceDeskAgent:
             verification.confidence = 0
             verification.unsupported_claims.append("No supporting evidence is available.")
         await self.note(state, "verify", verification.justification, self.provider.name())
-        return {
+        result = {
             "verification": verification.model_dump(),
             "confidence": min(state.get("confidence", 0), verification.confidence),
             "uncertainty": list(
@@ -959,6 +1058,15 @@ class ServiceDeskAgent:
                 dict.fromkeys(state.get("contradictions", []) + verification.contradictions)
             ),
         }
+        if clarifying:
+            result.update(
+                hypotheses=[
+                    hypothesis for hypothesis in state["decision"].get("hypotheses", [])
+                    if hypothesis.get("status") == "plausible" and hypothesis.get("evidence_ids")
+                ],
+                inferences=[], likely_issue=None,
+            )
+        return result
 
     def verification_route(self, state):
         v = state["verification"]
@@ -967,10 +1075,18 @@ class ServiceDeskAgent:
             return "finalize"
         if v["contradictions"] and v["should_continue_research"]:
             return "reason"
+        if v["unsupported_claims"]:
+            return (
+                "reason"
+                if decision.get("question_for_human") or not v["should_continue_research"]
+                else "plan"
+            )
         if decision.get("question_for_human"):
             if not v["unsupported_claims"] and not v["contradictions"]:
                 return "ask_human"
-            return "reason" if v["should_continue_research"] else "finalize"
+            # A rejected candidate needs revision even if the critic says no
+            # further research is necessary. The cycle limit bounds correction.
+            return "reason"
         if v["should_continue_research"]:
             return "plan"
         return "remember" if not v["unsupported_claims"] else "finalize"

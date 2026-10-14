@@ -154,3 +154,30 @@ def test_explicit_service_failure_can_retry_the_saved_node(make_client):
     assert retry.json()["thread_id"] == cid
     events = c.get(f"/cases/{cid}/events").json()
     assert sum(e["tool"] == "analyze_ticket" for e in events) == 1
+
+
+def test_history_provenance_and_resolution_preserve_existing_records():
+    from backend.app.main import case_response
+
+    state = {"case_id": "kept", "ticket": {"summary": "Fictional VPN acceptance"}, "status": "new"}
+    assert case_response(state).origin == "demo"
+    assert "origin" not in state
+    assert case_response({**state, "origin": "user"}).origin == "user"
+    customer = {**state, "ticket": {"summary": "A customer VPN issue"}}
+    assert case_response(customer).origin == "unknown"
+    assert case_response({**state, "ticket": {"summary": "Fictional test: VPN"}}).origin == "test"
+    ready = case_response({**state, "status": "assessment_ready"})
+    assert ready.resolution_status == "unconfirmed"
+    resolved = case_response({
+        **state, "voice_intake": {"resolution_status": "user_confirmed_resolved"}
+    })
+    assert resolved.resolution_status == "user_confirmed_resolved"
+
+
+def test_explicit_case_origin_survives_investigation(make_client):
+    client = make_client()
+    created = client.post("/cases", json={"summary": TICKET}).json()
+    assert created["origin"] == "test"
+    investigated = client.post(f"/cases/{created['case_id']}/investigate").json()
+    assert investigated["origin"] == "test"
+    assert client.get(f"/cases/{created['case_id']}").json()["origin"] == "test"

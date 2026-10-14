@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import logging
 import time
 import uuid
 from contextlib import contextmanager
@@ -15,9 +16,19 @@ class ManagedStoreError(RuntimeError):
     pass
 
 
+class ManagedStateConflict(ManagedStoreError):
+    pass
+
+
 def azure_credential(settings: Settings):
     from azure.identity import AzureCliCredential, DefaultAzureCredential
 
+    # SDK HTTP INFO diagnostics include resource identifiers and request metadata.
+    # Application boundaries already report sanitized, actionable failure codes.
+    logger = logging.getLogger("azure")
+    if not any(isinstance(handler, logging.NullHandler) for handler in logger.handlers):
+        logger.addHandler(logging.NullHandler())
+    logger.propagate = False
     return (
         AzureCliCredential(process_timeout=5)
         if settings.deployment_mode == "local"
@@ -73,15 +84,34 @@ class CosmosRecords:
         return current_principal(self.settings).tenant_id
 
     def read(self, kind: str, key: str, *, tenant: str | None = None) -> dict | None:
+        from azure.core.exceptions import ServiceRequestError, ServiceResponseError
+
         try:
             scope = tenant or self.tenant()
-            row = self.container.read_item(record_id(kind, key), partition_key=scope)
+            for attempt in range(2):
+                try:
+                    row = self.container.read_item(record_id(kind, key), partition_key=scope)
+                    break
+                except Exception as error:
+                    transient = (
+                        isinstance(error, ServiceRequestError | ServiceResponseError)
+                        or getattr(error, "status_code", None) in {429, 503, 504}
+                    )
+                    if attempt or not transient:
+                        raise
+                    # A point read is idempotent. Never repeat a write, model
+                    # request or paid search under this bounded transport retry.
+                    time.sleep(0.2)
             if row.get("tenant_id") != scope:
                 raise ManagedStoreError("Managed tenant isolation check failed")
             return row
         except Exception as error:  # noqa: BLE001 - Sanitize SDK/auth failures without disclosing response bodies.
             if getattr(error, "status_code", None) == 404:
                 return None
+            logging.getLogger(__name__).warning(
+                "Managed read failed: %s HTTP %s", type(error).__name__,
+                getattr(error, "status_code", None),
+            )
             raise ManagedStoreError("Managed state could not be read") from None
 
     def write(
@@ -129,9 +159,13 @@ class CosmosRecords:
             return self.container.upsert_item(document)
         except Exception as error:  # noqa: BLE001 - Sanitize SDK/auth failures without disclosing response bodies.
             if getattr(error, "status_code", None) in {409, 412}:
-                raise ManagedStoreError(
+                raise ManagedStateConflict(
                     "Managed state changed concurrently; retry the operation"
                 ) from None
+            logging.getLogger(__name__).warning(
+                "Managed write failed: %s HTTP %s", type(error).__name__,
+                getattr(error, "status_code", None),
+            )
             raise ManagedStoreError("Managed state could not be saved") from None
 
     def query(
@@ -176,11 +210,12 @@ class CosmosRecords:
         owner = uuid.uuid4().hex
         scope = tenant or self.tenant()
         row = None
-        for _ in range(5):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
             existing = self.read(kind, key, tenant=scope)
             payload = existing["payload"] if existing else {}
             if payload.get("lock_until", 0) > time.time():
-                time.sleep(0.05)
+                time.sleep(0.1)
                 continue
             try:
                 row = self.write(
@@ -192,8 +227,8 @@ class CosmosRecords:
                     create_only=existing is None,
                 )
                 break
-            except ManagedStoreError:
-                time.sleep(0.05)
+            except ManagedStateConflict:
+                time.sleep(0.1)
         if row is None:
             raise ManagedStoreError("Managed state is busy; retry shortly")
         payload = dict(row["payload"])
@@ -204,8 +239,15 @@ class CosmosRecords:
             payload.update(lock_owner="", lock_until=0)
             self.write(kind, key, payload, previous=row, tenant=scope)
         except BaseException:
-            # No write on failure: the previous conservative reservation remains.
-            # The short lease expires automatically rather than unlocking a newer owner.
+            # Release only this lease using its original ETag and payload. Failed
+            # work is discarded; a newer owner's state cannot be overwritten.
+            # If release itself fails the short lease still expires safely.
+            try:
+                original = dict(row["payload"])
+                original.update(lock_owner="", lock_until=0)
+                self.write(kind, key, original, previous=row, tenant=scope)
+            except ManagedStoreError:
+                pass
             raise
 
     def close(self):

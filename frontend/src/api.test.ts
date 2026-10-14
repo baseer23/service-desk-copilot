@@ -1,7 +1,11 @@
 import { afterEach, expect, test, vi } from 'vitest'
-import { request } from './api'
+import { publicErrorMessage, request } from './api'
 
 afterEach(() => vi.unstubAllGlobals())
+
+test.each(['Managed state could not be read', 'Managed usage ledger unavailable', 'Cosmos service timeout'])('keeps infrastructure errors out of the normal interface: %s', message => {
+  expect(publicErrorMessage(message)).toBe('DeskMate cannot complete this request right now. Your saved work is available. Please try again later or contact your administrator.')
+})
 
 test('shows the structured readiness explanation and safe code', async () => {
   vi.stubGlobal(

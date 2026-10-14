@@ -12,10 +12,23 @@ export class VoiceAudio {
   closed = false
   generation = 0
   finishTimer: ReturnType<typeof setTimeout> | undefined
+  frames = 0
+
+  get capturing(): boolean {
+    return !this.closed && this.context?.state === 'running' &&
+      !!this.stream?.getAudioTracks().some(track => track.readyState === 'live')
+  }
+
+  setMuted(value: boolean): void {
+    this.muted = value
+    this.stream?.getAudioTracks().forEach(track => { track.enabled = !value })
+  }
 
   async start(
     send: (audio: string) => void,
     progress: (stage: string) => void = () => undefined,
+    activity: (level: number) => void = () => undefined,
+    deviceId?: string,
   ): Promise<void> {
     if (window.isSecureContext === false)
       throw new VoiceClientError(
@@ -30,7 +43,10 @@ export class VoiceAudio {
     progress('Requesting microphone permission')
     try {
       this.stream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+        audio: {
+          channelCount: 1, echoCancellation: true, noiseSuppression: true,
+          ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
+        },
         video: false,
       })
     } catch (error) {
@@ -58,16 +74,11 @@ export class VoiceAudio {
     try {
       this.context = new AudioContext({ sampleRate: 24000 })
     } catch {
-      throw new VoiceClientError(
-        'AUDIO_CONTEXT_UNAVAILABLE',
-        'Browser audio could not start. Use text support.',
-      )
+      try { this.context = new AudioContext() }
+      catch {
+        throw new VoiceClientError('AUDIO_CONTEXT_UNAVAILABLE', 'Browser audio could not start. Use text support.')
+      }
     }
-    if (this.context.sampleRate !== 24000)
-      throw new VoiceClientError(
-        'AUDIO_SAMPLE_RATE_UNSUPPORTED',
-        'This browser cannot capture 24 kHz audio. Use text support.',
-      )
     try {
       await this.context.audioWorklet.addModule('/pcm-worklet.js')
     } catch {
@@ -79,10 +90,14 @@ export class VoiceAudio {
     if (this.closed) return
     try {
       this.input = this.context.createMediaStreamSource(this.stream)
-      this.capture = new AudioWorkletNode(this.context, 'deskmate-pcm')
+      this.capture = new AudioWorkletNode(this.context, 'deskmate-pcm', {
+        channelCount: 1, channelCountMode: 'explicit', channelInterpretation: 'speakers',
+      })
       this.capture.port.onmessage = (event) => {
+        this.frames++
+        activity(this.muted || this.closed ? 0 : Number(event.data.level ?? 0))
         if (this.muted || this.closed) return
-        const bytes = new Uint8Array(event.data)
+        const bytes = new Uint8Array(event.data.audio ?? event.data)
         let value = ''
         for (const byte of bytes) value += String.fromCharCode(byte)
         send(btoa(value))

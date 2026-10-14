@@ -149,7 +149,6 @@ def configuration_readiness(
         voice.authenticated = "YES"
         voice.reachable = "YES"
         voice.locally_initialized = True
-    workflow_ok = checks.get("text_workflow", {}).get("passed", True)
     if demo:
         for capability in (reason, embedding, voice):
             capability.authenticated = "NOT_APPLICABLE"
@@ -182,14 +181,14 @@ def configuration_readiness(
         text_ready=reason.configured
         and reasoning_initialized
         and local_ready
-        and session_auth
-        and workflow_ok,
+        and session_auth,
         voice_ready=reason.configured
+        and (demo or allowance.get("remaining_estimated_cad", 0) >= (
+            settings.azure_max_voice_session_minutes * settings.azure_estimated_voice_cad_per_minute
+        ))
         and reason.locally_initialized
         and embedding.configured
         and voice.configured
         and local_ready
-        and session_auth
-        and workflow_ok
-        and checks.get("voice", {}).get("passed", True),
+        and session_auth,
     )

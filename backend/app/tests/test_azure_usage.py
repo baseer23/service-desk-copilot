@@ -113,6 +113,44 @@ def test_emergency_disable_persists_across_instances_and_restart(settings):
         other.reserve("embedding", 100)
 
 
+def test_explicit_demo_activation_preserves_charges_and_persistent_cap(settings):
+    config = enabled(settings, azure_estimated_monthly_app_limit_cad=50)
+    guard = AzureUsageGuard(config)
+    token = guard.reserve("reasoning", 500, 100)
+    guard.finish(token)
+    guard.disable()
+    guard.enable_demo(0.01, "user-authorized-demo")
+    restored = AzureUsageGuard(config)
+    assert restored.snapshot()["estimated_used_cad"] == 0.009
+    assert restored.snapshot()["limit_cad"] == 0.01
+    with pytest.raises(AzureUsageBlocked, match="allowance"):
+        restored.reserve("embedding", 2000)
+    lowered = AzureUsageGuard(
+        config.model_copy(update={"azure_estimated_monthly_app_limit_cad": 0.005})
+    )
+    assert lowered.snapshot()["limit_cad"] == 0.005
+    assert not lowered.snapshot()["enabled"]
+    restored.disable()
+    assert not AzureUsageGuard(config).snapshot()["enabled"]
+
+
+def test_demo_activation_never_clears_active_reservations_or_configuration_shutdown(settings):
+    config = enabled(settings, azure_estimated_monthly_app_limit_cad=50)
+    guard = AzureUsageGuard(config)
+    token = guard.reserve("reasoning", 100, 50)
+    guard.disable()
+    guard.enable_demo(50, "user-authorized-demo")
+    with pytest.raises(AzureUsageBlocked, match="one Azure"):
+        guard.reserve("embedding", 100)
+    guard.finish(token)
+    disabled = AzureUsageGuard(config.model_copy(update={"azure_emergency_disable": True}))
+    with pytest.raises(AzureUsageBlocked, match="configured guard"):
+        disabled.enable_demo(50, "user-authorized-demo")
+    for value in (51, float("nan"), float("inf"), -1, True):
+        with pytest.raises(ValueError):
+            guard.enable_demo(value, "user-authorized-demo")
+
+
 def test_corrupt_ledger_fails_closed(settings):
     guard = AzureUsageGuard(enabled(settings))
     guard.path.write_bytes(b"not a sqlite ledger")
@@ -489,7 +527,9 @@ def test_readiness_exposes_sanitized_failure_and_blocks_unvalidated_workflow(set
         config, reasoning_initialized=True, local_mcp="READY", private_stores="READY"
     )
     assert report.reasoning.live_validated and report.embeddings.live_validated
-    assert not report.text_ready and not report.voice_ready
+    # Historical failures remain visible but cannot permanently latch off retry
+    # after an operator fixes quota/configuration. Dispatch still enforces policy.
+    assert report.text_ready and report.voice_ready
     assert report.azure_validation["text_workflow"]["code"] == "rate_limit_exceeded"
     guard.record_check("voice", False, "private@example.com secret")
     assert guard.checks()["voice"]["code"] == "REDACTED"

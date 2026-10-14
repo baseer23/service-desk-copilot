@@ -68,7 +68,8 @@ def normalize_phone(raw: str, region: str | None = None) -> str:
 
 
 def confirmation(raw: str) -> bool | None:
-    value = raw.strip().lower().strip(".!?")
+    value = re.sub(r"\s+", " ", raw.replace("\u2019", "'").replace(",", " "))
+    value = value.strip().lower().strip(".!?")
     if value in {
         "yes",
         "yes please",
@@ -77,9 +78,18 @@ def confirmation(raw: str) -> bool | None:
         "that is correct",
         "confirm",
         "confirmed",
+        "yes that is correct",
+        "yes that's correct",
+        "yes that is right",
+        "yes that's right",
+        "that's right",
+        "that is right",
     }:
         return True
-    if value in {"no", "incorrect", "not correct", "that's wrong", "that is wrong"}:
+    if value in {
+        "no", "incorrect", "not correct", "that's wrong", "that is wrong",
+        "no that's wrong", "no that is wrong", "no that's not correct", "no that is not correct",
+    }:
         return False
     return None
 

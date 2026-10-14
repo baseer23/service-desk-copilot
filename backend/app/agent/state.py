@@ -1,10 +1,11 @@
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict
 
 
 class InvestigationState(TypedDict, total=False):
     case_id: str
     tenant_id: str
     voice_intake: dict[str, Any]
+    origin: Literal["user", "demo", "test", "unknown"]
     persist_case: bool
     route_request: bool
     ticket: dict[str, Any]
@@ -38,3 +39,5 @@ class InvestigationState(TypedDict, total=False):
     final_answer: str | None
     final_response: dict[str, Any]
     uncertainty: list[str]
+    chat_messages: list[dict[str, str]]
+    request_owner: str

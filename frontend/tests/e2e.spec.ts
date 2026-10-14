@@ -16,8 +16,8 @@ for (const summary of [
     page.on('pageerror', error => errors.push(error.name))
     await page.goto('/')
     await page.getByLabel('Question or ticket').fill(summary)
-    await page.getByRole('button', { name: 'Run DeskMate' }).click()
-    await expect(page.locator('.status-pill')).toHaveText(/needs input|assessment ready|insufficient information/)
+    await page.getByRole('button', { name: 'Send' }).click()
+    await expect(page.locator('.case-heading .status-pill')).toHaveText(/needs input|assessment ready|insufficient information/)
     await expect(page.getByRole('alert')).toHaveCount(0)
     await expect(page.getByText('ISOLATED DEMO', { exact: true }).first()).toBeVisible()
     expect(errors).toEqual([])
@@ -28,6 +28,7 @@ test('local PDF extraction, staging, dedup and cited keyword search use real HTT
   const errors: string[] = []
   page.on('pageerror', error => errors.push(error.name))
   await page.goto('/')
+  await page.getByRole('button', { name: 'Knowledge', exact: true }).click()
   await page.getByRole('button', { name: 'PDF', exact: true }).click()
   await page.getByLabel('Document title').fill('Fictional local PDF')
   await page.getByLabel('PDF document').setInputFiles({ name: 'fictional.pdf', mimeType: 'application/pdf', buffer: resumePDF() })
@@ -51,14 +52,16 @@ test('save and reopen an uninvestigated local case then explicitly investigate',
   const summary = 'Fictional printer offline request for local saving'
   await page.getByLabel('Question or ticket').fill(summary)
   await page.getByRole('button', { name: 'Save request' }).click()
-  await expect(page.locator('.status-pill')).toHaveText('new')
+  await expect(page.locator('.case-heading .status-pill')).toHaveText('new')
   await expect(page.getByText('Your request is saved. Automated investigation has not started.')).toBeVisible()
   const id = await page.getByTestId('case-id').textContent()
   await page.reload()
+  await page.getByRole('button', { name: 'Investigations', exact: true }).click()
+  await page.getByLabel('History', {exact:true}).selectOption('samples')
   await page.getByRole('button', { name: `${summary} new`, exact: true }).click()
   await expect(page.getByTestId('case-id')).toHaveText(id!)
   await page.getByRole('button', { name: 'Investigate saved case' }).click()
-  await expect(page.locator('.status-pill')).not.toHaveText('new')
+  await expect(page.locator('.case-heading .status-pill')).not.toHaveText('new')
 })
 
 test('Jake investigation interrupts twice, resumes one case and remembers facts across cases', async ({
@@ -67,13 +70,14 @@ test('Jake investigation interrupts twice, resumes one case and remembers facts 
 }) => {
   await page.goto('/')
   await page.getByLabel('Question or ticket').fill(ticket)
-  await page.getByRole('button', { name: 'Run DeskMate' }).click()
+  await page.getByRole('button', { name: 'Send' }).click()
   await expect(
     page
       .locator('.human-input .question')
       .filter({ hasText: 'Which site or floor is Jake Peralta currently working from?' }),
   ).toBeVisible()
   const caseID = (await page.getByTestId('case-id').textContent())!
+  await page.getByText('Investigation progress',{exact:true}).click()
   await expect(page.getByText('Ticket analyzed', { exact: true })).toBeVisible()
   await expect(
     page.getByText('Checking previous incidents', { exact: true }),
@@ -90,7 +94,8 @@ test('Jake investigation interrupts twice, resumes one case and remembers facts 
   await expect(page.getByTestId('case-id')).toHaveText(caseID)
   await page.getByLabel('Your answer').fill('Yes')
   await page.getByRole('button', { name: 'Continue Investigation' }).click()
-  await expect(page.locator('.status-pill')).toHaveText('assessment ready')
+  await expect(page.locator('.case-heading .status-pill')).toHaveText('assessment ready')
+  await page.getByText('Investigation details',{exact:true}).click()
   await expect(
     page.getByText(/The required update is confirmed installed. Refresh the client profile/),
   ).toBeVisible()
@@ -109,12 +114,13 @@ test('Jake investigation interrupts twice, resumes one case and remembers facts 
   expect(events.filter((e: any) => e.tool === 'remember_fact')).toHaveLength(3)
   await page.screenshot({ path: 'test-results/jake-assessment.png', fullPage: true })
   await page.getByLabel('Question or ticket').fill(ticket)
-  await page.getByRole('button', { name: 'Run DeskMate' }).click()
+  await page.getByRole('button', { name: 'Send' }).click()
   await expect(page.getByTestId('case-id')).not.toHaveText(caseID)
+  if (!await page.locator('details.assessment').evaluate(element => element.hasAttribute('open'))) await page.getByText('Investigation details',{exact:true}).click()
   await expect(
     page.getByRole('heading', { name: 'Remembered facts from previous cases' }),
   ).toBeVisible()
-  await expect(page.locator('.status-pill')).toHaveText('assessment ready')
+  await expect(page.locator('.case-heading .status-pill')).toHaveText('assessment ready')
   const secondID = (await page.getByTestId('case-id').textContent())!
   const second = await (await request.get(`/cases/${secondID}`)).json()
   expect(second.remembered_facts).toHaveLength(3)
@@ -125,6 +131,7 @@ test('Jake investigation interrupts twice, resumes one case and remembers facts 
 // Real browser requests, real MCP subprocess and temporary persistent stores.
 test('resume question uses knowledge and never asks for a floor', async ({ page, request }) => {
   await page.goto('/')
+  await page.getByRole('button', { name: 'Knowledge', exact: true }).click()
   await page.getByRole('button', { name: 'PDF', exact: true }).click()
   await page.getByLabel('Document title').fill('Abdul resume')
   await page
@@ -136,8 +143,9 @@ test('resume question uses knowledge and never asks for a floor', async ({ page,
   const answerResponse = page.waitForResponse(
     (r) => r.url().endsWith('/ask') && r.request().method() === 'POST',
   )
+  await page.getByRole('button', { name: 'Chat', exact: true }).click()
   await page.getByLabel('Question or ticket').fill('What year did Abdul graduate?')
-  await page.getByRole('button', { name: 'Run DeskMate', exact: true }).click()
+  await page.getByRole('button', { name: 'Send', exact: true }).click()
   await expect(page.getByRole('heading', { name: 'Answer', exact: true })).toBeVisible()
   await expect(page.getByText('Abdul graduated in 2022.', { exact: true })).toBeVisible()
   await expect(page.getByLabel('Your answer')).toHaveCount(0)
@@ -149,8 +157,8 @@ test('resume question uses knowledge and never asks for a floor', async ({ page,
   const events = response.events
   expect(events.some((e: any) => e.tool === 'verify')).toBeTruthy()
   expect(events.some((e: any) => e.tool === 'get_site_context')).toBeFalsy()
-  await page.getByText('Agent activity', { exact: true }).click()
-  await expect(page.getByText('Search supporting information', { exact: true })).toBeVisible()
+  await page.getByText('Investigation progress', { exact: true }).click()
+  await expect(page.getByTestId('investigation-scroll').first()).toBeVisible()
 })
 
 for (const [title, ticket, tool] of [
@@ -163,8 +171,8 @@ for (const [title, ticket, tool] of [
   }) => {
     await page.goto('/')
     await page.getByLabel('Question or ticket').fill(ticket)
-    await page.getByRole('button', { name: 'Run DeskMate', exact: true }).click()
-    await expect(page.locator('.status-pill')).toHaveText('assessment ready')
+    await page.getByRole('button', { name: 'Send', exact: true }).click()
+    await expect(page.locator('.case-heading .status-pill')).toHaveText('assessment ready')
     await expect(page.getByLabel('Your answer')).toHaveCount(0)
     const cid = (await page.getByTestId('case-id').textContent())!
     const state = await (await request.get(`/cases/${cid}`)).json()
@@ -173,6 +181,7 @@ for (const [title, ticket, tool] of [
     expect(events.some((e: any) => e.tool === tool)).toBeTruthy()
     expect(events.some((e: any) => e.tool === 'verify')).toBeTruthy()
     expect(events.some((e: any) => e.tool === 'get_site_context')).toBeFalsy()
+    await page.getByText('Investigation details',{exact:true}).click()
     await expect(page.getByRole('heading', { name: 'Contradictions', exact: true })).toBeVisible()
   })
 }
@@ -191,14 +200,14 @@ test('empty proxy response shows a readable error and a retry reaches the real a
   const before = (await (await request.get('/cases')).json()).length
   await page.goto('/')
   await page.getByLabel('Question or ticket').fill('Sarah cannot complete Microsoft 365 MFA.')
-  await page.getByRole('button', { name: 'Run DeskMate', exact: true }).click()
+  await page.getByRole('button', { name: 'Send', exact: true }).click()
   await expect(page.getByRole('alert')).toHaveText(
     'The DeskMate server is temporarily unavailable (HTTP 502). Please try again.',
   )
-  await expect(page.getByRole('button', { name: 'Run DeskMate', exact: true })).toBeEnabled()
+  await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeEnabled()
   expect((await (await request.get('/cases')).json()).length).toBe(before)
-  await page.getByRole('button', { name: 'Run DeskMate', exact: true }).click()
-  await expect(page.locator('.status-pill')).toHaveText('assessment ready')
+  await page.getByRole('button', { name: 'Send', exact: true }).click()
+  await expect(page.locator('.case-heading .status-pill')).toHaveText('assessment ready')
   await expect(page.getByRole('alert')).toHaveCount(0)
   expect((await (await request.get('/cases')).json()).length).toBe(before + 1)
   const caseID = (await page.getByTestId('case-id').textContent())!
@@ -209,13 +218,14 @@ test('empty proxy response shows a readable error and a retry reaches the real a
 
 test('browser support uses isolated real HTTP/MCP, confirmations and case save', async ({ page }) => {
   await page.goto('/')
+  await page.getByRole('button', { name: 'Voice', exact: true }).click()
   await page.getByRole('button', { name: 'Start text support' }).click()
   await expect(page.getByTestId('voice-transcript')).toContainText('AI support assistant')
   const message = async (text: string, expected: string) => {
     await page.getByLabel('Message DeskMate').fill(text)
     await page.getByRole('button', { name: 'Send message' }).click()
     await expect(page.getByTestId('voice-transcript').locator('article').last()).toContainText(expected)
-    await expect(page.getByTestId('voice-status')).not.toHaveText('assistant speaking')
+    await expect(page.getByTestId('voice-status')).not.toHaveText('Thinking')
   }
   await message('My name is Alex Test', 'Is that correct?')
   await message('yes', 'email address')
@@ -227,14 +237,16 @@ test('browser support uses isolated real HTTP/MCP, confirmations and case save',
   await message('it worked', 'You confirmed')
   await page.getByRole('button', { name: 'Save case summary' }).click()
   await expect(page.getByTestId('case-id')).toContainText('voice-')
-  await expect(page.getByTestId('voice-status')).toHaveText('completed')
+  await expect(page.getByTestId('voice-status')).toHaveText('Completed')
 })
 
 test('permission rejection never opens real microphone and offers text fallback', async ({ page }) => {
   await page.addInitScript(() => { Object.defineProperty(navigator, 'mediaDevices', { value: { getUserMedia: async () => { throw new Error('Synthetic permission rejection') } } }) })
   await page.goto('/')
+  await page.getByRole('button', { name: 'Voice', exact: true }).click()
   await page.getByRole('button', { name: 'Test microphone' }).click()
   await expect(page.getByRole('alert')).toContainText('start text support')
+  await page.getByRole('button', { name: 'Voice', exact: true }).click()
   await page.getByRole('button', { name: 'Start text support' }).click()
   await expect(page.getByTestId('voice-transcript')).toContainText('AI support assistant')
   await page.getByRole('button', { name: 'Stop session' }).click()
@@ -260,6 +272,7 @@ test('1000 alternating messages keep the browser layout bounded and support jump
     window.WebSocket = StressSocket
   })
   await page.goto('/')
+  await page.getByRole('button', { name: 'Voice', exact: true }).click()
   await page.getByRole('button', { name: 'Start text support' }).click()
   await expect.poll(() => page.getByTestId('voice-message').count()).toBeGreaterThanOrEqual(1000)
   const panel = page.getByTestId('voice-transcript')
@@ -284,14 +297,15 @@ test('fake microphone plumbing shows stages, cookie, PCM frames and cleanup with
     const stats={audioFrames:0,pings:0,tracksStopped:0}
     Object.assign(window,{voiceTestStats:stats})
     const node=()=>({connect(){},disconnect(){}})
-    Object.defineProperty(navigator,'mediaDevices',{value:{getUserMedia:async()=>({getTracks:()=>[{stop(){stats.tracksStopped++}}]})}})
+    const track={enabled:true,readyState:'live',stop(){stats.tracksStopped++}}
+    Object.defineProperty(navigator,'mediaDevices',{value:{getUserMedia:async()=>({getTracks:()=>[track],getAudioTracks:()=>[track]})}})
     class Context {
       sampleRate=24000;currentTime=0;state='running';destination={}
       audioWorklet={addModule:async(url:string)=>{const response=await fetch(url);if(!response.ok)throw new Error('processor unavailable')}}
       createMediaStreamSource(){return node()}
       createGain(){return {...node(),gain:{value:1}}}
       createBuffer(_channels:number,length:number,rate:number){return {getChannelData:()=>new Float32Array(length),duration:length/rate}}
-      createBufferSource(){return {...node(),buffer:null,onended:null,start(){},stop(){}}}
+      createBufferSource(){return {...node(),buffer:null,onended:null,start(){setTimeout(()=>Reflect.get(this,'onended')?.(),20)},stop(){}}}
       async resume(){}async close(){}
     }
     class Worklet {
@@ -310,6 +324,7 @@ test('fake microphone plumbing shows stages, cookie, PCM frames and cleanup with
     window.WebSocket=Observed
   })
   await page.goto('/')
+  await page.getByRole('button', { name: 'Voice', exact: true }).click()
   const voice=page.getByRole('region',{name:'Voice Support'})
   await expect(voice.getByText('ISOLATED DEMO',{exact:true})).toBeVisible()
   const mic=voice.getByRole('button',{name:'Test microphone',exact:true})
@@ -318,17 +333,15 @@ test('fake microphone plumbing shows stages, cookie, PCM frames and cleanup with
   expect(await mic.evaluate(el=>getComputedStyle(el).outlineStyle)).not.toBe('none')
   expect(await mic.evaluate(el=>getComputedStyle(el).borderRadius)).not.toBe('0px')
   await mic.click()
-  await expect(page.getByTestId('voice-status')).toHaveText('listening')
-  await expect(page.getByRole('list',{name:'Connection progress'})).toContainText('Requesting microphone permission')
+  await expect(page.getByTestId('voice-status')).toHaveText('Listening')
+  await expect(page.getByTestId('voice-status')).toHaveText('Listening')
   await expect.poll(()=>page.evaluate(()=>Reflect.get(window,'voiceTestStats').audioFrames)).toBeGreaterThan(0)
   expect(await page.evaluate(()=>Reflect.get(window,'voiceTestStats').pings)).toBe(1)
   expect((await context.cookies()).some(cookie=>cookie.name==='deskmate_voice_identity' && cookie.httpOnly)).toBeTruthy()
-  const controls=await voice.locator('.voice-controls').boundingBox()
-  const activity=await voice.locator('.voice-activity').boundingBox()
-  expect(controls!.y).toBeGreaterThanOrEqual(activity!.y+activity!.height)
+  await expect(page.getByRole('meter',{name:'Microphone activity'})).toBeVisible()
   await page.screenshot({path:'test-results/voice-support-polished.png',fullPage:true})
   await page.getByRole('button',{name:'Stop session'}).click()
-  await expect(page.getByTestId('voice-status')).toHaveText('stopped')
+  await expect(page.getByTestId('voice-status')).toHaveText('Stopped')
   expect(await page.evaluate(()=>Reflect.get(window,'voiceTestStats').tracksStopped)).toBeGreaterThan(0)
   await expect(page.getByRole('button',{name:'Reconnect with text'})).toHaveCount(0)
 })
@@ -341,7 +354,10 @@ test('investigation timeline and huge sources scroll independently with intentio
   await page.route('**/cases/scroll-case',route=>route.fulfill({json:current}))
   await page.route('**/cases/scroll-case/events',route=>route.fulfill({json:events}))
   await page.goto('/')
+  await page.getByRole('button', { name: 'Investigations', exact: true }).click()
+  await page.getByLabel('History', {exact:true}).selectOption('samples')
   await page.getByRole('button',{name:/Fictional VPN investigation/}).click()
+  await page.getByText('Investigation progress',{exact:true}).click()
   const timeline=page.getByTestId('investigation-scroll').first()
   const sources=page.getByTestId('evidence-scroll')
   await expect(timeline.locator('li')).toHaveCount(1000)
@@ -363,7 +379,7 @@ test('unrelated general questions stop before investigation or research', async 
   await page.goto('/')
   await page.getByLabel('Question or ticket').fill('What is the latest on immigration in Canada?')
   const response=page.waitForResponse(r=>r.url().endsWith('/ask')&&r.request().method()==='POST')
-  await page.getByRole('button',{name:'Run DeskMate',exact:true}).click()
+  await page.getByRole('button',{name:'Send',exact:true}).click()
   const body=await (await response).json()
   expect(body.case_id).toBeNull();expect(body.result.evidence).toHaveLength(0)
   expect(body.events.every((event:{tool:string})=>event.tool==='classify_intent')).toBeTruthy()
@@ -373,8 +389,9 @@ test('unrelated general questions stop before investigation or research', async 
 test('a stale isolated-demo cookie permits a fresh text session after restart', async ({ page, context }) => {
   await context.addCookies([{ name: 'deskmate_voice_identity', value: 'stale-demo-cookie', url: 'http://127.0.0.1:5184', httpOnly: true, sameSite: 'Strict' }])
   await page.goto('/')
+  await page.getByRole('button', { name: 'Voice', exact: true }).click()
   await page.getByRole('button', { name: 'Start text support', exact: true }).click()
-  await expect(page.getByTestId('voice-status')).toHaveText('listening')
+  await expect(page.getByTestId('voice-status')).toHaveText('Ready for messages')
   await expect(page.getByTestId('voice-message')).toContainText('AI support assistant')
   const cookies = await context.cookies()
   expect(cookies.some(cookie => cookie.name === 'deskmate_voice_identity' && cookie.value !== 'stale-demo-cookie' && cookie.httpOnly)).toBeTruthy()

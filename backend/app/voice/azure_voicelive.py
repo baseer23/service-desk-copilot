@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import time
+from collections import deque
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,8 @@ class AzureVoiceLiveProvider:
         self.guard_check_task: asyncio.Task[None] | None = None
         self.reply_epoch = 0
         self.response_pending = False
+        self.active_response_id = ""
+        self.response_epochs = deque()
 
     async def create_session(self) -> None:
         from azure.ai.voicelive.aio import connect
@@ -56,10 +59,10 @@ class AzureVoiceLiveProvider:
         s = self.settings
         if not s.azure_voicelive_endpoint:
             raise RuntimeError("Azure Voice Live endpoint is not configured")
-        self.usage_token = self.usage_guard.reserve("session_voice")
+        self.usage_token = await self.guard(self.usage_guard.reserve, "session_voice")
         self.started = time.monotonic()
         try:
-            self.usage_guard.require_enabled()
+            await self.guard(self.usage_guard.require_enabled)
             if self.credential is None:
                 if s.azure_use_entra_id:
                     self.credential = (
@@ -89,7 +92,7 @@ class AzureVoiceLiveProvider:
                 },
             )
             self.connection = await asyncio.wait_for(self.context.__aenter__(), 20)
-            self.ensure_active()
+            await self.ensure_active_async()
             self.watchdog_task = asyncio.create_task(self.watchdog())
             await self.connection.session.update(
                 session=RequestSession(
@@ -106,7 +109,8 @@ class AzureVoiceLiveProvider:
                         None
                         if s.azure_setup_validation_mode
                         else ServerVad(
-                            create_response=False, interrupt_response=True, auto_truncate=True
+                            threshold=0.4, prefix_padding_ms=400, silence_duration_ms=500,
+                            create_response=False, interrupt_response=False, auto_truncate=True
                         )
                     ),
                     tools=[],
@@ -131,6 +135,11 @@ class AzureVoiceLiveProvider:
         self.usage_guard.require_enabled()
         self.check_duration()
 
+    async def guard(self, function: Any, *args: Any, **kwargs: Any) -> Any:
+        if self.settings.data_platform == "azure":
+            return await asyncio.to_thread(function, *args, **kwargs)
+        return function(*args, **kwargs)
+
     def check_duration(self) -> None:
         seconds = (
             self.settings.azure_setup_max_voice_seconds
@@ -146,7 +155,9 @@ class AzureVoiceLiveProvider:
             return
         if time.monotonic() - self.guard_checked_at >= 0.25:
             if self.guard_check_task is None or self.guard_check_task.done():
-                self.guard_check_task = asyncio.create_task(asyncio.to_thread(self.usage_guard.require_enabled))
+                self.guard_check_task = asyncio.create_task(
+                    asyncio.to_thread(self.usage_guard.require_enabled)
+                )
             await asyncio.shield(self.guard_check_task)
             self.guard_checked_at = time.monotonic()
         self.check_duration()
@@ -177,15 +188,16 @@ class AzureVoiceLiveProvider:
         if len(approved_text.encode()) + 128 > self.settings.azure_max_input_tokens:
             raise RuntimeError("Azure voice reply input limit reached")
         self.response_pending = True
+        self.active_response_id = ""
+        self.response_epochs.append(epoch)
         await self.connection.response.create(
             response={
-                "instructions": "Read only this approved reply verbatim. Add no information: "
-                + approved_text,
-                "tool_choice": "none",
-                "modalities": ["audio", "text"],
-                "max_output_tokens": self.settings.azure_max_output_tokens,
-                "input_items": [],
-                "commit": False,
+                # Voice Live renders graph-approved text directly. Generic
+                # Realtime response fields can serialize yet be rejected live.
+                "pre_generated_assistant_message": {
+                    "type": "message", "role": "assistant",
+                    "content": [{"type": "text", "text": approved_text}],
+                },
             }
         )
 
@@ -248,11 +260,17 @@ class AzureVoiceLiveProvider:
                 data["channel"] = "audio_transcript" if "audio_transcript" in kind else "text"
             if kind == "response.created":
                 data["response_id"] = value.get("response", {}).get("id", "")
+                epoch = self.response_epochs.popleft() if self.response_epochs else self.reply_epoch
+                if epoch == self.reply_epoch:
+                    self.active_response_id = data["response_id"]
             if kind == "response.done":
-                self.response_pending = False
+                data["response_id"] = value.get("response", {}).get("id", "")
+                if data["response_id"] == self.active_response_id:
+                    self.response_pending = False
+                    self.active_response_id = ""
                 data["status"] = value.get("response", {}).get("status", "")
                 if self.usage_token:
-                    self.usage_guard.voice_usage(
+                    await self.guard(self.usage_guard.voice_usage,
                         self.usage_token,
                         value.get("event_id", "") or value.get("response", {}).get("id", ""),
                         value.get("response", {}).get("usage"),
@@ -271,6 +289,8 @@ class AzureVoiceLiveProvider:
     async def close_session(self) -> None:
         self.reply_epoch += 1
         self.response_pending = False
+        self.active_response_id = ""
+        self.response_epochs.clear()
         if self.guard_check_task:
             self.guard_check_task.cancel()
             await asyncio.gather(self.guard_check_task, return_exceptions=True)
@@ -295,6 +315,8 @@ class AzureVoiceLiveProvider:
         self.connection = None
         if self.usage_token:
             token, self.usage_token = self.usage_token, ""
-            self.usage_guard.finish(token, seconds=time.monotonic() - self.started)
+            await self.guard(
+                self.usage_guard.finish, token, seconds=time.monotonic() - self.started
+            )
             if self.settings.azure_live_test_mode and not self.settings.azure_setup_validation_mode:
-                self.usage_guard.disable()
+                await self.guard(self.usage_guard.disable)

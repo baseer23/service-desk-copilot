@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import { post, request } from './api'
 import { type ReadinessReport } from './readiness'
@@ -36,8 +36,21 @@ export default function KnowledgePanel({
   const [query, setQuery] = useState('')
   const [matches, setMatches] = useState<Match[]>([])
   const [searched, setSearched] = useState(false)
+  const [libraryQuery, setLibraryQuery] = useState('')
+  const [dragging, setDragging] = useState(false)
+  const picker = useRef<HTMLInputElement>(null)
   const indexingBlocked = readiness?.semantic_ingestion_ready === false
   const urlBlocked = readiness?.url_ingestion_enabled === false
+
+  function chooseFile(selected: File | undefined) {
+    if (!selected) return
+    if (selected.size > 5 * 1024 * 1024) { setError('Choose a document smaller than 5 MB.'); return }
+    setFile(selected)
+    setMode('pdf')
+    setPreview('')
+    setMessage('')
+    setError('')
+  }
 
   async function refreshDocuments() {
     const list = await request<Document[]>('/documents')
@@ -171,16 +184,19 @@ export default function KnowledgePanel({
   }
 
   return (
-    <section className="card">
+    <section className="card knowledge-card">
       <h2>Documents and knowledge</h2>
       {listError && (
         <p className="muted" role="status">
           {listError}
         </p>
       )}
-      <p className="muted">
-        Upload documents you are authorized to share with your workspace and find supporting information for your investigations.
-      </p>
+      <div className={`document-drop ${dragging ? 'dragging' : ''}`} onDragOver={event => { event.preventDefault(); setDragging(true) }} onDragLeave={() => setDragging(false)} onDrop={event => { event.preventDefault(); setDragging(false); chooseFile(event.dataTransfer.files[0]) }}>
+        <svg aria-hidden="true" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M12 16V3m-5 5 5-5 5 5M4 15v5h16v-5" /></svg>
+        <h3>{file ? file.name : 'Give your answers a source'}</h3><p>Drag a document here, or choose a file.</p>
+        <button type="button" className="button button-neutral" disabled={busy} onClick={() => picker.current?.click()}>Choose document</button>
+        <p className="muted">Share only documents you’re authorized to use.</p>
+      </div>
       <div className="tabs" role="group" aria-label="Ingestion method">
         {(['paste', 'pdf', 'url'] as const).map((item) => (
           <button
@@ -212,27 +228,23 @@ export default function KnowledgePanel({
             <input id="title" value={title} onChange={(event) => setTitle(event.target.value)} />
           </>
         )}
-        {mode === 'pdf' ? (
-          <>
+        <div hidden={mode !== 'pdf'}>
             <label htmlFor="pdf">PDF document</label>
             <input
+              ref={picker}
               id="pdf"
               type="file"
               accept={readiness?.managed_documents ? 'application/pdf,.txt,.md,.docx,.png,.jpg,.jpeg,.tiff' : 'application/pdf,.txt,.md'}
-              required
-              onChange={(event) => {
-                setFile(event.target.files?.[0] ?? null)
-                setPreview('')
-                setMessage('')
-              }}
+              required={mode === 'pdf' && !file}
+              onChange={(event) => chooseFile(event.target.files?.[0])}
             />
             <p className="muted">
               {readiness?.managed_documents ? 'PDF, Word, images or UTF-8 text; up to 5 MB. PDFs: up to 100 pages.' : 'PDF, UTF-8 .txt or .md; up to 5 MB. PDFs: up to 20 pages.'}
               {readiness?.local_ocr_available === false &&
                 ' Text preview may be unavailable for scanned documents. Upload them for processing.'}
             </p>
-          </>
-        ) : (
+          </div>
+        {mode !== 'pdf' && (
           <>
             <label htmlFor="knowledge">
               {mode === 'url' ? 'Public page URL' : 'Knowledge text'}
@@ -302,23 +314,26 @@ export default function KnowledgePanel({
       {documents.length > 0 && (
         <>
           <h3>Saved documents</h3>
-          <ul>
-            {documents.map((document) => (
+          <label htmlFor="document-filter">Search document library</label>
+          <input id="document-filter" placeholder="Find a document…" value={libraryQuery} onChange={event => setLibraryQuery(event.target.value)} />
+          <ul className="document-library">
+            {documents.filter(document => document.title.toLowerCase().includes(libraryQuery.toLowerCase())).map((document) => (
               <li key={document.id}>
                 <strong>{document.title}</strong> · {document.pages} page(s)
                 {document.version && <span> · Version {document.version}</span>}
                 {document.status && <span> · {document.status === 'ready' ? 'Ready' : document.status === 'error' ? 'Needs review' : 'Processing pending'}</span>}
                 {readiness?.managed_documents && <a href={`/documents/${document.id}/download`}>Download source</a>}
-                <button
+                {document.status !== 'ready' && <button
                   type="button"
                   disabled={busy || indexingBlocked}
                   onClick={() => void indexSaved(document.id)}
                 >
                   Process {document.title}
-                </button>
+                </button>}
               </li>
             ))}
           </ul>
+          {!documents.some(document => document.title.toLowerCase().includes(libraryQuery.toLowerCase())) && <p className="muted">No documents match your search.</p>}
         </>
       )}
       <h3>Search knowledge</h3>

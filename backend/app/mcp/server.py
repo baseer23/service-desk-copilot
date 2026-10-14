@@ -4,7 +4,7 @@ import asyncio
 import base64
 from datetime import datetime, timezone
 from functools import lru_cache, wraps
-from typing import Any
+from typing import Any, Literal
 
 from backend.app.agent.memory import CaseMemoryStore
 from backend.app.agent.models import CapabilityResult, MemoryFact
@@ -163,7 +163,11 @@ def documents():
 
 
 @capability("chroma")
-def search_knowledge(question: str, mode: str = "HYBRID", top_k: int = 6):
+def search_knowledge(
+    question: str,
+    mode: Literal["VECTOR", "GRAPH", "HYBRID", "KEYWORD"] = "HYBRID",
+    top_k: int = 6,
+):
     """Semantic document/KB retrieval. Use for factual questions, resumes, PDFs and troubleshooting documentation."""
     if mode.upper() not in {"VECTOR", "GRAPH", "HYBRID", "KEYWORD"}:
         raise ValueError("mode must be VECTOR, GRAPH, HYBRID or KEYWORD")

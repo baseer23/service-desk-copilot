@@ -195,6 +195,7 @@ test('successful synthetic capture mutes frames and stops tracks on session stop
   const node = { connect: vi.fn(), disconnect: vi.fn() }
   class Context {
     sampleRate = 24000
+    state = 'running'
     audioWorklet = { addModule: vi.fn().mockResolvedValue(undefined) }
     destination = {}
     createMediaStreamSource = () => node
@@ -215,7 +216,7 @@ test('successful synthetic capture mutes frames and stops tracks on session stop
   vi.stubGlobal('AudioWorkletNode', Worklet)
   Object.defineProperty(navigator, 'mediaDevices', {
     configurable: true,
-    value: { getUserMedia: vi.fn().mockResolvedValue({ getTracks: () => [{ stop }] }) },
+    value: { getUserMedia: vi.fn().mockResolvedValue({ getTracks: () => [{ stop }], getAudioTracks: () => [{ stop, enabled: true, readyState: 'live' }] }) },
   })
   const view = render(<VoiceSupport onCaseCreated={vi.fn()} readiness={azureReady} />)
   await userEvent.click(screen.getByRole('button', { name: 'Start voice chat' }))
@@ -231,6 +232,9 @@ test('successful synthetic capture mutes frames and stops tracks on session stop
   await userEvent.click(screen.getByRole('button', { name: 'Unmute' }))
   Worklet.last.port.onmessage?.({ data: new ArrayBuffer(960) })
   expect(JSON.parse(ws.sent[0]).type).toBe('audio.append')
+  expect(screen.getByTestId('voice-status')).not.toHaveTextContent('Listening')
+  act(() => ws.emit('audio.delivery', 2, { frames: 1 }))
+  await waitFor(() => expect(screen.getByTestId('voice-status')).toHaveTextContent('Listening'))
   await userEvent.click(screen.getByRole('button', { name: 'Stop session' }))
   expect(stop).toHaveBeenCalledOnce()
   expect(contextClose).toHaveBeenCalledOnce()
@@ -252,7 +256,7 @@ test('client queue and send buffer saturation close the session explicitly', asy
     for (let index = 0; index < 65; index++) ws.emit('audio', index + 2, { audio: 'AAA=' })
   })
   expect(screen.getByRole('alert')).toHaveTextContent('queue is full')
-  expect(screen.getByTestId('voice-status')).toHaveTextContent('failed')
+  expect(screen.getByTestId('voice-status')).toHaveTextContent('Failed')
 })
 
 test('isolated demo has an explicit warning and a microphone plumbing button', () => {
@@ -266,7 +270,7 @@ test('isolated demo has an explicit warning and a microphone plumbing button', (
   expect(
     screen.getByText('Responses and audio are simulated in this sample session.'),
   ).toBeInTheDocument()
-  expect(screen.getByRole('button', { name: 'Test microphone' })).toHaveClass('button-primary')
+  expect(screen.getByRole('button', { name: 'Test microphone' })).toHaveClass('microphone-orb')
   expect(screen.queryByRole('button', { name: 'Start voice chat' })).not.toBeInTheDocument()
   expect(screen.getByText(/will not recognize speech or speak/)).toBeInTheDocument()
   expect(screen.getByRole('button', { name: 'Start text support' })).toBeEnabled()
@@ -300,7 +304,7 @@ test('late playback failure from a stopped session cannot close the new session'
   await act(async () => {
     rejectPlayback(new Error('private expired playback response'))
   })
-  expect(screen.getByTestId('voice-status')).toHaveTextContent('listening')
+  expect(screen.getByTestId('voice-status')).toHaveTextContent('Ready for messages')
   expect(screen.queryByRole('alert')).not.toBeInTheDocument()
 })
 
@@ -352,7 +356,7 @@ test('AudioWorklet load failure is visible and capture is cleaned up', async () 
   const stop = vi.fn()
   Object.defineProperty(navigator, 'mediaDevices', {
     configurable: true,
-    value: { getUserMedia: vi.fn().mockResolvedValue({ getTracks: () => [{ stop }] }) },
+    value: { getUserMedia: vi.fn().mockResolvedValue({ getTracks: () => [{ stop }], getAudioTracks: () => [{ stop, enabled: true, readyState: 'live' }] }) },
   })
   class Context {
     sampleRate = 24000

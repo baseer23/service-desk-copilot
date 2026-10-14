@@ -101,10 +101,19 @@ export default function VoiceSupport({
   const [saving, setSaving] = useState(false)
   const [microphoneActive, setMicrophoneActive] = useState(false)
   const [microphoneRequested, setMicrophoneRequested] = useState(false)
+  const [inputLevel, setInputLevel] = useState(0)
+  const [captureReady, setCaptureReady] = useState(false)
+  const [delivered, setDelivered] = useState(false)
+  const [speaking, setSpeaking] = useState(false)
+  const [deviceId, setDeviceId] = useState('')
+  const [devices, setDevices] = useState<MediaDeviceInfo[]>([])
+  const lastCapture = useRef(0)
+  const lastMeter = useRef(0)
   const attempt = useRef(0)
   const explicitlyStopped = useRef(false)
   const connectionTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const readyTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const heartbeatTimer = useRef<ReturnType<typeof setInterval> | undefined>(undefined)
   const [conversation, setConversation] = useState<Conversation | null>(null)
   const [turns, setTurns] = useState<Turn[]>([])
   const [status, setStatus] = useState('idle')
@@ -128,10 +137,12 @@ export default function VoiceSupport({
     attempt.current++
     clearTimeout(connectionTimer.current)
     clearTimeout(readyTimer.current)
+    clearInterval(heartbeatTimer.current)
     playbackEpoch.current++
     audioQueue.current = { pending: 0 }
     playback.current = Promise.resolve()
     streamReady.current = false
+    lastCapture.current = 0
     audio.current?.close()
     audio.current = null
     const ws = socket.current
@@ -146,6 +157,20 @@ export default function VoiceSupport({
       cleanup()
     }
   }, [cleanup])
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setCaptureReady(!!audio.current?.capturing && Date.now() - lastCapture.current < 2000)
+      setSpeaking(!!audio.current?.playback.size)
+    }, 500)
+    return () => window.clearInterval(timer)
+  }, [])
+  async function listMicrophones() {
+    try {
+      const available = await navigator.mediaDevices?.enumerateDevices()
+      if (mounted.current) setDevices((available ?? []).filter(device => device.kind === 'audioinput'))
+    } catch { /* Device selection is optional; capture errors remain explicit. */ }
+  }
+  useEffect(() => { void listMicrophones() }, [])
 
   function fail(error: unknown) {
     const visible = visibleVoiceError(error)
@@ -153,12 +178,13 @@ export default function VoiceSupport({
 
     cleanup()
     setMicrophoneActive(false)
+    setInputLevel(0)
     setStatus('failed')
   }
   function send(type: string, payload: Record<string, unknown> = {}) {
     const ws = socket.current
-    if (type === 'audio.append' && !streamReady.current) return
-    if (ws?.readyState !== WebSocket.OPEN) return
+    if (type === 'audio.append' && !streamReady.current) return false
+    if (ws?.readyState !== WebSocket.OPEN) return false
     if (ws.bufferedAmount > 262144) {
       fail(
         new VoiceClientError(
@@ -166,7 +192,7 @@ export default function VoiceSupport({
           'Audio connection is too slow. Reconnect or use text.',
         ),
       )
-      return
+      return false
     }
     ws.send(
       JSON.stringify({
@@ -177,6 +203,7 @@ export default function VoiceSupport({
         payload,
       }),
     )
+    return true
   }
   function merge(id: string, role: Turn['role'], value: string, partial: boolean) {
     setTurns((old) => {
@@ -234,7 +261,7 @@ export default function VoiceSupport({
           const state = p.conversation as Conversation
           streamReady.current = !terminal.has(state.status)
           clearTimeout(readyTimer.current)
-          setStage(terminal.has(state.status) ? '' : 'Listening')
+          setStage('')
           setConversation(state)
           setTurns(state.turns)
           setStatus(state.status)
@@ -242,7 +269,8 @@ export default function VoiceSupport({
             audio.current?.stopCapture()
             setMicrophoneActive(false)
           }
-        } else if (message.type === 'status') setStatus(String(p.status))
+        } else if (message.type === 'audio.delivery') setDelivered(Number(p.frames) > 0)
+        else if (message.type === 'status') setStatus(String(p.status))
         else if (message.type.startsWith('transcript.'))
           merge(
             String(p.turn_id),
@@ -294,6 +322,7 @@ export default function VoiceSupport({
       clearTimeout(connectionTimer.current)
       setStage('Connected')
       send('ping')
+      heartbeatTimer.current = setInterval(() => { if (socket.current === ws) send('ping') }, 20000)
       readyTimer.current = setTimeout(() => {
         if (socket.current === ws && !streamReady.current)
           fail(
@@ -317,6 +346,7 @@ export default function VoiceSupport({
       if (socket.current !== ws || !mounted.current) return
       clearTimeout(connectionTimer.current)
       clearTimeout(readyTimer.current)
+      clearInterval(heartbeatTimer.current)
       socket.current = null
       streamReady.current = false
       audio.current?.finish()
@@ -363,6 +393,9 @@ export default function VoiceSupport({
     setMicrophoneRequested(withMicrophone)
     setStage('Preparing session')
     setMuted(false)
+    setDelivered(false)
+    setCaptureReady(false)
+    setInputLevel(0)
     audio.current?.close()
     audio.current = new VoiceAudio()
     try {
@@ -372,8 +405,17 @@ export default function VoiceSupport({
           (next) => {
             if (attempt.current === currentAttempt && mounted.current) setStage(next)
           },
+          (level) => {
+            lastCapture.current = Date.now()
+            if (Date.now() - lastMeter.current >= 100 && mounted.current) {
+              setInputLevel(level)
+              lastMeter.current = Date.now()
+            }
+          },
+          deviceId || undefined,
         )
         setMicrophoneActive(!!audio.current?.stream)
+        void listMicrophones()
       }
       if (!mounted.current || attempt.current !== currentAttempt || !starting.current) return
       setStage('Connecting')
@@ -381,7 +423,7 @@ export default function VoiceSupport({
         '/voice/sessions',
         post(
           resume && conversation
-            ? { resume_session_id: conversation.session_id, mode: 'text' }
+            ? { resume_session_id: conversation.session_id, mode: withMicrophone ? 'voice' : 'text' }
             : { mode: withMicrophone ? 'voice' : 'text' },
         ),
       )
@@ -409,6 +451,7 @@ export default function VoiceSupport({
     setStatus('stopped')
     setStage('')
     setMicrophoneActive(false)
+    setInputLevel(0)
     if (id)
       try {
         const state = await request<Conversation>(`/voice/sessions/${id}/stop`, post())
@@ -441,6 +484,15 @@ export default function VoiceSupport({
   }
   const connected = !terminal.has(status) && status !== 'idle' && status !== 'connecting'
   const busy = status === 'connecting'
+  const listeningReady = streamReady.current && captureReady && delivered && microphoneActive
+  const displayStatus = terminal.has(status) ? status[0].toUpperCase() + status.slice(1) :
+    status === 'idle' ? 'Ready to talk' :
+    muted && microphoneActive ? 'Microphone muted' :
+    busy || !streamReady.current ? 'Connecting' :
+    speaking ? 'Speaking' :
+    status === 'assistant_speaking' ? 'Thinking' :
+    ['processing', 'using_tools'].includes(status) ? 'Thinking' :
+    microphoneRequested ? (listeningReady ? 'Listening' : 'Connecting') : 'Ready for messages'
   const canReconnect =
     conversation &&
     !explicitlyStopped.current &&
@@ -461,11 +513,7 @@ export default function VoiceSupport({
           <span className="eyebrow">TALK TO DESKMATE</span>
           <h2>Voice Support</h2>
         </div>
-        <span className={`provider-badge ${demo ? 'demo' : ''}`}>
-          {demo ? 'Sample session' : 'Support conversation'}
-        </span>
       </header>
-      <p>Investigate an IT issue through voice or text, with a visible transcript and sources.</p>
       {demo && (
         <div className="demo-banner">
           <strong>ISOLATED DEMO</strong>
@@ -476,26 +524,42 @@ export default function VoiceSupport({
           </p>
         </div>
       )}
-      <div className="readiness-summary" aria-label="Support availability">
-        <span>Text support: {readiness?.text_ready ? 'Available' : 'Temporarily unavailable'}</span>
-        <span>Voice support: {readiness?.voice_ready ? 'Available' : 'Temporarily unavailable'}</span>
+      {(error || !readiness?.voice_ready) && <div className="readiness-summary" aria-label="Support availability">
         <button type="button" className="button button-subtle" disabled={checking || busy}
           onClick={() => void refresh()}>{checking ? 'Checking status…' : 'Refresh status'}</button>
-      </div>
+      </div>}
       {readiness && !readiness.voice_ready && <p className="readiness-note">Voice support is temporarily unavailable. You can save your request and search knowledge.</p>}
       {readiness && !readiness.text_ready && <p className="readiness-note">Text support is temporarily unavailable. You can save your request and return later.</p>}
       {!readiness && <p className="readiness-note">Support availability could not be checked. Refresh status or try again later.</p>}
+      <div className="voice-center">
+        <button type="button" className={`microphone-orb ${listeningReady && !muted ? 'listening' : ''}`}
+          aria-label={connected ? (muted ? 'Unmute microphone' : 'Mute microphone') : demo ? 'Test microphone' : 'Start voice chat'}
+          aria-pressed={connected ? muted : undefined}
+          disabled={busy || (!connected && !readiness?.voice_ready) || (connected && !microphoneActive)}
+          onClick={() => {
+            if (!connected) void start(true)
+            else { audio.current?.setMuted(!muted); setMuted(!muted); setInputLevel(0) }
+          }}>
+          <svg viewBox="0 0 24 24" width="34" height="34" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8"/></svg>
+        </button>
+        <div className="microphone-meter" role="meter" aria-label="Microphone activity"
+          aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(Math.min(1, inputLevel * 8) * 100)}>
+          {Array.from({ length: 15 }, (_, i) => <i key={i} style={{ height: `${6 + Math.min(1, inputLevel * 8) * (30 - Math.abs(7 - i) * 3)}px` }} />)}
+        </div>
       <div className="voice-state">
         <span className={`status-dot ${connected ? 'active' : ''}`} aria-hidden="true" />
         <p role="status" data-testid="voice-status">
-          {status.replace(/_/g, ' ')}
+          {displayStatus}
         </p>
-        {microphoneActive && <span>Microphone {muted ? 'muted' : 'on'}</span>}
+      </div>
+      {!connected && !busy && <p className="muted">Start a conversation. I’m here to help.</p>}
+      {microphoneRequested && listeningReady && !muted && inputLevel < 0.001 && <p className="muted">Speak naturally. The microphone meter moves when sound is captured.</p>}
+      {!connected && <><label htmlFor="microphone-device">Microphone</label><select id="microphone-device" value={deviceId} disabled={busy} onChange={event => setDeviceId(event.target.value)}><option value="">System default</option>{devices.filter(device => device.deviceId !== 'default').map((device, i) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Microphone ${i + 1}`}</option>)}</select></>}
       </div>
       {stage && (
         <div className="connection-progress">
           <p aria-live="polite">{stage}</p>
-          <ol aria-label="Connection progress">
+          <ol className="sr-only" aria-label="Connection progress">
             {stages.map((label, index) => (
               <li
                 key={label}
@@ -516,14 +580,14 @@ export default function VoiceSupport({
 
         </div>
       )}
-      <Transcript turns={turns} />
-      {!turns.length && (
+      {conversation && <Transcript turns={turns} />}
+      {!turns.length && conversation && (
         <p className="voice-empty">
           Your conversation will appear above. Start text support, or{' '}
           {demo ? 'test the microphone transport' : 'start voice chat'} when ready.
         </p>
       )}
-      <details className="voice-activity">
+      <details className="voice-activity" hidden>
         <summary>Activity</summary>
         {/* eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- Keyboard users must be able to scroll the bounded activity region. */}
         <div role="region" tabIndex={0} aria-label="Voice activity">
@@ -536,15 +600,6 @@ export default function VoiceSupport({
       </details>
       <div className="voice-controls">
         <div className="voice-button-row">
-          <button
-            type="button"
-            className="button button-primary"
-            disabled={!!socket.current || busy || !readiness?.voice_ready}
-            aria-busy={busy}
-            onClick={() => void start(true)}
-          >
-            {demo ? 'Test microphone' : 'Start voice chat'}
-          </button>
           <button
             type="button"
             className="button button-secondary"
@@ -564,28 +619,30 @@ export default function VoiceSupport({
               Reconnect with text
             </button>
           )}
-          <button
+          {canReconnect && microphoneRequested && <button type="button" className="button button-secondary" disabled={!readiness?.voice_ready || busy} onClick={() => void start(true, true)}>Reconnect voice</button>}
+          {(connected || busy) && <button
             type="button"
             className="button button-toggle"
             aria-pressed={muted}
             disabled={!connected || !microphoneActive}
             onClick={() => {
               if (audio.current) {
-                audio.current.muted = !muted
+                audio.current.setMuted(!muted)
                 setMuted(!muted)
+                setInputLevel(0)
               }
             }}
           >
             {muted ? 'Unmute' : 'Mute'}
-          </button>
-          <button
+          </button>}
+          {(connected || busy) && <button
             type="button"
             className="button button-danger"
             disabled={!connected && !busy}
             onClick={() => void stop()}
           >
             Stop session
-          </button>
+          </button>}
           {conversation && (
             <button
               type="button"
@@ -604,7 +661,7 @@ export default function VoiceSupport({
             through text.
           </p>
         )}
-        <form className="voice-composer" onSubmit={submit}>
+        {conversation && <form className="voice-composer" onSubmit={submit}>
           <label htmlFor="voice-text">Message DeskMate</label>
           <div>
             <input
@@ -619,7 +676,7 @@ export default function VoiceSupport({
               Send message
             </button>
           </div>
-        </form>
+        </form>}
       </div>
     </section>
   )

@@ -157,14 +157,14 @@ def register_voice_routes(app: FastAPI) -> None:
     @app.post("/voice/sessions", status_code=201)
     async def start(body: SessionStart, request: Request, response: Response) -> dict[str, Any]:
         service = manager()
-        service.ready(body.mode)
+        await service.store(service.ready, body.mode)
         actor, token = await actor_for(
             request, service.settings, create=not bool(body.resume_session_id)
         )
         state = (
-            service.repository.get(body.resume_session_id, actor)
+            await service.store(service.repository.get, body.resume_session_id, actor)
             if body.resume_session_id
-            else service.create(actor, body.mode)
+            else await service.store(service.create, actor, body.mode)
         )
         if body.resume_session_id and (
             state.status.value == "completed" or state.failure_category == "explicit_stop"
@@ -183,7 +183,9 @@ def register_voice_routes(app: FastAPI) -> None:
                     )
                 conversation.mode = body.mode
 
-            state = service.repository.update(state.session_id, actor, switch_mode)
+            state = await service.store(
+                service.repository.update, state.session_id, actor, switch_mode
+            )
         response.set_cookie(
             COOKIE_NAME,
             token,
@@ -199,17 +201,20 @@ def register_voice_routes(app: FastAPI) -> None:
     @app.get("/voice/sessions/{session_id}")
     async def get(session_id: str, request: Request) -> dict[str, Any]:
         actor, _ = await actor_for(request, manager().settings)
-        return manager().repository.get(session_id, actor).public()
+        service = manager()
+        return (await service.store(service.repository.get, session_id, actor)).public()
 
     @app.post("/voice/sessions/{session_id}/stop")
     async def stop(session_id: str, request: Request) -> dict[str, Any]:
         actor, _ = await actor_for(request, manager().settings)
-        return manager().end(session_id, actor).public()
+        service = manager()
+        state = await service.end_session(session_id, actor)
+        return state.public()
 
     @app.post("/voice/sessions/{session_id}/create-case")
     async def create_case(session_id: str, request: Request) -> dict[str, Any]:
         actor, token = await actor_for(request, manager().settings)
-        manager().repository.get(session_id, actor)
+        await manager().store(manager().repository.get, session_id, actor)
         result = await manager().harness.invoke(
             "create_case_from_voice_session", {"session_id": session_id, "identity_token": token}
         )
