@@ -67,7 +67,7 @@ daily sessions, twenty turns and emergency shutdown are preserved. CAD 10 Azure
 budget alerts remain. Estimates are not an Azure invoice cap.
 
 Validation exhausted most of the application estimate. Voice sessions were
-tightened to three minutes so a demo can fit the remaining allowance; the normal
+tightened to two minutes so a demo can fit the remaining allowance; the normal
 ten-minute reservation requires CAD 5. A proposed CAD 175 total allowance has not
 been applied without separate approval. Use protected `/admin/readiness` to
 inspect current estimates before the demo.
@@ -139,7 +139,7 @@ AZURE_ESTIMATED_MONTHLY_APP_LIMIT_CAD=150
 AZURE_ESTIMATED_INFRASTRUCTURE_CAD=90
 AZURE_MAX_LIVE_SESSIONS_PER_DAY=20
 AZURE_MAX_CONCURRENT_SESSIONS=1
-AZURE_MAX_VOICE_SESSION_MINUTES=3
+AZURE_MAX_VOICE_SESSION_MINUTES=2
 AZURE_MAX_TURNS_PER_SESSION=20
 AZURE_REASONING_MIN_INTERVAL_SECONDS=1
 AZURE_EMBEDDING_MIN_INTERVAL_SECONDS=1
