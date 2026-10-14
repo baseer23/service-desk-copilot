@@ -10,7 +10,8 @@ export interface CapabilityReadiness {
   missing: string[]
 }
 export interface ReadinessReport {
-  runtime_mode: 'isolated_demo' | 'azure'
+  runtime_mode: 'isolated_demo' | 'azure' | 'standard'
+  managed_documents?: boolean
   reasoning: CapabilityReadiness
   embeddings: CapabilityReadiness
   voice: CapabilityReadiness
@@ -38,17 +39,7 @@ export interface ReadinessReport {
 }
 export function reasoningBlocker(report: ReadinessReport | null): string | null {
   if (!report || report.text_ready) return null
-  const failure = report.azure_validation?.text_workflow
-  const usage = report.azure_usage
-  return [
-    usage && !usage.enabled
-      ? 'Azure requests are disabled by the usage guard or emergency shutdown.'
-      : 'Azure reasoning is not ready.',
-    failure && !failure.passed ? `Last workflow failure: ${failure.code}.` : '',
-    'You can save cases, extract documents and search local knowledge without Azure.',
-  ]
-    .filter(Boolean)
-    .join(' ')
+  return 'Automated investigation is temporarily unavailable. You can still save your request, upload documents and search available knowledge.'
 }
 
 export function useReadiness(supplied?: ReadinessReport | null): {
@@ -62,7 +53,7 @@ export function useReadiness(supplied?: ReadinessReport | null): {
     setChecking(true)
     try {
       const report = await request<ReadinessReport>('/readiness')
-      setReadiness(report.runtime_mode && report.reasoning && report.voice ? report : null)
+      setReadiness(report.runtime_mode && typeof report.text_ready === 'boolean' && typeof report.voice_ready === 'boolean' ? report : null)
     } catch {
       setReadiness(null)
     } finally {

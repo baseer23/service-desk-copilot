@@ -30,7 +30,9 @@ export default defineConfig({
         KNOWLEDGE_SCOPE: 'support',
         RESEARCH_SOURCE_POLICY: 'prefer_primary',
         MAX_INVESTIGATION_CYCLES: '8',
-        MAX_RESEARCH_ROUNDS: '2',
+        // Research routing has backend tests with explicit external-service mocks.
+        // Public crawling here would persist nondeterministic pages into this suite's KB.
+        MAX_RESEARCH_ROUNDS: '0',
         EMBED_PROVIDER: 'stub',
         NEO4J_URI: '',
         CASE_DB_PATH: join(runtime, 'cases.db'),

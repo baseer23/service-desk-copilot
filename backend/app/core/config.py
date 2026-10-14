@@ -1,6 +1,7 @@
 """Azure-only live settings. Private local environment files are never rewritten."""
 
 import json
+import uuid
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -22,6 +23,26 @@ class Settings(BaseSettings):
     embed_provider: Literal["azure_openai", "stub"] = "azure_openai"
     test_mode: bool = False
     deployment_mode: Literal["local", "production"] = "local"
+    data_platform: Literal["local", "azure"] = "local"
+    azure_cosmos_endpoint: str = ""
+    azure_cosmos_database: str = "deskmate"
+    azure_cosmos_container: str = "state"
+    azure_storage_account_url: str = ""
+    azure_storage_container: str = "documents"
+    azure_search_endpoint: str = ""
+    azure_search_index: str = "knowledge"
+    azure_search_semantic_enabled: bool = True
+    azure_document_endpoint: str = ""
+    azure_document_api_version: str = "2024-11-30"
+    azure_document_free_tier: bool = True
+    azure_document_monthly_page_limit: int = Field(default=500, ge=1, le=500)
+    azure_key_vault_url: str = ""
+    azure_session_secret_name: str = "deskmate-session-signing-key"
+    auth_client_id: str = ""
+    auth_allowed_tenants: Annotated[list[str], NoDecode] = []
+    auth_operator_ids: Annotated[list[str], NoDecode] = []
+    enable_local_fixtures: bool = True
+    enable_public_web_tools: bool = False
     model_timeout_sec: int = Field(default=30, ge=1, le=120)
     azure_foundry_endpoint: str = Field(
         default="",
@@ -117,7 +138,13 @@ class Settings(BaseSettings):
         env_file=PROJECT_ROOT / ".env", extra="ignore", hide_input_in_errors=True
     )
 
-    @field_validator("allowed_origins", "research_preferred_domains", mode="before")
+    @field_validator(
+        "allowed_origins",
+        "research_preferred_domains",
+        "auth_allowed_tenants",
+        "auth_operator_ids",
+        mode="before",
+    )
     @classmethod
     def parse_origins(cls, value: str | list[str]) -> list[str]:
         if isinstance(value, str):
@@ -145,6 +172,59 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_runtime(self) -> "Settings":
+        if len(self.auth_allowed_tenants) > 8:
+            raise ValueError("The pilot supports at most eight authorized tenants")
+        if self.data_platform == "azure" and not self.azure_document_free_tier:
+            raise ValueError("Paid document analysis requires an explicitly approved cost policy")
+        if self.deployment_mode == "production":
+            if self.data_platform != "azure":
+                raise ValueError("Production tenant isolation requires managed Azure storage")
+            if (
+                not self.auth_client_id
+                or not self.auth_allowed_tenants
+                or not self.voice_session_signing_key
+            ):
+                raise ValueError(
+                    "Production requires an application audience, authorized tenants and a persistent signing key"
+                )
+            for identifier in [
+                self.auth_client_id,
+                *self.auth_allowed_tenants,
+                *self.auth_operator_ids,
+            ]:
+                try:
+                    uuid.UUID(identifier)
+                except ValueError:
+                    raise ValueError(
+                        "Identity configuration requires valid object identifiers"
+                    ) from None
+            if self.enable_local_fixtures:
+                raise ValueError("Production must disable fictional enterprise context")
+        managed_endpoints = {
+            "azure_cosmos_endpoint": ".documents.azure.com",
+            "azure_storage_account_url": ".blob.core.windows.net",
+            "azure_search_endpoint": ".search.windows.net",
+            "azure_document_endpoint": ".cognitiveservices.azure.com",
+            "azure_key_vault_url": ".vault.azure.net",
+        }
+        for name, suffix in managed_endpoints.items():
+            value = getattr(self, name)
+            if value:
+                parsed = urlsplit(value)
+                if (
+                    parsed.scheme != "https"
+                    or not parsed.hostname
+                    or not parsed.hostname.endswith(suffix)
+                    or parsed.username
+                    or parsed.password
+                    or parsed.query
+                    or parsed.fragment
+                    or parsed.path not in {"", "/"}
+                    or parsed.port not in {None, 443}
+                ):
+                    raise ValueError("Managed endpoints require Microsoft HTTPS resource origins")
+            elif self.data_platform == "azure" and name != "azure_key_vault_url":
+                raise ValueError("Managed storage and document endpoints are required")
         if self.azure_live_test_mode:
             self.allow_url_ingest = False
             self.max_research_rounds = 0
@@ -168,6 +248,11 @@ class Settings(BaseSettings):
             and len(self.voice_session_signing_key.get_secret_value()) < 32
         ):
             raise ValueError("VOICE_SESSION_SIGNING_KEY requires at least 32 characters")
+        if (
+            self.voice_session_signing_key
+            and self.voice_session_signing_key.get_secret_value().startswith("@Microsoft.KeyVault(")
+        ):
+            raise ValueError("The persistent signing secret reference must resolve before startup")
         if self.neo4j_uri and not self.neo4j_uri.startswith(("neo4j+s://", "neo4j+ssc://")):
             raise ValueError("NEO4J_URI must be an Aura TLS URI or empty")
         for endpoint in (self.azure_foundry_endpoint, self.azure_voicelive_endpoint):

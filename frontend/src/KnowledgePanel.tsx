@@ -8,12 +8,14 @@ interface Document {
   title: string
   source_type: string
   pages: number
+  status?: string
+  version?: number
 }
 interface Match {
   id: string
   text: string
   storage: string
-  metadata: { title?: string; doc_id?: string }
+  metadata: { title?: string; doc_id?: string; page?: number; source?: string }
 }
 
 export default function KnowledgePanel({
@@ -47,6 +49,24 @@ export default function KnowledgePanel({
       setListError('Saved documents could not be loaded. Check the server and reload the page.'),
     )
   }, [])
+  useEffect(() => {
+    if (!readiness?.managed_documents || !readiness.semantic_ingestion_ready || !documents.some(document => document.status !== 'ready' && document.status !== 'error')) return
+    let timer: number | undefined
+    const stop = () => { if (timer !== undefined) window.clearInterval(timer); timer = undefined }
+    const visibility = () => {
+      stop()
+      if (document.visibilityState === 'hidden') return
+      timer = window.setInterval(() => {
+        void refreshDocuments().catch(() => {
+          stop()
+          setListError('Document status could not be refreshed. Reload the page to try again.')
+        })
+      }, 10000)
+    }
+    visibility()
+    document.addEventListener('visibilitychange', visibility)
+    return () => { stop(); document.removeEventListener('visibilitychange', visibility) }
+  }, [documents, readiness?.managed_documents, readiness?.semantic_ingestion_ready])
 
   async function action(kind: 'index' | 'save' | 'extract') {
     setBusy(true)
@@ -62,6 +82,7 @@ export default function KnowledgePanel({
         if (title) body.append('title', title)
         options = { method: 'POST', body }
         path =
+          readiness?.managed_documents && kind !== 'extract' ? '/documents/upload' :
           kind === 'extract'
             ? '/documents/extract'
             : kind === 'save'
@@ -72,7 +93,7 @@ export default function KnowledgePanel({
       } else {
         if (!text.trim()) throw new Error('Enter knowledge text or a URL first.')
         path =
-          mode === 'url' ? '/ingest/url' : kind === 'save' ? '/documents/paste' : '/ingest/paste'
+          mode === 'url' ? '/ingest/url' : kind === 'save' || readiness?.managed_documents ? '/documents/paste' : '/ingest/paste'
         options = post(mode === 'url' ? { url: text } : { title: title || null, text })
       }
       let result = await request<{
@@ -81,25 +102,29 @@ export default function KnowledgePanel({
         pages?: number
         chunks: number
         duplicate?: boolean
+        status?: string
       }>(path, options)
-      if (kind === 'index' && path === '/documents/upload' && result.id) {
+      if (kind === 'index' && !readiness?.managed_documents && path === '/documents/upload' && result.id) {
         result = await request(`/documents/${result.id}/index`, post())
       }
       if (kind === 'extract') {
         setPreview(result.text ?? '')
-        setMessage(`Extracted ${result.pages} page(s) locally. No Azure request was made.`)
+        setMessage(`Text preview is ready (${result.pages} page(s)).`)
+      } else if (result.status && result.status !== 'ready') {
+        setMessage('Your document is uploaded. It will appear in knowledge when processing is complete.')
+        await refreshDocuments()
       } else if (kind === 'save') {
         setMessage(
           result.duplicate
-            ? 'This document is already saved locally.'
-            : `${result.chunks} chunks saved locally. Keyword search is available; semantic indexing is separate.`,
+            ? 'This document is already saved.'
+            : 'Your document is saved. Search available knowledge or return when processing is complete.',
         )
         await refreshDocuments()
       } else {
         setMessage(
           result.duplicate
             ? 'This content is already in knowledge.'
-            : `${result.chunks} knowledge chunks ingested.`,
+            : 'Your document was added to knowledge.',
         )
       }
     } catch (caught) {
@@ -119,8 +144,8 @@ export default function KnowledgePanel({
       )
       setMessage(
         result.duplicate
-          ? 'This content is already in semantic knowledge.'
-          : `${result.chunks} chunks indexed for semantic retrieval.`,
+          ? 'This document is already in knowledge.'
+          : 'Your document is ready for knowledge search.',
       )
     } catch (caught) {
       setError((caught as Error).message)
@@ -147,14 +172,14 @@ export default function KnowledgePanel({
 
   return (
     <section className="card">
-      <h2>Knowledge ingestion</h2>
+      <h2>Documents and knowledge</h2>
       {listError && (
         <p className="muted" role="status">
           {listError}
         </p>
       )}
       <p className="muted">
-        Save and search documents locally. Azure embeddings are required for semantic indexing.
+        Upload documents you are authorized to share with your workspace and find supporting information for your investigations.
       </p>
       <div className="tabs" role="group" aria-label="Ingestion method">
         {(['paste', 'pdf', 'url'] as const).map((item) => (
@@ -193,7 +218,7 @@ export default function KnowledgePanel({
             <input
               id="pdf"
               type="file"
-              accept="application/pdf,.txt,.md"
+              accept={readiness?.managed_documents ? 'application/pdf,.txt,.md,.docx,.png,.jpg,.jpeg,.tiff' : 'application/pdf,.txt,.md'}
               required
               onChange={(event) => {
                 setFile(event.target.files?.[0] ?? null)
@@ -202,9 +227,9 @@ export default function KnowledgePanel({
               }}
             />
             <p className="muted">
-              PDF, UTF-8 .txt or .md; up to 5 MB. PDFs: up to 20 pages.
+              {readiness?.managed_documents ? 'PDF, Word, images or UTF-8 text; up to 5 MB. PDFs: up to 100 pages.' : 'PDF, UTF-8 .txt or .md; up to 5 MB. PDFs: up to 20 pages.'}
               {readiness?.local_ocr_available === false &&
-                ' Scanned PDFs require local Poppler and Tesseract OCR.'}
+                ' Text preview may be unavailable for scanned documents. Upload them for processing.'}
             </p>
           </>
         ) : (
@@ -233,14 +258,14 @@ export default function KnowledgePanel({
         )}
         <button
           className="secondary"
-          disabled={busy || indexingBlocked || (mode === 'url' && urlBlocked)}
+          disabled={busy || (indexingBlocked && !readiness?.managed_documents) || (mode === 'url' && urlBlocked)}
         >
           {busy ? 'Working…' : 'Add to knowledge'}
         </button>
-        {indexingBlocked && <p className="muted">{readiness?.semantic_ingestion_blocker}</p>}
+        {indexingBlocked && <p className="muted">Document processing is temporarily unavailable. You can still save documents and search available knowledge.</p>}
         {mode === 'url' && urlBlocked && (
           <p className="muted">
-            URL ingestion is disabled by the configured source or live acceptance policy.
+            Web page uploads are currently unavailable. You can upload a document or paste its text.
           </p>
         )}
         {mode !== 'url' && (
@@ -250,7 +275,7 @@ export default function KnowledgePanel({
             disabled={busy || (mode === 'pdf' ? !file : !text.trim())}
             onClick={() => void action('save')}
           >
-            Save document locally
+            Save document
           </button>
         )}
         {mode === 'pdf' && (
@@ -276,26 +301,29 @@ export default function KnowledgePanel({
       )}
       {documents.length > 0 && (
         <>
-          <h3>Locally saved documents</h3>
+          <h3>Saved documents</h3>
           <ul>
             {documents.map((document) => (
               <li key={document.id}>
                 <strong>{document.title}</strong> · {document.pages} page(s)
+                {document.version && <span> · Version {document.version}</span>}
+                {document.status && <span> · {document.status === 'ready' ? 'Ready' : document.status === 'error' ? 'Needs review' : 'Processing pending'}</span>}
+                {readiness?.managed_documents && <a href={`/documents/${document.id}/download`}>Download source</a>}
                 <button
                   type="button"
                   disabled={busy || indexingBlocked}
                   onClick={() => void indexSaved(document.id)}
                 >
-                  Index {document.title}
+                  Process {document.title}
                 </button>
               </li>
             ))}
           </ul>
         </>
       )}
-      <h3>Search local knowledge</h3>
+      <h3>Search knowledge</h3>
       <p className="muted">
-        Keyword matches with source citations. These are document excerpts, not an AI answer.
+        Matching document excerpts with source references. Open an investigation for a supported answer.
       </p>
       <form onSubmit={search}>
         <label htmlFor="knowledge-query">Knowledge search</label>
@@ -319,8 +347,8 @@ export default function KnowledgePanel({
             <strong>{match.metadata.title ?? 'Untitled'}</strong>
             <p>{match.text}</p>
             <small>
-              Source: {match.id} ·{' '}
-              {match.storage === 'chroma' ? 'Indexed document' : 'Local document'}
+              Source: {match.metadata.title ?? 'Untitled'} · Document excerpt{match.metadata.page ? ` · Page ${match.metadata.page}` : ''}
+              {match.metadata.doc_id && readiness?.managed_documents && <a href={`/documents/${encodeURIComponent(match.metadata.doc_id)}/download`}>View source</a>}
             </small>
           </article>
         ))}

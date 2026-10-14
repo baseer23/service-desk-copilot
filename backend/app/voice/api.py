@@ -2,6 +2,7 @@
 
 import asyncio
 import ipaddress
+import time
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -41,6 +42,24 @@ async def actor_for(
     request: Request | WebSocket, settings: Settings, *, create: bool = False
 ) -> tuple[Actor, str]:
     browser_guard(request, settings)
+    if settings.data_platform == "azure" and settings.deployment_mode == "production":
+        from backend.app.core.authentication import SESSION_COOKIE
+        from backend.app.core.principal import verify_principal
+
+        try:
+            principal = verify_principal(settings, request.cookies.get(SESSION_COOKIE, ""))
+        except PermissionError:
+            raise VoiceError("Please sign in to continue.", 401) from None
+        token = request.cookies.get(COOKIE_NAME)
+        if token:
+            actor = verify_actor(settings, token)
+            if actor.tenant_id != principal.tenant_id or actor.owner_id != principal.owner_id:
+                raise VoiceError("Conversation authorization failed.", 403)
+            return actor, token
+        if not create:
+            raise VoiceError("Conversation authorization is required.", 401)
+        token = issue_actor(settings, principal.owner_id, principal.tenant_id)
+        return verify_actor(settings, token), token
     token = request.cookies.get(COOKIE_NAME)
     if token:
         try:
@@ -204,6 +223,23 @@ def register_voice_routes(app: FastAPI) -> None:
     async def stream(socket: WebSocket, session_id: str) -> None:
         try:
             actor, _ = await actor_for(socket, manager().settings)
-            await manager().connect(socket, session_id, actor)
+            from backend.app.core.authentication import SESSION_COOKIE
+            from backend.app.core.principal import Principal, principal_scope, verify_principal
+
+            principal = (
+                verify_principal(manager().settings, socket.cookies.get(SESSION_COOKIE, ""))
+                if manager().settings.deployment_mode == "production"
+                else Principal(actor.tenant_id, actor.owner_id)
+            )
+            with principal_scope(principal):
+                if principal.expires_at:
+                    await asyncio.wait_for(
+                        manager().connect(socket, session_id, actor),
+                        max(0, principal.expires_at - time.time()),
+                    )
+                else:
+                    await manager().connect(socket, session_id, actor)
+        except TimeoutError:
+            await socket.close(code=1008, reason="SESSION_EXPIRED")
         except VoiceError as exc:
             await socket.close(code=1008, reason=exc.code)

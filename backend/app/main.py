@@ -1,38 +1,41 @@
 """Case API, ingestion endpoints and a lifespan-owned MCP/SQLite graph runtime."""
 
 from __future__ import annotations
-import uuid
+
 import asyncio
-from typing import Any
-from collections.abc import Awaitable, Callable
-from starlette.responses import Response
 import base64
 import secrets
-from pydantic import SecretStr
+import uuid
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Request
+from typing import Any
+
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from pydantic import SecretStr
+from starlette.responses import Response
+
+from backend.app.agent.checkpoints import checkpoint_store
 from backend.app.agent.graph import ServiceDeskAgent
 from backend.app.core.config import Settings, get_settings
 from backend.app.diagnostics.readiness import ReadinessReport
-from backend.app.mcp.client import DeskMateMCPClient, MCPToolError, MCPConnectionError
+from backend.app.mcp.client import DeskMateMCPClient, MCPConnectionError, MCPToolError
 from backend.app.models.dto import (
+    AskResponse,
     CaseCreateRequest,
-    CaseResumeRequest,
-    CaseResponse,
     CaseEvent,
+    CaseResponse,
+    CaseResumeRequest,
     HealthResponse,
     IngestPasteRequest,
     IngestPasteResponse,
     IngestPdfResponse,
     IngestUrlRequest,
     IngestUrlResponse,
-    AskResponse,
 )
 from backend.app.models.provider import LLMError
 from backend.app.models.provider_factory import get_provider
-from backend.app.services.web import UnsafeURL, FetchError
+from backend.app.services.web import FetchError, UnsafeURL
 from backend.app.store.vector_chroma import StorageError
 
 
@@ -66,6 +69,8 @@ def case_response(state):
 def create_app(settings: Settings | None = None):
     s = settings or get_settings()
     if s.voice_session_signing_key is None:
+        if s.deployment_mode == "production":
+            raise ValueError("Production requires a persistent session signing key")
         s = s.model_copy(update={"voice_session_signing_key": SecretStr(secrets.token_urlsafe(48))})
 
     @asynccontextmanager
@@ -74,6 +79,7 @@ def create_app(settings: Settings | None = None):
         app.state.settings, app.state.mcp = s, mcp
         voice_manager = None
         provider = None
+        ingestion_task = None
         try:
             try:
                 provider = get_provider(s)
@@ -82,37 +88,57 @@ def create_app(settings: Settings | None = None):
                 # errors explicitly. No fake provider is constructed as a fallback.
                 provider = None
             await mcp.start()
-            # Checkpoint infrastructure may precede the first MCP storage call.
-            s.case_db_path.parent.mkdir(parents=True, exist_ok=True)
-            async with AsyncSqliteSaver.from_conn_string(
-                str(s.case_db_path) + ".supervisor.checkpoints.sqlite3"
-            ) as saver:
-                await saver.setup()
-                app.state.agent = ServiceDeskAgent(s, mcp, provider, saver)
-                await app.state.agent.initialize()
-                from backend.app.voice.service import VoiceManager
+            from backend.app.core.principal import Principal, principal_scope
 
-                voice_manager = VoiceManager(s, app.state.agent.harness, provider)
-                app.state.voice = voice_manager
-                app.state.provider_initialized = provider is not None
-                try:
-                    local = await app.state.agent.harness.invoke("get_local_storage_status", {})
-                    app.state.local_storage = local["result"]
-                except (MCPToolError, MCPConnectionError, StorageError):
-                    app.state.local_storage = {
-                        "chroma": False,
-                        "sqlite": False,
-                        "aura_connected": False,
-                    }
-                yield
+            system_tenant = (
+                s.auth_allowed_tenants[0] if s.auth_allowed_tenants else s.voice_tenant_id
+            )
+            with principal_scope(Principal(system_tenant, "system-runtime", True)):
+                async with checkpoint_store(s) as saver:
+                    app.state.agent = ServiceDeskAgent(s, mcp, provider, saver)
+                    await app.state.agent.initialize()
+                    from backend.app.voice.service import VoiceManager
+
+                    voice_manager = VoiceManager(s, app.state.agent.harness, provider)
+                    app.state.voice = voice_manager
+                    app.state.provider_initialized = provider is not None
+                    try:
+                        local = await app.state.agent.harness.invoke("get_local_storage_status", {})
+                        app.state.local_storage = local["result"]
+                    except (MCPToolError, MCPConnectionError, StorageError):
+                        app.state.local_storage = {
+                            "chroma": False,
+                            "sqlite": False,
+                            "aura_connected": False,
+                        }
+                    if s.data_platform == "azure":
+                        from backend.app.services.document_worker import document_worker
+
+                        ingestion_task = asyncio.create_task(
+                            document_worker(s, app.state.agent.harness)
+                        )
+                    yield
         finally:
+            if ingestion_task:
+                ingestion_task.cancel()
+                await asyncio.gather(ingestion_task, return_exceptions=True)
             if voice_manager:
                 await voice_manager.close()
             await mcp.close()
             if provider and hasattr(provider, "close"):
                 await asyncio.wait_for(asyncio.to_thread(provider.close), 5)
+            if s.data_platform == "azure":
+                from backend.app.core.azure_managed_usage import close_usage_clients
 
-    app = FastAPI(title="DeskMate Case API", lifespan=lifespan)
+                await asyncio.to_thread(close_usage_clients)
+
+    app = FastAPI(
+        title="DeskMate Case API",
+        lifespan=lifespan,
+        docs_url=None if s.deployment_mode == "production" else "/docs",
+        redoc_url=None,
+        openapi_url=None if s.deployment_mode == "production" else "/openapi.json",
+    )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=s.allowed_origins,
@@ -129,19 +155,67 @@ def create_app(settings: Settings | None = None):
         request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
         if request.url.path.startswith(("/cases/voice-", "/requests/voice-")):
-            from backend.app.voice.auth import COOKIE_NAME, VoiceError, verify_actor
             from fastapi.responses import JSONResponse
+
+            from backend.app.voice.auth import COOKIE_NAME, VoiceError, verify_actor
 
             try:
                 from backend.app.voice.api import browser_guard
 
                 browser_guard(request, s)
-                actor = verify_actor(s, request.cookies.get(COOKIE_NAME))
+                if s.deployment_mode == "production":
+                    from backend.app.core.principal import current_principal
+                    from backend.app.voice.auth import Actor
+
+                    principal = current_principal(s)
+                    actor = Actor(principal.owner_id, principal.tenant_id)
+                else:
+                    actor = verify_actor(s, request.cookies.get(COOKIE_NAME))
                 session_id = request.url.path.split("/")[2].removeprefix("voice-")
                 app.state.voice.repository.get(session_id, actor)
             except VoiceError as exc:
                 return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
         return await call_next(request)
+
+    from fastapi.responses import JSONResponse
+
+    from backend.app.core.authentication import authenticate, mutation_origin, register_auth_routes
+    from backend.app.core.principal import current_principal, principal_scope
+
+    register_auth_routes(app, s)
+
+    @app.middleware("http")
+    async def tenant_authority(request: Request, call_next):
+        public = request.url.path in {
+            "/",
+            "/health",
+            "/auth/configuration",
+            "/auth/session",
+            "/auth/logout",
+        } or request.url.path.startswith("/assets/")
+        if request.method == "OPTIONS" or public:
+            return await call_next(request)
+        try:
+            mutation_origin(request, s)
+            actor = await authenticate(request, s)
+            with principal_scope(actor):
+                return await call_next(request)
+        except HTTPException as error:
+            return JSONResponse(status_code=error.status_code, content={"detail": error.detail})
+
+    @app.get("/admin/readiness")
+    async def operator_readiness():
+        if not current_principal(s).operator:
+            raise HTTPException(403, "This action requires an administrator.")
+        return readiness().model_dump()
+
+    @app.post("/admin/azure/usage/disable")
+    async def operator_disable():
+        if not current_principal(s).operator:
+            raise HTTPException(403, "This action requires an administrator.")
+        app.state.voice.usage_guard.disable()
+        await app.state.voice.close()
+        return {"disabled": True}
 
     def readiness() -> ReadinessReport:
         from backend.app.diagnostics.readiness import configuration_readiness
@@ -159,10 +233,28 @@ def create_app(settings: Settings | None = None):
     @app.get("/readiness")
     async def get_readiness() -> dict[str, Any]:
         # No token acquisition/network probe; statuses and missing variable names only.
-        return readiness().model_dump()
+        report = readiness()
+        return {
+            "runtime_mode": "isolated_demo"
+            if report.runtime_mode == "isolated_demo"
+            else "standard",
+            "text_ready": report.text_ready,
+            "voice_ready": report.voice_ready,
+            "local_documents_ready": report.local_documents_ready,
+            "local_ocr_available": report.local_ocr_available,
+            "semantic_ingestion_ready": report.semantic_ingestion_ready,
+            "url_ingestion_enabled": report.url_ingestion_enabled,
+            "managed_documents": s.data_platform == "azure",
+        }
 
-    @app.get("/health", response_model=HealthResponse)
+    @app.get("/health")
     async def health():
+        if s.deployment_mode == "production":
+            return {
+                "status": "ok"
+                if app.state.local_storage["chroma"] and app.state.local_storage["sqlite"]
+                else "degraded"
+            }
         report = readiness()
         environment = app.state.local_storage
         return HealthResponse(
@@ -187,6 +279,10 @@ def create_app(settings: Settings | None = None):
         report = readiness()
         if not report.text_ready:
             message = "Azure reasoning is not ready. Local case saving, document extraction and keyword search remain available."
+            if s.deployment_mode == "production":
+                raise HTTPException(
+                    503, "Investigations are temporarily unavailable. Your saved work is preserved."
+                )
             if report.azure_usage and not report.azure_usage["enabled"]:
                 message = "Azure requests are disabled by the usage guard or emergency shutdown. Local case saving, document extraction and keyword search remain available."
             failure = report.azure_validation.get("text_workflow", {})
@@ -237,9 +333,16 @@ def create_app(settings: Settings | None = None):
         if len(data) > 5_000_000:
             raise HTTPException(413, "Document exceeds 5 MB")
         suffix = Path(file.filename or "").suffix.lower()
-        media_type = {".pdf": "application/pdf", ".txt": "text/plain", ".md": "text/markdown"}.get(
-            suffix
-        )
+        media_type = {
+            ".pdf": "application/pdf",
+            ".txt": "text/plain",
+            ".md": "text/markdown",
+            ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".tiff": "image/tiff",
+        }.get(suffix)
         if media_type is None:
             raise HTTPException(400, "Choose a PDF, .txt or .md document")
         arguments = {"data_base64": base64.b64encode(data).decode(), "media_type": media_type}
@@ -287,6 +390,29 @@ def create_app(settings: Settings | None = None):
             await app.state.agent.harness.invoke("index_document", {"document_id": document_id})
         )["result"]
 
+    @app.get("/documents/{document_id}/status")
+    async def document_status(document_id: str):
+        return (await app.state.agent.harness.invoke("get_document", {"document_id": document_id}))[
+            "result"
+        ]
+
+    @app.get("/documents/{document_id}/download")
+    async def document_download(document_id: str):
+        value = (
+            await app.state.agent.harness.invoke(
+                "get_document_original", {"document_id": document_id}
+            )
+        )["result"]
+        return Response(
+            base64.b64decode(value["data_base64"]),
+            media_type=value["media_type"],
+            headers={
+                "Content-Disposition": "attachment",
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "private, no-store",
+            },
+        )
+
     @app.get("/knowledge/search")
     async def search_local_knowledge(question: str):
         if not question.strip() or len(question) > 2000:
@@ -331,7 +457,12 @@ def create_app(settings: Settings | None = None):
             ]
             return JSONResponse(
                 status_code=502,
-                content={"detail": str(exc), "case_id": request_id if stored else None},
+                content={
+                    "detail": "The investigation could not finish. Your saved work is preserved."
+                    if s.deployment_mode == "production"
+                    else str(exc),
+                    "case_id": request_id if stored else None,
+                },
             )
 
     @app.post("/ask", response_model=AskResponse)
@@ -350,7 +481,13 @@ def create_app(settings: Settings | None = None):
             if not state["case_id"].startswith("voice-"):
                 return True
             try:
-                actor = verify_actor(s, request.cookies.get(COOKIE_NAME))
+                if s.deployment_mode == "production":
+                    from backend.app.voice.auth import Actor
+
+                    principal = current_principal(s)
+                    actor = Actor(principal.owner_id, principal.tenant_id)
+                else:
+                    actor = verify_actor(s, request.cookies.get(COOKIE_NAME))
                 app.state.voice.repository.get(state["case_id"].removeprefix("voice-"), actor)
                 return True
             except VoiceError:
@@ -387,7 +524,12 @@ def create_app(settings: Settings | None = None):
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
         except (LLMError, MCPToolError, MCPConnectionError, StorageError) as exc:
-            raise HTTPException(502, str(exc)) from exc
+            raise HTTPException(
+                502,
+                "The investigation could not finish. Please try again later."
+                if s.deployment_mode == "production"
+                else str(exc),
+            ) from exc
 
     @app.post("/cases/{case_id}/investigate", response_model=CaseResponse)
     async def investigate(case_id: str):
@@ -410,7 +552,14 @@ def create_app(settings: Settings | None = None):
     async def storage_error(request, exc):
         from fastapi.responses import JSONResponse
 
-        return JSONResponse(status_code=getattr(exc, "status_code", 502), content={"detail": str(exc)})
+        return JSONResponse(
+            status_code=getattr(exc, "status_code", 502),
+            content={
+                "detail": "The operation could not finish. Your saved work is preserved."
+                if s.deployment_mode == "production"
+                else str(exc)
+            },
+        )
 
     @app.exception_handler(UnsafeURL)
     @app.exception_handler(FetchError)
@@ -418,6 +567,27 @@ def create_app(settings: Settings | None = None):
         from fastapi.responses import JSONResponse
 
         return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    from pathlib import Path
+
+    from fastapi.staticfiles import StaticFiles
+    from starlette.responses import FileResponse
+
+    web_dist = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+    if web_dist.is_dir():
+        app.mount("/assets", StaticFiles(directory=web_dist / "assets"), name="assets")
+
+        @app.get("/")
+        @app.get("/admin")
+        async def web_application():
+            return FileResponse(
+                web_dist / "index.html",
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Content-Type-Options": "nosniff",
+                    "Referrer-Policy": "same-origin",
+                },
+            )
 
     return app
 

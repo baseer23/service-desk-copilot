@@ -19,6 +19,8 @@ class Retriever:
 
     def keyword_search(self, question: str, top_k: int) -> List[Dict[str, object]]:
         """Explicit local excerpts, with provenance; no semantic or generated-answer claim."""
+        if getattr(self.settings, "data_platform", "local") == "azure":
+            return self.vector_store.search_keywords(question, top_k)
         local = self.document_repository.search(question, top_k) if self.document_repository else []
         indexed = self.vector_store.search_keywords(question, top_k)
         rows, seen = [], set()
@@ -58,6 +60,9 @@ class Retriever:
 
     def hybrid_search(self, question: str, top_k: int) -> List[Dict[str, object]]:
         """Blend graph-anchored recall with vector ranking as a fallback."""
+        if hasattr(self.vector_store, "hybrid"):
+            embedding = self.embedding_provider.embed_texts([question])[0]
+            return self.vector_store.hybrid(question, embedding, top_k)
         graph_results = self.graph_search(question, top_k)
         if not graph_results:
             return self.vector_search(question, top_k)

@@ -88,7 +88,7 @@ def test_missing_azure_boots_readiness_without_canned_answers_or_cloud(make_clie
             "AZURE_VOICELIVE_ENDPOINT": "",
         }
     )
-    report = client.get("/readiness").json()
+    report = client.get("/admin/readiness").json()
     assert (
         report["runtime_mode"] == "azure" and not report["text_ready"] and not report["voice_ready"]
     )
@@ -110,7 +110,7 @@ def test_http_readiness_and_health_never_leak_values(make_client):
             "VOICE_SESSION_SIGNING_KEY": "never-print-signing-xxxxxxxxxxxxxxxxxxxxxxxxxxx",
         }
     )
-    for url in ["/health", "/readiness"]:
+    for url in ["/health", "/admin/readiness"]:
         text = client.get(url).text
         assert not any(
             value in text
@@ -229,7 +229,7 @@ def test_azure_text_fallback_has_no_voice_live_connection_and_generates_greeting
     with TestClient(
         create_app(s), base_url="http://127.0.0.1", client=("127.0.0.1", 12345)
     ) as client:
-        report = client.get("/readiness").json()
+        report = client.get("/admin/readiness").json()
         assert report["text_ready"] and not report["voice_ready"]
         response = client.post(
             "/voice/sessions", json={"mode": "text"}, headers={"Origin": "http://127.0.0.1"}

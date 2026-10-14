@@ -37,6 +37,10 @@ class AzureVoiceLiveProvider:
         self.watchdog_task: asyncio.Task[Any] | None = None
         self.close_lock = asyncio.Lock()
         self.last_error_code = ""
+        self.guard_checked_at = 0.0
+        self.guard_check_task: asyncio.Task[None] | None = None
+        self.reply_epoch = 0
+        self.response_pending = False
 
     async def create_session(self) -> None:
         from azure.ai.voicelive.aio import connect
@@ -118,13 +122,16 @@ class AzureVoiceLiveProvider:
         while True:
             await asyncio.sleep(0.25)
             try:
-                self.ensure_active()
+                await self.ensure_active_async()
             except RuntimeError:
                 await self.close_session()
                 return
 
     def ensure_active(self) -> None:
         self.usage_guard.require_enabled()
+        self.check_duration()
+
+    def check_duration(self) -> None:
         seconds = (
             self.settings.azure_setup_max_voice_seconds
             if self.settings.azure_setup_validation_mode
@@ -133,16 +140,27 @@ class AzureVoiceLiveProvider:
         if time.monotonic() - self.started >= seconds:
             raise RuntimeError("Azure voice session duration limit reached")
 
+    async def ensure_active_async(self) -> None:
+        if self.settings.data_platform != "azure":
+            self.ensure_active()
+            return
+        if time.monotonic() - self.guard_checked_at >= 0.25:
+            if self.guard_check_task is None or self.guard_check_task.done():
+                self.guard_check_task = asyncio.create_task(asyncio.to_thread(self.usage_guard.require_enabled))
+            await asyncio.shield(self.guard_check_task)
+            self.guard_checked_at = time.monotonic()
+        self.check_duration()
+
     async def send_audio(self, audio: str) -> None:
-        self.ensure_active()
+        await self.ensure_active_async()
         await self.connection.input_audio_buffer.append(audio=audio)
 
     async def commit_audio(self) -> None:
-        self.ensure_active()
+        await self.ensure_active_async()
         await self.connection.input_audio_buffer.commit()
 
     async def send_text(self, text: str) -> None:
-        self.ensure_active()
+        await self.ensure_active_async()
         if len(text.encode()) > self.settings.azure_max_input_tokens:
             raise RuntimeError("Azure text input limit reached")
         from azure.ai.voicelive.models import InputTextContentPart, UserMessageItem
@@ -152,9 +170,13 @@ class AzureVoiceLiveProvider:
         )
 
     async def respond(self, approved_text: str) -> None:
-        self.ensure_active()
+        epoch = self.reply_epoch
+        await self.ensure_active_async()
+        if epoch != self.reply_epoch or self.connection is None:
+            return
         if len(approved_text.encode()) + 128 > self.settings.azure_max_input_tokens:
             raise RuntimeError("Azure voice reply input limit reached")
+        self.response_pending = True
         await self.connection.response.create(
             response={
                 "instructions": "Read only this approved reply verbatim. Add no information: "
@@ -168,7 +190,10 @@ class AzureVoiceLiveProvider:
         )
 
     async def interrupt(self) -> None:
-        await self.connection.response.cancel()
+        self.reply_epoch += 1
+        if self.response_pending and self.connection:
+            await self.connection.response.cancel()
+            self.response_pending = False
 
     async def tool_result(self, call_id: str, result: dict[str, Any]) -> None:
         import json
@@ -224,6 +249,7 @@ class AzureVoiceLiveProvider:
             if kind == "response.created":
                 data["response_id"] = value.get("response", {}).get("id", "")
             if kind == "response.done":
+                self.response_pending = False
                 data["status"] = value.get("response", {}).get("status", "")
                 if self.usage_token:
                     self.usage_guard.voice_usage(
@@ -243,6 +269,12 @@ class AzureVoiceLiveProvider:
             )
 
     async def close_session(self) -> None:
+        self.reply_epoch += 1
+        self.response_pending = False
+        if self.guard_check_task:
+            self.guard_check_task.cancel()
+            await asyncio.gather(self.guard_check_task, return_exceptions=True)
+            self.guard_check_task = None
         if self.watchdog_task and self.watchdog_task is not asyncio.current_task():
             self.watchdog_task.cancel()
             await asyncio.gather(self.watchdog_task, return_exceptions=True)

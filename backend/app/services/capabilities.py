@@ -7,6 +7,10 @@ from backend.app.store.vector_chroma import VectorChromaStore
 
 
 def knowledge_stores(settings, *, connect_graph=True):
+    if settings.data_platform == "azure":
+        from backend.app.store.azure_knowledge import AzureSearchStore
+
+        return AzureSearchStore(settings), InMemoryGraphRepository(), None
     model = (
         "sha256-unit-vector-v1" if settings.embed_provider == "stub" else settings.embed_model_name
     )

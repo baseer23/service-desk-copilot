@@ -1,5 +1,10 @@
 # Browser voice implementation review — 2026-10-12
 
+For the subsequent managed-data, Entra, MCP authority and asynchronous voice-I/O
+changes, see [AZURE_ENTERPRISE.md](AZURE_ENTERPRISE.md). These changes add regression
+and SDK checks; they do not establish live microphone or Azure voice acceptance.
+The user's persistent emergency shutdown remains enabled.
+
 This records the earlier browser migration checks. The subsequent readiness/UI/scope
 review, updated test totals and exact runtime traces are in
 [READINESS_REVIEW.md](READINESS_REVIEW.md); current Azure portal instructions are in

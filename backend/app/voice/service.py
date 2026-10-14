@@ -65,12 +65,20 @@ class VoiceRuntime:
     def state(self) -> VoiceConversation:
         return self.manager.repository.get(self.session_id, self.actor)
 
-    def update(
+    async def state_async(self) -> VoiceConversation:
+        return await self.store(self.manager.repository.get, self.session_id, self.actor)
+
+    async def store(self, function, *arguments):
+        if self.manager.settings.data_platform == "azure":
+            return await asyncio.to_thread(function, *arguments)
+        return function(*arguments)
+
+    async def update(
         self, fn: Callable[[VoiceConversation], None], event_id: str | None = None
     ) -> VoiceConversation:
         if self.stop.is_set():
             raise VoiceError("Voice session stopped")
-        return self.manager.repository.update(self.session_id, self.actor, fn, self.lease, event_id)
+        return await self.store(self.manager.repository.update, self.session_id, self.actor, fn, self.lease, event_id)
 
     async def send(self, kind: str, **payload: Any) -> None:
         await asyncio.wait_for(self.outgoing.put((kind, payload)), 2)
@@ -81,7 +89,7 @@ class VoiceRuntime:
             if label in {"Searching knowledge", "Checking previous incidents"}
             else VoiceStatus.PROCESSING
         )
-        self.update(lambda c: setattr(c, "status", status), uuid.uuid4().hex)
+        await self.update(lambda c: setattr(c, "status", status), uuid.uuid4().hex)
         await self.send("status", status=status.value)
         await self.send("activity", label=label)
 
@@ -96,41 +104,48 @@ class VoiceRuntime:
             self.outgoing.task_done()
 
     async def publish_state(self) -> None:
-        await self.send("session.snapshot", conversation=self.state().public())
+        await self.send("session.snapshot", conversation=(await self.state_async()).public())
 
     async def respond(self, text: str) -> None:
+        epoch = self.epoch
         self.approved = text
         self.rendered = ""
         self.render_channel = ""
         self.final_received = False
-        self.pending_response = True
-        self.created_epochs.append(self.epoch)
         self.assistant_id = uuid.uuid4().hex
+        assistant_id = self.assistant_id
 
         def apply(c: VoiceConversation) -> None:
             c.turns.append(
-                TranscriptTurn(id=self.assistant_id, role="assistant", text=text, state="partial")
+                TranscriptTurn(id=assistant_id, role="assistant", text=text, state="partial")
             )
             if c.status not in TERMINAL:
                 c.status = VoiceStatus.ASSISTANT_SPEAKING
 
-        self.update(apply)
+        await self.update(apply)
+        if self.stop.is_set() or epoch != self.epoch:
+            return
         await self.send("transcript.assistant.partial", turn_id=self.assistant_id, text="")
+        if self.stop.is_set() or epoch != self.epoch:
+            return
+        self.pending_response = True
+        self.created_epochs.append(epoch)
         await self.provider.respond(text)
-        await self.send("status", status=self.state().status.value)
+        await self.send("status", status=(await self.state_async()).status.value)
 
     async def interrupt(self) -> None:
         self.epoch += 1
         if self.response_id:
             self.cancelled.add(self.response_id)
         if self.assistant_id:
+            assistant_id = self.assistant_id
 
             def apply(c: VoiceConversation) -> None:
                 for t in c.turns:
-                    if t.id == self.assistant_id:
+                    if t.id == assistant_id:
                         t.state = "interrupted"
 
-            self.update(apply)
+            await self.update(apply)
         # Unsolicited cancel when there is no response would produce an Azure error.
         if self.pending_response:
             await self.provider.interrupt()
@@ -142,14 +157,14 @@ class VoiceRuntime:
         text = text.strip()
         if not text or len(text) > 8000:
             raise VoiceError("Text turn must contain 1 to 8000 characters", 422)
-        if any(t.id == turn_id for t in self.state().turns):
+        if any(t.id == turn_id for t in (await self.state_async()).turns):
             return
         if not self.manager.settings.test_mode:
             count = self.manager.usage_guard.turn(
                 self.text_usage_token or self.provider.usage_token
             )
             self.last_turn = count >= self.manager.settings.azure_max_turns_per_session
-        if len(self.state().turns) >= self.manager.settings.voice_max_turns:
+        if len((await self.state_async()).turns) >= self.manager.settings.voice_max_turns:
             self.reason = "turn_limit"
             self.stop.set()
             return
@@ -160,7 +175,7 @@ class VoiceRuntime:
             c.turns.append(TranscriptTurn(id=turn_id, role="user", text=text))
             c.status = VoiceStatus.PROCESSING
 
-        self.update(apply, "user:" + turn_id)
+        await self.update(apply, "user:" + turn_id)
         await self.send("transcript.user.final", turn_id=turn_id, text=text)
         await asyncio.wait_for(self.turns.put((turn_id, text)), 2)
 
@@ -241,7 +256,7 @@ class VoiceRuntime:
                 continue
             if event.type == "speech.started":
                 await self.interrupt()
-                self.update(lambda c: setattr(c, "status", VoiceStatus.USER_SPEAKING), event.id)
+                await self.update(lambda c: setattr(c, "status", VoiceStatus.USER_SPEAKING), event.id)
                 await self.send("status", status="user_speaking")
             elif event.type == "speech.stopped":
                 await self.activity("Transcribing")
@@ -288,12 +303,14 @@ class VoiceRuntime:
                 else:
                     self.final_received = True
 
+                    assistant_id = self.assistant_id
+
                     def finalized(c: VoiceConversation) -> None:
                         for turn in c.turns:
-                            if turn.id == self.assistant_id:
+                            if turn.id == assistant_id:
                                 turn.state = "final"
 
-                    self.update(finalized)
+                    await self.update(finalized)
                     await self.send(
                         "transcript.assistant.final", turn_id=self.assistant_id, text=self.approved
                     )
@@ -313,13 +330,13 @@ class VoiceRuntime:
                     self.reason = "turn_limit"
                     self.stop.set()
                     return
-                if self.state().status == VoiceStatus.COMPLETED:
+                if (await self.state_async()).status == VoiceStatus.COMPLETED:
                     self.reason = "completed"
                     await self.publish_state()
                     await asyncio.wait_for(self.outgoing.join(), 2)
                     self.stop.set()
                     return
-                self.update(
+                await self.update(
                     lambda c: setattr(
                         c,
                         "status",
@@ -357,7 +374,7 @@ class VoiceRuntime:
             epoch = self.epoch
             try:
                 await self.activity("Preparing response")
-                state, reply = await self.graph.run(self.state(), text, turn_id)
+                state, reply = await self.graph.run((await self.state_async()), text, turn_id)
                 if self.stop.is_set() or epoch != self.epoch:
                     continue
 
@@ -381,7 +398,7 @@ class VoiceRuntime:
                     ):
                         setattr(c, field, getattr(turn_state, field))
 
-                self.update(apply)
+                await self.update(apply)
                 await self.respond(reply)
             finally:
                 self.turns.task_done()
@@ -389,7 +406,7 @@ class VoiceRuntime:
     async def watchdog(self) -> None:
         while True:
             await asyncio.sleep(5)
-            state = self.state()
+            state = (await self.state_async())
             if state.status in TERMINAL and state.status != VoiceStatus.COMPLETED:
                 self.reason = state.failure_category or "explicit_stop"
                 self.stop.set()
@@ -399,7 +416,7 @@ class VoiceRuntime:
                 self.stop.set()
                 return
             if not self.manager.settings.test_mode:
-                self.manager.usage_guard.require_enabled()
+                await self.store(self.manager.usage_guard.require_enabled)
                 if (
                     time.monotonic() - self.started
                     >= self.manager.settings.azure_max_voice_session_minutes * 60
@@ -407,10 +424,10 @@ class VoiceRuntime:
                     self.reason = "session_timeout"
                     self.stop.set()
                     return
-            self.manager.repository.renew(self.session_id, self.lease)
+            await self.store(self.manager.repository.renew, self.session_id, self.lease)
 
     async def run(self) -> None:
-        self.manager.repository.claim(self.session_id, self.actor, self.lease)
+        await self.store(self.manager.repository.claim, self.session_id, self.actor, self.lease)
         self.manager.active[self.session_id] = self
         await self.socket.accept()
         tasks: list[asyncio.Task[Any]] = []
@@ -434,7 +451,7 @@ class VoiceRuntime:
                     raise VoiceError("The provider disconnected during preparation", 502)
 
                 await asyncio.wait_for(configured(), 10)
-                if not self.state().turns:
+                if not (await self.state_async()).turns:
                     return (
                         GREETING if self.manager.settings.test_mode else await self.graph.greeting()
                     )
@@ -452,7 +469,7 @@ class VoiceRuntime:
             if opening not in done or self.stop.is_set():
                 return
             greeting = opening.result()
-            self.update(lambda c: setattr(c, "status", VoiceStatus.LISTENING))
+            await self.update(lambda c: setattr(c, "status", VoiceStatus.LISTENING))
             tasks += [
                 asyncio.create_task(fn())
                 for fn in (
@@ -533,7 +550,14 @@ class VoiceManager:
     ) -> None:
         self.settings, self.harness, self.reasoning = settings, harness, reasoning
         self.usage_guard = AzureUsageGuard(settings)
-        self.repository = SQLiteVoiceConversationRepository(settings.case_db_path)
+        if settings.data_platform == "azure":
+            from backend.app.store.azure_records import CosmosRecords
+
+            from .azure_repository import CosmosVoiceConversationRepository
+
+            self.repository = CosmosVoiceConversationRepository(CosmosRecords(settings))
+        else:
+            self.repository = SQLiteVoiceConversationRepository(settings.case_db_path)
         self.provider_factory = provider_factory
         self.active: dict[str, VoiceRuntime] = {}
 
@@ -590,16 +614,16 @@ class VoiceManager:
                 self.active.pop(session_id, None)
 
     def end(self, session_id: str, actor: Actor) -> VoiceConversation:
+        self.repository.get(session_id, actor)  # Confirm ownership before signalling transport.
+        if session_id in self.active:
+            self.active[session_id].reason = "explicit_stop"
+            self.active[session_id].stop.set()
         def apply(c: VoiceConversation) -> None:
             if c.status != VoiceStatus.COMPLETED:
                 c.status = VoiceStatus.STOPPED
                 c.failure_category = "explicit_stop"
 
-        state = self.repository.update(session_id, actor, apply, event_id="explicit_stop")
-        if session_id in self.active:
-            self.active[session_id].reason = "explicit_stop"
-            self.active[session_id].stop.set()
-        return state
+        return self.repository.update(session_id, actor, apply, event_id="explicit_stop")
 
     async def close(self) -> None:
         for runtime in list(self.active.values()):

@@ -117,7 +117,7 @@ test('renders explicit API errors and restores the submit control', async () => 
   render(<App />)
   await user.type(screen.getByLabelText('Question or ticket'), 'Incident details')
   await user.click(screen.getByRole('button', { name: 'Run DeskMate' }))
-  expect(await screen.findByRole('alert')).toHaveTextContent('Azure OpenAI request failed')
+  expect(await screen.findByRole('alert')).toHaveTextContent('DeskMate cannot complete this request right now')
   expect(screen.getByRole('button', { name: 'Run DeskMate' })).toBeEnabled()
 })
 
@@ -216,7 +216,7 @@ test('preserves the provider error and restores its saved case for retry', async
   await user.type(screen.getByLabelText('Question or ticket'), 'An incident')
   await user.click(screen.getByRole('button', { name: 'Run DeskMate' }))
   expect(await screen.findByRole('alert')).toHaveTextContent(
-    'Azure OpenAI request failed (HTTP 429, TPD quota limit)',
+    'DeskMate cannot complete this request right now',
   )
   expect(await screen.findByRole('button', { name: 'Retry Investigation' })).toBeEnabled()
   expect(screen.getByTestId('case-id')).toHaveTextContent(current.case_id)
@@ -259,7 +259,7 @@ test('shows remembered facts and fixture provenance when reopening a case', asyn
   await user.click(await screen.findByRole('button', { name: /Jake Peralta from B99/ }))
   expect(await screen.findByText('Remembered facts from previous cases')).toBeInTheDocument()
   expect(screen.getByText('B99 2nd floor')).toBeInTheDocument()
-  expect(screen.getByText('Fictional fixture · local_fixture')).toBeInTheDocument()
+  expect(screen.getByText(/Sample data/)).toBeInTheDocument()
 })
 
 test('ingests pasted knowledge and shows duplicate feedback', async () => {
@@ -345,6 +345,6 @@ test('knowledge answer, contradictions, and activity render without a ticket que
   expect(screen.getByText('The newer resume supersedes the old version.')).toBeInTheDocument()
   expect(screen.queryByLabelText('Your answer')).not.toBeInTheDocument()
   await user.click(screen.getByText('Agent activity'))
-  expect(screen.getByText('search_knowledge', { exact: true })).toBeInTheDocument()
+  expect(screen.getByText('Search supporting information', { exact: true })).toBeInTheDocument()
   expect(screen.queryByText('Private internal draft')).not.toBeInTheDocument()
 })

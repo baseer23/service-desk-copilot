@@ -5,13 +5,13 @@ import base64
 from datetime import datetime, timezone
 from functools import lru_cache, wraps
 from typing import Any
-from mcp.server.fastmcp import FastMCP
+
 from backend.app.agent.memory import CaseMemoryStore
 from backend.app.agent.models import CapabilityResult, MemoryFact
-from backend.app.voice.auth import Actor
-from backend.app.voice.repository import SQLiteVoiceConversationRepository
 from backend.app.core.config import get_settings
 from backend.app.repositories.fixtures import FixtureRepository
+from backend.app.voice.auth import Actor
+from mcp.server.fastmcp import Context, FastMCP
 
 server = FastMCP("deskmate")
 fixtures = FixtureRepository()
@@ -20,9 +20,42 @@ fixtures = FixtureRepository()
 def capability(source_system, reliability=0.9):
     def decorate(fn):
         @wraps(fn)
-        async def invoke(*args, **kwargs):
+        async def invoke(*args, ctx: Context = None, **kwargs):
             try:
-                result = await asyncio.to_thread(fn, *args, **kwargs)
+                from backend.app.core.principal import (
+                    current_principal,
+                    principal_scope,
+                    verify_principal,
+                )
+
+                settings = get_settings()
+                system = source_system
+                if settings.data_platform == "azure" and fn.__name__ != "extract_document":
+                    system = {
+                        "sqlite": "azure_cosmos",
+                        "chroma": "azure_search",
+                        "local_document": "azure_documents",
+                    }.get(source_system, source_system)
+                if (
+                    settings.deployment_mode == "production"
+                    and fn.__name__ in {"search_web", "fetch_web_page", "ingest_url"}
+                    and not settings.enable_public_web_tools
+                ):
+                    raise ValueError("Public research requires explicit workspace authorization")
+                meta = ctx.request_context.meta if ctx is not None else None
+                supplied = meta.model_dump().get("deskmate_authority") if meta else None
+                if supplied:
+                    actor = verify_principal(settings, supplied)
+                else:
+                    actor = current_principal(settings)
+                with principal_scope(actor):
+                    if source_system == "local_fixture" and not settings.enable_local_fixtures:
+                        result = {
+                            "available": False,
+                            "reason": "This organizational data source is not connected.",
+                        }
+                    else:
+                        result = await asyncio.to_thread(fn, *args, **kwargs)
                 rows = result if isinstance(result, list) else [result] if result else []
                 status = (
                     "unavailable"
@@ -31,7 +64,7 @@ def capability(source_system, reliability=0.9):
                 )
                 return CapabilityResult(
                     tool=fn.__name__,
-                    source_system=source_system,
+                    source_system=system,
                     timestamp=datetime.now(timezone.utc).isoformat(),
                     reliability=reliability,
                     status=status,
@@ -52,7 +85,7 @@ def capability(source_system, reliability=0.9):
                     message += " [" + code + "]"
                 return CapabilityResult(
                     tool=fn.__name__,
-                    source_system=source_system,
+                    source_system=locals().get("system", source_system),
                     timestamp=datetime.now(timezone.utc).isoformat(),
                     reliability=0,
                     status="error",
@@ -62,10 +95,19 @@ def capability(source_system, reliability=0.9):
                     ),
                 )
 
-        invoke.__annotations__ = {**fn.__annotations__, "return": CapabilityResult}
+        invoke.__annotations__ = {**fn.__annotations__, "ctx": Context, "return": CapabilityResult}
         import inspect
 
-        invoke.__signature__ = inspect.signature(fn).replace(return_annotation=CapabilityResult)
+        signature = inspect.signature(fn)
+        invoke.__signature__ = signature.replace(
+            parameters=[
+                *signature.parameters.values(),
+                inspect.Parameter(
+                    "ctx", inspect.Parameter.KEYWORD_ONLY, default=None, annotation=Context
+                ),
+            ],
+            return_annotation=CapabilityResult,
+        )
         server.tool()(invoke)
         return invoke
 
@@ -74,15 +116,26 @@ def capability(source_system, reliability=0.9):
 
 @lru_cache
 def memory():
+    if get_settings().data_platform == "azure":
+        from backend.app.repositories.azure_memory import CosmosCaseMemoryStore
+
+        return CosmosCaseMemoryStore(managed_records())
     return CaseMemoryStore(get_settings().case_db_path)
 
 
 @lru_cache
+def managed_records():
+    from backend.app.store.azure_records import CosmosRecords
+
+    return CosmosRecords(get_settings())
+
+
+@lru_cache
 def environment():
-    from backend.app.services.capabilities import knowledge_stores
     from backend.app.adapters.embeddings import get_embedding_provider
-    from backend.app.services.ingest_service import IngestService
     from backend.app.rag.retrieve import Retriever
+    from backend.app.services.capabilities import knowledge_stores
+    from backend.app.services.ingest_service import IngestService
 
     s = get_settings()
     vector, graph, driver = knowledge_stores(s)
@@ -100,6 +153,10 @@ def environment():
 
 @lru_cache
 def documents():
+    if get_settings().data_platform == "azure":
+        from backend.app.services.azure_documents import AzureDocumentRepository
+
+        return AzureDocumentRepository(get_settings(), records=managed_records())
     from backend.app.repositories.documents import DocumentRepository
 
     return DocumentRepository(get_settings().case_db_path)
@@ -287,6 +344,11 @@ def extract_document(data_base64: str, media_type: str = "application/pdf"):
 @capability("local_document")
 def save_document(data_base64: str, title: str | None = None, media_type: str = "application/pdf"):
     """Operator-controlled extraction and local staging; never creates fake semantic vectors."""
+    if get_settings().data_platform == "azure":
+        data = base64.b64decode(data_base64, validate=True)
+        if len(data) > 5_000_000:
+            raise ValueError("Document exceeds 5 MB")
+        return documents().upload(data, title, media_type)
     result = _extract_upload(data_base64, media_type)
     return {
         **documents().save(
@@ -309,6 +371,8 @@ def list_documents():
 @capability("chroma")
 def index_document(document_id: str):
     """Explicit operator write: embed a staged document into the configured verified collection."""
+    if get_settings().data_platform == "azure":
+        return documents().process(document_id)
     record = documents().get(document_id)
     if get_settings().azure_live_test_mode:
         raise ValueError(
@@ -330,10 +394,30 @@ def index_document(document_id: str):
     )
 
 
+@capability("document_store")
+def get_document(document_id: str):
+    """Read an authorized document's processing status."""
+    return documents().get(document_id)
+
+
+@capability("document_store")
+def get_document_original(document_id: str):
+    """Authorized immutable source download; no SAS URLs or storage credentials."""
+    if get_settings().data_platform != "azure":
+        raise ValueError("Original-file download is unavailable for locally extracted text")
+    record = documents().get(document_id)
+    data = documents().blobs.get(document_id, "original")
+    return {
+        "data_base64": base64.b64encode(data).decode(),
+        "title": record["title"],
+        "media_type": record["media_type"],
+    }
+
+
 @capability("chroma")
 def ingest_url(url: str, max_depth: int | None = None, max_pages: int | None = None):
     """Safely crawl bounded public pages and ingest extracted documents with URL provenance."""
-    from backend.app.services.url_crawler import UrlCrawler, CrawlLimits
+    from backend.app.services.url_crawler import CrawlLimits, UrlCrawler
 
     s = get_settings()
     if not s.allow_url_ingest:
@@ -433,7 +517,7 @@ def list_available_context():
         "knowledge_chunks": vector.count(),
         "chroma": vector.ping(),
         "aura_connected": driver is not None,
-        **fixtures.inventory(),
+        **(fixtures.inventory() if get_settings().enable_local_fixtures else {}),
         "fixture_source_system": "local_fixture",
         "memory": "sqlite_memory",
         "web": "public_web",
@@ -444,9 +528,13 @@ def list_available_context():
 def get_local_storage_status() -> dict[str, bool]:
     """Probe local SQLite/Chroma only; no embedding, identity, Azure or Aura requests."""
     from contextlib import closing
+
     from backend.app.services.capabilities import knowledge_stores
 
     vector, _, _ = knowledge_stores(get_settings(), connect_graph=False)
+    if get_settings().data_platform == "azure":
+        managed_records().query("case", limit=1)
+        return {"chroma": vector.ping(), "sqlite": True, "aura_connected": False}
     with closing(memory()._connect()) as connection:
         sqlite_ready = connection.execute("SELECT 1").fetchone()[0] == 1
     return {
@@ -457,7 +545,11 @@ def get_local_storage_status() -> dict[str, bool]:
 
 
 @lru_cache(maxsize=1)
-def voice_repository() -> SQLiteVoiceConversationRepository:
+def voice_repository():
+    if get_settings().data_platform == "azure":
+        from backend.app.voice.azure_repository import CosmosVoiceConversationRepository
+
+        return CosmosVoiceConversationRepository(managed_records())
     from backend.app.voice.repository import SQLiteVoiceConversationRepository
 
     return SQLiteVoiceConversationRepository(get_settings().case_db_path)

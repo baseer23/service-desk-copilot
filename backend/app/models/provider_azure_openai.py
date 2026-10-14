@@ -177,7 +177,12 @@ class AzureOpenAIProvider:
         attempts = 1 if stage == "readiness" or self.settings.azure_setup_validation_mode else 2
         for attempt in range(attempts):
             try:
-                while delay := self.usage_guard.request_delay("reasoning"):
+                while True:
+                    delay = (await asyncio.to_thread(self.usage_guard.request_delay, "reasoning")
+                             if self.settings.data_platform == "azure"
+                             else self.usage_guard.request_delay("reasoning"))
+                    if not delay:
+                        break
                     await asyncio.sleep(min(delay, 1))
             except AzureUsageBlocked as exc:
                 raise LLMError(str(exc)) from None

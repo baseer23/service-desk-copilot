@@ -98,7 +98,6 @@ export default function VoiceSupport({
   const { readiness, refresh, checking } = useReadiness(suppliedReadiness)
   const demo = readiness?.runtime_mode === 'isolated_demo'
   const [stage, setStage] = useState('')
-  const [errorCode, setErrorCode] = useState('')
   const [saving, setSaving] = useState(false)
   const [microphoneActive, setMicrophoneActive] = useState(false)
   const [microphoneRequested, setMicrophoneRequested] = useState(false)
@@ -151,7 +150,7 @@ export default function VoiceSupport({
   function fail(error: unknown) {
     const visible = visibleVoiceError(error)
     setError(visible.message)
-    setErrorCode(visible.code)
+
     cleanup()
     setMicrophoneActive(false)
     setStatus('failed')
@@ -359,7 +358,7 @@ export default function VoiceSupport({
     explicitlyStopped.current = false
     if (!resume) activeId.current = ''
     setError('')
-    setErrorCode('')
+
     setStatus('connecting')
     setMicrophoneRequested(withMicrophone)
     setStage('Preparing session')
@@ -416,18 +415,8 @@ export default function VoiceSupport({
         setConversation(state)
       } catch {
         setError('Connection closed. The server will also expire the session automatically.')
-        setErrorCode('VOICE_STOP_REQUEST_FAILED')
+
       }
-  }
-  async function disableAzure() {
-    try {
-      await request('/azure/usage/disable', post())
-      window.dispatchEvent(new Event('azure-usage-disabled'))
-      await stop()
-      await refresh()
-    } catch (error) {
-      fail(error)
-    }
   }
   async function submit(event: FormEvent) {
     event.preventDefault()
@@ -445,7 +434,7 @@ export default function VoiceSupport({
       await onCaseCreated(result.case_id)
     } catch {
       setError('The case summary could not be saved. Confirm your contact details first.')
-      setErrorCode('VOICE_CASE_SAVE_FAILED')
+
     } finally {
       setSaving(false)
     }
@@ -465,11 +454,6 @@ export default function VoiceSupport({
     'Connected',
     'Listening',
   ]
-  const missingVoice = [
-    ...(readiness?.reasoning.missing ?? []),
-    ...(readiness?.voice.missing ?? []),
-    ...(readiness?.embeddings.missing ?? []),
-  ]
   return (
     <section className="voice-support card" aria-label="Voice Support">
       <header className="voice-heading">
@@ -478,92 +462,29 @@ export default function VoiceSupport({
           <h2>Voice Support</h2>
         </div>
         <span className={`provider-badge ${demo ? 'demo' : ''}`}>
-          {demo ? 'Isolated demo' : 'Azure'} {readiness ? '' : 'readiness pending'}
+          {demo ? 'Sample session' : 'Support conversation'}
         </span>
       </header>
       <p>Investigate an IT issue through voice or text, with a visible transcript and sources.</p>
       {demo && (
         <div className="demo-banner">
           <strong>ISOLATED DEMO</strong>
-          <p>Responses and audio are simulated. Azure is not being used.</p>
+          <p>Responses and audio are simulated in this sample session.</p>
           <p>
             Use text support. Test microphone checks capture and transport only; it will not
             recognize speech or speak.
           </p>
         </div>
       )}
-      <div className="readiness-summary" aria-label="Support readiness">
-        <span>
-          Reasoning:{' '}
-          {demo
-            ? 'Simulated'
-            : readiness?.reasoning.configured
-              ? 'Configured'
-              : 'Missing configuration'}
-        </span>
-        <span>
-          Voice:{' '}
-          {demo
-            ? 'Simulated'
-            : readiness?.voice.configured
-              ? 'Configured'
-              : 'Missing configuration'}
-        </span>
-        <span>Live validated: {readiness?.live_azure_validated ? 'Yes' : 'No'}</span>
-        <button
-          type="button"
-          className="button button-subtle"
-          disabled={checking || busy}
-          aria-busy={checking}
-          onClick={() => void refresh()}
-        >
-          {checking ? 'Checking status…' : 'Refresh status'}
-        </button>
+      <div className="readiness-summary" aria-label="Support availability">
+        <span>Text support: {readiness?.text_ready ? 'Available' : 'Temporarily unavailable'}</span>
+        <span>Voice support: {readiness?.voice_ready ? 'Available' : 'Temporarily unavailable'}</span>
+        <button type="button" className="button button-subtle" disabled={checking || busy}
+          onClick={() => void refresh()}>{checking ? 'Checking status…' : 'Refresh status'}</button>
       </div>
-      {!readiness && (
-        <p className="readiness-note">
-          Readiness could not be confirmed. Check the backend, then refresh status.
-        </p>
-      )}
-      {!demo && readiness?.azure_usage && (
-        <div className="readiness-note" aria-label="Estimated Azure demo allowance">
-          <p>
-            Azure usage: {readiness.azure_usage.enabled ? 'Enabled' : 'Disabled'}. Remaining
-            estimated demo allowance: CAD $
-            {readiness.azure_usage.remaining_estimated_cad.toFixed(2)} of CAD $
-            {readiness.azure_usage.limit_cad.toFixed(2)} this month.
-          </p>
-          <p>This local estimate does not cap your Azure invoice or cover other resources.</p>
-          <button type="button" className="button" onClick={() => void disableAzure()}>
-            Disable Azure usage
-          </button>
-        </div>
-      )}
-      {!demo &&
-        readiness?.azure_validation &&
-        Object.entries(readiness.azure_validation)
-          .filter(([, check]) => !check.passed)
-          .map(([name, check]) => (
-            <p role="alert" className="readiness-note" key={name}>
-              Azure {name.replace(/_/g, ' ')} validation failed: {check.code || 'CHECK_FAILED'}.
-              Live retries are stopped. Review AZURE_ACTIVATION_REVIEW.md before testing.
-            </p>
-          ))}
-      {readiness && !readiness.voice_ready && (
-        <p className="readiness-note">
-          Voice unavailable:{' '}
-          {missingVoice.length
-            ? [...new Set(missingVoice)].join(', ')
-            : 'Check local MCP, stores and session identity.'}
-        </p>
-      )}
-      {readiness && !readiness.text_ready && (
-        <p className="readiness-note">
-          Text support unavailable:{' '}
-          {readiness.reasoning.missing.join(', ') ||
-            'Check local initialization and session identity.'}
-        </p>
-      )}
+      {readiness && !readiness.voice_ready && <p className="readiness-note">Voice support is temporarily unavailable. You can save your request and search knowledge.</p>}
+      {readiness && !readiness.text_ready && <p className="readiness-note">Text support is temporarily unavailable. You can save your request and return later.</p>}
+      {!readiness && <p className="readiness-note">Support availability could not be checked. Refresh status or try again later.</p>}
       <div className="voice-state">
         <span className={`status-dot ${connected ? 'active' : ''}`} aria-hidden="true" />
         <p role="status" data-testid="voice-status">
@@ -592,12 +513,7 @@ export default function VoiceSupport({
       {error && (
         <div className="voice-error" role="alert">
           <p>{error}</p>
-          {errorCode && (
-            <details>
-              <summary>Error detail</summary>
-              <code>{errorCode}</code>
-            </details>
-          )}
+
         </div>
       )}
       <Transcript turns={turns} />

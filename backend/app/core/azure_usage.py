@@ -27,11 +27,46 @@ class AzureUsageBlocked(RuntimeError):
 
 
 class AzureUsageGuard:
+    def __new__(cls, settings: Settings, *args, **kwargs):
+        if cls is AzureUsageGuard and settings.data_platform == "azure":
+            from backend.app.core.azure_managed_usage import CosmosUsageGuard
+
+            return object.__new__(CosmosUsageGuard)
+        return object.__new__(cls)
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.path = settings.azure_usage_db_path or settings.case_db_path.with_name(
             settings.case_db_path.name + ".azure-usage.sqlite3"
         )
+
+    def ledger_exists(self) -> bool:
+        return self.path.exists()
+
+    def earmark_infrastructure(self, reference: str, cad_estimate: float) -> None:
+        """Reserve a bounded hosting/storage forecast without enabling AI dispatch."""
+        if not 0 <= cad_estimate <= 0.25 or not re.fullmatch(r"[a-z0-9-]{1,64}", reference):
+            raise ValueError("Unsupported infrastructure forecast")
+        now = datetime.now(UTC)
+        month = now.strftime("%Y-%m")
+        key = "infrastructure-" + month + "-" + reference
+        estimate = math.ceil(cad_estimate * 1_000_000)
+        with self.transaction() as db:
+            existing = db.execute("SELECT estimate FROM azure_usage WHERE id=?", (key,)).fetchone()
+            spent = db.execute(
+                "SELECT COALESCE(SUM(estimate),0) FROM azure_usage WHERE month=?", (month,)
+            ).fetchone()[0]
+            previous = existing[0] if existing else 0
+            increase = max(0, estimate - previous)
+            if spent + increase > self.limit:
+                raise AzureUsageBlocked("Infrastructure forecast exceeds the application allowance")
+            if not existing:
+                db.execute(
+                    "INSERT INTO azure_usage(id,month,day,kind,estimate,active,phase) VALUES(?,?,?,?,?,0,'demo')",
+                    (key, month, now.strftime("%Y-%m-%d"), "infrastructure", estimate),
+                )
+            elif increase:
+                db.execute("UPDATE azure_usage SET estimate=? WHERE id=?", (estimate, key))
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -317,7 +352,7 @@ class AzureUsageGuard:
             )
 
     def checks(self) -> dict[str, Any]:
-        if not self.path.exists():
+        if not self.ledger_exists():
             return {}
         try:
             with self.transaction() as db:
@@ -358,7 +393,7 @@ class AzureUsageGuard:
         usage: dict[str, int] = {}
         error = False
         setup_spent = 0
-        if self.path.exists():
+        if self.ledger_exists():
             try:
                 with self.transaction() as db:
                     disabled = db.execute("SELECT disabled FROM azure_policy WHERE id=1").fetchone()

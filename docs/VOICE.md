@@ -1,5 +1,14 @@
 # Browser Voice Support
 
+The Azure-native production implementation and current acceptance limits are in
+[AZURE_ENTERPRISE.md](AZURE_ENTERPRISE.md). Production requires Entra authentication,
+tenant-partitioned managed state and persistent Key Vault signing material. Detailed
+readiness and emergency controls are operator-only at `/admin/readiness` and
+`/admin/azure/usage/disable`; ordinary `/readiness` returns product availability.
+Emergency shutdown remains enabled by explicit user instruction. No new live
+reasoning, embedding, document-analysis or microphone acceptance is authorized.
+The historical live procedure below requires separate enablement before use.
+
 For the latest repair results and the still-blocked Azure activation, see
 [REPAIR_REVIEW.md](REPAIR_REVIEW.md). Local PDF/text extraction, document saving,
 case saving and cited keyword retrieval work independently of Azure reasoning.

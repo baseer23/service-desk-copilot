@@ -28,12 +28,14 @@ class Actor:
     tenant_id: str
 
 
-def issue_actor(settings: Settings, owner_id: str | None = None) -> str:
+def issue_actor(
+    settings: Settings, owner_id: str | None = None, tenant_id: str | None = None
+) -> str:
     if not settings.voice_session_signing_key:
         raise VoiceError("Voice session authentication is unavailable", 503)
     payload = {
         "uid": owner_id or uuid.uuid4().hex,
-        "tid": settings.voice_tenant_id,
+        "tid": tenant_id or settings.voice_tenant_id,
         "exp": int(time.time()) + 86400,
     }
     encoded = (
@@ -64,7 +66,11 @@ def verify_actor(settings: Settings, token: str | None) -> Actor:
         payload = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
         if (
             payload["exp"] < time.time()
-            or payload["tid"] != settings.voice_tenant_id
+            or (
+                payload["tid"] not in settings.auth_allowed_tenants
+                if settings.data_platform == "azure"
+                else payload["tid"] != settings.voice_tenant_id
+            )
             or not isinstance(payload["uid"], str)
         ):
             raise ValueError("Expired identity")

@@ -6,6 +6,57 @@ from backend.app.agent.models import MemoryFact
 from datetime import datetime, timezone
 
 
+def test_hosted_mcp_subprocess_keeps_installed_library_path(settings, monkeypatch, tmp_path):
+    import subprocess
+    import sys
+
+    library = tmp_path / "host-installed-libraries"
+    library.mkdir()
+    (library / "hosted_dependency.py").write_text("VALUE = 'available'\n")
+    monkeypatch.setenv("PYTHONPATH", str(library))
+    client = DeskMateMCPClient(settings)
+    process = subprocess.run(
+        [sys.executable, "-c", "import hosted_dependency; print(hosted_dependency.VALUE)"],
+        env=client.subprocess_env(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert process.returncode == 0 and process.stdout.strip() == "available"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "name",
+    [
+        "save_document",
+        "index_document",
+        "ingest_text",
+        "save_case",
+        "save_fact",
+        "search_knowledge",
+        "create_case_from_voice_session",
+    ],
+)
+async def test_ambiguous_write_or_paid_retrieval_transport_failure_is_not_replayed(
+    settings, monkeypatch, name
+):
+    from backend.app.mcp.client import MCPConnectionError
+
+    client = DeskMateMCPClient(settings)
+    starts = []
+    async def unavailable():
+        starts.append(1)
+        raise MCPConnectionError("Explicit isolated transport failure")
+    async def close():
+        pass
+    monkeypatch.setattr(client, "start", unavailable)
+    monkeypatch.setattr(client, "close", close)
+    with pytest.raises(MCPConnectionError):
+        await client.call_tool(name, {})
+    assert starts == [1]
+
+
 @pytest.mark.asyncio
 async def test_ten_calls_errors_reuse_and_clean_close(settings):
     client = DeskMateMCPClient(settings)

@@ -264,7 +264,7 @@ test('isolated demo has an explicit warning and a microphone plumbing button', (
   )
   expect(screen.getByText('ISOLATED DEMO')).toBeInTheDocument()
   expect(
-    screen.getByText('Responses and audio are simulated. Azure is not being used.'),
+    screen.getByText('Responses and audio are simulated in this sample session.'),
   ).toBeInTheDocument()
   expect(screen.getByRole('button', { name: 'Test microphone' })).toHaveClass('button-primary')
   expect(screen.queryByRole('button', { name: 'Start voice chat' })).not.toBeInTheDocument()
@@ -313,7 +313,7 @@ test('missing Azure readiness disables only the relevant controls', () => {
   const view = render(<VoiceSupport onCaseCreated={vi.fn()} readiness={report} />)
   expect(screen.getByRole('button', { name: 'Start voice chat' })).toBeDisabled()
   expect(screen.getByRole('button', { name: 'Start text support' })).toBeEnabled()
-  expect(screen.getByText(/Voice unavailable: AZURE_VOICELIVE_ENDPOINT/)).toBeInTheDocument()
+  expect(screen.getByText(/Voice support is temporarily unavailable/)).toBeInTheDocument()
   view.rerender(
     <VoiceSupport
       onCaseCreated={vi.fn()}
@@ -325,7 +325,7 @@ test('missing Azure readiness disables only the relevant controls', () => {
     />,
   )
   expect(screen.getByRole('button', { name: 'Start text support' })).toBeDisabled()
-  expect(screen.getByText(/Text support unavailable: AZURE_MODEL_DEPLOYMENT/)).toBeInTheDocument()
+  expect(screen.getByText(/Text support is temporarily unavailable/)).toBeInTheDocument()
 })
 
 test('permission denial exposes stages and a safe error code, never the raw error', async () => {
@@ -343,8 +343,7 @@ test('permission denial exposes stages and a safe error code, never the raw erro
   expect(screen.getByRole('list', { name: 'Connection progress' })).toHaveTextContent(
     'Preparing sessionRequesting microphone permissionOpening microphoneConnectingConnectedListening',
   )
-  await userEvent.click(screen.getByText('Error detail'))
-  expect(screen.getByText('MIC_PERMISSION_DENIED')).toBeInTheDocument()
+  expect(screen.queryByText('MIC_PERMISSION_DENIED')).not.toBeInTheDocument()
   expect(screen.queryByText('private raw detail')).not.toBeInTheDocument()
   expect(screen.getByRole('button', { name: 'Start text support' })).toBeEnabled()
 })
@@ -364,7 +363,7 @@ test('AudioWorklet load failure is visible and capture is cleaned up', async () 
   render(<VoiceSupport onCaseCreated={vi.fn()} readiness={azureReady} />)
   await userEvent.click(screen.getByRole('button', { name: 'Start voice chat' }))
   expect(await screen.findByRole('alert')).toHaveTextContent('audio processor could not be loaded')
-  expect(screen.getByText('AUDIO_PROCESSOR_LOAD_FAILED')).toBeInTheDocument()
+  expect(screen.queryByText('AUDIO_PROCESSOR_LOAD_FAILED')).not.toBeInTheDocument()
   expect(stop).toHaveBeenCalledOnce()
   expect(screen.queryByText('private processor response')).not.toBeInTheDocument()
 })
@@ -374,7 +373,7 @@ test('WebSocket failure is shown with a code and a stopped session cannot reconn
   await userEvent.click(screen.getByRole('button', { name: 'Start text support' }))
   act(() => Socket.instances[0].onerror?.())
   expect(screen.getByRole('alert')).toHaveTextContent('WebSocket could not connect')
-  expect(screen.getByText('VOICE_WS_CONNECT_FAILED')).toBeInTheDocument()
+  expect(screen.queryByText('VOICE_WS_CONNECT_FAILED')).not.toBeInTheDocument()
   await userEvent.click(screen.getByRole('button', { name: 'Start text support' }))
   const ws = Socket.instances[1]
   act(() =>
@@ -405,41 +404,17 @@ test('shows the remaining estimated CAD allowance without claiming an invoice ca
       }}
     />,
   )
-  const panel = screen.getByLabelText('Estimated Azure demo allowance')
-  expect(panel).toHaveTextContent('CAD $2.75')
-  expect(panel).toHaveTextContent('does not cap your Azure invoice')
+  expect(screen.queryByLabelText('Estimated Azure demo allowance')).not.toBeInTheDocument()
+  expect(screen.queryByText(/CAD|invoice|Azure/)).not.toBeInTheDocument()
 })
 
-test('emergency Azure disable closes transport and refreshes readiness', async () => {
-  const usage = {
-    enabled: true,
-    remaining_estimated_cad: 8,
-    estimated_used_cad: 0,
-    limit_cad: 8,
-    invoice_cap: false as const,
-    ledger_error: false,
-  }
-  const stopped = {
-    ...azureReady,
-    text_ready: false,
-    voice_ready: false,
-    azure_usage: { ...usage, enabled: false },
-  }
-  vi.stubGlobal(
-    'fetch',
-    vi.fn(async () => ({ ok: true, json: async () => stopped })),
-  )
-  render(<VoiceSupport onCaseCreated={vi.fn()} readiness={{ ...azureReady, azure_usage: usage }} />)
-  await userEvent.click(screen.getByRole('button', { name: 'Disable Azure usage' }))
-  expect(fetch).toHaveBeenCalledWith(
-    expect.stringContaining('/azure/usage/disable'),
-    expect.objectContaining({ method: 'POST' }),
-  )
-  await waitFor(() =>
-    expect(screen.getByLabelText('Estimated Azure demo allowance')).toHaveTextContent('Disabled'),
-  )
-  expect(screen.getByRole('button', { name: 'Start voice chat' })).toBeDisabled()
-  expect(screen.getByRole('button', { name: 'Start text support' })).toBeDisabled()
+test('emergency Azure disable remains available in the protected administration console', async () => {
+  const { default: AdminConsole } = await import('./AdminConsole')
+  vi.stubGlobal('fetch', vi.fn(async () => Response.json({ azure_usage: { enabled: false } })))
+  render(<AdminConsole />)
+  await userEvent.click(await screen.findByRole('button', { name: 'Disable Azure usage' }))
+  expect(fetch).toHaveBeenCalledWith('/admin/azure/usage/disable', expect.objectContaining({ method: 'POST' }))
+  expect(await screen.findByText(/"enabled": false/)).toBeInTheDocument()
 })
 
 test('shows real validation failures and blocks live controls without a fake fallback', () => {
@@ -454,7 +429,8 @@ test('shows real validation failures and blocks live controls without a fake fal
       }}
     />,
   )
-  expect(screen.getByRole('alert')).toHaveTextContent('rate_limit_exceeded')
+  expect(screen.getByText(/Text support is temporarily unavailable/)).toBeInTheDocument()
+  expect(screen.queryByText('rate_limit_exceeded')).not.toBeInTheDocument()
   expect(screen.getByRole('button', { name: 'Start voice chat' })).toBeDisabled()
   expect(screen.getByRole('button', { name: 'Start text support' })).toBeDisabled()
   expect(screen.queryByText('ISOLATED DEMO')).not.toBeInTheDocument()

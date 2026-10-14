@@ -29,3 +29,12 @@ openai>=2,<3
 PyJWT[crypto]>=2.10,<3
 azure-ai-voicelive[aiohttp]==1.3.0
 phonenumbers>=9,<10
+# Managed Azure data platform; Entra authentication, never account keys.
+azure-cosmos>=4.9,<5
+azure-storage-blob>=12.24,<13
+azure-search-documents>=11.6,<12
+azure-ai-documentintelligence>=1.0,<2
+azure-keyvault-secrets>=4.9,<5
+pypdf>=6,<7
+Pillow>=11,<13
+defusedxml>=0.7,<1

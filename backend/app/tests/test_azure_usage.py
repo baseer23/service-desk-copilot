@@ -289,7 +289,7 @@ def test_emergency_http_checks_origin_and_persists(make_client):
     )
     response = client.post("/azure/usage/disable", headers={"Origin": "http://testserver"})
     assert response.status_code == 200 and not response.json()["azure_usage"]["enabled"]
-    assert not client.get("/readiness").json()["azure_usage"]["invoice_cap"]
+    assert not client.get("/admin/readiness").json()["azure_usage"]["invoice_cap"]
 
 
 @pytest.mark.asyncio

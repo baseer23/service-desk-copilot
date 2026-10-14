@@ -19,7 +19,7 @@ export interface EvidenceRecord {
   content: unknown
 }
 export const providerLabel = (value: string): string =>
-  value === 'stub' ? 'Isolated demo' : value === 'azure_openai' ? 'Azure reasoning' : value
+  value === 'stub' ? 'Sample session' : value === 'human_input' ? 'User report' : value === 'local_fixture' ? 'Sample data' : 'DeskMate'
 export const timestamp = (value: string): string =>
   new Date(value.includes('T') ? value : value.replace(' ', 'T') + 'Z').toLocaleString()
 const safeActivity = (event: ActivityEvent): string => {
@@ -67,14 +67,19 @@ function readable(content: unknown): string {
     const row = content as Record<string, unknown>
     if (typeof row.text === 'string') return row.text
   }
-  return JSON.stringify(content, null, 2) ?? ''
+  const hidden = new Set(['metadata', 'source_system', 'embedding_model', 'embedding_provider', 'tool', 'tenant_id', 'owner_id', 'thread_id'])
+  if (content && typeof content === 'object') return Object.entries(content as Record<string, unknown>)
+    .filter(([key]) => !hidden.has(key))
+    .map(([key, value]) => `${key.replace(/_/g, ' ')}: ${typeof value === 'object' ? JSON.stringify(value) : String(value ?? 'Not recorded')}`)
+    .join('\n')
+  return String(content ?? '')
 }
 function EvidenceCard({ evidence }: { evidence: EvidenceRecord }): JSX.Element {
   const [expanded, setExpanded] = useState(false)
   const text = readable(evidence.content)
   const sourceClass =
     evidence.source_system === 'local_fixture'
-      ? 'Fictional fixture'
+      ? 'Sample data'
       : evidence.source_quality === 'third_party'
         ? 'Third-party source'
         : evidence.source_quality === 'primary'
@@ -94,6 +99,9 @@ function EvidenceCard({ evidence }: { evidence: EvidenceRecord }): JSX.Element {
       : typeof row?.title === 'string'
         ? row.title
         : evidence.source
+  const documentPath = typeof meta?.doc_id === 'string' && /^[a-f0-9]{64}$/.test(meta.doc_id)
+    ? `/documents/${meta.doc_id}/download`
+    : evidence.url && /^\/documents\/[a-f0-9]{64}\/download$/.test(evidence.url) ? evidence.url : null
   return (
     <article className="evidence-card">
       <header>
@@ -107,7 +115,9 @@ function EvidenceCard({ evidence }: { evidence: EvidenceRecord }): JSX.Element {
       <small>
         {timestamp(evidence.observed_at)} · {evidence.tool.replace(/_/g, ' ')}
         {evidence.source_type ? ' · ' + evidence.source_type.replace(/_/g, ' ') : ''}
+        {typeof meta?.page === 'number' ? ` · Page ${meta.page}` : ''}
       </small>
+      {documentPath && <p className="source-link"><a href={documentPath}>Download original document</a></p>}
       {evidence.url && /^https?:\/\//i.test(evidence.url) && (
         <p className="source-link">
           <a href={evidence.url} target="_blank" rel="noreferrer">
@@ -123,9 +133,7 @@ function EvidenceCard({ evidence }: { evidence: EvidenceRecord }): JSX.Element {
         <summary>Show full evidence</summary>
         {expanded && (
           <pre tabIndex={0} aria-label="Full evidence">
-            {typeof evidence.content === 'string'
-              ? evidence.content
-              : JSON.stringify(evidence.content, null, 2)}
+            {text}
           </pre>
         )}
       </details>

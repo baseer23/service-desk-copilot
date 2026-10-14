@@ -97,7 +97,7 @@ def test_emergency_disabled_http_mcp_local_paths_no_azure_calls(make_client):
     case = client.post("/cases", json={"summary": "Fictional VPN failure"}).json()
     assert case["status"] == "new" and not case["final_answer"]
     assert client.get(f"/cases/{case['case_id']}").status_code == 200
-    assert client.get("/readiness").json()["azure_usage"]["estimated_used_cad"] == 0
+    assert client.get("/admin/readiness").json()["azure_usage"]["estimated_used_cad"] == 0
     bad = client.post(
         "/documents/extract", files={"file": ("bad.pdf", b"%PDF-invalid", "application/pdf")}
     )

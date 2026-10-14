@@ -200,7 +200,7 @@ export default function App() {
         </div>
         <span className="runtime-label">{readiness?.runtime_mode==='isolated_demo' ? 'Isolated demo' : 'Case investigations'}</span>
       </header>
-      {readiness?.runtime_mode === 'isolated_demo' && <div className="demo-banner runtime-banner"><strong>ISOLATED DEMO</strong><p>Responses and audio are simulated. Azure is not being used.</p></div>}
+      {readiness?.runtime_mode === 'isolated_demo' && <div className="demo-banner runtime-banner"><strong>ISOLATED DEMO</strong><p>Responses and audio are simulated in this sample session.</p></div>}
       {error && (
         <div className="error-banner" role="alert">
           {error}
@@ -225,7 +225,7 @@ export default function App() {
                 {busy ? 'Investigating…' : 'Run DeskMate'}
               </button>
               {blocker && <p className="muted" role="status">{blocker}</p>}
-              <button type="button" className="secondary" disabled={busy || !ticket.trim()} onClick={() => void saveRequest()}>Save request locally</button>
+              <button type="button" className="secondary" disabled={busy || !ticket.trim()} onClick={() => void saveRequest()}>Save request</button>
               <button type="button" className="secondary" disabled={checking || busy} onClick={() => void refresh()}>{checking ? 'Checking app status…' : 'Refresh app status'}</button>
             </form>
           </section>
@@ -303,7 +303,7 @@ export default function App() {
               </section>
               {active.status === 'new' && <section className="card">
                 <h2>Saved request</h2>
-                <p>Saved locally. Automated investigation has not started.</p>
+                <p>Your request is saved. Automated investigation has not started.</p>
                 <button className="primary" disabled={busy || !!blocker} onClick={() => void retry()}>Investigate saved case</button>
                 {blocker && <p className="muted">{blocker}</p>}
               </section>}
@@ -478,7 +478,7 @@ export default function App() {
                         .filter((t) => t && /^(search_|get_|fetch_|ingest_)/.test(t)),
                     ),
                   ).map((t) => (
-                    <li key={t}>{t}</li>
+                    <li key={t}>{t?.startsWith('search_') ? 'Search supporting information' : t?.startsWith('get_') ? 'Review supporting information' : 'Save supporting information'}</li>
                   ))}
                 </ul>
                 {active.workflow === 'knowledge' && (

@@ -19,7 +19,7 @@ test('shows the structured readiness explanation and safe code', async () => {
     ),
   )
   await expect(request('/ask')).rejects.toMatchObject({
-    message: 'Azure disabled; save a request locally.',
+    message: 'DeskMate cannot complete this request right now. Your saved work is available. Please try again later or contact your administrator.',
     code: 'AZURE_REASONING_NOT_READY',
     status: 503,
   })

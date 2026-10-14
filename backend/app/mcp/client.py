@@ -1,6 +1,7 @@
 """Async MCP transport with one task owning the complete stdio lifetime."""
 
 from __future__ import annotations
+
 import asyncio
 import json
 import os
@@ -8,6 +9,7 @@ import sys
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
+
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
@@ -68,7 +70,14 @@ class DeskMateMCPClient:
         }
         env.update(
             {
-                "PYTHONPATH": str(PROJECT_ROOT),
+                "PYTHONPATH": os.pathsep.join(
+                    dict.fromkeys(
+                        [
+                            str(PROJECT_ROOT),
+                            *filter(None, os.environ.get("PYTHONPATH", "").split(os.pathsep)),
+                        ]
+                    )
+                ),
                 "CHROMA_DIR": str(s.chroma_dir.resolve()),
                 "CASE_DB_PATH": str(s.case_db_path.resolve()),
                 "EMBED_PROVIDER": s.embed_provider,
@@ -88,6 +97,13 @@ class DeskMateMCPClient:
                 "RESEARCH_PREFERRED_DOMAINS": json.dumps(s.research_preferred_domains),
                 "MAX_RESEARCH_ROUNDS": str(s.max_research_rounds),
                 "ALLOW_URL_INGEST": str(s.allow_url_ingest).lower(),
+                "DATA_PLATFORM": s.data_platform,
+                "AUTH_CLIENT_ID": s.auth_client_id,
+                "AUTH_ALLOWED_TENANTS": json.dumps(s.auth_allowed_tenants),
+                "AUTH_OPERATOR_IDS": json.dumps(s.auth_operator_ids),
+                "ENABLE_LOCAL_FIXTURES": str(s.enable_local_fixtures).lower(),
+                "ENABLE_PUBLIC_WEB_TOOLS": str(s.enable_public_web_tools).lower(),
+                "DEPLOYMENT_MODE": s.deployment_mode,
             }
         )
         # Forward all voice configuration explicitly; never log this environment.
@@ -134,20 +150,24 @@ class DeskMateMCPClient:
             )
             async with stdio_client(params, errlog=self.stderr or sys.stderr) as (read, write):
                 async with ClientSession(
-                    read, write, read_timeout_seconds=timedelta(seconds=60)
+                    read,
+                    write,
+                    read_timeout_seconds=timedelta(
+                        seconds=180 if self.settings.data_platform == "azure" else 60
+                    ),
                 ) as session:
                     await session.initialize()
                     self.connection_count += 1
                     self._ready.set_result(None)
                     pending = set()
 
-                    async def dispatch(name, arguments, future):
+                    async def dispatch(name, arguments, future, meta):
                         try:
                             if name == "__list_tools__":
                                 result = await session.list_tools()
                                 value = [t.model_dump() for t in result.tools]
                             else:
-                                result = await session.call_tool(name, arguments)
+                                result = await session.call_tool(name, arguments, meta=meta)
                                 if result.isError:
                                     message = " ".join(
                                         getattr(c, "text", "") for c in result.content
@@ -200,13 +220,28 @@ class DeskMateMCPClient:
             try:
                 await self.start()
                 future = asyncio.get_running_loop().create_future()
-                self._queue.put_nowait((tool_name, params, future))
+                from backend.app.core.principal import current_principal, sign_principal
+
+                meta = (
+                    {
+                        "deskmate_authority": sign_principal(
+                            self.settings, current_principal(self.settings)
+                        )
+                    }
+                    if self.settings.voice_session_signing_key
+                    else None
+                )
+                self._queue.put_nowait((tool_name, params, future, meta))
                 return await future
             except MCPConnectionError:
                 await self.close()
                 # Do not repeat a write after an ambiguous transport failure.
-                if attempt or tool_name in {
-                    "create_case_from_voice_session",
+                if attempt or tool_name not in {
+                    "__list_tools__", "get_local_storage_status", "get_case", "list_cases",
+                    "get_case_history", "get_document", "list_documents", "search_memory",
+                    "search_remembered_facts", "get_user_context", "get_company_context",
+                    "get_site_context", "get_device_context", "get_active_alerts",
+                    "get_recent_changes", "list_available_context", "search_previous_tickets",
                 }:
                     raise
 

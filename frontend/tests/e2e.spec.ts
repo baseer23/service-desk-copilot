@@ -5,8 +5,11 @@ const ticket = 'Jake Peralta from B99 cannot connect to the VPN. Authentication 
 for (const summary of [
   'Fictional test: Microsoft 365 MFA fails for Amy Santiago from B99.',
   'Fictional test: VPN authentication fails for Charles Boyle from B99.',
-  'Fictional test: the printer is offline for Rosa Diaz from B99.',
-  'Fictional test: Outlook is not opening for Terry Jeffords from B99.',
+  'Fictional test: printer installation fails for Rosa Diaz from B99.',
+  'Fictional test: Outlook email synchronization fails for Terry Jeffords from B99.',
+  'Fictional test: Noah Fictional from B99 has lost network connectivity.',
+  'Fictional test: Emma Fictional from B99 reports a Microsoft 365 account lockout.',
+  'Fictional test: Oliver Fictional from B99 cannot establish a remote desktop connection.',
 ]) {
   test(`simulated reasoning through real browser and MCP: ${summary}`, async ({ page }) => {
     const errors: string[] = []
@@ -30,12 +33,12 @@ test('local PDF extraction, staging, dedup and cited keyword search use real HTT
   await page.getByLabel('PDF document').setInputFiles({ name: 'fictional.pdf', mimeType: 'application/pdf', buffer: resumePDF() })
   await page.getByRole('button', { name: 'Extract text', exact: true }).click()
   await expect(page.locator('.document-preview')).toContainText('2022')
-  await expect(page.getByText(/No Azure request was made/)).toBeVisible()
-  await page.getByRole('button', { name: 'Save document locally' }).click()
-  await expect(page.getByText(/chunks saved locally/)).toBeVisible()
-  await expect(page.getByRole('heading', { name: 'Locally saved documents' })).toBeVisible()
-  await page.getByRole('button', { name: 'Save document locally' }).click()
-  await expect(page.getByText('This document is already saved locally.')).toBeVisible()
+  await expect(page.getByText(/Text preview is ready/)).toBeVisible()
+  await page.getByRole('button', { name: 'Save document' }).click()
+  await expect(page.getByText(/Your document is saved/)).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Saved documents' })).toBeVisible()
+  await page.getByRole('button', { name: 'Save document' }).click()
+  await expect(page.getByText('This document is already saved.')).toBeVisible()
   await page.getByRole('textbox', { name: 'Knowledge search', exact: true }).fill('graduated')
   await page.getByRole('button', { name: 'Search knowledge' }).click()
   await expect(page.getByLabel('Knowledge search results')).toContainText('2022')
@@ -47,9 +50,9 @@ test('save and reopen an uninvestigated local case then explicitly investigate',
   await page.goto('/')
   const summary = 'Fictional printer offline request for local saving'
   await page.getByLabel('Question or ticket').fill(summary)
-  await page.getByRole('button', { name: 'Save request locally' }).click()
+  await page.getByRole('button', { name: 'Save request' }).click()
   await expect(page.locator('.status-pill')).toHaveText('new')
-  await expect(page.getByText('Saved locally. Automated investigation has not started.')).toBeVisible()
+  await expect(page.getByText('Your request is saved. Automated investigation has not started.')).toBeVisible()
   const id = await page.getByTestId('case-id').textContent()
   await page.reload()
   await page.getByRole('button', { name: `${summary} new`, exact: true }).click()
@@ -128,7 +131,7 @@ test('resume question uses knowledge and never asks for a floor', async ({ page,
     .getByLabel('PDF document')
     .setInputFiles({ name: 'abdul-resume.pdf', mimeType: 'application/pdf', buffer: resumePDF() })
   await page.getByRole('button', { name: 'Add to knowledge', exact: true }).click()
-  await expect(page.getByText(/knowledge chunks ingested/)).toBeVisible()
+  await expect(page.getByText(/Your document was added to knowledge/)).toBeVisible()
   const before = (await (await request.get('/cases')).json()).length
   const answerResponse = page.waitForResponse(
     (r) => r.url().endsWith('/ask') && r.request().method() === 'POST',
@@ -147,7 +150,7 @@ test('resume question uses knowledge and never asks for a floor', async ({ page,
   expect(events.some((e: any) => e.tool === 'verify')).toBeTruthy()
   expect(events.some((e: any) => e.tool === 'get_site_context')).toBeFalsy()
   await page.getByText('Agent activity', { exact: true }).click()
-  await expect(page.getByText('search_knowledge', { exact: true })).toBeVisible()
+  await expect(page.getByText('Search supporting information', { exact: true })).toBeVisible()
 })
 
 for (const [title, ticket, tool] of [
