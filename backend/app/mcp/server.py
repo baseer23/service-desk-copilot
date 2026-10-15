@@ -10,7 +10,6 @@ from backend.app.agent.memory import CaseMemoryStore
 from backend.app.agent.models import CapabilityResult, MemoryFact
 from backend.app.core.config import get_settings
 from backend.app.repositories.fixtures import FixtureRepository
-from backend.app.voice.auth import Actor
 from mcp.server.fastmcp import Context, FastMCP
 
 server = FastMCP("deskmate")
@@ -30,14 +29,8 @@ def capability(source_system, reliability=0.9):
 
                 settings = get_settings()
                 system = source_system
-                if settings.data_platform == "azure" and fn.__name__ != "extract_document":
-                    system = {
-                        "sqlite": "azure_cosmos",
-                        "chroma": "azure_search",
-                        "local_document": "azure_documents",
-                    }.get(source_system, source_system)
                 if (
-                    settings.deployment_mode == "production"
+                    (settings.deployment_mode == "production" or not settings.test_mode)
                     and fn.__name__ in {"search_web", "fetch_web_page", "ingest_url"}
                     and not settings.enable_public_web_tools
                 ):
@@ -108,7 +101,13 @@ def capability(source_system, reliability=0.9):
             ],
             return_annotation=CapabilityResult,
         )
-        server.tool()(invoke)
+        from backend.app.agent.tools import READ_TOOLS
+
+        available = source_system != "local_fixture" or get_settings().enable_local_fixtures
+        server.tool(
+            annotations={"readOnlyHint": fn.__name__ in READ_TOOLS},
+            meta={"deskmate": {"source_system": source_system, "available": available}},
+        )(invoke)
         return invoke
 
     return decorate
@@ -117,9 +116,9 @@ def capability(source_system, reliability=0.9):
 @lru_cache
 def memory():
     if get_settings().uses_record_store:
-        from backend.app.repositories.azure_memory import CosmosCaseMemoryStore
+        from backend.app.repositories.record_memory import RecordCaseMemoryStore
 
-        return CosmosCaseMemoryStore(managed_records())
+        return RecordCaseMemoryStore(managed_records())
     return CaseMemoryStore(get_settings().case_db_path)
 
 
@@ -139,7 +138,7 @@ def environment():
 
     s = get_settings()
     vector, graph, driver = knowledge_stores(s)
-    if driver:
+    if driver and s.test_mode and s.enable_local_fixtures:
         graph.upsert_relationships(fixtures.relationships())
     embedding = get_embedding_provider(s)
     return (
@@ -157,10 +156,6 @@ def documents():
         from backend.app.services.local_documents import LocalDocumentRepository
 
         return LocalDocumentRepository(get_settings(), records=managed_records())
-    if get_settings().uses_record_store:
-        from backend.app.services.azure_documents import AzureDocumentRepository
-
-        return AzureDocumentRepository(get_settings(), records=managed_records())
     from backend.app.repositories.documents import DocumentRepository
 
     return DocumentRepository(get_settings().case_db_path)
@@ -264,8 +259,6 @@ def get_recent_changes(company: str, site: str | None = None, product: str | Non
 @capability("public_web", 0.6)
 def search_web(query: str, max_results: int = 3):
     """Public research for a specific evidence gap; prefer vendor/authoritative documentation. Search snippets are not verified facts."""
-    if get_settings().azure_live_test_mode:
-        raise ValueError("Public web research is disabled during Azure live acceptance")
     from ddgs import DDGS
 
     if not 1 <= max_results <= 10:
@@ -285,8 +278,6 @@ def search_web(query: str, max_results: int = 3):
 @capability("public_web", 0.7)
 def fetch_web_page(url: str):
     """Fetch/extract a bounded public HTML page with SSRF and redirect validation."""
-    if get_settings().azure_live_test_mode:
-        raise ValueError("Public web research is disabled during Azure live acceptance")
     from backend.app.services.web import fetch_page
 
     return fetch_page(url, max_bytes=get_settings().web_max_bytes)
@@ -301,14 +292,6 @@ def ingest_text(
     url: str = "",
 ):
     """Normalize, SHA256 deduplicate, chunk/embed and persist text with provenance; available to searches immediately."""
-    if get_settings().azure_live_test_mode and (
-        source != "paste" or source_type != "paste" or url or len(text.encode()) > 1024
-    ):
-        raise ValueError("Azure acceptance allows only a tiny pasted fictional document")
-    if get_settings().azure_live_test_mode:
-        from backend.app.core.azure_usage import AzureUsageGuard
-
-        AzureUsageGuard(get_settings()).claim_fixture(text)
     return (
         environment()[3]
         .ingest_text(title, text, source=source, source_type=source_type, url=url)
@@ -321,8 +304,6 @@ def ingest_document(
     data_base64: str, title: str | None = None, media_type: str = "application/pdf"
 ):
     """Extract and ingest an uploaded PDF, limited to 5 MB. Input bytes are base64, never a filesystem path."""
-    if get_settings().azure_live_test_mode:
-        raise ValueError("Azure acceptance allows only a tiny pasted fictional document")
     if media_type != "application/pdf" or len(data_base64) > 6_666_672:
         raise ValueError("A PDF of at most 5 MB is required")
     data = base64.b64decode(data_base64, validate=True)
@@ -393,14 +374,6 @@ def index_document(document_id: str):
     if get_settings().uses_record_store:
         return documents().process(document_id)
     record = documents().get(document_id)
-    if get_settings().azure_live_test_mode:
-        raise ValueError(
-            "Semantic indexing of saved documents is blocked by the single-document Azure acceptance policy"
-        )
-    if get_settings().embed_provider != "stub":
-        from backend.app.core.azure_usage import AzureUsageGuard
-
-        AzureUsageGuard(get_settings()).require_enabled()
     return (
         environment()[3]
         .ingest_text(
@@ -563,54 +536,6 @@ def get_local_storage_status() -> dict[str, bool]:
     }
 
 
-@lru_cache(maxsize=1)
-def voice_repository():
-    if get_settings().uses_record_store:
-        from backend.app.voice.azure_repository import CosmosVoiceConversationRepository
-
-        return CosmosVoiceConversationRepository(managed_records())
-    from backend.app.voice.repository import SQLiteVoiceConversationRepository
-
-    return SQLiteVoiceConversationRepository(get_settings().case_db_path)
-
-
-def voice_actor(identity_token: str) -> Actor:
-    from backend.app.voice.auth import verify_actor
-
-    return verify_actor(get_settings(), identity_token)
-
-
-@capability("voice_support", 1)
-def get_voice_session(session_id: str, identity_token: str) -> dict[str, Any]:
-    """Owner-scoped conversation; application-controlled identity is mandatory."""
-    return voice_repository().get(session_id, voice_actor(identity_token)).public()
-
-
-@capability("voice_support", 1)
-def get_voice_session_summary(session_id: str, identity_token: str) -> dict[str, Any]:
-    """Read the authenticated owner’s concise support summary."""
-    state = voice_repository().get(session_id, voice_actor(identity_token))
-    return {
-        "session_id": session_id,
-        "summary": state.final_summary or state.issue_summary,
-        "resolution_status": state.resolution_status,
-        "case_id": state.case_id,
-    }
-
-
-@capability("voice_support", 1)
-def list_voice_session_evidence(session_id: str, identity_token: str) -> list[dict[str, Any]]:
-    """Read canonical evidence linked to an owned browser support session."""
-    state = voice_repository().get(session_id, voice_actor(identity_token))
-    return [e.model_dump(mode="json") for e in state.evidence]
-
-
-@capability("voice_support", 1)
-def create_case_from_voice_session(session_id: str, identity_token: str) -> dict[str, str]:
-    """Explicit user action; graph plans cannot select this write capability."""
-    return {
-        "case_id": voice_repository().create_case(session_id, voice_actor(identity_token), memory())
-    }
 
 
 if __name__ == "__main__":

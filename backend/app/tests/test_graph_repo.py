@@ -230,5 +230,5 @@ def test_relationship_discovery_is_bounded_parameterized_and_provenanced():
     assert rows[0]["predicate"] == "USES" and rows[0]["source_system"] == "local_fixture"
     query, arguments = statements[-1]
     assert "[*1..2]" in query and "LIMIT $limit" in query
-    assert arguments == {"terms": ["jake peralta"], "limit": 5}
+    assert arguments == {"terms": ["jake peralta"], "limit": 5, "tenant": None, "allow_fixtures": True}
     assert any("WORKS_AT" in q for q, _ in statements)

@@ -9,10 +9,6 @@ class StubProvider:
         return "stub"
 
     async def generate_structured(self, stage: str, context: dict[str, Any], schema: Any) -> Any:
-        if stage.startswith("voice_"):
-            from backend.app.testing.voice_reasoning import generate
-
-            return generate(stage, context, schema)
         text = context.get("request") or context.get("ticket", {}).get("summary", "")
         lower = text.lower()
         if stage == "classify_intent":

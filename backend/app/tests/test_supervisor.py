@@ -229,7 +229,7 @@ def test_verifier_blocks_unsupported_claim_and_researches_again(make_client):
     cid, result = run(c, "What year did Abdul graduate?")
     assert result["status"] == "assessment_ready" and count == 2
     assert result["research_iteration"] == 2
-    assert sum(e["tool"] == "search_knowledge" for e in c.get(f"/cases/{cid}/events").json()) == 2
+    assert sum(e["tool"] == "search_knowledge" for e in c.get(f"/cases/{cid}/events").json()) == 3  # one parallel keyword prefetch and two planned retrievals
 
 
 def test_verifier_rejects_unsupported_final_answer(make_client):

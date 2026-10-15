@@ -18,6 +18,7 @@ from starlette.responses import Response
 from backend.app.agent.checkpoints import checkpoint_store
 from backend.app.agent.graph import ServiceDeskAgent
 from backend.app.core.config import Settings, get_settings
+from backend.app.services.knowledge_policy import is_test_knowledge
 from backend.app.diagnostics.readiness import ReadinessReport
 from backend.app.mcp.client import DeskMateMCPClient, MCPConnectionError, MCPToolError
 from backend.app.models.dto import (
@@ -34,7 +35,9 @@ from backend.app.models.dto import (
     IngestUrlResponse,
 )
 from backend.app.models.provider import LLMError
-from backend.app.models.provider_factory import get_provider
+from backend.app.models.provider_factory import get_selectable_provider as get_provider
+from backend.app.models.provider_routing import provider_scope, selected_provider
+from backend.app.mcp.multi import MultiMCPClient
 from backend.app.services.web import FetchError, UnsafeURL
 from backend.app.store.vector_chroma import StorageError
 
@@ -88,9 +91,8 @@ def create_app(settings: Settings | None = None):
 
     @asynccontextmanager
     async def lifespan(app):
-        mcp = DeskMateMCPClient(s)
+        mcp = MultiMCPClient(s, builtin=DeskMateMCPClient(s))
         app.state.settings, app.state.mcp = s, mcp
-        voice_manager = None
         provider = None
         ingestion_task = None
         try:
@@ -110,10 +112,9 @@ def create_app(settings: Settings | None = None):
                 async with checkpoint_store(s) as saver:
                     app.state.agent = ServiceDeskAgent(s, mcp, provider, saver)
                     await app.state.agent.initialize()
-                    from backend.app.voice.service import VoiceManager
+                    from backend.app.voice.history import VoiceHistory
 
-                    voice_manager = VoiceManager(s, app.state.agent.harness, provider)
-                    app.state.voice = voice_manager
+                    app.state.voice = VoiceHistory(s)
                     app.state.provider_initialized = provider is not None
                     try:
                         local = await app.state.agent.harness.invoke("get_local_storage_status", {})
@@ -135,13 +136,14 @@ def create_app(settings: Settings | None = None):
             if ingestion_task:
                 ingestion_task.cancel()
                 await asyncio.gather(ingestion_task, return_exceptions=True)
-            if voice_manager:
-                await voice_manager.close()
+            await app.state.speech.close()
             await mcp.close()
-            if provider and hasattr(provider, "close"):
+            if provider and hasattr(provider, "aclose"):
+                await provider.aclose()
+            elif provider and hasattr(provider, "close"):
                 await asyncio.wait_for(asyncio.to_thread(provider.close), 5)
             if s.uses_record_store:
-                from backend.app.core.azure_managed_usage import close_usage_clients
+                from backend.app.core.record_usage import close_usage_clients
 
                 await asyncio.to_thread(close_usage_clients)
 
@@ -157,11 +159,11 @@ def create_app(settings: Settings | None = None):
         allow_origins=s.allowed_origins,
         allow_credentials=True,
         allow_methods=["GET", "POST"],
-        allow_headers=["Content-Type", "Authorization"],
+        allow_headers=["Content-Type", "Authorization", "X-DeskMate-Provider"],
     )
-    from backend.app.voice.api import register_voice_routes
+    from backend.app.speech.api import register_speech_routes
 
-    register_voice_routes(app)
+    register_speech_routes(app, s)
 
     @app.middleware("http")
     async def protect_voice_cases(
@@ -173,7 +175,7 @@ def create_app(settings: Settings | None = None):
             from backend.app.voice.auth import COOKIE_NAME, VoiceError, verify_actor
 
             try:
-                from backend.app.voice.api import browser_guard
+                from backend.app.voice.history import browser_guard
 
                 browser_guard(request, s)
                 if s.deployment_mode == "production":
@@ -216,7 +218,12 @@ def create_app(settings: Settings | None = None):
         try:
             mutation_origin(request, s)
             actor = await authenticate(request, s)
-            with principal_scope(actor):
+            selection = request.headers.get("X-DeskMate-Provider", s.generation_provider)
+            if s.test_mode and s.generation_provider == "stub":
+                selection = "stub"
+            if selection not in {"groq", "azure_openai", "stub"} or (selection == "stub" and not s.test_mode):
+                raise HTTPException(422, "Choose Groq or Azure OpenAI")
+            with principal_scope(actor), provider_scope(selection):
                 return await call_next(request)
         except HTTPException as error:
             return JSONResponse(status_code=error.status_code, content={"detail": error.detail})
@@ -228,11 +235,13 @@ def create_app(settings: Settings | None = None):
         return (await app.state.voice.store(readiness)).model_dump()
 
     @app.post("/admin/azure/usage/disable")
-    async def operator_disable():
+    async def operator_disable(request: Request):
+        from backend.app.speech.api import browser_guard
+        browser_guard(request, s)
         if not current_principal(s).operator:
             raise HTTPException(403, "This action requires an administrator.")
-        await app.state.voice.store(app.state.voice.usage_guard.disable)
-        await app.state.voice.close()
+        await asyncio.to_thread(app.state.voice.usage_guard.disable)
+        await app.state.speech.close()
         return {"disabled": True}
 
     def readiness() -> ReadinessReport:
@@ -277,18 +286,17 @@ def create_app(settings: Settings | None = None):
         environment = app.state.local_storage
         return HealthResponse(
             status="ok" if report.text_ready else "degraded",
-            generation_provider=s.generation_provider,
+            generation_provider=selected_provider(s),
             test_mode=s.test_mode,
             mcp_connected=report.local_mcp == "READY",
             chroma=environment["chroma"],
             aura_configured=bool(s.neo4j_uri),
             aura_connected=environment["aura_connected"],
-            voice_enabled=s.voice_enabled,
-            voice_provider=s.voice_provider,
-            voicelive_configured=s.voice_provider == "azure_voicelive" and report.voice.configured,
+            speech_enabled=s.speech_enabled,
+            speech_configured=report.voice.configured,
             embedding_provider=s.embed_provider,
             azure_openai_configured=(
-                s.generation_provider == "azure_openai" and report.reasoning.configured
+                selected_provider(s) == "azure_openai" and report.reasoning.configured
             ),
             readiness=report.model_dump(),
         )
@@ -296,23 +304,10 @@ def create_app(settings: Settings | None = None):
     async def require_reasoning() -> None:
         report = await app.state.voice.store(readiness)
         if not report.text_ready:
-            message = "Azure reasoning is not ready. Local case saving, document extraction and keyword search remain available."
-            if s.deployment_mode == "production":
-                raise HTTPException(
-                    503, "Investigations are temporarily unavailable. Your saved work is preserved."
-                )
-            if report.azure_usage and not report.azure_usage["enabled"]:
-                message = "Azure requests are disabled by the usage guard or emergency shutdown. Local case saving, document extraction and keyword search remain available."
-            failure = report.azure_validation.get("text_workflow", {})
-            if failure and not failure["passed"]:
-                message += " Last Azure workflow failure: " + failure["code"] + "."
-            raise HTTPException(
-                503,
-                {
-                    "code": "AZURE_REASONING_NOT_READY",
-                    "message": message,
-                },
-            )
+            raise HTTPException(503, {
+                "code": "REASONING_NOT_READY",
+                "message": "The selected AI service is unavailable. Check its configuration or choose another provider. Your saved work is preserved.",
+            })
 
     @app.post("/ingest/paste", response_model=IngestPasteResponse)
     async def ingest_paste(body: IngestPasteRequest):
@@ -400,7 +395,7 @@ def create_app(settings: Settings | None = None):
             raise HTTPException(
                 503,
                 {
-                    "code": "AZURE_EMBEDDINGS_NOT_READY",
+                    "code": "LOCAL_EMBEDDINGS_NOT_READY",
                     "message": report.semantic_ingestion_blocker,
                 },
             )
@@ -486,16 +481,38 @@ def create_app(settings: Settings | None = None):
             )
 
     @app.post("/ask", response_model=AskResponse)
-    async def ask(body: CaseCreateRequest):
+    async def ask(request: Request, body: CaseCreateRequest):
+        if "text/event-stream" in request.headers.get("accept", ""):
+            return stream_operation(request, lambda: request_result(uuid.uuid4().hex, body.summary))
         return await request_result(uuid.uuid4().hex, body.summary)
 
     @app.post("/requests/{request_id}/resume", response_model=AskResponse)
-    async def resume_request(request_id: str, body: CaseResumeRequest):
+    async def resume_request(request: Request, request_id: str, body: CaseResumeRequest):
+        if "text/event-stream" in request.headers.get("accept", ""):
+            return stream_operation(request, lambda: request_result(request_id, answer=body.answer))
         return await request_result(request_id, answer=body.answer)
 
     @app.post("/requests/{request_id}/message", response_model=AskResponse)
-    async def conversation_message(request_id: str, body: CaseCreateRequest):
+    async def conversation_message(request: Request, request_id: str, body: CaseCreateRequest):
+        if "text/event-stream" in request.headers.get("accept", ""):
+            return stream_operation(request, lambda: request_result(request_id, message=body.summary))
         return await request_result(request_id, message=body.summary)
+
+    def stream_operation(request: Request, operation):
+        from backend.app.agent.streaming import investigation_stream
+        return investigation_stream(request, s, operation)
+
+    @app.post("/ask/stream")
+    async def ask_stream(request: Request, body: CaseCreateRequest):
+        return stream_operation(request, lambda: request_result(uuid.uuid4().hex, body.summary))
+
+    @app.post("/requests/{request_id}/resume/stream")
+    async def resume_stream(request: Request, request_id: str, body: CaseResumeRequest):
+        return stream_operation(request, lambda: request_result(request_id, answer=body.answer))
+
+    @app.post("/requests/{request_id}/message/stream")
+    async def message_stream(request: Request, request_id: str, body: CaseCreateRequest):
+        return stream_operation(request, lambda: request_result(request_id, message=body.summary))
 
     @app.get("/cases", response_model=list[CaseResponse])
     async def list_cases(request: Request) -> list[CaseResponse]:
@@ -535,7 +552,10 @@ def create_app(settings: Settings | None = None):
         return [
             case_response(state)
             for state in items
-            if await visible(state)
+            if await visible(state) and (s.test_mode or not (
+                state.get("origin") in {"demo", "test"}
+                or is_test_knowledge({"title": state.get("ticket", {}).get("summary", ""), "source_system": state.get("source_system", "")})
+            ))
         ]
 
     @app.post("/cases", response_model=CaseResponse, status_code=201)
@@ -572,12 +592,24 @@ def create_app(settings: Settings | None = None):
             ) from exc
 
     @app.post("/cases/{case_id}/investigate", response_model=CaseResponse)
-    async def investigate(case_id: str):
+    async def investigate(request: Request, case_id: str):
+        if "text/event-stream" in request.headers.get("accept", ""):
+            return stream_operation(request, lambda: run(case_id))
         return await run(case_id)
 
     @app.post("/cases/{case_id}/resume", response_model=CaseResponse)
-    async def resume(case_id: str, body: CaseResumeRequest):
+    async def resume(request: Request, case_id: str, body: CaseResumeRequest):
+        if "text/event-stream" in request.headers.get("accept", ""):
+            return stream_operation(request, lambda: run(case_id, body.answer))
         return await run(case_id, body.answer)
+
+    @app.post("/cases/{case_id}/investigate/stream")
+    async def investigate_stream(request: Request, case_id: str):
+        return stream_operation(request, lambda: run(case_id))
+
+    @app.post("/cases/{case_id}/resume/stream")
+    async def case_resume_stream(request: Request, case_id: str, body: CaseResumeRequest):
+        return stream_operation(request, lambda: run(case_id, body.answer))
 
     @app.get("/cases/{case_id}/events", response_model=list[CaseEvent])
     async def events(case_id: str):
@@ -614,7 +646,7 @@ def create_app(settings: Settings | None = None):
     from starlette.responses import FileResponse
 
     web_dist = Path(__file__).resolve().parents[2] / "frontend" / "dist"
-    if web_dist.is_dir():
+    if (web_dist / "assets").is_dir():
         app.mount("/assets", StaticFiles(directory=web_dist / "assets"), name="assets")
 
         @app.get("/")

@@ -3,167 +3,193 @@ import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import VoiceSupport, { Transcript } from './VoiceSupport'
 import { VoiceAudio } from './voiceAudio'
-import type { ReadinessReport } from './readiness'
 
-const capability = {
-  configured: true,
-  locally_initialized: true,
-  authenticated: 'NOT_CHECKED',
-  reachable: 'NOT_CHECKED',
-  live_validated: false,
-  missing: [],
-}
-const azureReady: ReadinessReport = {
-  runtime_mode: 'azure',
-  reasoning: capability,
-  embeddings: capability,
-  voice: capability,
-  local_mcp: 'READY',
-  private_stores: 'READY',
-  session_auth_configured: true,
-  text_ready: true,
-  voice_ready: true,
-  live_azure_validated: false,
-}
-const sid = 'a'.repeat(32)
 class Socket {
   static OPEN = 1
   static instances: Socket[] = []
   readyState = 1
   bufferedAmount = 0
-  sent: string[] = []
+  sent: (string | ArrayBuffer)[] = []
   onmessage: ((event: { data: string }) => void) | null = null
-  onclose: (() => void) | null = null
+  onclose: ((event: { code: number }) => void) | null = null
   onerror: (() => void) | null = null
-  constructor() {
+  closed = false
+  acknowledgeStop = true
+  constructor(public url: string) {
     Socket.instances.push(this)
   }
-  send(data: string) {
+  send(data: string | ArrayBuffer) {
     this.sent.push(data)
+    if (typeof data === 'string' && JSON.parse(data).type === 'stop' && this.acknowledgeStop)
+      this.emit('state', { state: 'stopped' })
   }
   close() {
-    this.onclose?.()
+    this.closed = true
+    this.onclose?.({ code: 1000 })
   }
-  emit(type: string, sequence: number, payload: unknown) {
-    this.onmessage?.({
-      data: JSON.stringify({ version: 1, session_id: sid, type, sequence, payload }),
-    })
+  emit(type: string, payload: object = {}) {
+    this.onmessage?.({ data: JSON.stringify({ type, ...payload }) })
   }
 }
+let captureFrame: (frame: ArrayBuffer) => void
 beforeEach(() => {
   Socket.instances = []
   vi.stubGlobal('WebSocket', Socket)
   vi.stubGlobal(
     'fetch',
-    vi.fn(async () => ({
+    vi.fn(async (path: string) => ({
       ok: true,
-      json: async () => ({
-        session_id: sid,
-        status: 'listening',
-        turns: [],
-        case_id: null,
-        resolution_status: 'unconfirmed',
-      }),
+      json: async () =>
+        path === '/speech/readiness'
+          ? { ready: true }
+          : {
+              request_id: 'request1',
+              case_id: 'case1',
+              result: {
+                status: 'assessment_ready',
+                final_answer: 'Check the verified VPN authentication result.',
+              },
+            },
     })),
   )
-  vi.spyOn(VoiceAudio.prototype, 'play').mockResolvedValue()
+  vi.spyOn(VoiceAudio.prototype, 'start').mockImplementation(async function (send) {
+    captureFrame = send
+  })
+  vi.spyOn(VoiceAudio.prototype, 'close').mockImplementation(() => undefined)
 })
 afterEach(() => {
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
+  vi.useRealTimers()
 })
 
-test('no microphone before click; rejection offers text and cleans tracks', async () => {
-  const getUserMedia = vi.fn().mockRejectedValue(new Error('permission denied'))
-  Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: { getUserMedia } })
-  render(<VoiceSupport onCaseCreated={vi.fn()} readiness={azureReady} />)
-  expect(getUserMedia).not.toHaveBeenCalled()
-  await userEvent.click(screen.getByRole('button', { name: 'Start voice chat' }))
-  expect(await screen.findByRole('alert')).toHaveTextContent('start text support')
-  expect(getUserMedia).toHaveBeenCalledOnce()
-  expect(fetch).not.toHaveBeenCalled()
-  await userEvent.click(screen.getByRole('button', { name: 'Start text support' }))
-  expect(Socket.instances).toHaveLength(1)
-})
+async function start() {
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Ready to Talk' })).toBeEnabled())
+  await userEvent.click(screen.getByRole('button', { name: 'Ready to Talk' }))
+  const ws = Socket.instances[Socket.instances.length - 1]
+  act(() => ws.emit('state', { state: 'listening' }))
+  return ws
+}
 
-test('text fallback, stable partial bubbles, duplicate ordering and interruption', async () => {
-  const clear = vi.spyOn(VoiceAudio.prototype, 'clearPlayback')
-  render(<VoiceSupport onCaseCreated={vi.fn()} readiness={azureReady} />)
-  await userEvent.click(screen.getByRole('button', { name: 'Start text support' }))
-  expect(screen.getByRole('list', { name: 'Connection progress' })).not.toHaveTextContent(
-    'microphone',
-  )
-  const ws = Socket.instances[0]
+test('no microphone before click; continuous partial/final speech replaces partials and deduplicates final callbacks', async () => {
+  render(<VoiceSupport onCaseCreated={vi.fn()} />)
+  expect(VoiceAudio.prototype.start).not.toHaveBeenCalled()
+  const ws = await start()
+  expect(String(ws.url)).toMatch(/\/speech\/stream$/)
   act(() => {
-    ws.emit('session.snapshot', 1, {
-      conversation: { session_id: sid, status: 'listening', turns: [] },
-    })
-    ws.emit('transcript.user.partial', 2, { turn_id: 'u', text: 'VPN ' })
-    ws.emit('transcript.user.partial', 3, { turn_id: 'u', text: 'broken' })
-    ws.emit('transcript.user.final', 4, { turn_id: 'u', text: 'VPN broken' })
-    ws.emit('transcript.user.final', 4, { turn_id: 'u', text: 'DUPLICATE' })
-    ws.emit('audio', 5, { audio: 'AAA=' })
-    ws.emit('playback.clear', 6, {})
+    ws.emit('transcript.partial', { id: '1:a', text: 'VPN' })
+    ws.emit('transcript.partial', { id: '1:a', text: 'VPN fails' })
   })
   expect(screen.getAllByTestId('voice-message')).toHaveLength(1)
-  expect(screen.getByText('VPN broken')).toBeInTheDocument()
-  expect(screen.queryByText('DUPLICATE')).not.toBeInTheDocument()
-  expect(clear).toHaveBeenCalled()
-  await userEvent.type(screen.getByLabelText('Message DeskMate'), 'it worked')
-  await userEvent.click(screen.getByRole('button', { name: 'Send message' }))
-  expect(JSON.parse(ws.sent[0]).type).toBe('text.input')
-  act(() => ws.emit('pong', 9, {}))
-  expect(screen.getByRole('alert')).toHaveTextContent('out of order')
-})
-
-test('streamed audio plays in order, stop/unmount closes capture and session', async () => {
-  const played: string[] = []
-  vi.spyOn(VoiceAudio.prototype, 'play').mockImplementation(async (value) => {
-    played.push(value)
-  })
-  const close = vi.spyOn(VoiceAudio.prototype, 'close')
-  const view = render(<VoiceSupport onCaseCreated={vi.fn()} readiness={azureReady} />)
-  await userEvent.click(screen.getByRole('button', { name: 'Start text support' }))
-  const ws = Socket.instances[0]
+  expect(screen.getByText('VPN fails')).toBeInTheDocument()
   act(() => {
-    ws.emit('session.snapshot', 1, {
-      conversation: { session_id: sid, status: 'listening', turns: [] },
-    })
-    ws.emit('audio', 2, { audio: 'first' })
-    ws.emit('audio', 3, { audio: 'second' })
+    ws.emit('transcript.final', { id: '1:a', text: 'VPN fails.' })
+    ws.emit('transcript.final', { id: '1:a', text: 'VPN fails.' })
+    ws.emit('transcript.final', { id: '1:b', text: 'I can sign in elsewhere.' })
   })
-  await waitFor(() => expect(played).toEqual(['first', 'second']))
+  expect(screen.getAllByTestId('voice-message')).toHaveLength(2)
+  expect(screen.getByLabelText('Message DeskMate')).toHaveValue(
+    'VPN fails. I can sign in elsewhere.',
+  )
+  expect(screen.getByTestId('voice-status')).toHaveTextContent('Listening')
+  expect(VoiceAudio.prototype.close).not.toHaveBeenCalled()
+  expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled()
+})
+
+test('standalone spoken Stop is excluded; a sentence containing stop is preserved; Stop releases microphone and sends only text to common workflow', async () => {
+  render(<VoiceSupport onCaseCreated={vi.fn()} />)
+  const ws = await start()
+  act(() => {
+    ws.emit('transcript.final', { id: '1:a', text: 'The service will stop responding.' })
+    ws.emit('transcript.final', { id: '1:b', text: 'Stop.' })
+  })
+  expect(screen.getByTestId('voice-status')).toHaveTextContent('Stopped')
+  expect(screen.queryByText('Stop.')).not.toBeInTheDocument()
+  expect(screen.getByLabelText('Message DeskMate')).toHaveValue('The service will stop responding.')
+  expect(VoiceAudio.prototype.close).toHaveBeenCalledOnce()
+  expect(ws.sent).toContain(JSON.stringify({ type: 'stop' }))
+  await userEvent.click(screen.getByRole('button', { name: 'Send message' }))
+  expect(fetch).toHaveBeenCalledWith(
+    '/ask',
+    expect.objectContaining({
+      body: JSON.stringify({ summary: 'The service will stop responding.' }),
+    }),
+  )
+  expect(
+    await screen.findByText('Check the verified VPN authentication result.'),
+  ).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Open investigation' })).toBeInTheDocument()
+})
+
+test('SDK reconnect state preserves accumulated transcript and keeps microphone; genuine usage includes silence', async () => {
+  render(<VoiceSupport onCaseCreated={vi.fn()} />)
+  const ws = await start()
+  act(() => {
+    ws.emit('transcript.final', { id: '1:a', text: 'First words.' })
+    ws.emit('state', { state: 'reconnecting' })
+    ws.emit('usage', { listening_seconds: 120, connected_seconds: 115.4, estimated_cad: 0.0641 })
+  })
+  expect(screen.getByTestId('voice-status')).toHaveTextContent('Reconnecting')
+  expect(screen.getByLabelText('Message DeskMate')).toHaveValue('First words.')
+  expect(screen.getByLabelText('Speech usage')).toHaveTextContent(
+    'Connected speech 115s · Estimated CAD $0.0641',
+  )
+  expect(VoiceAudio.prototype.close).not.toHaveBeenCalled()
+  act(() => {
+    ws.emit('state', { state: 'listening' })
+    ws.emit('transcript.final', { id: '2:b', text: 'Still listening.' })
+  })
+  expect(screen.getByLabelText('Message DeskMate')).toHaveValue('First words. Still listening.')
+})
+
+test('captures binary 16k PCM, handles mute, explicitly stops, permits next recording, and ignores stale callbacks', async () => {
+  const view = render(<VoiceSupport onCaseCreated={vi.fn()} />)
+  const old = await start()
+  const frame = new ArrayBuffer(640)
+  captureFrame(frame)
+  expect(old.sent[0]).toBe(frame)
+  await userEvent.click(screen.getByRole('button', { name: 'Mute' }))
+  expect(screen.getByTestId('voice-status')).toHaveTextContent('Microphone muted')
+  await userEvent.click(screen.getByRole('button', { name: 'Unmute' }))
   await userEvent.click(screen.getByRole('button', { name: 'Stop session' }))
-  expect(close).toHaveBeenCalled()
-  expect(JSON.parse(ws.sent[ws.sent.length - 1]).type).toBe('session.stop')
+  const next = await start()
+  act(() => old.emit('error', { message: 'stale failure' }))
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  expect(screen.getByTestId('voice-status')).toHaveTextContent('Listening')
   view.unmount()
+  expect(next.closed).toBe(true)
+  expect(VoiceAudio.prototype.close).toHaveBeenCalledTimes(2)
 })
 
-test('actual audio cleanup stops tracks even when permission completes after unmount', async () => {
-  let resolve: (value: MediaStream) => void = () => undefined
-  const stop = vi.fn()
-  Object.defineProperty(navigator, 'mediaDevices', {
-    configurable: true,
-    value: {
-      getUserMedia: () =>
-        new Promise<MediaStream>((r) => {
-          resolve = r
-        }),
-    },
+test('permission failure leaves text available and never opens speech WebSocket', async () => {
+  vi.mocked(VoiceAudio.prototype.start).mockRejectedValue(
+    new Error('Microphone permission was denied.'),
+  )
+  render(<VoiceSupport onCaseCreated={vi.fn()} />)
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Ready to Talk' })).toBeEnabled())
+  await userEvent.click(screen.getByRole('button', { name: 'Ready to Talk' }))
+  expect(await screen.findByRole('alert')).toHaveTextContent('permission was denied')
+  expect(Socket.instances).toHaveLength(0)
+  expect(screen.getByLabelText('Message DeskMate')).toBeEnabled()
+})
+
+test('server recognition faults are errors, release capture and preserve transcript', async () => {
+  render(<VoiceSupport onCaseCreated={vi.fn()} />)
+  const ws = await start()
+  act(() => {
+    ws.emit('transcript.final', { id: '1:a', text: 'Preserve this.' })
+    ws.emit('error', { message: 'Speech recognition stopped. Please try again.' })
   })
-  const player = new VoiceAudio()
-  const pending = player.start(vi.fn())
-  player.close()
-  resolve({ getTracks: () => [{ stop }] } as unknown as MediaStream)
-  await pending
-  expect(stop).toHaveBeenCalledOnce()
+  expect(screen.getByTestId('voice-status')).toHaveTextContent('Error')
+  expect(screen.getByLabelText('Message DeskMate')).toHaveValue('Preserve this.')
+  expect(VoiceAudio.prototype.close).toHaveBeenCalledOnce()
 })
 
-test('1000 messages stay in one scroll panel; preserve upward scroll and jump', () => {
-  const turns = Array.from({ length: 1000 }, (_, index) => ({
-    id: String(index),
-    role: index % 2 ? ('assistant' as const) : ('user' as const),
-    text: 'message ' + index,
+test('1000 messages remain in one bounded transcript panel with a jump control', () => {
+  const turns = Array.from({ length: 1000 }, (_, i) => ({
+    id: String(i),
+    role: 'user' as const,
+    text: 'message ' + i,
   }))
   const view = render(<Transcript turns={turns} />)
   const panel = screen.getByTestId('voice-transcript')
@@ -174,269 +200,53 @@ test('1000 messages stay in one scroll panel; preserve upward scroll and jump', 
   panel.scrollTop = 10
   fireEvent.scroll(panel)
   view.rerender(
-    <Transcript turns={[...turns, { id: 'latest', role: 'assistant', text: 'newest' }]} />,
+    <Transcript turns={[...turns, { id: 'latest', role: 'assistant', text: 'latest' }]} />,
   )
-  expect(panel.scrollTop).toBe(10)
   expect(screen.getAllByTestId('voice-message')).toHaveLength(1001)
   fireEvent.click(screen.getByRole('button', { name: 'Jump to latest' }))
   expect(panel.scrollTop).toBe(100000)
-  expect(screen.queryByRole('button', { name: 'Jump to latest' })).not.toBeInTheDocument()
-  panel.scrollTop = 99530
-  fireEvent.scroll(panel)
-  view.rerender(
-    <Transcript turns={[...turns, { id: 'newer', role: 'assistant', text: 'newer' }]} />,
-  )
-  expect(panel.scrollTop).toBe(100000)
 })
 
-test('successful synthetic capture mutes frames and stops tracks on session stop', async () => {
-  const stop = vi.fn()
-  const contextClose = vi.fn().mockResolvedValue(undefined)
-  const node = { connect: vi.fn(), disconnect: vi.fn() }
-  class Context {
-    sampleRate = 24000
-    state = 'running'
-    audioWorklet = { addModule: vi.fn().mockResolvedValue(undefined) }
-    destination = {}
-    createMediaStreamSource = () => node
-    createGain = () => ({ ...node, gain: { value: 1 } })
-    resume = vi.fn().mockResolvedValue(undefined)
-    close = contextClose
-  }
-  class Worklet {
-    static last: Worklet
-    port: { onmessage: ((event: { data: ArrayBuffer }) => void) | null } = { onmessage: null }
-    connect = vi.fn()
-    disconnect = vi.fn()
-    constructor() {
-      Worklet.last = this
-    }
-  }
-  vi.stubGlobal('AudioContext', Context)
-  vi.stubGlobal('AudioWorkletNode', Worklet)
-  Object.defineProperty(navigator, 'mediaDevices', {
-    configurable: true,
-    value: { getUserMedia: vi.fn().mockResolvedValue({ getTracks: () => [{ stop }], getAudioTracks: () => [{ stop, enabled: true, readyState: 'live' }] }) },
-  })
-  const view = render(<VoiceSupport onCaseCreated={vi.fn()} readiness={azureReady} />)
-  await userEvent.click(screen.getByRole('button', { name: 'Start voice chat' }))
-  const ws = Socket.instances[0]
-  act(() =>
-    ws.emit('session.snapshot', 1, {
-      conversation: { session_id: sid, status: 'listening', turns: [] },
-    }),
-  )
-  await userEvent.click(screen.getByRole('button', { name: 'Mute' }))
-  Worklet.last.port.onmessage?.({ data: new ArrayBuffer(960) })
-  expect(ws.sent).toHaveLength(1)
-  expect(atob(JSON.parse(ws.sent[0]).payload.audio)).toBe('\0'.repeat(960))
-  await userEvent.click(screen.getByRole('button', { name: 'Unmute' }))
-  Worklet.last.port.onmessage?.({ data: new ArrayBuffer(960) })
-  expect(JSON.parse(ws.sent[1]).type).toBe('audio.append')
-  expect(screen.getByTestId('voice-status')).not.toHaveTextContent('Listening')
-  act(() => ws.emit('audio.delivery', 2, { frames: 1 }))
-  await waitFor(() => expect(screen.getByTestId('voice-status')).toHaveTextContent('Listening'))
+test('Stop releases microphone immediately but the next recording waits for confirmed SDK settlement', async () => {
+  render(<VoiceSupport onCaseCreated={vi.fn()} />)
+  const ws = await start()
+  ws.acknowledgeStop = false
   await userEvent.click(screen.getByRole('button', { name: 'Stop session' }))
-  expect(stop).toHaveBeenCalledOnce()
-  expect(contextClose).toHaveBeenCalledOnce()
-  view.unmount()
-  expect(stop).toHaveBeenCalledOnce()
+  expect(VoiceAudio.prototype.close).toHaveBeenCalledOnce()
+  expect(screen.getByTestId('voice-status')).toHaveTextContent('Stopping')
+  expect(screen.getByRole('button', { name: 'Ready to Talk' })).toBeDisabled()
+  act(() => ws.emit('state', { state: 'stopped' }))
+  expect(screen.getByRole('button', { name: 'Ready to Talk' })).toBeEnabled()
 })
 
-test('client queue and send buffer saturation close the session explicitly', async () => {
-  vi.spyOn(VoiceAudio.prototype, 'play').mockImplementation(
-    () => new Promise<void>(() => undefined),
+test('new microphone capture waits while the submitted transcript investigation is in flight', async () => {
+  let finish: (response: Response) => void = () => undefined
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (path: string) =>
+      path === '/speech/readiness'
+        ? Response.json({ ready: true })
+        : new Promise<Response>((resolve) => {
+            finish = resolve
+          }),
+    ),
   )
-  render(<VoiceSupport onCaseCreated={vi.fn()} readiness={azureReady} />)
-  await userEvent.click(screen.getByRole('button', { name: 'Start text support' }))
-  const ws = Socket.instances[0]
-  act(() => {
-    ws.emit('session.snapshot', 1, {
-      conversation: { session_id: sid, status: 'listening', turns: [] },
-    })
-    for (let index = 0; index < 65; index++) ws.emit('audio', index + 2, { audio: 'AAA=' })
-  })
-  expect(screen.getByRole('alert')).toHaveTextContent('queue is full')
-  expect(screen.getByTestId('voice-status')).toHaveTextContent('Failed')
-})
-
-test('isolated demo has an explicit warning and a microphone plumbing button', () => {
-  render(
-    <VoiceSupport
-      onCaseCreated={vi.fn()}
-      readiness={{ ...azureReady, runtime_mode: 'isolated_demo' }}
-    />,
-  )
-  expect(screen.getByText('ISOLATED DEMO')).toBeInTheDocument()
-  expect(
-    screen.getByText('Responses and audio are simulated in this sample session.'),
-  ).toBeInTheDocument()
-  expect(screen.getByRole('button', { name: 'Test microphone' })).toHaveClass('microphone-orb')
-  expect(screen.queryByRole('button', { name: 'Start voice chat' })).not.toBeInTheDocument()
-  expect(screen.getByText(/will not recognize speech or speak/)).toBeInTheDocument()
-  expect(screen.getByRole('button', { name: 'Start text support' })).toBeEnabled()
-})
-
-test('late playback failure from a stopped session cannot close the new session', async () => {
-  let rejectPlayback: (error: Error) => void = () => undefined
-  vi.spyOn(VoiceAudio.prototype, 'play').mockImplementation(
-    () =>
-      new Promise<void>((_resolve, reject) => {
-        rejectPlayback = reject
+  render(<VoiceSupport onCaseCreated={vi.fn()} />)
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Ready to Talk' })).toBeEnabled())
+  await userEvent.type(screen.getByLabelText('Message DeskMate'), 'VPN fails')
+  await userEvent.click(screen.getByRole('button', { name: 'Send message' }))
+  expect(screen.getByRole('button', { name: 'Ready to Talk' })).toBeDisabled()
+  expect(screen.getByRole('button', { name: 'Start voice chat' })).toBeDisabled()
+  expect(VoiceAudio.prototype.start).not.toHaveBeenCalled()
+  await act(async () =>
+    finish(
+      Response.json({
+        request_id: 'request1',
+        case_id: null,
+        result: { status: 'assessment_ready', final_answer: 'Verified text response' },
       }),
+    ),
   )
-  render(<VoiceSupport onCaseCreated={vi.fn()} readiness={azureReady} />)
-  await userEvent.click(screen.getByRole('button', { name: 'Start text support' }))
-  const old = Socket.instances[0]
-  act(() => {
-    old.emit('session.snapshot', 1, {
-      conversation: { session_id: sid, status: 'listening', turns: [] },
-    })
-    old.emit('audio', 2, { audio: 'AAA=' })
-  })
-  await waitFor(() => expect(VoiceAudio.prototype.play).toHaveBeenCalled())
-  await userEvent.click(screen.getByRole('button', { name: 'Stop session' }))
-  await userEvent.click(screen.getByRole('button', { name: 'Start text support' }))
-  act(() =>
-    Socket.instances[1].emit('session.snapshot', 1, {
-      conversation: { session_id: sid, status: 'listening', turns: [] },
-    }),
-  )
-  await act(async () => {
-    rejectPlayback(new Error('private expired playback response'))
-  })
-  expect(screen.getByTestId('voice-status')).toHaveTextContent('Ready for messages')
-  expect(screen.queryByRole('alert')).not.toBeInTheDocument()
-})
-
-test('missing Azure readiness disables only the relevant controls', () => {
-  const report = {
-    ...azureReady,
-    voice_ready: false,
-    voice: { ...capability, configured: false, missing: ['AZURE_VOICELIVE_ENDPOINT'] },
-  }
-  const view = render(<VoiceSupport onCaseCreated={vi.fn()} readiness={report} />)
-  expect(screen.getByRole('button', { name: 'Start voice chat' })).toBeDisabled()
-  expect(screen.getByRole('button', { name: 'Start text support' })).toBeEnabled()
-  expect(screen.getByText(/Voice support is temporarily unavailable/)).toBeInTheDocument()
-  view.rerender(
-    <VoiceSupport
-      onCaseCreated={vi.fn()}
-      readiness={{
-        ...report,
-        text_ready: false,
-        reasoning: { ...capability, configured: false, missing: ['AZURE_MODEL_DEPLOYMENT'] },
-      }}
-    />,
-  )
-  expect(screen.getByRole('button', { name: 'Start text support' })).toBeDisabled()
-  expect(screen.getByText(/Text support is temporarily unavailable/)).toBeInTheDocument()
-})
-
-test('permission denial exposes stages and a safe error code, never the raw error', async () => {
-  Object.defineProperty(navigator, 'mediaDevices', {
-    configurable: true,
-    value: {
-      getUserMedia: vi
-        .fn()
-        .mockRejectedValue(new DOMException('private raw detail', 'NotAllowedError')),
-    },
-  })
-  render(<VoiceSupport onCaseCreated={vi.fn()} readiness={azureReady} />)
-  await userEvent.click(screen.getByRole('button', { name: 'Start voice chat' }))
-  expect(await screen.findByRole('alert')).toHaveTextContent('Microphone permission was denied')
-  expect(screen.getByRole('list', { name: 'Connection progress' })).toHaveTextContent(
-    'Preparing sessionRequesting microphone permissionOpening microphoneConnectingConnectedListening',
-  )
-  expect(screen.queryByText('MIC_PERMISSION_DENIED')).not.toBeInTheDocument()
-  expect(screen.queryByText('private raw detail')).not.toBeInTheDocument()
-  expect(screen.getByRole('button', { name: 'Start text support' })).toBeEnabled()
-})
-
-test('AudioWorklet load failure is visible and capture is cleaned up', async () => {
-  const stop = vi.fn()
-  Object.defineProperty(navigator, 'mediaDevices', {
-    configurable: true,
-    value: { getUserMedia: vi.fn().mockResolvedValue({ getTracks: () => [{ stop }], getAudioTracks: () => [{ stop, enabled: true, readyState: 'live' }] }) },
-  })
-  class Context {
-    sampleRate = 24000
-    audioWorklet = { addModule: vi.fn().mockRejectedValue(new Error('private processor response')) }
-    close = vi.fn().mockResolvedValue(undefined)
-  }
-  vi.stubGlobal('AudioContext', Context)
-  render(<VoiceSupport onCaseCreated={vi.fn()} readiness={azureReady} />)
-  await userEvent.click(screen.getByRole('button', { name: 'Start voice chat' }))
-  expect(await screen.findByRole('alert')).toHaveTextContent('audio processor could not be loaded')
-  expect(screen.queryByText('AUDIO_PROCESSOR_LOAD_FAILED')).not.toBeInTheDocument()
-  expect(stop).toHaveBeenCalledOnce()
-  expect(screen.queryByText('private processor response')).not.toBeInTheDocument()
-})
-
-test('WebSocket failure is shown with a code and a stopped session cannot reconnect', async () => {
-  render(<VoiceSupport onCaseCreated={vi.fn()} readiness={azureReady} />)
-  await userEvent.click(screen.getByRole('button', { name: 'Start text support' }))
-  act(() => Socket.instances[0].onerror?.())
-  expect(screen.getByRole('alert')).toHaveTextContent('WebSocket could not connect')
-  expect(screen.queryByText('VOICE_WS_CONNECT_FAILED')).not.toBeInTheDocument()
-  await userEvent.click(screen.getByRole('button', { name: 'Start text support' }))
-  const ws = Socket.instances[1]
-  act(() =>
-    ws.emit('session.snapshot', 1, {
-      conversation: { session_id: sid, status: 'listening', turns: [] },
-    }),
-  )
-  await userEvent.click(screen.getByRole('button', { name: 'Stop session' }))
-  expect(screen.queryByRole('button', { name: 'Reconnect with text' })).not.toBeInTheDocument()
-  expect(screen.getByText(/This session has stopped/)).toBeInTheDocument()
-  expect(screen.getByRole('button', { name: 'Start text support' })).toBeEnabled()
-})
-
-test('shows the remaining estimated CAD allowance without claiming an invoice cap', () => {
-  render(
-    <VoiceSupport
-      onCaseCreated={vi.fn()}
-      readiness={{
-        ...azureReady,
-        azure_usage: {
-          enabled: true,
-          remaining_estimated_cad: 2.75,
-          estimated_used_cad: 5.25,
-          limit_cad: 8,
-          invoice_cap: false,
-          ledger_error: false,
-        },
-      }}
-    />,
-  )
-  expect(screen.queryByLabelText('Estimated Azure demo allowance')).not.toBeInTheDocument()
-  expect(screen.queryByText(/CAD|invoice|Azure/)).not.toBeInTheDocument()
-})
-
-test('emergency Azure disable remains available in the protected administration console', async () => {
-  const { default: AdminConsole } = await import('./AdminConsole')
-  vi.stubGlobal('fetch', vi.fn(async () => Response.json({ azure_usage: { enabled: false } })))
-  render(<AdminConsole />)
-  await userEvent.click(await screen.findByRole('button', { name: 'Disable Azure usage' }))
-  expect(fetch).toHaveBeenCalledWith('/admin/azure/usage/disable', expect.objectContaining({ method: 'POST' }))
-  expect(await screen.findByText(/"enabled": false/)).toBeInTheDocument()
-})
-
-test('shows real validation failures and blocks live controls without a fake fallback', () => {
-  render(
-    <VoiceSupport
-      onCaseCreated={vi.fn()}
-      readiness={{
-        ...azureReady,
-        text_ready: false,
-        voice_ready: false,
-        azure_validation: { text_workflow: { passed: false, code: 'rate_limit_exceeded' } },
-      }}
-    />,
-  )
-  expect(screen.getByText(/Text support is temporarily unavailable/)).toBeInTheDocument()
-  expect(screen.queryByText('rate_limit_exceeded')).not.toBeInTheDocument()
-  expect(screen.getByRole('button', { name: 'Start voice chat' })).toBeDisabled()
-  expect(screen.getByRole('button', { name: 'Start text support' })).toBeDisabled()
-  expect(screen.queryByText('ISOLATED DEMO')).not.toBeInTheDocument()
+  expect(await screen.findByText('Verified text response')).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Ready to Talk' })).toBeEnabled()
 })

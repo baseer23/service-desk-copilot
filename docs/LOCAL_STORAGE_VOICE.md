@@ -1,3 +1,5 @@
+> **Archived — superseded on 2026-10-14.** This document records an earlier deployment, migration or validation. Its Azure persistence, Voice Live, billing and startup instructions are not current. Do not execute its old provisioning or deployment commands. See [current architecture](ARCHITECTURE_SIMPLIFICATION.md), [setup](../README.md) and [Speech](SPEECH.md). Historical backups and financial records remain protected.
+
 # Local persistence and repeatable voice sessions
 
 The Mac profile uses `DATA_PLATFORM=local` and `LOCAL_PERSISTENCE_ENABLED=true`.

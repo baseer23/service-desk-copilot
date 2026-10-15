@@ -7,7 +7,8 @@ import re
 import tempfile
 from pathlib import Path
 
-from backend.app.store.azure_records import ManagedStoreError
+from backend.app.store.records import ManagedStoreError
+from backend.app.services.knowledge_policy import is_test_knowledge
 
 
 class LocalDocuments:
@@ -17,11 +18,10 @@ class LocalDocuments:
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
 
     def path(self, document_id, artifact):
-        if not re.fullmatch(r"[a-f0-9]{64}", document_id) or artifact not in {
-            "original",
-            "extraction.json",
-            "vectors.json",
-        }:
+        valid_artifact = artifact in {"original", "extraction.json", "vectors.json"} or bool(
+            re.fullmatch(r"vectors-[a-f0-9]{16}\.json", artifact)
+        )
+        if not re.fullmatch(r"[a-f0-9]{64}", document_id) or not valid_artifact:
             raise ValueError("Unsupported document artifact")
         return (
             hashlib.sha256(self.records.tenant().encode()).hexdigest()
@@ -114,6 +114,8 @@ class LocalKnowledgeStore:
 
     def row(self, identifier, text, metadata, score=0, **extra):
         meta = json.loads(metadata["metadata_json"])
+        if not self.records.settings.test_mode and is_test_knowledge(meta):
+            return None
         if meta.get("family"):
             family = self.records.read("document_family", meta["family"])
             if family and family["payload"].get("published") not in {None, meta.get("doc_id")}:
@@ -153,9 +155,11 @@ class LocalKnowledgeStore:
         if not terms:
             return []
         rows = {}
-        # Old embedding spaces remain separate, and are searched lexically only.
+        # Every historical embedding space remains intact and lexical-only.
         collections = [self.vector._collection] + [
-            c for c in self.vector._client.list_collections() if c.name.startswith("archive_")
+            c for c in self.vector._client.list_collections()
+            if c.name != self.vector.collection_name
+            and (c.name.startswith("archive_") or c.name.startswith("chunks_azure_"))
         ]
         for collection in collections:
             offset = 0

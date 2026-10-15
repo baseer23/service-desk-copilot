@@ -1,4 +1,4 @@
-"""Azure-only case reasoning, using Entra ID by default and bounded validation."""
+"""Azure case reasoning, using Entra ID by default and bounded validation."""
 
 import asyncio
 import json
@@ -12,6 +12,7 @@ from backend.app.core.config import Settings
 
 from .instructions import stage_instructions
 from .provider import LLMError
+from .provider_routing import model_event
 
 T = TypeVar("T", bound=BaseModel)
 TOKEN_LIMITS = {
@@ -23,9 +24,6 @@ TOKEN_LIMITS = {
     "reason": 1500,
     "verify": 800,
     "evaluate_sources": 350,
-    "voice_greeting": 100,
-    "voice_turn": 700,
-    "voice_reply": 350,
 }
 
 
@@ -87,10 +85,9 @@ def structured_request(
         {
             "role": "user",
             "content": json.dumps(
-                compact_context(
-                    {key: value for key, value in context.items() if key != "instructions"}
-                    if stage.startswith("voice_") else context
-                ), default=str, separators=(",", ":"),
+                compact_context(context),
+                default=str,
+                separators=(",", ":"),
             ),
         },
     ]
@@ -182,10 +179,19 @@ class AzureOpenAIProvider:
     def name(self) -> str:
         return "azure_openai"
 
+    def as_runnable(self):
+        from langchain_core.runnables import RunnableLambda
+
+        async def invoke(request):
+            return await self.generate_structured(
+                request["stage"], request["context"], request["schema"]
+            )
+
+        return RunnableLambda(invoke, name="Azure structured reasoning")
+
     async def generate_structured(self, stage: str, context: dict, schema: type[T]) -> T:
-        # The live greeting and first recognized turn may overlap. The durable
-        # guard permits one paid operation; queue locally instead of failing a
-        # valid conversation when its own greeting holds that reservation.
+        # One persistent paid-operation reservation is shared by concurrent
+        # investigations. Queue locally rather than racing the ledger.
         async with self.request_lock:
             return await self._generate_structured(stage, context, schema)
 
@@ -195,9 +201,11 @@ class AzureOpenAIProvider:
         for attempt in range(attempts):
             try:
                 while True:
-                    delay = (await asyncio.to_thread(self.usage_guard.request_delay, "reasoning")
-                             if self.settings.uses_record_store
-                             else self.usage_guard.request_delay("reasoning"))
+                    delay = (
+                        await asyncio.to_thread(self.usage_guard.request_delay, "reasoning")
+                        if self.settings.uses_record_store
+                        else self.usage_guard.request_delay("reasoning")
+                    )
                     if not delay:
                         break
                     await asyncio.sleep(min(delay, 1))
@@ -237,6 +245,20 @@ class AzureOpenAIProvider:
                 content = response.choices[0].message.content
                 if not isinstance(content, str):
                     raise ValueError("No structured content")
+                counters = getattr(response, "usage", None)
+                usage = {
+                    "input_tokens": getattr(counters, "prompt_tokens", None),
+                    "output_tokens": getattr(counters, "completion_tokens", None),
+                    "total_tokens": getattr(counters, "total_tokens", None),
+                }
+                await model_event(
+                    kind="llm_usage",
+                    status="completed",
+                    provider="azure_openai",
+                    stage=stage,
+                    summary="Azure OpenAI request completed",
+                    usage={key: value for key, value in usage.items() if isinstance(value, int)},
+                )
             except AzureUsageBlocked as exc:
                 raise LLMError(str(exc)) from None
             except Exception as exc:  # noqa: BLE001 - sanitized provider boundary

@@ -5,6 +5,11 @@ import pytest
 from backend.app.agent.models import InvestigationPlan, RequestIntent
 from backend.app.models.provider import LLMError
 from backend.app.models.provider_azure_openai import AzureOpenAIProvider
+from pydantic import BaseModel
+
+
+class Probe(BaseModel):
+    status: str
 
 
 def provider(settings, responses):
@@ -34,17 +39,19 @@ def provider(settings, responses):
 
 
 @pytest.mark.asyncio
-async def test_overlapping_live_greeting_and_first_turn_queue_without_reservation_conflict(settings):
+async def test_overlapping_structured_calls_queue_without_reservation_conflict(settings):
     import asyncio
     import threading
-    from backend.app.voice.models import VoiceGreeting
 
     entered, release = threading.Event(), threading.Event()
     calls = []
-    config = settings.model_copy(update={
-        "azure_foundry_endpoint": "https://example.openai.azure.com",
-        "azure_model_deployment": "test-deployment", "azure_usage_guard_enabled": True,
-    })
+    config = settings.model_copy(
+        update={
+            "azure_foundry_endpoint": "https://example.openai.azure.com",
+            "azure_model_deployment": "test-deployment",
+            "azure_usage_guard_enabled": True,
+        }
+    )
 
     def create(**kwargs):
         calls.append(kwargs)
@@ -52,29 +59,29 @@ async def test_overlapping_live_greeting_and_first_turn_queue_without_reservatio
             entered.set()
             assert release.wait(2)
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content='{"reply":"Fictional question?"}'))],
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"status":"ok"}'))],
             usage=SimpleNamespace(prompt_tokens=10, completion_tokens=10),
         )
 
-    model = AzureOpenAIProvider(config, SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create))))
-    greeting = asyncio.create_task(model.generate_structured("voice_greeting", {}, VoiceGreeting))
+    model = AzureOpenAIProvider(
+        config, SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    )
+    first = asyncio.create_task(model.generate_structured("readiness", {}, Probe))
     try:
         assert await asyncio.to_thread(entered.wait, 1)
-        first_turn = asyncio.create_task(model.generate_structured("voice_reply", {}, VoiceGreeting))
+        second = asyncio.create_task(model.generate_structured("readiness", {}, Probe))
         await asyncio.sleep(0.02)
-        assert len(calls) == 1 and not first_turn.done()
+        assert len(calls) == 1 and not second.done()
         release.set()
-        results = await asyncio.gather(greeting, first_turn)
-        assert len(calls) == 2 and all(result.reply == "Fictional question?" for result in results)
+        results = await asyncio.gather(first, second)
+        assert len(calls) == 2 and all(result.status == "ok" for result in results)
     finally:
         release.set()
-        await greeting
+        await first
 
 
 @pytest.mark.asyncio
 async def test_readiness_probe_is_one_minimal_request_without_schema_retries(settings):
-    from backend.app.diagnostics.azure_readiness import Probe
-
     model, payloads = provider(settings, ["{}", '{"status":"ok"}'])
     with pytest.raises(LLMError, match="invalid structured"):
         await model.generate_structured("readiness", {}, Probe)

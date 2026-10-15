@@ -1,16 +1,8 @@
-import { useEffect, useRef, useState } from 'react'
+import { useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import { post, request } from './api'
 import { type ReadinessReport } from './readiness'
 
-interface Document {
-  id: string
-  title: string
-  source_type: string
-  pages: number
-  status?: string
-  version?: number
-}
 interface Match {
   id: string
   text: string
@@ -31,12 +23,9 @@ export default function KnowledgePanel({
   const [message, setMessage] = useState('')
   const [error, setError] = useState('')
   const [preview, setPreview] = useState('')
-  const [documents, setDocuments] = useState<Document[]>([])
-  const [listError, setListError] = useState('')
   const [query, setQuery] = useState('')
   const [matches, setMatches] = useState<Match[]>([])
   const [searched, setSearched] = useState(false)
-  const [libraryQuery, setLibraryQuery] = useState('')
   const [dragging, setDragging] = useState(false)
   const picker = useRef<HTMLInputElement>(null)
   const indexingBlocked = readiness?.semantic_ingestion_ready === false
@@ -51,35 +40,6 @@ export default function KnowledgePanel({
     setMessage('')
     setError('')
   }
-
-  async function refreshDocuments() {
-    const list = await request<Document[]>('/documents')
-    setDocuments(Array.isArray(list) ? list : [])
-    setListError('')
-  }
-  useEffect(() => {
-    void refreshDocuments().catch(() =>
-      setListError('Saved documents could not be loaded. Check the server and reload the page.'),
-    )
-  }, [])
-  useEffect(() => {
-    if (!readiness?.managed_documents || !readiness.semantic_ingestion_ready || !documents.some(document => document.status !== 'ready' && document.status !== 'error')) return
-    let timer: number | undefined
-    const stop = () => { if (timer !== undefined) window.clearInterval(timer); timer = undefined }
-    const visibility = () => {
-      stop()
-      if (document.visibilityState === 'hidden') return
-      timer = window.setInterval(() => {
-        void refreshDocuments().catch(() => {
-          stop()
-          setListError('Document status could not be refreshed. Reload the page to try again.')
-        })
-      }, 10000)
-    }
-    visibility()
-    document.addEventListener('visibilitychange', visibility)
-    return () => { stop(); document.removeEventListener('visibilitychange', visibility) }
-  }, [documents, readiness?.managed_documents, readiness?.semantic_ingestion_ready])
 
   async function action(kind: 'index' | 'save' | 'extract') {
     setBusy(true)
@@ -125,14 +85,12 @@ export default function KnowledgePanel({
         setMessage(`Text preview is ready (${result.pages} page(s)).`)
       } else if (result.status && result.status !== 'ready') {
         setMessage('Your document is uploaded. It will appear in knowledge when processing is complete.')
-        await refreshDocuments()
       } else if (kind === 'save') {
         setMessage(
           result.duplicate
             ? 'This document is already saved.'
             : 'Your document is saved. Search available knowledge or return when processing is complete.',
         )
-        await refreshDocuments()
       } else {
         setMessage(
           result.duplicate
@@ -147,25 +105,6 @@ export default function KnowledgePanel({
     }
   }
 
-  async function indexSaved(id: string) {
-    setBusy(true)
-    setError('')
-    try {
-      const result = await request<{ chunks: number; duplicate: boolean }>(
-        `/documents/${id}/index`,
-        post(),
-      )
-      setMessage(
-        result.duplicate
-          ? 'This document is already in knowledge.'
-          : 'Your document is ready for knowledge search.',
-      )
-    } catch (caught) {
-      setError((caught as Error).message)
-    } finally {
-      setBusy(false)
-    }
-  }
   async function search(event: FormEvent) {
     event.preventDefault()
     setBusy(true)
@@ -186,11 +125,6 @@ export default function KnowledgePanel({
   return (
     <section className="card knowledge-card">
       <h2>Documents and knowledge</h2>
-      {listError && (
-        <p className="muted" role="status">
-          {listError}
-        </p>
-      )}
       <div className={`document-drop ${dragging ? 'dragging' : ''}`} onDragOver={event => { event.preventDefault(); setDragging(true) }} onDragLeave={() => setDragging(false)} onDrop={event => { event.preventDefault(); setDragging(false); chooseFile(event.dataTransfer.files[0]) }}>
         <svg aria-hidden="true" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M12 16V3m-5 5 5-5 5 5M4 15v5h16v-5" /></svg>
         <h3>{file ? file.name : 'Give your answers a source'}</h3><p>Drag a document here, or choose a file.</p>
@@ -310,31 +244,6 @@ export default function KnowledgePanel({
           <summary>Extracted text</summary>
           <pre className="document-preview">{preview}</pre>
         </details>
-      )}
-      {documents.length > 0 && (
-        <>
-          <h3>Saved documents</h3>
-          <label htmlFor="document-filter">Search document library</label>
-          <input id="document-filter" placeholder="Find a document…" value={libraryQuery} onChange={event => setLibraryQuery(event.target.value)} />
-          <ul className="document-library">
-            {documents.filter(document => document.title.toLowerCase().includes(libraryQuery.toLowerCase())).map((document) => (
-              <li key={document.id}>
-                <strong>{document.title}</strong> · {document.pages} page(s)
-                {document.version && <span> · Version {document.version}</span>}
-                {document.status && <span> · {document.status === 'ready' ? 'Ready' : document.status === 'error' ? 'Needs review' : 'Processing pending'}</span>}
-                {readiness?.managed_documents && <a href={`/documents/${document.id}/download`}>Download source</a>}
-                {document.status !== 'ready' && <button
-                  type="button"
-                  disabled={busy || indexingBlocked}
-                  onClick={() => void indexSaved(document.id)}
-                >
-                  Process {document.title}
-                </button>}
-              </li>
-            ))}
-          </ul>
-          {!documents.some(document => document.title.toLowerCase().includes(libraryQuery.toLowerCase())) && <p className="muted">No documents match your search.</p>}
-        </>
       )}
       <h3>Search knowledge</h3>
       <p className="muted">

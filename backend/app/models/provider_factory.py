@@ -1,4 +1,4 @@
-"""Azure is the only live reasoning provider; fixtures require explicit test mode."""
+"""Explicit provider construction. Never switch providers after a failed call."""
 
 from backend.app.core.config import Settings
 
@@ -11,6 +11,16 @@ def get_provider(settings: Settings) -> CaseReasoningProvider:
         from backend.app.testing.provider_stub import StubProvider
 
         return StubProvider()
-    if settings.generation_provider != "azure_openai":
-        raise ValueError("Only Azure reasoning is supported outside isolated tests")
-    return AzureOpenAIProvider(settings)
+    if settings.generation_provider == "groq":
+        from .provider_groq import GroqProvider
+
+        return GroqProvider(settings)
+    if settings.generation_provider == "azure_openai":
+        return AzureOpenAIProvider(settings)
+    raise ValueError("Only configured Groq or Azure OpenAI reasoning is supported")
+
+
+def get_selectable_provider(settings: Settings) -> CaseReasoningProvider:
+    from .provider_routing import SelectableReasoningProvider
+
+    return SelectableReasoningProvider(settings)

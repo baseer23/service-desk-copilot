@@ -65,3 +65,11 @@ def test_hybrid_filters_vector_results():
     results = retriever.hybrid_search("Widget Alpha details", top_k=2)
     assert len(results) == 1
     assert results[0]["id"] == "chunk-1"
+
+
+def test_local_hybrid_still_queries_real_graph_relationships():
+    class Hybrid(VectorStub):
+        def hybrid(self, question, embedding, limit): return self.results[:limit]
+    graph=GraphStub(degrees={'widget alpha':1},chunks=sample_vector_results[1:])
+    retriever=Retriever(SimpleNamespace(top_k=2),Hybrid(sample_vector_results[:1]),graph,StubEmbeddingProvider(dim=4))
+    assert [x['id'] for x in retriever.hybrid_search('Widget Alpha details',2)]==['chunk-1','chunk-2']

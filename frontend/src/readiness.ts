@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { request } from './api'
+import { providerChangedEvent } from './providerSelection'
 
 export interface CapabilityReadiness {
   configured: boolean
@@ -67,7 +68,8 @@ export function useReadiness(supplied?: ReadinessReport | null): {
   useEffect(() => {
     const update = () => void refresh()
     window.addEventListener('azure-usage-disabled', update)
-    return () => window.removeEventListener('azure-usage-disabled', update)
+    window.addEventListener(providerChangedEvent, update)
+    return () => { window.removeEventListener('azure-usage-disabled', update); window.removeEventListener(providerChangedEvent, update) }
   }, [refresh])
   return { readiness, refresh, checking }
 }

@@ -13,7 +13,7 @@ from contextlib import closing
 from pathlib import Path
 
 from backend.app.core.principal import Principal, principal_scope
-from backend.app.services.azure_migration import RecordMigration, digest
+from backend.app.services.local_backup import RecordMigration, digest
 from backend.app.services.capabilities import knowledge_stores
 from backend.app.store.local_records import LocalRecords
 
@@ -114,7 +114,7 @@ def cloud_chunk(chunk, root, originals, settings):
         if not candidates or any(value != candidates[0] for value in candidates):
             raise ValueError("An original knowledge vector could not be recovered unambiguously")
         vector = candidates[0]
-    if len(vector) != settings.azure_embedding_dimensions:
+    if len(vector) != 384:
         raise ValueError("Recovered vector dimensions do not match")
     return {
         "id": chunk["chunk_id"],
@@ -242,9 +242,9 @@ def import_legacy_database(path, records, tenant, report):
 async def import_legacy_checkpoints(path, records, report):
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-    from backend.app.agent.azure_checkpoints import CosmosCheckpointSaver
+    from backend.app.agent.checkpoints_records import LocalCheckpointSaver
 
-    saver = CosmosCheckpointSaver(records)
+    saver = LocalCheckpointSaver(records)
     # SqliteSaver may initialize schemas: use a private scratch copy.
     with tempfile.TemporaryDirectory(prefix="deskmate-checkpoint-read-") as temporary:
         copied = Path(temporary) / "checkpoints.db"
@@ -303,8 +303,17 @@ def migrate(root, settings):
     for row in rows(root / "search.jsonl"):
         with principal_scope(Principal(row["tenant_id"], "local-migration", True)):
             chunk = cloud_chunk(row, root, originals, settings)
-            vector.upsert([chunk])
-            values = vector.vector._collection.get(
+            archive = vector.vector._client.get_or_create_collection(
+                "archive_managed_vectors_v1", embedding_function=None,
+                metadata={"purpose": "preserved_imported_vector_space", "semantic_queries": "disabled"},
+            )
+            archive.upsert(ids=[vector.physical_id(chunk["id"])], documents=[chunk["text"]],
+                embeddings=[chunk["embedding"]], metadatas=[{
+                    **{k: v for k, v in chunk["metadata"].items() if isinstance(v, str | int | float | bool)},
+                    "tenant_id": records.tenant(), "chunk_id": chunk["id"],
+                    "metadata_json": json.dumps(chunk["metadata"]),
+                }])
+            values = archive.get(
                 ids=[vector.physical_id(chunk["id"])],
                 include=["documents", "metadatas", "embeddings"],
             )

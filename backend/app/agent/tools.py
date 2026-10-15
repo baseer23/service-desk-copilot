@@ -1,6 +1,9 @@
 """Bound LangChain invocation. Schemas/descriptions come from MCP discovery."""
 
 from typing import Any, Literal
+from referencing.exceptions import Unresolvable
+from backend.app.mcp.schema import checked_schema, validator, planning_schema
+from jsonschema.exceptions import ValidationError as SchemaValidationError
 
 from langchain_core.tools import StructuredTool
 from pydantic import ConfigDict, create_model
@@ -41,7 +44,7 @@ def allowed_tools(workflow: str) -> set[str]:
 
 def annotation(spec):
     if "enum" in spec:
-        return Literal[tuple(spec["enum"])]
+        return Any if any(isinstance(value, dict | list) for value in spec["enum"]) else Literal[tuple(spec["enum"]) ]
     if "anyOf" in spec:
         types = [annotation(s) for s in spec["anyOf"]]
         result = types[0]
@@ -69,59 +72,80 @@ class AgentToolHarness:
         self.invocation_count = 0
 
     async def initialize(self):
-        for item in await self.mcp_client.list_tools():
-            name = item["name"]
-            schema = item["inputSchema"]
-            required = schema.get("required", [])
-            fields = {
-                k: (annotation(v), ... if k in required else v.get("default"))
-                for k, v in schema.get("properties", {}).items()
-            }
-            args = create_model(name + "Input", __config__=ConfigDict(extra="forbid"), **fields)
+        items = await self.mcp_client.list_tools()
+        self.tools.clear()
+        self.descriptors.clear()
+        for item in items:
+            try:
+                name = item["name"]
+                if not isinstance(name, str):
+                    continue
+                schema = checked_schema(item["inputSchema"])
+                required = schema.get("required", [])
+                fields = {
+                    k: (annotation(v), ... if k in required else v.get("default"))
+                    for k, v in schema.get("properties", {}).items()
+                }
+                args = create_model(name + "Input", __config__=ConfigDict(extra="forbid"), **fields)
 
-            async def call(_tool=name, **arguments):
-                self.invocation_count += 1
-                return await self.mcp_client.call_tool(_tool, arguments)
+                def bind(tool_name):
+                    async def call(**arguments):
+                        self.invocation_count += 1
+                        return await self.mcp_client.call_tool(tool_name, arguments)
+                    return call
 
-            self.tools[name] = StructuredTool.from_function(
-                name=name,
-                description=item.get("description", name),
-                coroutine=call,
-                args_schema=args,
-            )
+                tool = StructuredTool.from_function(
+                    name=name, description=item.get("description") or name,
+                    coroutine=bind(name), args_schema=args,
+                )
+            except (KeyError, TypeError, ValueError):
+                continue  # An invalid integration must not hide healthy tools.
+            self.tools[name] = tool
             self.descriptors[name] = item
 
     async def invoke(self, name, arguments):
         if name not in self.tools:
             raise ValueError(f"Unknown capability: {name}")
+        self.validate_arguments(name, arguments)
         return await self.tools[name].ainvoke(arguments)
 
+    def allowed_names(self, workflow):
+        permitted = set(allowed_tools(workflow)) | {
+            name for name, item in self.descriptors.items()
+            if item.get("_deskmate_read_permitted") is True
+            and workflow in item.get("_deskmate_workflows", [])
+        }
+        def available(item):
+            metadata = item.get("meta") or item.get("_meta") or {}
+            if not isinstance(metadata, dict):
+                return False
+            source = metadata.get("deskmate", {})
+            return isinstance(source, dict) and source.get("available") is not False
+
+        return {name for name in permitted if available(self.descriptors.get(name, {}))}
+
+    def validate_arguments(self, name, arguments):
+        try:
+            validator(self.descriptors[name]["inputSchema"]).validate(arguments)
+        except (SchemaValidationError, Unresolvable, RecursionError):
+            raise ValueError("Tool arguments do not match its discovered schema") from None
+
     def validate_plan(self, plan, workflow):
-        allowed = allowed_tools(workflow)
+        allowed = self.allowed_names(workflow)
         for call in plan.tool_calls:
             if call.name not in allowed or call.name not in self.tools:
                 raise ValueError(f"Capability not permitted in {workflow}: {call.name}")
             self.tools[call.name].args_schema.model_validate(call.arguments)
+            self.validate_arguments(call.name, call.arguments)
 
     def schemas(self, workflow="service_desk"):
-        allowed = allowed_tools(workflow)
+        allowed = self.allowed_names(workflow)
         results = []
         for name, item in self.descriptors.items():
             if name not in allowed:
                 continue
-            schema = item["inputSchema"]
-            properties = {
-                key: {k: v for k, v in spec.items() if k not in {"title", "default"}}
-                for key, spec in schema.get("properties", {}).items()
-            }
-            results.append(
-                {
-                    "name": name,
-                    "description": item["description"],
-                    "input_schema": {
-                        "properties": properties,
-                        "required": schema.get("required", []),
-                    },
-                }
-            )
+            results.append({
+                "name": name, "description": item.get("description", name),
+                "input_schema": planning_schema(item["inputSchema"]),
+            })
         return results

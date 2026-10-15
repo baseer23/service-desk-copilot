@@ -77,7 +77,6 @@ async def measure():
             test_mode=True,
             generation_provider="stub",
             embed_provider="stub",
-            voice_provider="fake",
             case_db_path=root / "cases.db",
             chroma_dir=root / "chroma",
             allow_url_ingest=False,

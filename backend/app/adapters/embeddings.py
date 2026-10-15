@@ -1,11 +1,12 @@
-"""Azure-only live embeddings; each deployment has a verified vector namespace."""
+"""Local SentenceTransformers embeddings with explicit provenance and failure states."""
 
-import time
+import math
+import threading
 from collections.abc import Iterable
 from typing import Any, Protocol
 
-from backend.app.core.azure_errors import AzureOperationError, azure_error_code
-from backend.app.core.azure_usage import AzureUsageGuard
+from langchain_core.embeddings import Embeddings
+
 from backend.app.core.config import Settings
 
 
@@ -13,79 +14,72 @@ class EmbeddingProvider(Protocol):
     def embed_texts(self, texts: Iterable[str]) -> list[list[float]]: ...
 
 
-class AzureEmbeddingProvider:
-    provider = "azure_openai"
+class SentenceTransformerEmbeddingProvider(Embeddings):
+    provider = "sentence_transformers"
+    _models: dict[str, Any] = {}
+    _load_lock = threading.Lock()
+    _encode_lock = threading.Lock()
 
-    def __init__(self, settings: Settings, client: Any = None) -> None:
-        if not settings.azure_embedding_deployment:
-            raise ValueError("AZURE_EMBEDDING_DEPLOYMENT is required for live embeddings")
-        self.settings = settings
-        self.usage_guard = AzureUsageGuard(settings)
+    def __init__(self, settings: Settings, model: Any = None):
         self.model_name = settings.embed_model_name
-        self.dim = settings.azure_embedding_dimensions
-        if client is None:
-            from backend.app.models.provider_azure_openai import AzureOpenAIProvider
+        if self.model_name != "all-MiniLM-L6-v2":
+            raise ValueError("Local embeddings require all-MiniLM-L6-v2")
+        self.dim = 384
+        self._injected_model = model
 
-            client = AzureOpenAIProvider(settings).client
-        self.client = client
+    def _model(self):
+        if self._injected_model is not None:
+            return self._injected_model
+        with self._load_lock:
+            if self.model_name not in self._models:
+                try:
+                    from sentence_transformers import SentenceTransformer
+
+                    # Fixed public model, CPU-only; never execute repository code.
+                    model = SentenceTransformer(
+                        "sentence-transformers/" + self.model_name,
+                        device="cpu", trust_remote_code=False,
+                    )
+                    dimension = getattr(model, "get_embedding_dimension", None) or model.get_sentence_embedding_dimension
+                    if dimension() != self.dim:
+                        raise ValueError("Unexpected local embedding dimensions")
+                    self._models[self.model_name] = model
+                except Exception:
+                    raise RuntimeError(
+                        "Local embedding model could not be loaded; check the model cache or download access"
+                    ) from None
+            return self._models[self.model_name]
 
     def embed_texts(self, texts: Iterable[str]) -> list[list[float]]:
         values = list(texts)
         if not values:
             return []
-        if any(not isinstance(v, str) for v in values):
+        if any(not isinstance(value, str) for value in values):
             raise ValueError("Embedding input must contain text chunks")
-        # Keep the entire document operation below the MCP transport deadline.
-        # Never continue paid batches indefinitely after an API caller times out.
-        deadline = time.monotonic() + min(self.settings.model_timeout_sec, 45)
-        vectors = []
-        for start in range(0, len(values), 4):
-            while delay := self.usage_guard.request_delay("embedding"):
-                if time.monotonic() + delay >= deadline:
-                    raise AzureOperationError(
-                        "Document embedding deadline exceeded; split the document before indexing",
-                        "DOCUMENT_TIMEOUT",
-                    )
-                time.sleep(min(delay, 1))
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise AzureOperationError(
-                    "Document embedding deadline exceeded", "DOCUMENT_TIMEOUT"
-                )
-            vectors.extend(self._embed_batch(values[start : start + 4], remaining))
-        return vectors
-
-    def _embed_batch(self, values: list[str], timeout: float) -> list[list[float]]:
-        reservation = self.usage_guard.reserve(
-            "embedding", sum(len(v.encode()) + 32 for v in values)
-        )
-        response = None
         try:
-            self.usage_guard.require_enabled()
-            response = self.client.embeddings.create(
-                model=self.settings.azure_embedding_deployment,
-                input=values,
-                dimensions=self.dim,
-                timeout=min(self.settings.model_timeout_sec, timeout),
-            )
-            rows = sorted(response.data, key=lambda row: row.index)
-            if len(rows) != len(values) or [row.index for row in rows] != list(range(len(values))):
-                raise ValueError("Embedding index mismatch")
-            vectors = [row.embedding for row in rows]
-            import math
-
-            if any(
-                len(vector) != self.dim or not all(math.isfinite(v) for v in vector)
+            # Sharing one CPU model avoids duplicate memory/downloads in a process.
+            # The MCP capability runs this synchronous work on its worker thread.
+            with self._encode_lock:
+                result = self._model().encode(
+                    values, batch_size=32, normalize_embeddings=True,
+                    show_progress_bar=False, convert_to_numpy=True,
+                )
+            vectors = result.tolist() if hasattr(result, "tolist") else list(result)
+            if len(vectors) != len(values) or any(
+                len(vector) != self.dim or not all(math.isfinite(float(v)) for v in vector)
                 for vector in vectors
             ):
-                raise ValueError("Embedding dimensions or values are invalid")
-            return vectors
-        except Exception as exc:  # noqa: BLE001 - do not leak credentials or source texts
-            code = azure_error_code(exc)
-            self.usage_guard.record_check("embeddings", False, code)
-            raise AzureOperationError("Azure embedding generation failed", code) from None
-        finally:
-            self.usage_guard.finish(reservation, getattr(response, "usage", None))
+                raise ValueError("Invalid local embedding result")
+            return [[float(value) for value in vector] for vector in vectors]
+        except Exception:
+            raise RuntimeError("Local embedding generation failed; stored knowledge was preserved") from None
+
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self.embed_texts(texts)
+
+    def embed_query(self, text: str) -> list[float]:
+        return self.embed_texts([text])[0]
 
 
 def get_embedding_provider(settings: Settings) -> EmbeddingProvider:
@@ -93,6 +87,6 @@ def get_embedding_provider(settings: Settings) -> EmbeddingProvider:
         from backend.app.testing.embeddings import StubEmbeddingProvider
 
         return StubEmbeddingProvider()
-    if settings.embed_provider != "azure_openai":
-        raise ValueError("Only Azure embeddings are supported outside isolated tests")
-    return AzureEmbeddingProvider(settings)
+    if settings.embed_provider == "sentence_transformers":
+        return SentenceTransformerEmbeddingProvider(settings)
+    raise ValueError("Live embeddings must use local SentenceTransformers")

@@ -62,7 +62,16 @@ class Retriever:
         """Blend graph-anchored recall with vector ranking as a fallback."""
         if hasattr(self.vector_store, "hybrid"):
             embedding = self.embedding_provider.embed_texts([question])[0]
-            return self.vector_store.hybrid(question, embedding, top_k)
+            local = self.vector_store.hybrid(question, embedding, top_k)
+            graph = self.graph_search(question, top_k)
+            seen, rows = set(), []
+            # Keep exact identifiers and local lexical/semantic ranking, while
+            # allowing genuine graph-linked chunks to extend recall.
+            for row in local + graph:
+                if row["id"] not in seen:
+                    rows.append(row)
+                    seen.add(row["id"])
+            return rows[:top_k]
         graph_results = self.graph_search(question, top_k)
         if not graph_results:
             return self.vector_search(question, top_k)

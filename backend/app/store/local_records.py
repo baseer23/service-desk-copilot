@@ -13,7 +13,7 @@ import time
 from contextlib import contextmanager
 
 from backend.app.core.principal import current_principal
-from backend.app.store.azure_records import ManagedStateConflict, ManagedStoreError, record_id
+from backend.app.store.records import ManagedStateConflict, ManagedStoreError, record_id
 
 
 class LocalRecords:
@@ -244,8 +244,5 @@ class LocalRecords:
 
 
 def record_store(settings):
-    if settings.data_platform == "azure":
-        from backend.app.store.azure_records import CosmosRecords
-
-        return CosmosRecords(settings)
+    """Application records always persist on the local filesystem."""
     return LocalRecords(settings)

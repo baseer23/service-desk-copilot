@@ -17,13 +17,11 @@ for key, value in {
     "ENABLE_LOCAL_FIXTURES": "true",
     "GENERATION_PROVIDER": "stub",
     "EMBED_PROVIDER": "stub",
-    "VOICE_ENABLED": "false",
-    "VOICE_PROVIDER": "fake",
     "AZURE_USAGE_GUARD_ENABLED": "false",
     "AZURE_EMERGENCY_DISABLE": "false",
-    "AZURE_LIVE_TEST_MODE": "false",
     "AZURE_SETUP_VALIDATION_MODE": "false",
     "AZURE_USAGE_DB_PATH": "",
+    "SPEECH_ENABLED": "false",
     "NEO4J_URI": "",
 }.items():
     os.environ[key] = value

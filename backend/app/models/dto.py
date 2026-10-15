@@ -132,9 +132,8 @@ class HealthResponse(BaseModel):
     chroma: bool
     aura_configured: bool
     aura_connected: bool
-    voice_enabled: bool = False
-    voice_provider: str = "azure_voicelive"
-    voicelive_configured: bool = False
-    embedding_provider: str = "azure_openai"
+    speech_enabled: bool = False
+    speech_configured: bool = False
+    embedding_provider: str = "sentence_transformers"
     azure_openai_configured: bool = False
     readiness: dict[str, Any] = Field(default_factory=dict)

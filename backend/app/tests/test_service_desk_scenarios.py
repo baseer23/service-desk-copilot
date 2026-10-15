@@ -262,7 +262,9 @@ def runtime(tmp_path, monkeypatch, scenario=None, *, fake_network=True, fail_fet
             original_structured = StructuredTool.ainvoke
 
             async def trace_protocol(name, arguments):
-                protocol.append((name, arguments))
+                # ListTools is SDK discovery, not a model-selected capability.
+                if name != "__list_tools__":
+                    protocol.append((name, arguments))
                 return await original_protocol(name, arguments)
 
             async def trace_structured(tool, arguments, *args, **kwargs):

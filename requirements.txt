@@ -3,7 +3,7 @@ fastapi>=0.115,<1
 uvicorn>=0.31,<1
 pydantic>=2.11,<3
 pydantic-settings>=2.5,<3
-mcp>=1.14,<2
+mcp==1.30.0
 langgraph>=1.0,<2
 langgraph-checkpoint-sqlite>=3,<4
 langchain-core>=1,<2
@@ -23,18 +23,20 @@ black>=24.4
 mypy>=1.10
 pre-commit>=3.7
 types-requests>=2.32
-# Azure-only reasoning, embeddings and browser speech (no live sessions in tests)
+# Selectable inference and continuous Speech-to-Text (no synthesized speech)
 azure-identity>=1.19,<2
 openai>=2,<3
 PyJWT[crypto]>=2.10,<3
-azure-ai-voicelive[aiohttp]==1.3.0
 phonenumbers>=9,<10
-# Managed Azure data platform; Entra authentication, never account keys.
-azure-cosmos>=4.9,<5
-azure-storage-blob>=12.24,<13
-azure-search-documents>=11.6,<12
+# Document Intelligence processing and optional secret management only.
 azure-ai-documentintelligence>=1.0,<2
 azure-keyvault-secrets>=4.9,<5
 pypdf>=6,<7
 Pillow>=11,<13
 defusedxml>=0.7,<1
+langchain-groq>=1,<2
+groq==0.37.1
+azure-cognitiveservices-speech==1.52.0
+sentence-transformers>=3,<6
+
+jsonschema>=4.23,<5

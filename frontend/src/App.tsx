@@ -1,4 +1,7 @@
-import { type FormEvent, useEffect, useState } from 'react'
+import { type FormEvent, useEffect, useRef, useState } from 'react'
+import { ProviderSelector } from './ProviderSelector'
+import InvestigationActivity from './InvestigationActivity'
+import { streamInvestigation, type ActivityEvent } from './investigationStream'
 import VoiceSupport from './VoiceSupport'
 import KnowledgePanel from './KnowledgePanel'
 import InvestigationHistory from './InvestigationHistory'
@@ -73,6 +76,8 @@ type AskResponse = {
   events: Event[]
 }
 export default function App(): JSX.Element {
+  // This custom data hook accepts no effect callback.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   const { readiness, refresh, checking } = useReadiness()
   const blocker = reasoningBlocker(readiness)
   const [ticket, setTicket] = useState('')
@@ -83,6 +88,27 @@ export default function App(): JSX.Element {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [section, setSection] = useState('Chat')
+  const [activity, setActivity] = useState<ActivityEvent[]>([])
+  const investigation = useRef<AbortController | null>(null)
+  useEffect(() => () => investigation.current?.abort(), [])
+
+  async function investigate<T>(path: string, body?: unknown): Promise<T> {
+    investigation.current?.abort()
+    const controller = new AbortController()
+    investigation.current = controller
+    setActivity([])
+    try {
+      return await streamInvestigation<T>(path, body, event => setActivity(current => [...current, event]), controller.signal)
+    } catch (error) {
+      if (controller.signal.aborted) {
+        setActivity(current => [...current, { sequence: (current[current.length - 1]?.sequence ?? 0) + 1, kind: 'workflow', stage: 'cancelled', status: 'cancelled', summary: 'Investigation cancelled. Saved work is preserved.' }])
+        throw new Error('Investigation cancelled. Saved work is preserved.')
+      }
+      throw error
+    } finally {
+      if (investigation.current === controller) investigation.current = null
+    }
+  }
 
   function navigate(name: string, id: string) {
     setSection(name)
@@ -123,7 +149,7 @@ export default function App(): JSX.Element {
     setAnswer('')
     setEvents([])
     try {
-      await displayRequest(await request<AskResponse>('/ask', post({ summary: ticket.trim() })))
+      await displayRequest(await investigate<AskResponse>('/ask', { summary: ticket.trim() }))
     } catch (e) {
       setError((e as Error).message)
       const id = (e as Error & { case_id?: string }).case_id
@@ -140,14 +166,14 @@ export default function App(): JSX.Element {
     try {
       if (active.transient) {
         await displayRequest(
-          await request<AskResponse>(
+          await investigate<AskResponse>(
             `/requests/${active.case_id}/resume`,
-            post({ answer: answer.trim() }),
+            { answer: answer.trim() },
           ),
         )
       } else
         await display(
-          await request<Case>(`/cases/${active.case_id}/resume`, post({ answer: answer.trim() })),
+          await investigate<Case>(`/cases/${active.case_id}/resume`, { answer: answer.trim() }),
         )
       setAnswer('')
     } catch (e) {
@@ -169,7 +195,7 @@ export default function App(): JSX.Element {
     setBusy(true)
     setError('')
     try {
-      await display(await request<Case>(`/cases/${active.case_id}/investigate`, post()))
+      await display(await investigate<Case>(`/cases/${active.case_id}/investigate`))
     } catch (e) {
       setError((e as Error).message)
       await refreshAfterFailure(active.case_id)
@@ -205,7 +231,7 @@ export default function App(): JSX.Element {
     setBusy(true)
     setError('')
     try {
-      await displayRequest(await request<AskResponse>(`/requests/${active.case_id}/message`, post({ summary: answer.trim() })))
+      await displayRequest(await investigate<AskResponse>(`/requests/${active.case_id}/message`, { summary: answer.trim() }))
       setAnswer('')
     } catch (caught) { setError((caught as Error).message) }
     finally { setBusy(false) }
@@ -221,6 +247,7 @@ export default function App(): JSX.Element {
           <h1>DeskMate</h1>
           <p>Your support workspace</p>
         </div>
+        <ProviderSelector />
         <span className="runtime-label">{readiness?.runtime_mode==='isolated_demo' ? 'Isolated demo' : 'Your workspace'}</span>
       </header>
       <nav className="workspace-nav" aria-label="Workspace">
@@ -228,7 +255,7 @@ export default function App(): JSX.Element {
           <button key={name} className={section === name ? 'active' : ''} aria-current={section === name ? 'page' : undefined} onClick={() => navigate(name, id)}>{name}</button>
         ))}
       </nav>
-      {readiness?.runtime_mode === 'isolated_demo' && <div className="demo-banner runtime-banner"><strong>ISOLATED DEMO</strong><p>Responses and audio are simulated in this sample session.</p></div>}
+      {readiness?.runtime_mode === 'isolated_demo' && <div className="demo-banner runtime-banner"><strong>ISOLATED DEMO</strong><p>Responses are simulated in this isolated test session.</p></div>}
       {error && (
         <div className="error-banner" role="alert">
           {error}
@@ -250,10 +277,11 @@ export default function App(): JSX.Element {
           </form>
         </section>
         <section hidden={section !== 'Investigations'} className="history-workspace" id="investigations" aria-label="Investigation history">
-          <InvestigationHistory cases={cases} selected={active?.case_id} busy={busy} onOpen={openCase} />
+          <InvestigationHistory cases={cases} selected={active?.case_id} busy={busy} onOpen={openCase} allowSamples={readiness?.runtime_mode === 'isolated_demo'} />
         </section>
         <section hidden={section !== 'Knowledge'} id="knowledge-workspace" className="knowledge-workspace" aria-label="Knowledge workspace"><KnowledgePanel readiness={readiness} /></section>
         <section hidden={section !== 'Voice'} id="voice" className="voice-workspace"><VoiceSupport onCaseCreated={openCase} readiness={readiness} /></section>
+        <div hidden={!['Chat', 'Investigations'].includes(section)}><InvestigationActivity events={activity} busy={busy && investigation.current !== null} onCancel={() => investigation.current?.abort()} /></div>
         <div className="investigation-panel" hidden={!active || !['Chat', 'Investigations'].includes(section)}>
           {!active ? (
             <section className="empty-state">

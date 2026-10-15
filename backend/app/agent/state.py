@@ -20,6 +20,8 @@ class InvestigationState(TypedDict, total=False):
     verification: dict[str, Any]
     evidence: list[dict[str, Any]]
     tool_results: list[dict[str, Any]]
+    prefetch_results: list[dict[str, Any]]
+    tools_discovered: bool
     available_context: dict[str, Any]
     remembered_facts: list[dict[str, Any]]
     confirmed_facts: list[dict[str, Any]]

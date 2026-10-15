@@ -1,4 +1,33 @@
-import { test, expect } from '@playwright/test'
+import { test, expect, type Response } from '@playwright/test'
+
+// Chromium does not retain SSE bodies for Network.getResponseBody. Clone the
+// browser's original fetch response for assertions; never send a second POST.
+test.beforeEach(async ({ page }) => {
+  await page.addInitScript(() => {
+    const nativeFetch = window.fetch.bind(window)
+    const responses = new Map<string, Promise<unknown>>()
+    Object.assign(window, { workflowTestResponses: responses })
+    window.fetch = async (...args) => {
+      const response = await nativeFetch(...args)
+      if (response.headers.get('content-type')?.includes('text/event-stream')) {
+        const parsed = response.clone().text().then(text => {
+          for (const block of text.replace(/\r\n/g, '\n').split('\n\n')) {
+            if (!block.split('\n').some(line => /^event: ?result$/.test(line))) continue
+            return JSON.parse(block.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n'))
+          }
+          throw new Error('The streamed investigation had no result')
+        })
+        responses.set(response.url, parsed)
+      }
+      return response
+    }
+  })
+})
+
+async function readWorkflowResponse(response: Response) {
+  if (!response.headers()['content-type']?.includes('text/event-stream')) return response.json()
+  return response.frame().evaluate(url => Reflect.get(window, 'workflowTestResponses').get(url), response.url())
+}
 import { resumePDF } from './pdf'
 const ticket = 'Jake Peralta from B99 cannot connect to the VPN. Authentication failed.'
 
@@ -37,7 +66,7 @@ test('local PDF extraction, staging, dedup and cited keyword search use real HTT
   await expect(page.getByText(/Text preview is ready/)).toBeVisible()
   await page.getByRole('button', { name: 'Save document' }).click()
   await expect(page.getByText(/Your document is saved/)).toBeVisible()
-  await expect(page.getByRole('heading', { name: 'Saved documents' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Saved documents' })).toHaveCount(0)
   await page.getByRole('button', { name: 'Save document' }).click()
   await expect(page.getByText('This document is already saved.')).toBeVisible()
   await page.getByRole('textbox', { name: 'Knowledge search', exact: true }).fill('graduated')
@@ -83,7 +112,7 @@ test('Jake investigation interrupts twice, resumes one case and remembers facts 
     page.getByText('Checking previous incidents', { exact: true }),
   ).toBeVisible()
   const first = await request.get(`/cases/${caseID}`)
-  expect((await first.json()).status).toBe('needs_input')
+  expect((await readWorkflowResponse(first)).status).toBe('needs_input')
   await page.getByLabel('Your answer').fill('2nd floor')
   await page.getByRole('button', { name: 'Continue Investigation' }).click()
   await expect(
@@ -149,7 +178,7 @@ test('resume question uses knowledge and never asks for a floor', async ({ page,
   await expect(page.getByRole('heading', { name: 'Answer', exact: true })).toBeVisible()
   await expect(page.getByText('Abdul graduated in 2022.', { exact: true })).toBeVisible()
   await expect(page.getByLabel('Your answer')).toHaveCount(0)
-  const response = await (await answerResponse).json()
+  const response = await readWorkflowResponse(await answerResponse)
   expect(response.case_id).toBeNull()
   expect(response.intent).toBe('knowledge_question')
   expect(response.result.workflow).toBe('knowledge')
@@ -216,139 +245,117 @@ test('empty proxy response shows a readable error and a retry reaches the real a
   expect(events.some((e: any) => e.tool === 'verify')).toBeTruthy()
 })
 
-test('browser support uses isolated real HTTP/MCP, confirmations and case save', async ({ page }) => {
-  const knowledge = await page.request.post('/ingest/paste', { data: {
-    title: 'Fictional voice VPN fixture',
-    text: 'Fictional VPN support: check whether the VPN client shows connected before retrying sign-in.',
-  } })
-  expect(knowledge.status()).toBe(200)
+test('unconfigured Speech is unavailable while typed investigation remains usable', async ({ page }) => {
   await page.goto('/')
   await page.getByRole('button', { name: 'Voice', exact: true }).click()
-  await page.getByRole('button', { name: 'Start text support' }).click()
-  await expect(page.getByTestId('voice-transcript')).toContainText('AI support assistant')
-  const message = async (text: string, expected: string) => {
-    await page.getByLabel('Message DeskMate').fill(text)
-    await page.getByRole('button', { name: 'Send message' }).click()
-    await expect(page.getByTestId('voice-transcript').locator('article').last()).toContainText(expected)
-    await expect(page.getByTestId('voice-status')).not.toHaveText('Thinking')
-  }
-  await message('My name is Alex Test', 'Is that correct?')
-  await message('yes', 'email address')
-  await message('Email is alex at example dot com', 'Is that correct?')
-  await message('yes', 'callback number')
-  await message('Callback: +12025550123', 'Is that correct?')
-  await message('yes', 'What problem')
-  await message('My VPN is broken', 'Did that work?')
-  await message('it worked', 'You confirmed')
-  await page.getByRole('button', { name: 'Save case summary' }).click()
-  await expect(page.getByTestId('case-id')).toContainText('voice-')
-  await expect(page.getByTestId('voice-status')).toHaveText('Completed')
+  await expect(page.getByRole('button', { name: 'Ready to Talk', exact: true })).toBeDisabled()
+  await expect(page.getByText('Speech recognition is unavailable. You can still type your request below.')).toBeVisible()
+  await page.getByLabel('Message DeskMate').fill('Sarah cannot complete Microsoft 365 MFA.')
+  await page.getByRole('button', { name: 'Send message', exact: true }).click()
+  await expect(page.getByTestId('voice-transcript')).not.toBeEmpty()
+  await expect(page.getByText('Investigation Activity', { exact: true })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Open investigation', exact: true })).toBeVisible()
 })
 
-test('permission rejection never opens real microphone and offers text fallback', async ({ page }) => {
-  await page.addInitScript(() => { Object.defineProperty(navigator, 'mediaDevices', { value: { getUserMedia: async () => { throw new Error('Synthetic permission rejection') } } }) })
-  await page.goto('/')
-  await page.getByRole('button', { name: 'Voice', exact: true }).click()
-  await page.getByRole('button', { name: 'Test microphone' }).click()
-  await expect(page.getByRole('alert')).toContainText('start text support')
-  await page.getByRole('button', { name: 'Voice', exact: true }).click()
-  await page.getByRole('button', { name: 'Start text support' }).click()
-  await expect(page.getByTestId('voice-transcript')).toContainText('AI support assistant')
-  await page.getByRole('button', { name: 'Stop session' }).click()
-})
-
-test('1000 alternating messages keep the browser layout bounded and support jump to latest', async ({ page }) => {
-  // Only this stress test synthesizes transcript transport; normal flows use real HTTP.
+test('isolated microphone permission rejection opens no Speech connection and preserves typed input', async ({ page }) => {
+  await page.route('**/speech/readiness', route => route.fulfill({ json: { ready: true } }))
   await page.addInitScript(() => {
-    const Native = window.WebSocket
-    class StressSocket extends Native {
-      set onmessage(handler: ((this: WebSocket, event: MessageEvent) => void) | null) {
-        super.onmessage = event => {
-          const value = JSON.parse(event.data)
-          if (value.type === 'session.snapshot') {
-            if (value.sequence === 1) value.payload.conversation.turns = Array.from({ length: 1000 }, (_, index) => ({ id: 'stress-' + index, role: index % 2 ? 'assistant' : 'user', text: 'Stress message ' + index, state: 'final' }))
-            else { value.type = 'status'; value.payload = { status: value.payload.conversation.status } }
-          }
-          handler?.call(this, new MessageEvent('message', { data: JSON.stringify(value) }))
-        }
-      }
-      get onmessage() { return super.onmessage }
-    }
-    window.WebSocket = StressSocket
+    Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: {
+      getUserMedia: async () => { throw new DOMException('Isolated permission rejection', 'NotAllowedError') },
+      enumerateDevices: async () => [],
+    } })
   })
   await page.goto('/')
   await page.getByRole('button', { name: 'Voice', exact: true }).click()
-  await page.getByRole('button', { name: 'Start text support' }).click()
-  await expect.poll(() => page.getByTestId('voice-message').count()).toBeGreaterThanOrEqual(1000)
-  const panel = page.getByTestId('voice-transcript')
-  const before = await panel.evaluate(el => ({ height: el.clientHeight, scroll: el.scrollHeight, body: document.body.scrollHeight, overflow: getComputedStyle(el).overflowY }))
-  expect(before.height).toBeLessThanOrEqual(480); expect(before.scroll).toBeGreaterThan(before.height * 10); expect(before.overflow).toBe('auto')
-  expect(before.body).toBeLessThan(5000)
-  await panel.evaluate(el => { el.scrollTop = 0; el.dispatchEvent(new Event('scroll', { bubbles: true })) })
-  // A real typed turn now exercises the jump behavior on a live server event.
-  await page.getByLabel('Message DeskMate').fill('hello')
-  await page.getByRole('button', { name: 'Send message' }).click()
-  await expect(page.getByRole('button', { name: 'Jump to latest' })).toBeVisible()
-  await page.getByRole('button', { name: 'Jump to latest' }).click()
-  await expect(page.getByRole('button', { name: 'Jump to latest' })).toHaveCount(0)
-  await page.getByRole('button', { name: 'Stop session' }).click()
+  await page.getByRole('button', { name: 'Ready to Talk', exact: true }).click()
+  await expect(page.getByRole('alert')).toContainText('Microphone permission was denied')
+  await expect(page.getByLabel('Message DeskMate')).toBeEnabled()
 })
 
-test('fake microphone plumbing shows stages, cookie, PCM frames and cleanup without real media', async ({ page, context, request }) => {
-  const processor=await request.get('/pcm-worklet.js')
+test('isolated Speech transport verifies continuous partials, reconnect, Stop exclusion and microphone cleanup', async ({ page, request }) => {
+  // Explicit browser-only stand-ins: this does not claim real Azure recognition.
+  const processor = await request.get('/pcm-worklet.js')
   expect(processor.status()).toBe(200)
-  expect(processor.headers()['content-type']).toMatch(/javascript/)
+  await page.route('**/speech/readiness', route => route.fulfill({ json: { ready: true } }))
   await page.addInitScript(() => {
-    const stats={audioFrames:0,pings:0,tracksStopped:0}
-    Object.assign(window,{voiceTestStats:stats})
-    const node=()=>({connect(){},disconnect(){}})
-    const track={enabled:true,readyState:'live',stop(){stats.tracksStopped++}}
-    Object.defineProperty(navigator,'mediaDevices',{value:{getUserMedia:async()=>({getTracks:()=>[track],getAudioTracks:()=>[track]})}})
+    const stats = { frames: 0, tracksStopped: 0, socketsClosed: 0 }
+    Object.assign(window, { speechTestStats: stats })
+    const node = () => ({ connect() {}, disconnect() {} })
+    const track = { enabled: true, readyState: 'live', stop() { stats.tracksStopped++ } }
+    Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: {
+      getUserMedia: async () => ({ getTracks: () => [track], getAudioTracks: () => [track] }),
+      enumerateDevices: async () => [],
+    } })
     class Context {
-      sampleRate=24000;currentTime=0;state='running';destination={}
-      audioWorklet={addModule:async(url:string)=>{const response=await fetch(url);if(!response.ok)throw new Error('processor unavailable')}}
-      createMediaStreamSource(){return node()}
-      createGain(){return {...node(),gain:{value:1}}}
-      createBuffer(_channels:number,length:number,rate:number){return {getChannelData:()=>new Float32Array(length),duration:length/rate}}
-      createBufferSource(){return {...node(),buffer:null,onended:null,start(){setTimeout(()=>Reflect.get(this,'onended')?.(),20)},stop(){}}}
-      async resume(){}async close(){}
+      sampleRate = 16000; state = 'running'; destination = {}
+      audioWorklet = { addModule: async (url: string) => { const response = await fetch(url); if (!response.ok) throw new Error('processor unavailable') } }
+      createMediaStreamSource() { return node() }
+      createGain() { return { ...node(), gain: { value: 1 } } }
+      async resume() {} async close() {}
     }
     class Worklet {
-      port:{onmessage:((event:{data:ArrayBuffer})=>void)|null}={onmessage:null}
-      timer=setInterval(()=>this.port.onmessage?.({data:new ArrayBuffer(960)}),20)
-      connect(){}disconnect(){clearInterval(this.timer)}
+      port: { onmessage: ((event: { data: { audio: ArrayBuffer; level: number } }) => void) | null } = { onmessage: null }
+      timer = setInterval(() => this.port.onmessage?.({ data: { audio: new ArrayBuffer(640), level: 0.1 } }), 20)
+      connect() {} disconnect() { clearInterval(this.timer) }
     }
-    Object.assign(window,{AudioContext:Context,AudioWorkletNode:Worklet})
-    const Native=window.WebSocket
-    class Observed extends Native {
-      send(data:string|ArrayBufferLike|Blob|ArrayBufferView){
-        if(typeof data==='string'){const message=JSON.parse(data);if(message.type==='audio.append')stats.audioFrames++;if(message.type==='ping')stats.pings++}
-        super.send(data)
+    class SpeechSocket {
+      static OPEN = 1
+      readyState = 1; bufferedAmount = 0; stopped = false; closed = false
+      onmessage: ((event: { data: string }) => void) | null = null
+      onclose: ((event: { code: number }) => void) | null = null
+      constructor() {
+        Object.assign(window, { speechTestEmit: (type: string, value: object) => this.emit(type, value) })
+        setTimeout(() => this.emit('state', { state: 'listening' }), 30)
       }
+      emit(type: string, value: object) { this.onmessage?.({ data: JSON.stringify({ type, ...value }) }) }
+      send(data: string | ArrayBuffer) {
+        if (typeof data !== 'string') { if (data.byteLength === 640) stats.frames++; return }
+        if (JSON.parse(data).type === 'stop' && !this.stopped) {
+          this.stopped = true
+          setTimeout(() => { this.emit('state', { state: 'stopped' }); this.close() }, 0)
+        }
+      }
+      close() { if (!this.closed) { this.closed = true; stats.socketsClosed++; this.onclose?.({ code: 1000 }) } }
     }
-    window.WebSocket=Observed
+    Object.assign(window, { AudioContext: Context, AudioWorkletNode: Worklet, WebSocket: SpeechSocket })
   })
   await page.goto('/')
   await page.getByRole('button', { name: 'Voice', exact: true }).click()
-  const voice=page.getByRole('region',{name:'Voice Support'})
-  await expect(voice.getByText('ISOLATED DEMO',{exact:true})).toBeVisible()
-  const mic=voice.getByRole('button',{name:'Test microphone',exact:true})
-  await expect(mic).toBeEnabled()
-  await mic.focus()
-  expect(await mic.evaluate(el=>getComputedStyle(el).outlineStyle)).not.toBe('none')
-  expect(await mic.evaluate(el=>getComputedStyle(el).borderRadius)).not.toBe('0px')
-  await mic.click()
+  await page.getByRole('button', { name: 'Ready to Talk', exact: true }).click()
   await expect(page.getByTestId('voice-status')).toHaveText('Listening')
-  await expect(page.getByTestId('voice-status')).toHaveText('Listening')
-  await expect.poll(()=>page.evaluate(()=>Reflect.get(window,'voiceTestStats').audioFrames)).toBeGreaterThan(0)
-  expect(await page.evaluate(()=>Reflect.get(window,'voiceTestStats').pings)).toBe(1)
-  expect((await context.cookies()).some(cookie=>cookie.name==='deskmate_voice_identity' && cookie.httpOnly)).toBeTruthy()
-  await expect(page.getByRole('meter',{name:'Microphone activity'})).toBeVisible()
-  await page.screenshot({path:'test-results/voice-support-polished.png',fullPage:true})
-  await page.getByRole('button',{name:'Stop session'}).click()
+  await expect.poll(() => page.evaluate(() => Reflect.get(window, 'speechTestStats').frames)).toBeGreaterThan(0)
+  await page.evaluate(() => {
+    const emit = Reflect.get(window, 'speechTestEmit')
+    emit('transcript.partial', { id: '1:a', text: 'VPN auth' })
+    emit('transcript.partial', { id: '1:a', text: 'VPN authentication fails' })
+  })
+  await expect(page.getByTestId('voice-message')).toHaveCount(1)
+  await page.evaluate(() => {
+    const emit = Reflect.get(window, 'speechTestEmit')
+    emit('transcript.final', { id: '1:a', text: 'VPN authentication fails.' })
+    emit('transcript.final', { id: '1:a', text: 'VPN authentication fails.' })
+    emit('state', { state: 'reconnecting' })
+  })
+  await expect(page.getByTestId('voice-status')).toHaveText('Reconnecting')
+  await page.evaluate(() => {
+    const emit = Reflect.get(window, 'speechTestEmit')
+    emit('state', { state: 'listening' })
+    emit('transcript.final', { id: '2:b', text: 'The application will stop responding.' })
+    emit('usage', { connected_seconds: 45, estimated_cad: 0.025 })
+  })
+  await expect(page.getByTestId('voice-message')).toHaveCount(2)
+  await expect(page.getByLabel('Speech usage')).toContainText('Connected speech 45s')
+  await page.getByRole('button', { name: 'Mute', exact: true }).click()
+  await expect(page.getByTestId('voice-status')).toHaveText('Microphone muted')
+  await page.getByRole('button', { name: 'Unmute', exact: true }).click()
+  await page.evaluate(() => Reflect.get(window, 'speechTestEmit')('transcript.final', { id: '2:stop', text: 'Stop.' }))
   await expect(page.getByTestId('voice-status')).toHaveText('Stopped')
-  expect(await page.evaluate(()=>Reflect.get(window,'voiceTestStats').tracksStopped)).toBeGreaterThan(0)
-  await expect(page.getByRole('button',{name:'Reconnect with text'})).toHaveCount(0)
+  await expect(page.getByLabel('Message DeskMate')).toHaveValue('VPN authentication fails. The application will stop responding.')
+  await expect.poll(() => page.evaluate(() => Reflect.get(window, 'speechTestStats').tracksStopped)).toBe(1)
+  await page.getByRole('button', { name: 'Ready to Talk', exact: true }).click()
+  await expect(page.getByTestId('voice-status')).toHaveText('Listening')
+  await page.getByRole('button', { name: 'Stop session', exact: true }).click()
+  await expect.poll(() => page.evaluate(() => Reflect.get(window, 'speechTestStats').tracksStopped)).toBe(2)
 })
 
 test('investigation timeline and huge sources scroll independently with intentional full expansion', async ({ page }) => {
@@ -385,20 +392,8 @@ test('unrelated general questions stop before investigation or research', async 
   await page.getByLabel('Question or ticket').fill('What is the latest on immigration in Canada?')
   const response=page.waitForResponse(r=>r.url().endsWith('/ask')&&r.request().method()==='POST')
   await page.getByRole('button',{name:'Send',exact:true}).click()
-  const body=await (await response).json()
+  const body=await readWorkflowResponse(await response)
   expect(body.case_id).toBeNull();expect(body.result.evidence).toHaveLength(0)
   expect(body.events.every((event:{tool:string})=>event.tool==='classify_intent')).toBeTruthy()
   await expect(page.getByText('DeskMate is configured for IT support and internal knowledge investigations. Please ask a service-desk or uploaded-document question.')).toBeVisible()
-})
-
-test('a stale isolated-demo cookie permits a fresh text session after restart', async ({ page, context }) => {
-  await context.addCookies([{ name: 'deskmate_voice_identity', value: 'stale-demo-cookie', url: 'http://127.0.0.1:5184', httpOnly: true, sameSite: 'Strict' }])
-  await page.goto('/')
-  await page.getByRole('button', { name: 'Voice', exact: true }).click()
-  await page.getByRole('button', { name: 'Start text support', exact: true }).click()
-  await expect(page.getByTestId('voice-status')).toHaveText('Ready for messages')
-  await expect(page.getByTestId('voice-message')).toContainText('AI support assistant')
-  const cookies = await context.cookies()
-  expect(cookies.some(cookie => cookie.name === 'deskmate_voice_identity' && cookie.value !== 'stale-demo-cookie' && cookie.httpOnly)).toBeTruthy()
-  await page.getByRole('button', { name: 'Stop session' }).click()
 })

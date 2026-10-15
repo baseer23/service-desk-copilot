@@ -9,10 +9,10 @@ from types import SimpleNamespace
 import pytest
 from backend.app.core.azure_usage import AzureUsageBlocked, AzureUsageGuard
 from backend.app.core.principal import Principal, principal_scope
-from backend.app.services.azure_migration import snapshot_sqlite
+from backend.app.services.local_backup import snapshot_sqlite
 from backend.app.services.capabilities import knowledge_stores
 from backend.app.services.local_documents import LocalDocumentRepository
-from backend.app.store.azure_records import ManagedStateConflict, ManagedStoreError
+from backend.app.store.records import ManagedStateConflict, ManagedStoreError
 from backend.app.store.local_knowledge import LocalDocuments
 from backend.app.store.local_records import LocalRecords
 
@@ -39,7 +39,7 @@ def test_import_is_lossless_tenant_scoped_and_conflicts_preserve_original(settin
         "_etag": "cloud-etag",
     }
     # Use the actual canonical identity, which hashes the key.
-    from backend.app.store.azure_records import record_id
+    from backend.app.store.records import record_id
 
     source["id"] = record_id("case", "legacy")
     assert records.import_record(source)
@@ -75,7 +75,7 @@ def test_cas_race_and_nested_transaction_rollback(settings):
 def test_atomic_batch_rolls_back_earlier_writes_on_later_conflict(settings):
     records = LocalRecords(config(settings))
     existing = records.write("case", "existing", {}, tenant="a")
-    from backend.app.store.azure_records import record_id
+    from backend.app.store.records import record_id
 
     created = {**existing, "id": record_id("case", "new"), "key": "new"}
     with pytest.raises(ManagedStateConflict):
@@ -140,28 +140,21 @@ def test_chroma_roundtrip_tenant_filter_metadata_and_vectors(settings):
         assert restarted.contains_hash("digest")
 
 
-def test_staged_documents_survive_blocked_ai_without_cloud_storage(settings, monkeypatch):
+def test_local_embedding_works_during_azure_emergency_and_survives_restart(settings):
     cfg = config(settings, azure_usage_guard_enabled=True, azure_emergency_disable=True)
-
-    def forbidden(*args, **kwargs):
-        pytest.fail("Local persistence must not construct a cloud persistence client")
-
-    monkeypatch.setattr("backend.app.store.azure_knowledge.AzureBlobDocuments", forbidden)
-    monkeypatch.setattr("backend.app.store.azure_knowledge.AzureSearchStore", forbidden)
-    repo = LocalDocumentRepository(cfg, extractor=SimpleNamespace(), embeddings=SimpleNamespace())
+    embeddings = SimpleNamespace(
+        provider="stub", model_name="sha256-unit-vector-v1",
+        embed_texts=lambda texts: [[1.0] + [0.0] * 383 for text in texts],
+    )
+    repo = LocalDocumentRepository(cfg, extractor=SimpleNamespace(), embeddings=embeddings)
     with principal_scope(Principal("a", "owner")):
         result = repo.upload(b"Fictional readable VPN instructions", "Fictional", "text/plain")
         assert result["storage"] == "local"
-        with pytest.raises(AzureUsageBlocked):
-            repo.process(result["id"])
-        restarted = LocalDocumentRepository(
-            cfg, extractor=SimpleNamespace(), embeddings=SimpleNamespace()
-        )
-        assert restarted.get(result["id"])["status"] == "waiting"
+        assert repo.process(result["id"])["status"] == "ready"
+        restarted = LocalDocumentRepository(cfg, extractor=SimpleNamespace(), embeddings=embeddings)
+        assert restarted.get(result["id"])["status"] == "ready"
         assert restarted.search("VPN", 3)[0]["text"] == "Fictional readable VPN instructions"
-        assert (
-            restarted.blobs.get(result["id"], "original") == b"Fictional readable VPN instructions"
-        )
+        assert restarted.blobs.get(result["id"], "original") == b"Fictional readable VPN instructions"
 
 
 def test_snapshot_has_no_ephemeral_wal_files_and_stable_hash(settings, tmp_path):
@@ -179,44 +172,33 @@ def test_snapshot_has_no_ephemeral_wal_files_and_stable_hash(settings, tmp_path)
         assert hashlib.sha256(target.read_bytes()).hexdigest() == report["sha256"]
 
 
-def test_unlimited_daily_restarts_still_obey_emergency_concurrency_and_budget(settings):
-    cfg = config(
-        settings,
-        azure_usage_guard_enabled=True,
-        azure_max_live_sessions_per_day=0,
-        azure_estimated_monthly_app_limit_cad=8,
-        azure_max_voice_session_minutes=2,
-    )
+def test_local_usage_ledger_preserves_spending_and_genuine_emergency_controls(settings):
+    cfg = config(settings, azure_usage_guard_enabled=True, azure_estimated_monthly_app_limit_cad=8)
     guard = AzureUsageGuard(cfg)
-    # New stores fail closed until an operator initializes their policy.
     with pytest.raises(AzureUsageBlocked):
-        guard.reserve("session_voice")
+        guard.reserve("reasoning", 100, 100)
     records = LocalRecords(cfg)
-    records.write(
-        "usage_policy",
-        "subscription",
-        {"tables": {"azure_policy": [{"id": 1, "disabled": 0}]}},
-        tenant="system:usage",
-    )
+    records.write("usage_policy", "subscription", {
+        "tables": {"azure_policy": [{"id": 1, "disabled": 0}]}
+    }, tenant="system:usage")
     for _ in range(3):
-        token = guard.reserve("session_voice")
-        with pytest.raises(AzureUsageBlocked, match="one live"):
-            guard.reserve("session_voice")
-        guard.finish(token, seconds=120)
-    assert guard.snapshot()["enabled"]
-    assert guard.snapshot()["estimated_used_cad"] == 3
+        token = guard.reserve("reasoning", 100, 100)
+        guard.finish(token, {"prompt_tokens": 100, "completion_tokens": 100})
+    before = guard.snapshot()
+    assert before["enabled"] and before["estimated_used_cad"] > 0
     guard.disable()
     with pytest.raises(AzureUsageBlocked, match="disabled"):
-        guard.reserve("session_voice")
+        guard.reserve("reasoning", 100, 100)
+    assert guard.snapshot()["estimated_used_cad"] == before["estimated_used_cad"]
 
 
 @pytest.mark.asyncio
 async def test_local_checkpoint_pending_writes_and_parent_survive_restart(settings):
-    from backend.app.agent.azure_checkpoints import CosmosCheckpointSaver
+    from backend.app.agent.checkpoints_records import LocalCheckpointSaver
     from langgraph.checkpoint.base import empty_checkpoint
 
     cfg = config(settings)
-    first = CosmosCheckpointSaver(LocalRecords(cfg))
+    first = LocalCheckpointSaver(LocalRecords(cfg))
     with principal_scope(Principal("tenant-a", "owner")):
         checkpoint = empty_checkpoint()
         checkpoint["channel_values"] = {"fictional": "preserved context"}
@@ -227,7 +209,7 @@ async def test_local_checkpoint_pending_writes_and_parent_survive_restart(settin
             {},
         )
         await first.aput_writes(saved, [("answer", {"text": "pending fact"})], "task-1")
-        restarted = CosmosCheckpointSaver(LocalRecords(cfg))
+        restarted = LocalCheckpointSaver(LocalRecords(cfg))
         found = await restarted.aget_tuple(saved)
         assert found.checkpoint == checkpoint
         assert found.pending_writes == [("task-1", "answer", {"text": "pending fact"})]
@@ -269,11 +251,7 @@ async def test_local_pdf_pipeline_keeps_original_and_legacy_ingest_response(sett
     from backend.app.mcp import server
     from backend.app.models.dto import IngestPdfResponse
 
-    cfg = config(settings, embed_provider="azure_openai", embed_model_name="text-embedding-3-small")
-    monkeypatch.setattr(
-        "backend.app.services.azure_documents.AzureUsageGuard",
-        lambda s: SimpleNamespace(require_enabled=lambda: None),
-    )
+    cfg = config(settings, embed_provider="sentence_transformers", embed_model_name="all-MiniLM-L6-v2")
     calls = []
 
     def extract(data, media):

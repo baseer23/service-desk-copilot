@@ -1,3 +1,5 @@
+> **Archived — superseded on 2026-10-14.** This document records an earlier deployment, migration or validation. Its Azure persistence, Voice Live, billing and startup instructions are not current. Do not execute its old provisioning or deployment commands. See [current architecture](ARCHITECTURE_SIMPLIFICATION.md), [setup](../README.md) and [Speech](SPEECH.md). Historical backups and financial records remain protected.
+
 # Browser readiness, UI and scope review — 2026-10-12
 
 The implementation is saved. It remains a local demo pending Azure acceptance;

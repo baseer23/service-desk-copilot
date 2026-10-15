@@ -1,8 +1,9 @@
 import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react'
-import { post, request } from './api'
+import { request } from './api'
+import { type ActivityEvent, streamInvestigation } from './investigationStream'
+import InvestigationActivity from './InvestigationActivity'
 import { VoiceAudio } from './voiceAudio'
-import { type ReadinessReport, useReadiness } from './readiness'
-import { VoiceClientError, visibleVoiceError } from './voiceErrors'
+import { type ReadinessReport } from './readiness'
 
 interface Turn {
   id: string
@@ -11,24 +12,6 @@ interface Turn {
   state?: string
   created_at?: string
 }
-interface Conversation {
-  session_id: string
-  status: string
-  turns: Turn[]
-  case_id: string | null
-  resolution_status: string
-  mode?: 'voice' | 'text'
-  failure_category?: string | null
-}
-interface Envelope {
-  version: number
-  type: string
-  session_id: string
-  sequence: number
-  payload: Record<string, unknown>
-}
-const terminal = new Set(['completed', 'stopped', 'failed'])
-
 export function Transcript({ turns }: { turns: Turn[] }): JSX.Element {
   const panel = useRef<HTMLDivElement>(null)
   const nearBottom = useRef(true)
@@ -90,422 +73,400 @@ export function Transcript({ turns }: { turns: Turn[] }): JSX.Element {
 
 export default function VoiceSupport({
   onCaseCreated,
-  readiness: suppliedReadiness,
+  readiness: _suppliedReadiness,
 }: {
   onCaseCreated: (caseId: string) => void | Promise<void>
   readiness?: ReadinessReport | null
 }): JSX.Element {
-  const { readiness, refresh, checking } = useReadiness(suppliedReadiness)
-  const demo = readiness?.runtime_mode === 'isolated_demo'
-  const [stage, setStage] = useState('')
-  const [saving, setSaving] = useState(false)
-  const [microphoneActive, setMicrophoneActive] = useState(false)
-  const [microphoneRequested, setMicrophoneRequested] = useState(false)
-  const [inputLevel, setInputLevel] = useState(0)
-  const [captureReady, setCaptureReady] = useState(false)
-  const [delivered, setDelivered] = useState(false)
-  const [speaking, setSpeaking] = useState(false)
-  const [deviceId, setDeviceId] = useState('')
-  const [devices, setDevices] = useState<MediaDeviceInfo[]>([])
-  const lastCapture = useRef(0)
-  const lastMeter = useRef(0)
-  const attempt = useRef(0)
-  const explicitlyStopped = useRef(false)
-  const connectionTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
-  const readyTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
-  const heartbeatTimer = useRef<ReturnType<typeof setInterval> | undefined>(undefined)
-  const [conversation, setConversation] = useState<Conversation | null>(null)
-  const [turns, setTurns] = useState<Turn[]>([])
+  const [available, setAvailable] = useState(false)
+  const [checking, setChecking] = useState(false)
   const [status, setStatus] = useState('idle')
+  const [stage, setStage] = useState('')
   const [error, setError] = useState('')
   const [muted, setMuted] = useState(false)
+  const [inputLevel, setInputLevel] = useState(0)
+  const [deviceId, setDeviceId] = useState('')
+  const [devices, setDevices] = useState<MediaDeviceInfo[]>([])
+  const [turns, setTurns] = useState<Turn[]>([])
+  const [partial, setPartial] = useState('')
   const [text, setText] = useState('')
-  const [activity, setActivity] = useState<string[]>([])
-  const socket = useRef<WebSocket | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [activity, setActivity] = useState<ActivityEvent[]>([])
+  const investigation = useRef<AbortController | null>(null)
+  const [caseId, setCaseId] = useState<string | null>(null)
+  const [usage, setUsage] = useState({
+    listening_seconds: 0,
+    connected_seconds: 0,
+    estimated_cad: 0,
+  })
   const audio = useRef<VoiceAudio | null>(null)
-  const starting = useRef(false)
+  const socket = useRef<WebSocket | null>(null)
+  const active = useRef(false)
   const mounted = useRef(true)
-  const sequence = useRef(0)
-  const serverSequence = useRef(0)
-  const activeId = useRef('')
-  const streamReady = useRef(false)
-  const playback = useRef(Promise.resolve())
-  const playbackEpoch = useRef(0)
-  const audioQueue = useRef({ pending: 0 })
+  const attempt = useRef(0)
+  const seen = useRef(new Set<string>())
+  const retry = useRef(0)
+  const reconnectTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const connectingTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const started = useRef(0)
+  const elapsedUsage = useRef({ connected_seconds: 0, estimated_cad: 0 })
+  const connectionUsage = useRef({ connected_seconds: 0, estimated_cad: 0 })
+  const lastMeter = useRef(0)
+  const lastRequest = useRef<{ id: string; transient: boolean; needsInput: boolean } | null>(null)
+
+  const refresh = useCallback(async () => {
+    setChecking(true)
+    try {
+      const report = await request<{ ready: boolean }>('/speech/readiness')
+      if (mounted.current) setAvailable(report.ready === true)
+    } catch {
+      if (mounted.current) setAvailable(false)
+    } finally {
+      if (mounted.current) setChecking(false)
+    }
+  }, [])
 
   const cleanup = useCallback(() => {
     attempt.current++
-    clearTimeout(connectionTimer.current)
-    clearTimeout(readyTimer.current)
-    clearInterval(heartbeatTimer.current)
-    playbackEpoch.current++
-    audioQueue.current = { pending: 0 }
-    playback.current = Promise.resolve()
-    streamReady.current = false
-    lastCapture.current = 0
+    active.current = false
+    clearTimeout(reconnectTimer.current)
+    clearTimeout(connectingTimer.current)
     audio.current?.close()
     audio.current = null
     const ws = socket.current
     socket.current = null
     ws?.close()
-    starting.current = false
   }, [])
   useEffect(() => {
     mounted.current = true
+    void refresh()
+    void navigator.mediaDevices
+      ?.enumerateDevices()
+      .then((all) => {
+        if (mounted.current) setDevices(all.filter((device) => device.kind === 'audioinput'))
+      })
+      .catch(() => undefined)
+    const disabled = () => {
+      cleanup()
+      setStatus('stopped')
+      void refresh()
+    }
+    window.addEventListener('azure-usage-disabled', disabled)
     return () => {
       mounted.current = false
+      investigation.current?.abort()
       cleanup()
+      window.removeEventListener('azure-usage-disabled', disabled)
     }
-  }, [cleanup])
+  }, [cleanup, refresh])
   useEffect(() => {
-    const timer = window.setInterval(() => {
-      setCaptureReady(!!audio.current?.capturing && Date.now() - lastCapture.current < 2000)
-      setSpeaking(!!audio.current?.playback.size)
-    }, 500)
-    return () => window.clearInterval(timer)
-  }, [])
-  async function listMicrophones() {
-    try {
-      const available = await navigator.mediaDevices?.enumerateDevices()
-      if (mounted.current) setDevices((available ?? []).filter(device => device.kind === 'audioinput'))
-    } catch { /* Device selection is optional; capture errors remain explicit. */ }
-  }
-  useEffect(() => { void listMicrophones() }, [])
-
-  function fail(error: unknown) {
-    const visible = visibleVoiceError(error)
-    setError(visible.message)
-
-    cleanup()
-    setMicrophoneActive(false)
-    setInputLevel(0)
-    setStatus('failed')
-  }
-  function send(type: string, payload: Record<string, unknown> = {}) {
-    const ws = socket.current
-    if (type === 'audio.append' && !streamReady.current) return false
-    if (ws?.readyState !== WebSocket.OPEN) return false
-    if (ws.bufferedAmount > 262144) {
-      fail(
-        new VoiceClientError(
-          'AUDIO_CONNECTION_SLOW',
-          'Audio connection is too slow. Reconnect or use text.',
-        ),
-      )
-      return false
-    }
-    ws.send(
-      JSON.stringify({
-        version: 1,
-        type,
-        session_id: activeId.current,
-        sequence: ++sequence.current,
-        payload,
-      }),
-    )
-    return true
-  }
-  function merge(id: string, role: Turn['role'], value: string, partial: boolean) {
-    setTurns((old) => {
-      const index = old.findIndex((turn) => turn.id === id)
-      if (index < 0)
-        return [
+    const timer = setInterval(() => {
+      if (active.current)
+        setUsage((old) => ({
           ...old,
-          {
-            id,
-            role,
-            text: value,
-            state: partial ? 'partial' : 'final',
-            created_at: new Date().toISOString(),
-          },
-        ]
-      return old.map((turn, i) =>
-        i === index
-          ? {
-              ...turn,
-              text: partial ? turn.text + value : value,
-              state: partial ? 'partial' : 'final',
-            }
-          : turn,
-      )
-    })
-  }
+          listening_seconds: Math.floor((Date.now() - started.current) / 1000),
+        }))
+    }, 1000)
+    return () => clearInterval(timer)
+  }, [])
 
-  function connect(id: string) {
-    activeId.current = id
-    sequence.current = 0
-    serverSequence.current = 0
-    const base = import.meta.env.VITE_API_BASE || location.origin
-    const url = new URL(`/voice/sessions/${id}/stream`, base)
+  function fail(message: string) {
+    cleanup()
+    if (mounted.current) {
+      setStatus('error')
+      setError(message)
+      setStage('')
+      setPartial('')
+      setInputLevel(0)
+    }
+  }
+  function stop() {
+    active.current = false
+    attempt.current++
+    clearTimeout(reconnectTimer.current)
+    clearTimeout(connectingTimer.current)
+    audio.current?.close()
+    audio.current = null
+    const ws = socket.current
+    setStage('')
+    setPartial('')
+    setInputLevel(0)
+    if (ws?.readyState === WebSocket.OPEN) {
+      // Release local capture immediately, but wait for SDK stop/usage settlement
+      // before another recording can reserve the single recognition slot.
+      setStatus('stopping')
+      connectingTimer.current = setTimeout(() => {
+        if (socket.current === ws)
+          fail(
+            'The microphone stopped, but recognition shutdown could not be confirmed. Refresh status before restarting.',
+          )
+      }, 10000)
+      ws.send(JSON.stringify({ type: 'stop' }))
+    } else {
+      socket.current = null
+      ws?.close()
+      setStatus('stopped')
+    }
+  }
+  function connect(currentAttempt: number) {
+    if (!active.current || attempt.current !== currentAttempt) return
+    const url = new URL('/speech/stream', import.meta.env.VITE_API_BASE || location.origin)
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
     const ws = new WebSocket(url)
     socket.current = ws
+    connectionUsage.current = { connected_seconds: 0, estimated_cad: 0 }
     ws.onmessage = (event) => {
       if (socket.current !== ws || !mounted.current) return
       try {
-        const message = JSON.parse(event.data) as Envelope
+        const value = JSON.parse(event.data) as {
+          type: string
+          state?: string
+          id?: string
+          text?: string
+          message?: string
+          connected_seconds?: number
+          estimated_cad?: number
+        }
         if (
-          message.version !== 1 ||
-          message.session_id !== id ||
-          message.sequence <= serverSequence.current
-        )
-          return
-        if (message.sequence !== serverSequence.current + 1)
-          throw new VoiceClientError(
-            'VOICE_SEQUENCE_ERROR',
-            'Voice messages arrived out of order. Please reconnect.',
-          )
-        serverSequence.current = message.sequence
-        const p = message.payload
-        if (message.type === 'session.snapshot') {
-          const state = p.conversation as Conversation
-          streamReady.current = !terminal.has(state.status)
-          clearTimeout(readyTimer.current)
-          setStage('')
-          setConversation(state)
-          setTurns(state.turns)
-          setStatus(state.status)
-          if (terminal.has(state.status)) {
-            audio.current?.stopCapture()
-            setMicrophoneActive(false)
+          typeof value.connected_seconds === 'number' &&
+          typeof value.estimated_cad === 'number'
+        ) {
+          connectionUsage.current = {
+            connected_seconds: value.connected_seconds,
+            estimated_cad: value.estimated_cad,
           }
-        } else if (message.type === 'audio.delivery') setDelivered(Number(p.frames) > 0)
-        else if (message.type === 'status') setStatus(String(p.status))
-        else if (message.type.startsWith('transcript.'))
-          merge(
-            String(p.turn_id),
-            message.type.includes('.user.') ? 'user' : 'assistant',
-            String(p.text),
-            message.type.endsWith('.partial'),
-          )
-        else if (message.type === 'activity')
-          setActivity((old) => [...old.slice(-99), String(p.label)])
-        else if (message.type === 'playback.clear') {
-          playbackEpoch.current++
-          audio.current?.clearPlayback()
-        } else if (message.type === 'audio') {
-          const queue = audioQueue.current
-          if (++queue.pending > 64)
-            throw new VoiceClientError(
-              'AUDIO_QUEUE_FULL',
-              'Audio playback queue is full. Please reconnect.',
-            )
-          const epoch = playbackEpoch.current
-          const player = audio.current
-          playback.current = playback.current
-            .then(async () => {
-              if (epoch === playbackEpoch.current) await player?.play(String(p.audio))
-            })
-            .catch(() => {
-              if (socket.current !== ws || audio.current !== player || !mounted.current) return
-              fail(
-                new VoiceClientError(
-                  'AUDIO_PLAYBACK_FAILED',
-                  'Audio playback failed. Please use text or reconnect.',
-                ),
-              )
-            })
-            .finally(() => {
-              queue.pending--
-            })
-        } else if (message.type === 'error')
-          throw new VoiceClientError(
-            typeof p.code === 'string' ? p.code : 'VOICE_CONNECTION_FAILED',
-            'The support connection ended. Reconnect through text or start a new session.',
-          )
-      } catch (e) {
-        fail(e)
+          setUsage((old) => ({
+            ...old,
+            connected_seconds:
+              elapsedUsage.current.connected_seconds + connectionUsage.current.connected_seconds,
+            estimated_cad:
+              elapsedUsage.current.estimated_cad + connectionUsage.current.estimated_cad,
+          }))
+        }
+        if (value.type === 'state') {
+          if (value.state === 'stopped') {
+            active.current = false
+            clearTimeout(connectingTimer.current)
+            audio.current?.close()
+            audio.current = null
+            socket.current = null
+            ws.close()
+            setStatus('stopped')
+            setStage('')
+            setPartial('')
+            setInputLevel(0)
+            return
+          }
+          if (value.state === 'error') {
+            fail('Speech recognition stopped. Refresh status and try again.')
+            return
+          }
+          if (!active.current) return
+          if (value.state === 'listening') {
+            clearTimeout(connectingTimer.current)
+            retry.current = 0
+            setStage('')
+          }
+          setStatus(value.state ?? 'connecting')
+        } else if (value.type === 'transcript.partial') {
+          if (!/^\s*stop[.!?,;:]*\s*$/i.test(value.text ?? '')) setPartial(value.text ?? '')
+        } else if (value.type === 'transcript.final') {
+          const recognized = value.text?.trim()
+          if (!recognized || !value.id || seen.current.has(value.id)) return
+          if (/^stop[.!?,;:]*$/i.test(recognized)) {
+            stop()
+            return
+          }
+          seen.current.add(value.id)
+          setPartial('')
+          setText((old) => (old ? `${old} ${recognized}` : recognized))
+          setTurns((old) => [
+            ...old,
+            {
+              id: value.id!,
+              role: 'user',
+              text: recognized,
+              state: 'final',
+              created_at: new Date().toISOString(),
+            },
+          ])
+        } else if (value.type === 'error')
+          fail(value.message ?? 'Speech recognition stopped. Please try again.')
+      } catch {
+        fail('The recognition connection returned an invalid message. Please try again.')
       }
     }
-    ws.onopen = () => {
-      if (socket.current !== ws) return
-      clearTimeout(connectionTimer.current)
-      setStage('Connected')
-      send('ping')
-      heartbeatTimer.current = setInterval(() => { if (socket.current === ws) send('ping') }, 20000)
-      readyTimer.current = setTimeout(() => {
-        if (socket.current === ws && !streamReady.current)
-          fail(
-            new VoiceClientError(
-              'VOICE_PROVIDER_TIMEOUT',
-              'The assistant did not become ready. Refresh status and reconnect through text.',
-            ),
-          )
-      }, 105000)
-    }
-    connectionTimer.current = setTimeout(() => {
-      if (socket.current === ws && ws.readyState !== WebSocket.OPEN)
-        fail(
-          new VoiceClientError(
-            'VOICE_WS_TIMEOUT',
-            'The voice WebSocket could not connect. Check the server and use the same localhost origin.',
-          ),
-        )
-    }, 10000)
     ws.onclose = (event) => {
       if (socket.current !== ws || !mounted.current) return
-      clearTimeout(connectionTimer.current)
-      clearTimeout(readyTimer.current)
-      clearInterval(heartbeatTimer.current)
       socket.current = null
-      streamReady.current = false
-      audio.current?.finish()
-      starting.current = false
-      setMicrophoneActive(false)
-      setStatus((old) => (terminal.has(old) ? old : 'stopped'))
-      if (event.code === 1008)
-        fail(
-          new VoiceClientError(
-            event.reason === 'VOICE_SESSION_TERMINAL' ? event.reason : 'VOICE_WS_AUTHORIZATION',
-            'The session could not connect. Start a new session using the same localhost origin.',
-          ),
-        )
-      else if (event.code !== 1000)
-        fail(
-          new VoiceClientError(
-            'VOICE_WS_DISCONNECTED',
-            'The support connection was interrupted. Reconnect through text or start a new session.',
-          ),
-        )
-      else setStage('')
-    }
-    ws.onerror = () => {
-      if (socket.current === ws)
-        fail(
-          new VoiceClientError(
-            'VOICE_WS_CONNECT_FAILED',
-            'The voice WebSocket could not connect. Check the backend and use one localhost origin consistently.',
-          ),
-        )
-    }
-  }
-
-  async function start(withMicrophone: boolean, resume = false) {
-    if (starting.current || socket.current) return
-    if (!(withMicrophone ? readiness?.voice_ready : readiness?.text_ready)) return
-    starting.current = true
-    const currentAttempt = ++attempt.current
-    explicitlyStopped.current = false
-    if (!resume) activeId.current = ''
-    setError('')
-
-    setStatus('connecting')
-    setMicrophoneRequested(withMicrophone)
-    setStage('Preparing session')
-    setMuted(false)
-    setDelivered(false)
-    setCaptureReady(false)
-    setInputLevel(0)
-    audio.current?.close()
-    audio.current = new VoiceAudio()
-    try {
-      if (withMicrophone) {
-        await audio.current.start(
-          (data) => send('audio.append', { audio: data }),
-          (next) => {
-            if (attempt.current === currentAttempt && mounted.current) setStage(next)
-          },
-          (level) => {
-            lastCapture.current = Date.now()
-            if (Date.now() - lastMeter.current >= 100 && mounted.current) {
-              setInputLevel(level)
-              lastMeter.current = Date.now()
-            }
-          },
-          deviceId || undefined,
-        )
-        setMicrophoneActive(!!audio.current?.stream)
-        void listMicrophones()
-      }
-      if (!mounted.current || attempt.current !== currentAttempt || !starting.current) return
-      setStage('Connecting')
-      const state = await request<Conversation>(
-        '/voice/sessions',
-        post(
-          resume && conversation
-            ? { resume_session_id: conversation.session_id, mode: withMicrophone ? 'voice' : 'text' }
-            : { mode: withMicrophone ? 'voice' : 'text' },
-        ),
-      )
-      if (!mounted.current || attempt.current !== currentAttempt || !starting.current) {
-        void request(`/voice/sessions/${state.session_id}/stop`, post()).catch(() => undefined)
+      clearTimeout(connectingTimer.current)
+      elapsedUsage.current.connected_seconds += connectionUsage.current.connected_seconds
+      elapsedUsage.current.estimated_cad += connectionUsage.current.estimated_cad
+      if (!active.current) {
+        setStatus('stopped')
         return
       }
-      if (state.failure_category === 'explicit_stop' || state.status === 'completed')
-        throw new VoiceClientError(
-          'VOICE_SESSION_TERMINAL',
-          'This session has stopped. Start a new session.',
-        )
-      setConversation(state)
-      setTurns(state.turns)
-      connect(state.session_id)
-    } catch (error) {
-      if (mounted.current && attempt.current === currentAttempt) fail(error)
-    }
-  }
-  async function stop() {
-    explicitlyStopped.current = true
-    const id = activeId.current
-    send('session.stop')
-    cleanup()
-    setStatus('stopped')
-    setStage('')
-    setMicrophoneActive(false)
-    setInputLevel(0)
-    if (id)
-      try {
-        const state = await request<Conversation>(`/voice/sessions/${id}/stop`, post())
-        setConversation(state)
-      } catch {
-        setError('Connection closed. The server will also expire the session automatically.')
-
+      if (event.code === 1008 || event.code === 1011 || event.code === 1000) {
+        fail('Speech recognition stopped. Refresh status and try again.')
+        return
       }
+      if (++retry.current > 5) {
+        fail('The speech connection could not recover. Your transcript is preserved.')
+        return
+      }
+      setStatus('reconnecting')
+      reconnectTimer.current = setTimeout(
+        () => connect(currentAttempt),
+        Math.min(8000, 500 * 2 ** (retry.current - 1)),
+      )
+    }
+    ws.onerror = () => {
+      /* close determines whether this interruption can recover */
+    }
+    connectingTimer.current = setTimeout(() => {
+      if (socket.current === ws) ws.close()
+    }, 25000)
+  }
+  async function start() {
+    if (active.current || socket.current !== null || busy || !available) return
+    cleanup()
+    const currentAttempt = ++attempt.current
+    active.current = true
+    retry.current = 0
+    seen.current.clear()
+    elapsedUsage.current = { connected_seconds: 0, estimated_cad: 0 }
+    connectionUsage.current = { connected_seconds: 0, estimated_cad: 0 }
+    started.current = Date.now()
+    setUsage({ listening_seconds: 0, connected_seconds: 0, estimated_cad: 0 })
+    setError('')
+    setStatus('connecting')
+    setMuted(false)
+    setStage('Preparing session')
+    const capture = new VoiceAudio()
+    audio.current = capture
+    try {
+      await capture.start(
+        (frame) => {
+          const ws = socket.current
+          if (!active.current || ws?.readyState !== WebSocket.OPEN) return
+          if (ws.bufferedAmount > 65536) {
+            fail('The microphone connection is too slow. Your transcript is preserved.')
+            return
+          }
+          ws.send(frame)
+        },
+        (next) => {
+          if (mounted.current && currentAttempt === attempt.current) setStage(next)
+        },
+        (level) => {
+          if (Date.now() - lastMeter.current > 100 && mounted.current) {
+            setInputLevel(level)
+            lastMeter.current = Date.now()
+          }
+        },
+        deviceId || undefined,
+        () =>
+          fail(
+            'The microphone disconnected. Your transcript is preserved. Reconnect the microphone and try again.',
+          ),
+      )
+      if (!mounted.current || currentAttempt !== attempt.current || !active.current) {
+        capture.close()
+        return
+      }
+      void navigator.mediaDevices
+        ?.enumerateDevices()
+        .then((all) => setDevices(all.filter((device) => device.kind === 'audioinput')))
+        .catch(() => undefined)
+      setStage('Connecting')
+      connect(currentAttempt)
+    } catch (e) {
+      if (mounted.current && currentAttempt === attempt.current) fail((e as Error).message)
+    }
   }
   async function submit(event: FormEvent) {
     event.preventDefault()
-    if (!text.trim()) return
-    send('text.input', { text: text.trim() })
-    setText('')
-  }
-  async function save() {
-    setSaving(true)
+    if (!text.trim() || busy || active.current) return
+    setBusy(true)
+    setError('')
+    setActivity([])
+    const controller = new AbortController()
+    investigation.current = controller
+    const progress = (event: ActivityEvent) => {
+      if (mounted.current) setActivity((old) => [...old, event])
+    }
     try {
-      const result = await request<{ case_id: string }>(
-        `/voice/sessions/${activeId.current}/create-case`,
-        post(),
-      )
-      await onCaseCreated(result.case_id)
-    } catch {
-      setError('The case summary could not be saved. Confirm your contact details first.')
-
+      const previous = lastRequest.current
+      const result = previous?.needsInput
+        ? await streamInvestigation<{
+            case_id?: string
+            request_id?: string
+            result?: Record<string, unknown>
+            [key: string]: unknown
+          }>(
+            `/${previous.transient ? 'requests' : 'cases'}/${previous.id}/resume`,
+            { answer: text.trim() },
+            progress,
+            controller.signal,
+          )
+        : await streamInvestigation<{
+            case_id: string | null
+            request_id: string
+            result: Record<string, unknown>
+          }>('/ask', { summary: text.trim() }, progress, controller.signal)
+      const state = (result.result ?? result) as {
+        pending_question?: string
+        final_answer?: string
+        recommended_next_action?: string
+        status?: string
+        final_response?: { answer?: string }
+      }
+      const answer =
+        state.pending_question ??
+        state.final_response?.answer ??
+        state.final_answer ??
+        state.recommended_next_action ??
+        'The investigation completed without a verified recommendation. Review the evidence in Chat.'
+      setTurns((old) => [
+        ...old,
+        {
+          id: `answer-${Date.now()}`,
+          role: 'assistant',
+          text: answer,
+          created_at: new Date().toISOString(),
+        },
+      ])
+      const id = String(result.case_id ?? result.request_id ?? previous?.id ?? '')
+      setCaseId(result.case_id ? String(result.case_id) : null)
+      lastRequest.current = {
+        id,
+        transient: !result.case_id,
+        needsInput: state.status === 'needs_input',
+      }
+      setText('')
+    } catch (e) {
+      if (mounted.current)
+        setError(
+          (e as Error).name === 'AbortError'
+            ? 'Investigation cancelled. Your transcript is preserved.'
+            : (e as Error).message,
+        )
     } finally {
-      setSaving(false)
+      if (mounted.current) setBusy(false)
+      investigation.current = null
     }
   }
-  const connected = !terminal.has(status) && status !== 'idle' && status !== 'connecting'
-  const busy = status === 'connecting'
-  const listeningReady = streamReady.current && captureReady && delivered && microphoneActive
-  const displayStatus = terminal.has(status) ? status[0].toUpperCase() + status.slice(1) :
-    status === 'idle' ? 'Ready to talk' :
-    muted && microphoneActive ? 'Microphone muted' :
-    busy || !streamReady.current ? 'Connecting' :
-    speaking ? 'Speaking' :
-    status === 'assistant_speaking' ? 'Thinking' :
-    ['processing', 'using_tools'].includes(status) ? 'Thinking' :
-    microphoneRequested ? (listeningReady ? 'Listening' : 'Connecting') : 'Ready for messages'
-  const canReconnect =
-    conversation &&
-    !explicitlyStopped.current &&
-    conversation.failure_category !== 'explicit_stop' &&
-    conversation.status !== 'completed' &&
-    terminal.has(status)
-  const stages = [
-    'Preparing session',
-    ...(microphoneRequested ? ['Requesting microphone permission', 'Opening microphone'] : []),
-    'Connecting',
-    'Connected',
-    'Listening',
-  ]
+  const connected = ['listening', 'reconnecting', 'connecting'].includes(status)
+  const displayStatus =
+    status === 'idle'
+      ? 'Ready to talk'
+      : muted && status === 'listening'
+        ? 'Microphone muted'
+        : status[0].toUpperCase() + status.slice(1)
+  const transcriptTurns = partial
+    ? [...turns, { id: 'partial', role: 'user' as const, text: partial, state: 'partial' }]
+    : turns
+  const duration = `${Math.floor(usage.listening_seconds / 60)}:${String(usage.listening_seconds % 60).padStart(2, '0')}`
   return (
     <section className="voice-support card" aria-label="Voice Support">
       <header className="voice-heading">
@@ -514,169 +475,188 @@ export default function VoiceSupport({
           <h2>Voice Support</h2>
         </div>
       </header>
-      {demo && (
-        <div className="demo-banner">
-          <strong>ISOLATED DEMO</strong>
-          <p>Responses and audio are simulated in this sample session.</p>
-          <p>
-            Use text support. Test microphone checks capture and transport only; it will not
-            recognize speech or speak.
-          </p>
+      {(!available || error) && (
+        <div className="readiness-summary" aria-label="Support availability">
+          <button
+            type="button"
+            className="button button-subtle"
+            disabled={checking || connected}
+            onClick={() => void refresh()}
+          >
+            {checking ? 'Checking status…' : 'Refresh status'}
+          </button>
         </div>
       )}
-      {(error || !readiness?.voice_ready) && <div className="readiness-summary" aria-label="Support availability">
-        <button type="button" className="button button-subtle" disabled={checking || busy}
-          onClick={() => void refresh()}>{checking ? 'Checking status…' : 'Refresh status'}</button>
-      </div>}
-      {readiness && !readiness.voice_ready && <p className="readiness-note">Voice support is temporarily unavailable. You can save your request and search knowledge.</p>}
-      {readiness && !readiness.text_ready && <p className="readiness-note">Text support is temporarily unavailable. You can save your request and return later.</p>}
-      {!readiness && <p className="readiness-note">Support availability could not be checked. Refresh status or try again later.</p>}
-      <div className="voice-center">
-        <button type="button" className={`microphone-orb ${listeningReady && !muted ? 'listening' : ''}`}
-          aria-label={connected ? (muted ? 'Unmute microphone' : 'Mute microphone') : demo ? 'Test microphone' : 'Start voice chat'}
-          aria-pressed={connected ? muted : undefined}
-          disabled={busy || (!connected && !readiness?.voice_ready) || (connected && !microphoneActive)}
-          onClick={() => {
-            if (!connected) void start(true)
-            else { audio.current?.setMuted(!muted); setMuted(!muted); setInputLevel(0) }
-          }}>
-          <svg viewBox="0 0 24 24" width="34" height="34" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8"/></svg>
-        </button>
-        <div className="microphone-meter" role="meter" aria-label="Microphone activity"
-          aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(Math.min(1, inputLevel * 8) * 100)}>
-          {Array.from({ length: 15 }, (_, i) => <i key={i} style={{ height: `${6 + Math.min(1, inputLevel * 8) * (30 - Math.abs(7 - i) * 3)}px` }} />)}
-        </div>
-      <div className="voice-state">
-        <span className={`status-dot ${connected ? 'active' : ''}`} aria-hidden="true" />
-        <p role="status" data-testid="voice-status">
-          {displayStatus}
+      {!available && !checking && (
+        <p className="readiness-note">
+          Speech recognition is unavailable. You can still type your request below.
         </p>
+      )}
+      <div className="voice-center">
+        <button
+          type="button"
+          className={`microphone-orb ${status === 'listening' && !muted ? 'listening' : ''}`}
+          aria-label={
+            connected ? (muted ? 'Unmute microphone' : 'Mute microphone') : 'Start voice chat'
+          }
+          aria-pressed={connected ? muted : undefined}
+          disabled={
+            (!connected && !available) || busy || status === 'connecting' || status === 'stopping'
+          }
+          onClick={() => {
+            if (!connected) void start()
+            else {
+              audio.current?.setMuted(!muted)
+              setMuted(!muted)
+              setInputLevel(0)
+            }
+          }}
+        >
+          <svg
+            viewBox="0 0 24 24"
+            width="34"
+            height="34"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.7"
+            aria-hidden="true"
+          >
+            <rect x="9" y="2" width="6" height="12" rx="3" />
+            <path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8" />
+          </svg>
+        </button>
+        <div
+          className="microphone-meter"
+          role="meter"
+          aria-label="Microphone activity"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={Math.round(Math.min(1, inputLevel * 8) * 100)}
+        >
+          {Array.from({ length: 15 }, (_, i) => (
+            <i
+              key={i}
+              style={{
+                height: `${6 + Math.min(1, inputLevel * 8) * (30 - Math.abs(7 - i) * 3)}px`,
+              }}
+            />
+          ))}
+        </div>
+        <div className="voice-state">
+          <span
+            className={`status-dot ${status === 'listening' ? 'active' : ''}`}
+            aria-hidden="true"
+          />
+          <p role="status" data-testid="voice-status">
+            {displayStatus}
+          </p>
+        </div>
+        <p className="muted">
+          Speak continuously. Say “Stop” on its own or click Stop when finished. Responses appear as
+          text.
+        </p>
+        <p aria-label="Speech usage">
+          Listening {duration} · Connected speech {usage.connected_seconds.toFixed(0)}s · Estimated
+          CAD ${usage.estimated_cad.toFixed(4)}
+        </p>
+        <p className="readiness-note">
+          Connected recognition includes pauses, silence and mute time. This estimate is not an
+          invoice or billing cap.
+        </p>
+        {!connected && (
+          <>
+            <label htmlFor="microphone-device">Microphone</label>
+            <select
+              id="microphone-device"
+              value={deviceId}
+              onChange={(event) => setDeviceId(event.target.value)}
+            >
+              <option value="">System default</option>
+              {devices
+                .filter((device) => device.deviceId !== 'default')
+                .map((device, i) => (
+                  <option key={device.deviceId} value={device.deviceId}>
+                    {device.label || `Microphone ${i + 1}`}
+                  </option>
+                ))}
+            </select>
+          </>
+        )}
       </div>
-      {!connected && !busy && <p className="muted">Start a conversation. I’m here to help.</p>}
-      {microphoneRequested && listeningReady && !muted && inputLevel < 0.001 && <p className="muted">Speak naturally. The microphone meter moves when sound is captured.</p>}
-      {!connected && <><label htmlFor="microphone-device">Microphone</label><select id="microphone-device" value={deviceId} disabled={busy} onChange={event => setDeviceId(event.target.value)}><option value="">System default</option>{devices.filter(device => device.deviceId !== 'default').map((device, i) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Microphone ${i + 1}`}</option>)}</select></>}
-      </div>
-      {stage && (
+      {stage && connected && (
         <div className="connection-progress">
           <p aria-live="polite">{stage}</p>
-          <ol className="sr-only" aria-label="Connection progress">
-            {stages.map((label, index) => (
-              <li
-                key={label}
-                aria-current={label === stage ? 'step' : undefined}
-                data-state={
-                  index < stages.indexOf(stage) ? 'done' : label === stage ? 'current' : 'pending'
-                }
-              >
-                {label}
-              </li>
-            ))}
-          </ol>
         </div>
       )}
       {error && (
         <div className="voice-error" role="alert">
           <p>{error}</p>
-
         </div>
       )}
-      {conversation && <Transcript turns={turns} />}
-      {!turns.length && conversation && (
-        <p className="voice-empty">
-          Your conversation will appear above. Start text support, or{' '}
-          {demo ? 'test the microphone transport' : 'start voice chat'} when ready.
-        </p>
-      )}
-      <details className="voice-activity" hidden>
-        <summary>Activity</summary>
-        {/* eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- Keyboard users must be able to scroll the bounded activity region. */}
-        <div role="region" tabIndex={0} aria-label="Voice activity">
-          {activity.length ? (
-            activity.map((label, index) => <p key={index}>{label}</p>)
-          ) : (
-            <p>No support activity yet.</p>
-          )}
-        </div>
-      </details>
+      {!!transcriptTurns.length && <Transcript turns={transcriptTurns} />}
+      <InvestigationActivity
+        events={activity}
+        busy={busy}
+        onCancel={() => investigation.current?.abort()}
+      />
       <div className="voice-controls">
         <div className="voice-button-row">
           <button
             type="button"
             className="button button-secondary"
-            disabled={!!socket.current || busy || !readiness?.text_ready}
-            aria-busy={busy}
-            onClick={() => void start(false)}
+            disabled={connected || status === 'stopping' || busy || !available}
+            onClick={() => void start()}
           >
-            Start text support
+            Ready to Talk
           </button>
-          {canReconnect && (
-            <button
-              type="button"
-              className="button button-neutral"
-              disabled={!readiness?.text_ready || busy}
-              onClick={() => void start(false, true)}
-            >
-              Reconnect with text
-            </button>
+          {connected && (
+            <>
+              <button
+                type="button"
+                className="button button-toggle"
+                aria-pressed={muted}
+                onClick={() => {
+                  audio.current?.setMuted(!muted)
+                  setMuted(!muted)
+                  setInputLevel(0)
+                }}
+              >
+                {muted ? 'Unmute' : 'Mute'}
+              </button>
+              <button type="button" className="button button-danger" onClick={stop}>
+                Stop session
+              </button>
+            </>
           )}
-          {canReconnect && microphoneRequested && <button type="button" className="button button-secondary" disabled={!readiness?.voice_ready || busy} onClick={() => void start(true, true)}>Reconnect voice</button>}
-          {(connected || busy) && <button
-            type="button"
-            className="button button-toggle"
-            aria-pressed={muted}
-            disabled={!connected || !microphoneActive}
-            onClick={() => {
-              if (audio.current) {
-                audio.current.setMuted(!muted)
-                setMuted(!muted)
-                setInputLevel(0)
-              }
-            }}
-          >
-            {muted ? 'Unmute' : 'Mute'}
-          </button>}
-          {(connected || busy) && <button
-            type="button"
-            className="button button-danger"
-            disabled={!connected && !busy}
-            onClick={() => void stop()}
-          >
-            Stop session
-          </button>}
-          {conversation && (
+          {caseId && (
             <button
               type="button"
               className="button button-success"
-              disabled={saving || busy}
-              aria-busy={saving}
-              onClick={() => void save()}
+              onClick={() => void onCaseCreated(caseId)}
             >
-              {saving ? 'Saving…' : 'Save case summary'}
+              Open investigation
             </button>
           )}
         </div>
-        {explicitlyStopped.current && (
-          <p className="readiness-note">
-            This session has stopped. Start a new session; disconnected sessions can reconnect
-            through text.
-          </p>
-        )}
-        {conversation && <form className="voice-composer" onSubmit={submit}>
+        <form className="voice-composer" onSubmit={submit}>
           <label htmlFor="voice-text">Message DeskMate</label>
           <div>
-            <input
+            <textarea
               id="voice-text"
               value={text}
               onChange={(event) => setText(event.target.value)}
-              placeholder="Describe the issue or type a correction…"
-              maxLength={8000}
-              disabled={!connected}
+              placeholder="Your recognized text appears here. You can also type…"
+              maxLength={20000}
+              disabled={connected || status === 'stopping' || busy}
             />
-            <button className="button button-send" disabled={!connected || !text.trim()}>
-              Send message
+            <button
+              className="button button-send"
+              disabled={connected || status === 'stopping' || busy || !text.trim()}
+            >
+              {busy ? 'Investigating…' : 'Send message'}
             </button>
           </div>
-        </form>}
+        </form>
       </div>
     </section>
   )

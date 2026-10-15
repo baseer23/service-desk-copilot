@@ -68,31 +68,29 @@ def test_local_store_restart_dedup_concurrency_and_case_preservation(tmp_path):
 def test_emergency_disabled_http_mcp_local_paths_no_azure_calls(make_client):
     client = make_client(
         {
-            "TEST_MODE": "false",
+            "TEST_MODE": "true",
+            "LOCAL_PERSISTENCE_ENABLED": "true",
             "GENERATION_PROVIDER": "azure_openai",
-            "EMBED_PROVIDER": "azure_openai",
-            "VOICE_PROVIDER": "azure_voicelive",
+            "EMBED_PROVIDER": "stub",
             "AZURE_FOUNDRY_ENDPOINT": "https://example.openai.azure.com",
             "AZURE_MODEL_DEPLOYMENT": "test-reasoning",
-            "AZURE_EMBEDDING_DEPLOYMENT": "test-embedding",
             "AZURE_USE_ENTRA_ID": "true",
             "AZURE_USAGE_GUARD_ENABLED": "true",
             "AZURE_EMERGENCY_DISABLE": "true",
-            "AZURE_LIVE_TEST_MODE": "true",
         }
     )
     assert client.get("/readiness").json()["local_documents_ready"]
-    assert not client.get("/readiness").json()["semantic_ingestion_ready"]
+    assert client.get("/readiness").json()["semantic_ingestion_ready"]
     upload = {"file": ("fixture.pdf", MINIMAL_PDF, "application/pdf")}
     assert "Hello PDF" in client.post("/documents/extract", files=upload).json()["text"]
-    saved = client.post("/documents/upload", files=upload, data={"title": "Fictional fixture"})
+    saved = client.post("/documents/upload", files=upload, data={"title": "Isolated PDF policy"})
     assert saved.status_code == 200 and saved.json()["storage"] == "local"
     assert client.post("/documents/upload", files=upload).json()["duplicate"]
+    indexed = client.post(f"/documents/{saved.json()['id']}/index")
+    assert indexed.status_code == 200 and indexed.json()["chunks"] > 0
     found = client.get("/knowledge/search", params={"question": "Hello PDF"}).json()
     assert not found["generated_answer"] and found["mode"] == "keyword"
-    assert found["items"][0]["metadata"]["title"] == "Fictional fixture"
-    assert found["items"][0]["id"].startswith(saved.json()["id"])
-    assert client.post(f"/documents/{saved.json()['id']}/index").status_code == 503
+    assert found["items"][0]["metadata"]["title"] == "Isolated PDF policy"
     assert client.post("/ask", json={"summary": "Fictional VPN failure"}).status_code == 503
     case = client.post("/cases", json={"summary": "Fictional VPN failure"}).json()
     assert case["status"] == "new" and not case["final_answer"]

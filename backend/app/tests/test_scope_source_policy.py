@@ -113,54 +113,26 @@ def test_search_snippets_cannot_be_diagnostic_evidence():
     assert not ServiceDeskAgent.usable_evidence(state)
 
 
-def test_fresh_azure_namespaces_preserve_legacy_and_isolated_vectors(settings):
+def test_fresh_local_namespaces_preserve_legacy_and_isolated_vectors(settings):
     from backend.app.services.capabilities import knowledge_stores
     from backend.app.store.vector_chroma import VectorChromaStore
 
     legacy = VectorChromaStore(str(settings.chroma_dir))
-    legacy.upsert(
-        [
-            {
-                "id": "retained",
-                "text": "Previous unrelated knowledge",
-                "metadata": {"doc_id": "legacy"},
-                "embedding": [1.0] * 384,
-            }
-        ]
-    )
+    legacy.upsert([{
+        "id": "retained", "text": "Previous unrelated knowledge",
+        "metadata": {"doc_id": "legacy"}, "embedding": [1.0] * 384,
+    }])
     isolated, _, _ = knowledge_stores(settings, connect_graph=False)
-    isolated.upsert(
-        [
-            {
-                "id": "test",
-                "text": "Fictional isolated knowledge",
-                "metadata": {
-                    "embedding_provider": "stub",
-                    "embedding_model": "sha256-unit-vector-v1",
-                },
-                "embedding": [1.0] * 384,
-            }
-        ]
-    )
-    azure = settings.model_copy(
-        update={
-            "embed_provider": "azure_openai",
-            "azure_foundry_endpoint": "https://demo.openai.azure.com",
-            "azure_embedding_deployment": "deskmate-embedding",
-        }
-    )
-    fresh, _, _ = knowledge_stores(azure, connect_graph=False)
-    changed, _, _ = knowledge_stores(
-        azure.model_copy(
-            update={
-                "azure_embedding_deployment": "other-deployment",
-            }
-        ),
-        connect_graph=False,
-    )
-    assert fresh.count() == changed.count() == 0
-    assert fresh.collection_name != changed.collection_name
+    isolated.upsert([{
+        "id": "test", "text": "Fictional isolated knowledge",
+        "metadata": {"embedding_provider": "stub", "embedding_model": "sha256-unit-vector-v1"},
+        "embedding": [1.0] * 384,
+    }])
+    local = settings.model_copy(update={"embed_provider": "sentence_transformers", "embed_model_name": "all-MiniLM-L6-v2"})
+    fresh, _, _ = knowledge_stores(local, connect_graph=False)
+    assert fresh.count() == 0
     assert fresh.collection_name != isolated.collection_name
+    assert fresh.collection_name != legacy.collection_name
     assert legacy.count() == isolated.count() == 1
 
 

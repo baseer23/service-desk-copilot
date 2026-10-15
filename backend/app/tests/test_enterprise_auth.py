@@ -123,7 +123,7 @@ def test_public_readiness_hides_operator_details(make_client):
     assert "azure_usage" in client.get("/admin/readiness").json()
 
 
-def test_unresolved_vault_reference_and_local_production_storage_are_rejected(settings):
+def test_unresolved_signing_reference_and_unscoped_production_storage_are_rejected(settings):
     from backend.app.core.config import Settings
 
     values = settings.model_dump()
@@ -134,29 +134,39 @@ def test_unresolved_vault_reference_and_local_production_storage_are_rejected(se
         Settings(_env_file=None, **values)
     values = settings.model_dump()
     values["deployment_mode"] = "production"
-    with pytest.raises(ValueError, match="managed Azure storage"):
+    with pytest.raises(ValueError, match="tenant-scoped persistent local records"):
         Settings(_env_file=None, **values)
+    secure = Settings(
+        _env_file=None, deployment_mode="production", data_platform="local",
+        local_persistence_enabled=True, test_mode=False,
+        generation_provider="groq", embed_provider="sentence_transformers",
+        embed_model_name="all-MiniLM-L6-v2", enable_local_fixtures=False,
+        auth_client_id=AUDIENCE, auth_allowed_tenants=[TENANT], auth_operator_ids=[OWNER],
+        voice_session_signing_key=SecretStr("fictional-auth-test-key-xxxxxxxxxxxxxxxxxxx"),
+        voice_auth_mode="entra", azure_use_entra_id=True,
+    )
+    assert secure.uses_record_store and secure.data_platform == "local"
 
 
-def test_sign_out_stops_only_the_authenticated_owners_conversations(settings):
+def test_sign_out_stops_only_the_authenticated_owners_speech_recognition(settings):
+    import asyncio
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
     from backend.app.core.authentication import register_auth_routes
-    from backend.app.voice.auth import Actor
+    from backend.app.speech.api import SpeechService
 
     config = production(settings)
     app = FastAPI()
-    ended = []
-    app.state.voice = SimpleNamespace(
-        active={
-            "mine": SimpleNamespace(actor=Actor(OWNER, TENANT), session_id="mine"),
-            "other": SimpleNamespace(actor=Actor("other-user", TENANT), session_id="other"),
-        },
-        end=lambda identifier, actor: ended.append(identifier),
-    )
+    mine, other = asyncio.Event(), asyncio.Event()
+    service = SpeechService(config)
+    service.active = {
+        mine: (Principal(TENANT, OWNER), asyncio.Event()),
+        other: (Principal(TENANT, "other-user"), asyncio.Event()),
+    }
+    app.state.speech = service
     register_auth_routes(app, config)
     client = TestClient(app, base_url="https://support.example")
     client.cookies.set("deskmate_session", sign_principal(config, Principal(TENANT, OWNER)))
     response = client.post("/auth/logout", headers={"Origin": "https://support.example"})
-    assert response.status_code == 200 and ended == ["mine"]
+    assert response.status_code == 200 and mine.is_set() and not other.is_set()
     assert "Max-Age=0" in response.headers["set-cookie"]

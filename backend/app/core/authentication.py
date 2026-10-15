@@ -139,18 +139,9 @@ def register_auth_routes(app, settings: Settings):
             actor = await authenticate(request, settings)
         except HTTPException:
             actor = None
-        service = getattr(request.app.state, "voice", None)
+        service = getattr(request.app.state, "speech", None)
         if actor and service:
-            from backend.app.core.principal import principal_scope
-            from backend.app.voice.auth import Actor
-
-            with principal_scope(actor):
-                for connection in list(service.active.values()):
-                    if (
-                        connection.actor.owner_id == actor.owner_id
-                        and connection.actor.tenant_id == actor.tenant_id
-                    ):
-                        service.end(connection.session_id, Actor(actor.owner_id, actor.tenant_id))
+            await service.close_for(actor)
         response.delete_cookie(
             SESSION_COOKIE,
             httponly=True,

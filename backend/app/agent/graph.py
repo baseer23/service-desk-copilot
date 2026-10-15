@@ -8,6 +8,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 from pydantic import ValidationError
 
+from backend.app.agent.activity import emit, instrument
 from backend.app.agent.models import (
     EvidenceItem,
     FinalResponse,
@@ -71,9 +72,9 @@ class ServiceDeskAgent:
             "remember",
             "finalize",
         ):
-            builder.add_node(name, getattr(self, name))
-        builder.add_node("reject_scope", self.reject_scope)
-        builder.add_node("general_chat", self.general_chat)
+            builder.add_node(name, instrument(name, getattr(self, name)))
+        builder.add_node("reject_scope", instrument("reject_scope", self.reject_scope))
+        builder.add_node("general_chat", instrument("general_chat", self.general_chat))
         builder.add_edge("general_chat", END)
         builder.add_edge("reject_scope", END)
         builder.add_node("knowledge_subgraph", self.knowledge_subgraph)
@@ -102,14 +103,17 @@ class ServiceDeskAgent:
 
     def _subgraph(self, workflow):
         graph = StateGraph(InvestigationState)
+        graph.add_node("prefetch_local_evidence", instrument("prefetch_local_evidence", self.prefetch_local_evidence))
+        graph.add_node("execute_tools", instrument("execute_tools", self.execute_tools))
         if workflow == "knowledge":
-            graph.add_node("understand_question", self.understand_question)
-            graph.add_node("retrieval_context", self.retrieval_context)
-            graph.add_node("formulate_retrieval_plan", self.plan)
+            graph.add_node("understand_question", instrument("understand_question", self.understand_question))
+            graph.add_node("retrieval_context", instrument("retrieval_context", self.retrieval_context))
+            graph.add_node("formulate_retrieval_plan", instrument("plan", self.plan))
             graph.add_edge(START, "understand_question")
             graph.add_edge("understand_question", "retrieval_context")
             graph.add_edge("retrieval_context", "formulate_retrieval_plan")
-            graph.add_edge("formulate_retrieval_plan", "execute_tools")
+            graph.add_edge("retrieval_context", "prefetch_local_evidence")
+            graph.add_edge(["formulate_retrieval_plan", "prefetch_local_evidence"], "execute_tools")
         else:
             for name in (
                 "analyze_ticket",
@@ -119,15 +123,15 @@ class ServiceDeskAgent:
             ):
                 graph.add_node(
                     name,
-                    self.plan if name == "formulate_investigation_plan" else getattr(self, name),
+                    instrument(name, self.plan if name == "formulate_investigation_plan" else getattr(self, name)),
                 )
             graph.add_edge(START, "analyze_ticket")
             graph.add_edge("analyze_ticket", "identify_entities")
             graph.add_edge("identify_entities", "load_memory")
             graph.add_edge("load_memory", "formulate_investigation_plan")
-            graph.add_edge("formulate_investigation_plan", "execute_tools")
-        graph.add_node("execute_tools", self.execute_tools)
-        graph.add_node("observe", self.observe)
+            graph.add_edge("load_memory", "prefetch_local_evidence")
+            graph.add_edge(["formulate_investigation_plan", "prefetch_local_evidence"], "execute_tools")
+        graph.add_node("observe", instrument("observe", self.observe))
         graph.add_edge("execute_tools", "observe")
         graph.add_edge("observe", END)
         return graph.compile()
@@ -174,7 +178,15 @@ class ServiceDeskAgent:
             and not permits(arguments["url"], self.settings)
         ):
             raise MCPToolError("Public source excluded by configured policy")
-        result = await self.harness.invoke(name, arguments)
+        summary = "Searching local knowledge" if name == "search_knowledge" else "Querying knowledge relationships" if name == "search_graph" else "Reading connected tool evidence"
+        await emit("tool:" + name, "running", summary, tool=name)
+        try:
+            result = await self.harness.invoke(name, arguments)
+        except BaseException:
+            await emit("tool:" + name, "failed", summary, tool=name)
+            raise
+        await emit("tool:" + name, "completed", summary, tool=name,
+                   result_count=len(result.get("items", [])) if isinstance(result, dict) else 0)
         if name == "fetch_web_page" and isinstance(result, dict):
             page = result.get("result") or result
             if not permits(page.get("url", arguments.get("url", "")), self.settings):
@@ -543,9 +555,32 @@ class ServiceDeskAgent:
         evidence = self._evidence(state, "search_memory", result)
         return {"remembered_facts": facts, "evidence": state.get("evidence", []) + evidence}
 
+    async def prefetch_local_evidence(self, state):
+        """Independent read-only work runs alongside model planning/queue waiting."""
+        calls = [("search_knowledge", {"question": state["ticket"]["summary"],
+                                       "mode": "KEYWORD", "top_k": 3})]
+        entities = state.get("analysis", {}).get("entities", [])[:8]
+        if entities:
+            calls.append(("search_graph", {"entities": entities}))
+        async def read(name, arguments):
+            if name not in getattr(self.harness, "tools", {}):
+                return None
+            try:
+                result = await self._call(state, name, arguments)
+                return {"name": name, "arguments": arguments, "output": result}
+            except (MCPToolError, ValueError):
+                return None
+        results = await asyncio.gather(*(read(name, args) for name, args in calls))
+        return {"prefetch_results": [row for row in results if row]}
+
     async def plan(self, state):
         if state.get("plan") and not state.get("plan_executed"):
             return {}
+        if not state.get("tools_discovered"):
+            await emit("discover_tools", "running", "Discovering available MCP tools")
+            await self.harness.initialize()
+            await emit("discover_tools", "completed", "MCP tool schemas validated",
+                       tool_count=len(self.harness.tools))
         context = self.context(state, True)
         for attempt in range(2):
             plan = await self.provider.generate_structured("plan", context, InvestigationPlan)
@@ -568,7 +603,7 @@ class ServiceDeskAgent:
             f"Plan: {plan.goal}. " + "; ".join(c.name + ": " + c.reason for c in plan.tool_calls),
             self.provider.name(),
         )
-        return {"plan": plan.model_dump(), "plan_executed": False}
+        return {"plan": plan.model_dump(), "plan_executed": False, "tools_discovered": True}
 
     async def execute_tools(self, state):
         plan = InvestigationPlan.model_validate(state["plan"])
@@ -576,12 +611,18 @@ class ServiceDeskAgent:
             self.harness.validate_plan(plan, state["workflow"])
         except ValueError as exc:
             raise LLMError("Model plan failed tool permission or argument validation") from exc
+        prefetched = state.get("prefetch_results", [])
         results = [None] * len(plan.tool_calls)
         web_round = any(c.name == "search_web" for c in plan.tool_calls)
 
         async def execute(index):
             call = plan.tool_calls[index]
             try:
+                cached = next((row for row in prefetched if row["name"] == call.name
+                               and row.get("arguments") == call.arguments), None)
+                if cached is not None:
+                    results[index] = {"name": call.name, "output": cached["output"]}
+                    return
                 if (
                     call.name in {"search_web", "fetch_web_page"}
                     and state.get("research_rounds", 0) >= self.settings.max_research_rounds
@@ -613,7 +654,9 @@ class ServiceDeskAgent:
             if i not in grouped:
                 await execute(i)
         return {
-            "tool_results": results,
+            "tool_results": [{"name": row["name"], "output": row["output"]}
+                             for row in prefetched] + results,
+            "prefetch_results": [],
             "plan_executed": True,
             "research_rounds": state.get("research_rounds", 0) + int(web_round),
         }
@@ -630,6 +673,7 @@ class ServiceDeskAgent:
                 "reliability": 0.6,
             }
         rows = result["items"]
+        unavailable = result.get("status") == "unavailable"
         if result.get("status") == "error":
             rows = [{"error": result.get("error")}]
         items = []
@@ -639,7 +683,7 @@ class ServiceDeskAgent:
             stamp = row.get("observed_at") or meta.get("created_at") or result["timestamp"]
             kind = (
                 "tool_error"
-                if system == "tool_error"
+                if system == "tool_error" or unavailable or row.get("available") is False
                 else "confirmed_fact"
                 if name in {"search_memory", "remember_fact"}
                 else "public_documentation"
@@ -660,12 +704,13 @@ class ServiceDeskAgent:
                     source=row.get("source") or meta.get("source") or row.get("url") or name,
                     content=row,
                     entities=state.get("analysis", {}).get("entities", []),
-                    reliability=result["reliability"],
+                    reliability=0 if kind == "tool_error" else result["reliability"],
                     relevance=1 / (1 + max(float(row.get("score") or 0), 0)),
                     case_id=state["case_id"] if state.get("persist_case") is not False else None,
                     url=row.get("url") or meta.get("url") or None,
                     doc_id=meta.get("doc_id"),
                     source_quality=(
+                        "unclassified" if kind == "tool_error" else
                         quality(row.get("url") or meta.get("url") or "", self.settings)
                         if kind == "public_documentation"
                         else "fixture" if system == "local_fixture" else "internal"

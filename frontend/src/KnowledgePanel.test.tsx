@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, expect, test, vi } from 'vitest'
 import KnowledgePanel from './KnowledgePanel'
@@ -39,15 +39,13 @@ test('never exposes infrastructure details in processing explanations', () => {
   expect(screen.queryByText(/text-embedding|TPM|MCP|Azure/)).not.toBeInTheDocument()
 })
 
-test('paused managed processing does not poll and keep hosting awake', async () => {
-  vi.stubGlobal('fetch', vi.fn(async () => Response.json([{ id: 'fictional', title: 'Fictional waiting document', status: 'waiting', pages: 1 }])))
-  const interval = vi.spyOn(window, 'setInterval')
-  const paused = { managed_documents: true, semantic_ingestion_ready: false } as ReadinessReport
-  const { rerender, unmount } = render(<KnowledgePanel readiness={paused} />)
-  await screen.findByText('Fictional waiting document')
-  expect(interval.mock.calls.filter(([, delay]) => delay === 10000)).toHaveLength(0)
-  rerender(<KnowledgePanel readiness={{ ...paused, semantic_ingestion_ready: true }} />)
-  await waitFor(() => expect(interval.mock.calls.filter(([, delay]) => delay === 10000)).toHaveLength(1))
-  unmount()
-  interval.mockRestore()
+test('never lists or fetches saved documents while preserving upload and search', () => {
+  const fetch = vi.fn(async () => Response.json([]))
+  vi.stubGlobal('fetch', fetch)
+  render(<KnowledgePanel readiness={{ managed_documents: true, semantic_ingestion_ready: true } as ReadinessReport} />)
+  expect(screen.queryByText(/Saved documents/i)).not.toBeInTheDocument()
+  expect(screen.queryByLabelText('Search document library')).not.toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Choose document' })).toBeInTheDocument()
+  expect(screen.getByLabelText('Knowledge search')).toBeInTheDocument()
+  expect(fetch).not.toHaveBeenCalled()
 })

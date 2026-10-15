@@ -1,41 +1,29 @@
-# Supervisor, reasoning and capability boundary
+# Reasoning, retrieval and capability boundaries
 
-Azure OpenAI supplies structured reasoning. Browser Voice Support uses Azure Voice
-Live for speech and a bounded application-owned LangGraph for investigation over
-the existing local stdio MCP client. See [VOICE.md](VOICE.md) for session boundaries
-and [AZURE_LIVE_SETUP.md](AZURE_LIVE_SETUP.md) for local acceptance setup.
+The active flow is React → FastAPI → LangGraph supervisor → LangChain tools → MCP → local or connected capabilities. The selected Groq/Azure OpenAI provider is request-scoped, applies to every reasoning stage and does not change embeddings or Speech recognition. Instructions live in `backend/app/models/instructions.py`.
 
-React → FastAPI → LangGraph supervisor → bound LangChain StructuredTool.ainvoke → async MCP → capabilities.
+## Investigation graph
 
-The supervisor has classify_intent, understand_request, plan, execute_tools, observe, reason, verify, ask_human, research, remember and finalize nodes. Knowledge and service-desk workflows are separately compiled LangGraph subgraphs; each performs understanding, validated initial planning, MCP execution and evidence observation, then shares the supervisor reasoning/verification loop. The knowledge path formulates document retrieval without operational questions. The case path analyzes identifiers/scope, loads confirmed memory and plans contextual investigation. Subsequent rounds replan from new evidence or verifier gaps.
+`backend/app/agent/graph.py` compiles a supervisor and knowledge/service-desk subgraphs. Understanding and ticket analysis extract symptoms, identifiers, scope and missing information. Discovery supplies MCP descriptions and schemas. Planning validates a small read-only tool plan and independent parallel groups. Local evidence prefetch can run independently while Groq waits for capacity. Tool results become sourced evidence, then reasoning and a separate verifier assess claims, contradictions and gaps. Conditional edges permit bounded reflection/replanning or request one material human answer with a real LangGraph interrupt.
 
-Azure OpenAI supplies typed RequestIntent, TicketAnalysis, InvestigationPlan, InvestigationDecision, ResearchSelection and VerificationResult. Python validates discovered tool schemas, read permissions, maximum tool count, parallel group indexes and cited evidence IDs. Independent groups use asyncio.gather; one task owns the SDK stdio contexts while concurrent SDK requests share that session. Write tools are unavailable to model plans. Human confirmations and explicitly observed trusted record fields alone produce semantic facts. No generated hypothesis is persisted as a fact.
+Knowledge requests remain separate from operational case creation. A retrieved document is not a live system observation. Untrusted source instructions cannot grant tool permissions. The graph distinguishes human reports, diagnostic observations, inferences and hypotheses. A candidate resolution stays unconfirmed until supported verification exists.
 
-EvidenceItem records source/system/type, tool, timestamp, entities, reliability, retrieval relevance, case ID and document/URL provenance. Confirmed facts, human confirmations, public documentation, inferences and hypotheses stay distinct. Conflicting memory values remain visible with their timestamps; the model evaluates freshness and provenance. A separate structured critic checks the current candidate and source evidence independently of earlier critic text or preliminary analysis hypotheses. It checks supported/unsupported claims, contradictions, pending question materiality and evidence gaps. Premature causation or compound/unjustified questions are revised before interrupting the human. Unsupported final claims are withheld; empty evidence and exhausted cycle budgets produce insufficient_information and explicit uncertainty. Retrieval relevance is separate from investigation confidence.
+## Persistent local knowledge
 
-Human input uses interrupt() and Command(resume=...) on the same case thread. Request events are idempotent across replay; answers and actual actions are episodic memory accessed through MCP. Checkpoints alone use direct SQLite infrastructure. Case snapshots, semantic memory, event/history reads, ingestion, fixtures, web and retrieval all cross MCP, including FastAPI ingestion routes. A new supervisor checkpoint file preserves old graph checkpoints without pretending incompatible paused states can resume in a new topology.
+`backend/app/rag/retrieve.py` owns retrieval behind MCP `search_knowledge`. Original PDFs, text and extraction artifacts stay in private local files. SHA-256 exact content hashes provide persistent deduplication. Chroma stores text, source/page provenance and local SentenceTransformers vectors. Transactional state, jobs, leases and checkpoints remain in SQLite rather than vector metadata.
 
-MCP exposes typed input/output, description, tool, source_system, timestamp, reliability, status/error and items. The inventory includes knowledge/graph/ticket/context/alert/change/web tools, ingest_text/ingest_document, remember_fact/search_memory, case notes/history and list_available_context. Additional infrastructure tools own case snapshot persistence. Existing Retriever, Chroma, IngestService and SQLite adapters remain behind the boundary.
+Embedding provider, model, dimensions and normalization determine the collection identity. The active local model is `all-MiniLM-L6-v2`, 384 dimensions. Historical vectors from another model remain separate; lexical archives preserve their text/provenance without pretending their geometry matches the active model. Re-embedding uses local inference and verifies resulting counts before replacing an active collection reference. No retrieval failure resets a collection.
 
-Aura is optional. search_graph uses bounded two-hop relationship discovery for WORKS_AT, HAS_SITE, USES, AFFECTS, APPLIES_TO, INVOLVES and ASSOCIATED_WITH; fixture edges explicitly carry local_fixture provenance. An unavailable Aura returns unavailable status and never masquerades as a live graph result. Existing document/entity/chunk relationships still enrich retrieval.
+Online Neo4j Aura enriches retrieval with actual document/entity/dependency relationships. It is optional: missing/unavailable graph connectivity returns an honest unavailable result and supported Chroma searches continue. Production has no in-memory invented enterprise graph. Tenant-scoped relationships retain source provenance; fixtures remain confined to isolated tests.
 
-Chroma stores documents, KBs, web research and useful notes, never transactional case state. Azure embedding vectors and test vectors stay in separate persistent collections. SHA-256 exact deduplication and source metadata are retained; no search error resets stored data. MCP ingestion makes new documents immediately searchable.
+## MCP and persistence
 
-Research starts with a specific model-generated evidence gap/query. A structured source selection prefers primary/vendor pages and selects only actual returned URLs. Actual fetched content receives a second usefulness assessment before ingestion; fetching, ingestion and subsequent retrieval happen through MCP. Failed research capabilities become explicit error evidence. Research has a separate round limit. Public content remains untrusted data. Shared crawler/extraction code enforces public URLs, redirect checks, body limits, robots/same-origin/page/depth/text/rate bounds.
+The lifespan owns the built-in MCP stdio transport. Additional explicitly configured MCP servers are discovered dynamically and namespaced. Input schemas, read permissions, maximum tool counts and parallel-group indexes are enforced before dispatch. Planned actions cannot invoke destructive write tools. Case snapshots, semantic memory, case history, document ingestion and retrieval all cross MCP; the checkpointer is the explicit direct-database exception.
 
-Tests instrument actual LangChain calls and real MCP requests, prohibit repository access in the application process, prove parallel requests, run conditional cycles/critic/interrupt/restart/resume, and cover resume, skills, PDF, VPN, MFA, printer and shared outages. Browser tests use an isolated real HTTP/MCP stack with deterministic backend providers. Previous live smoke results predate the Azure migration and do not validate Azure.
+Checkpoint state uses a stable conversation thread and tenant namespace. Human input resumes the persisted interrupt. Saved confirmed facts retain their provenance; model guesses do not become facts. Restart verification must read the same original file hashes, vector counts, case IDs and checkpoint payloads.
 
-The existing structured intent classifier also returns `in_scope`. With
-`KNOWLEDGE_SCOPE=support` (default), clearly unrelated general questions return a
-scope explanation before case creation, retrieval, web calls or ingestion. IT,
-internal-policy and uploaded-document questions are accepted. `broad` is an explicit
-operator opt-in. This model judgment can misclassify; it is not a keyword security
-boundary.
+## Progress and limits
 
-`RESEARCH_SOURCE_POLICY=prefer_primary` ranks configured vendor/government domains
-first. `primary_only` filters before fetch and after redirects; `allow_third_party`
-keeps all permitted sources. `RESEARCH_PREFERRED_DOMAINS` accepts a comma-separated
-list. Source labels remain visible. Fetching alone never authorizes ingestion: the
-content evaluator must select the page and set `directly_relevant=true`. Search
-snippets remain discovery only, never diagnostic evidence. Starting acceptance with
-fresh Chroma avoids previous irrelevant knowledge without deleting old collections.
+Authenticated SSE carries actual node/tool/capacity events to the expandable Investigation Activity panel. It preserves completed steps, distinguishes waiting from running and supports cancellation. It never transmits hidden internal model reasoning. Groq's documented headers supply daily-request and minute-token capacity; account-specific optional RPM/TPD limits must be configured from the current account rather than copied from illustrative documentation.
+
+Use [reasoning evaluation](REASONING_EVALUATION.md) for executed orchestration checks and [current architecture](ARCHITECTURE_SIMPLIFICATION.md) for live verification boundaries. Mock providers can verify graph behavior, but cannot establish live model, Aura or physical microphone success.

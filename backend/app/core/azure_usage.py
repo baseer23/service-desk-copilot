@@ -1,12 +1,12 @@
 """Local conservative CAD estimates. This cannot cap an Azure subscription invoice.
 
 Reserve before dispatch; finalize token estimates only with complete usage counters.
-Retain reservations for failed/unknown usage and the full speech duration allowance.
+Retain reservations for failed/unknown usage and all historical charges.
+Continuous Speech recognition is metered independently in the same local ledger.
 The shared SQLite file coordinates API/MCP processes and survives restarts. A crash
 leaves a session active deliberately: inspect it privately before any recovery.
 """
 
-import hashlib
 import json
 import math
 import os
@@ -16,7 +16,7 @@ import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 
 from backend.app.core.config import Settings
@@ -29,9 +29,9 @@ class AzureUsageBlocked(RuntimeError):
 class AzureUsageGuard:
     def __new__(cls, settings: Settings, *args, **kwargs):
         if cls is AzureUsageGuard and settings.uses_record_store:
-            from backend.app.core.azure_managed_usage import CosmosUsageGuard
+            from backend.app.core.record_usage import LocalUsageGuard
 
-            return object.__new__(CosmosUsageGuard)
+            return object.__new__(LocalUsageGuard)
         return object.__new__(cls)
 
     def __init__(self, settings: Settings) -> None:
@@ -66,7 +66,8 @@ class AzureUsageGuard:
                 raise AzureUsageBlocked("Infrastructure forecast exceeds the application allowance")
             if not existing:
                 db.execute(
-                    "INSERT INTO azure_usage(id,month,day,kind,estimate,active,phase) VALUES(?,?,?,?,?,0,'demo')",
+                    "INSERT INTO azure_usage(id,month,day,kind,estimate,active,phase) "
+                    "VALUES(?,?,?,?,?,0,'demo')",
                     (key, month, now.strftime("%Y-%m-%d"), "infrastructure", estimate),
                 )
             elif increase:
@@ -175,12 +176,10 @@ class AzureUsageGuard:
                     raise AzureUsageBlocked("Estimated Azure setup validation allowance exhausted")
 
     def request_delay(self, kind: str) -> float:
+        if kind != "reasoning":
+            raise ValueError("Unsupported usage category")
         self.require_enabled()
-        interval = (
-            self.settings.azure_reasoning_min_interval_seconds
-            if kind == "reasoning"
-            else self.settings.azure_embedding_min_interval_seconds
-        )
+        interval = self.settings.azure_reasoning_min_interval_seconds
         if not interval:
             return 0
         with self.transaction() as db:
@@ -231,7 +230,7 @@ class AzureUsageGuard:
 
     def reserve(self, kind: str, input_tokens: int = 0, output_tokens: int = 0) -> str:
         s = self.settings
-        if kind not in {"reasoning", "embedding", "session_voice", "session_text"}:
+        if kind != "reasoning":
             raise ValueError("Unsupported usage category")
         if any(
             not isinstance(v, int) or isinstance(v, bool) or v < 0
@@ -242,35 +241,13 @@ class AzureUsageGuard:
             raise AzureUsageBlocked("Azure usage disabled; explicit local enablement required")
         if input_tokens > s.azure_max_input_tokens or output_tokens > s.azure_max_output_tokens:
             raise AzureUsageBlocked("Azure request exceeds the conservative input/output limit")
-        if kind == "session_voice":
-            minutes = (
-                math.ceil(s.azure_setup_max_voice_seconds / 60)
-                if s.azure_setup_validation_mode
-                else s.azure_max_voice_session_minutes
-            )
-            cost = minutes * s.azure_estimated_voice_cad_per_minute
-        elif kind == "session_text":
-            cost = 0
-        else:
-            rate = (
-                s.azure_estimated_embedding_cad_per_million
-                if kind == "embedding"
-                else s.azure_estimated_input_cad_per_million
-            )
-            cost = (
-                input_tokens * rate + output_tokens * s.azure_estimated_output_cad_per_million
-            ) / 1_000_000
+        cost = (
+            input_tokens * s.azure_estimated_input_cad_per_million
+            + output_tokens * s.azure_estimated_output_cad_per_million
+        ) / 1_000_000
         estimate = math.ceil(cost * 1_000_000)
         now = datetime.now(UTC)
         month, day = now.strftime("%Y-%m"), now.strftime("%Y-%m-%d")
-        session = kind.startswith("session_")
-        # Never allocate a long-lived speech operation across a monthly reset.
-        if (
-            kind == "session_voice"
-            and (now + timedelta(minutes=s.azure_max_voice_session_minutes + 1)).strftime("%Y-%m")
-            != month
-        ):
-            raise AzureUsageBlocked("Start the Azure session after the calendar month resets")
         token = uuid.uuid4().hex
         with self.transaction() as db:
             self._allowed(db)
@@ -287,21 +264,7 @@ class AzureUsageGuard:
                 ).fetchone()[0]
                 if setup + estimate > s.azure_estimated_setup_limit_cad * 1_000_000:
                     raise AzureUsageBlocked("Estimated Azure setup validation allowance exhausted")
-            if session:
-                active = db.execute(
-                    "SELECT COUNT(*) FROM azure_usage WHERE active=1 AND kind LIKE 'session_%'"
-                ).fetchone()[0]
-                daily = db.execute(
-                    "SELECT COUNT(*) FROM azure_usage WHERE day=? AND kind LIKE 'session_%'", (day,)
-                ).fetchone()[0]
-                if active >= s.azure_max_concurrent_sessions:
-                    raise AzureUsageBlocked("Only one live Azure support session may run at a time")
-                if (
-                    s.azure_max_live_sessions_per_day > 0
-                    and daily >= s.azure_max_live_sessions_per_day
-                ):
-                    raise AzureUsageBlocked("Daily live Azure support session limit reached")
-            elif db.execute(
+            if db.execute(
                 "SELECT COUNT(*) FROM azure_usage WHERE active=1 "
                 "AND kind IN ('reasoning','embedding')"
             ).fetchone()[0]:
@@ -315,7 +278,7 @@ class AzureUsageGuard:
             )
         return token
 
-    def finish(self, token: str, usage: Any = None, seconds: float = 0) -> None:
+    def finish(self, token: str, usage: Any = None) -> None:
         counts = token_counts(usage)
         with self.transaction() as db:
             row = db.execute(
@@ -324,51 +287,19 @@ class AzureUsageGuard:
             if not row:
                 raise AzureUsageBlocked("Azure usage reservation missing")
             kind, estimate, previous = row
-            if (kind == "reasoning" and "input_tokens" in counts and "output_tokens" in counts) or (
-                kind == "embedding" and "input_tokens" in counts
-            ):
-                rate = (
-                    self.settings.azure_estimated_embedding_cad_per_million
-                    if kind == "embedding"
-                    else self.settings.azure_estimated_input_cad_per_million
-                )
+            if kind != "reasoning":
+                raise AzureUsageBlocked("Only current reasoning reservations can be finalized")
+            if "input_tokens" in counts and "output_tokens" in counts:
                 estimate = math.ceil(
-                    counts.get("input_tokens", 0) * rate
+                    counts.get("input_tokens", 0)
+                    * self.settings.azure_estimated_input_cad_per_million
                     + counts.get("output_tokens", 0)
                     * self.settings.azure_estimated_output_cad_per_million
                 )
             db.execute(
-                "UPDATE azure_usage SET active=0,estimate=?,usage=?,seconds=? WHERE id=?",
-                (estimate, json.dumps(counts) if counts else previous, max(0, seconds), token),
+                "UPDATE azure_usage SET active=0,estimate=?,usage=? WHERE id=?",
+                (estimate, json.dumps(counts) if counts else previous, token),
             )
-
-    def voice_usage(self, token: str, event_id: str, usage: Any) -> None:
-        counts = token_counts(usage)
-        if not counts:
-            return
-        with self.transaction() as db:
-            event = hashlib.sha256(event_id.encode()).hexdigest()
-            inserted = db.execute(
-                "INSERT OR IGNORE INTO azure_voice_usage VALUES(?,?,?)",
-                (token, event, json.dumps(counts)),
-            ).rowcount
-            if inserted:
-                row = db.execute("SELECT usage FROM azure_usage WHERE id=?", (token,)).fetchone()
-                previous = json.loads(row[0]) if row else {}
-                for key, value in counts.items():
-                    previous[key] = previous.get(key, 0) + value
-                db.execute(
-                    "UPDATE azure_usage SET usage=? WHERE id=?", (json.dumps(previous), token)
-                )
-
-    def turn(self, token: str) -> int:
-        with self.transaction() as db:
-            self._allowed(db)
-            row = db.execute("SELECT turns,active FROM azure_usage WHERE id=?", (token,)).fetchone()
-            if not row or not row[1] or row[0] >= self.settings.azure_max_turns_per_session:
-                raise AzureUsageBlocked("Live Azure support turn limit reached")
-            db.execute("UPDATE azure_usage SET turns=turns+1 WHERE id=?", (token,))
-            return row[0] + 1
 
     def disable(self) -> None:
         with self.transaction() as db:
@@ -379,13 +310,12 @@ class AzureUsageGuard:
     def record_check(self, capability: str, passed: bool, code: str = "") -> None:
         if capability not in {
             "auth_reasoning",
-            "auth_voice",
             "reasoning",
-            "embeddings",
             "mcp",
             "text_workflow",
-            "voice",
-            "voice_connection",
+            "auth_speech",
+            "speech_stt",
+            "speech_connection",
         }:
             raise ValueError("Unknown validation capability")
         safe_code = code if re.fullmatch(r"[A-Za-z0-9_.-]{0,64}", code) else "REDACTED"
@@ -409,26 +339,6 @@ class AzureUsageGuard:
                 }
         except AzureUsageBlocked:
             return {}
-
-    def claim_fixture(self, text: str) -> None:
-        digest = hashlib.sha256(text.encode()).hexdigest()
-        with self.transaction() as db:
-            self._allowed(db)
-            row = db.execute("SELECT digest FROM azure_acceptance_fixture WHERE id=1").fetchone()
-            if row and row[0] != digest:
-                raise AzureUsageBlocked(
-                    "Only one fictional knowledge document is allowed in Azure acceptance"
-                )
-            db.execute("INSERT OR IGNORE INTO azure_acceptance_fixture VALUES(1,?)", (digest,))
-
-    def claim_operator(self, identity: str) -> None:
-        digest = hashlib.sha256(identity.encode()).hexdigest()
-        with self.transaction() as db:
-            self._allowed(db)
-            row = db.execute("SELECT digest FROM azure_acceptance_operator WHERE id=1").fetchone()
-            if row and row[0] != digest:
-                raise AzureUsageBlocked("Azure acceptance is restricted to its first local tester")
-            db.execute("INSERT OR IGNORE INTO azure_acceptance_operator VALUES(1,?)", (digest,))
 
     def snapshot(self) -> dict[str, Any]:
         enabled = (
@@ -454,7 +364,10 @@ class AzureUsageGuard:
                         "SELECT COALESCE(SUM(estimate),0) FROM azure_usage WHERE phase='setup'"
                     ).fetchone()[0]
                     for _, raw in rows:
-                        for key, value in json.loads(raw).items():
+                        counters = json.loads(raw)
+                        if not isinstance(counters, dict):
+                            raise ValueError("Invalid usage counters")
+                        for key, value in token_counts(counters).items():
                             usage[key] = usage.get(key, 0) + value
             except (AzureUsageBlocked, ValueError, TypeError):
                 enabled, error = False, True
@@ -507,6 +420,17 @@ def token_counts(usage: Any) -> dict[str, int]:
         "input_tokens_details",
         "output_tokens_details",
     ):
+        # Previously persisted counters are flattened. Audit metadata is not a
+        # token counter and must neither leak publicly nor break budget reads.
+        for name in ("audio_tokens", "text_tokens", "cached_tokens"):
+            flat = field + "_" + name
+            value = usage.get(flat)
+            if (
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and 0 <= value <= 1_000_000_000
+            ):
+                result[flat] = value
         details = usage.get(field)
         if isinstance(details, dict):
             for name in ("audio_tokens", "text_tokens", "cached_tokens"):

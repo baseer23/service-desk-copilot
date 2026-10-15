@@ -40,91 +40,40 @@ async def local_checks(settings: Settings) -> tuple[StoreCheck, StoreCheck]:
 
 
 async def validate_live(settings: Settings, report: ReadinessReport) -> ReadinessReport:
-    """Exactly one reasoning request, one embedding, one silent Voice Live handshake."""
-    if (
-        settings.test_mode
-        or settings.generation_provider != "azure_openai"
-        or settings.embed_provider != "azure_openai"
-        or settings.voice_provider != "azure_voicelive"
-    ):
-        raise ValueError("LIVE_REQUIRES_AZURE_MODE")
-    if not all(cap.configured for cap in (report.reasoning, report.embeddings, report.voice)):
+    """One explicitly authorized Azure OpenAI text probe; no Speech/audio request."""
+    if settings.test_mode or settings.generation_provider != "azure_openai":
+        raise ValueError("LIVE_REQUIRES_AZURE_TEXT_MODE")
+    if not report.reasoning.configured:
         raise ValueError("LIVE_CONFIGURATION_MISSING")
     import logging
 
-    from azure.identity.aio import DefaultAzureCredential
-
-    from backend.app.adapters.embeddings import AzureEmbeddingProvider
     from backend.app.models.provider_azure_openai import AzureOpenAIProvider
-    from backend.app.voice.azure_voicelive import AzureVoiceLiveProvider
 
     for namespace in ("azure", "openai", "httpx", "httpcore"):
         logger = logging.getLogger(namespace)
         logger.addHandler(logging.NullHandler())
         logger.propagate = False
     reasoning = None
-    voice = None
-    current = report.reasoning
     try:
-        if settings.azure_use_entra_id:
-            async with DefaultAzureCredential(
-                process_timeout=5, connection_timeout=5, read_timeout=5, retry_total=0
-            ) as credential:
-                for scope in (
-                    "https://cognitiveservices.azure.com/.default",
-                    "https://ai.azure.com/.default",
-                ):
-                    await asyncio.wait_for(credential.get_token(scope), 15)
         reasoning = AzureOpenAIProvider(settings)
-        current.locally_initialized = True
-        await reasoning.generate_structured(
-            "readiness", {"request": "Fictional IT readiness check. Return JSON status ok."}, Probe
+        report.reasoning.locally_initialized = True
+        await asyncio.wait_for(
+            reasoning.generate_structured(
+                "readiness",
+                {"request": "Return JSON status ok for this text connectivity check."},
+                Probe,
+            ),
+            settings.model_timeout_sec + 1,
         )
         report.reasoning.authenticated = "YES"
         report.reasoning.reachable = "YES"
-        report.reasoning.locally_initialized = True
         report.reasoning.live_validated = True
-        current = report.embeddings
-        current.locally_initialized = True
-        embeddings = AzureEmbeddingProvider(settings, client=reasoning.client)
-        await asyncio.wait_for(
-            asyncio.to_thread(embeddings.embed_texts, ["Fictional service-desk readiness check."]),
-            settings.model_timeout_sec + 1,
-        )
-        report.embeddings.authenticated = "YES"
-        report.embeddings.reachable = "YES"
-        report.embeddings.locally_initialized = True
-        report.embeddings.live_validated = True
-        current = report.voice
-        current.locally_initialized = True
-        voice = AzureVoiceLiveProvider(settings)
-        await asyncio.wait_for(voice.create_session(), 25)
-
-        async def configured() -> None:
-            async for event in voice.events():
-                if event.type == "error":
-                    raise ValueError("VOICE_CONFIGURATION_REJECTED")
-                if event.type == "configured":
-                    return
-            raise ValueError("VOICE_DISCONNECTED")
-
-        await asyncio.wait_for(configured(), 10)
-        report.voice.authenticated = "YES"
-        report.voice.reachable = "YES"
-        report.voice.locally_initialized = True
-        report.voice.live_validated = True
         report.live_azure_validated = True
         return report
-    except Exception:  # noqa: BLE001 - never print raw provider responses
-        current.reachable = "NO"
+    except Exception:  # noqa: BLE001 - Never print native auth/model diagnostics.
+        report.reasoning.reachable = "NO"
         return report
     finally:
-        try:
-            if voice:
-                await asyncio.wait_for(voice.close_session(), 10)
-        except Exception:  # noqa: BLE001 - no raw SDK cleanup errors
-            report.voice.live_validated = False
-            report.live_azure_validated = False
         if reasoning:
             reasoning.close()
 
@@ -151,19 +100,22 @@ def rows(settings: Settings, report: ReadinessReport, signed_in: str) -> dict[st
 
     statuses = {
         "Runtime mode": report.runtime_mode,
+        "Selected reasoning provider": report.selected_provider,
         "Azure reasoning endpoint": found(settings.azure_foundry_endpoint),
         "Reasoning deployment": found(settings.azure_model_deployment),
         "Reasoning authentication": auth_method(settings),
-        "Azure embedding deployment": found(settings.azure_embedding_deployment),
-        "Voice Live enabled": "YES" if settings.voice_enabled else "NO",
-        "Voice Live endpoint": found(settings.azure_voicelive_endpoint),
-        "Voice Live model": found(settings.azure_voicelive_model),
-        "Voice Live authentication": auth_method(settings, True),
+        "Local embeddings": "YES"
+        if settings.embed_provider == "sentence_transformers"
+        else "TEST_ONLY",
+        "Speech STT enabled": "YES" if settings.speech_enabled else "NO",
+        "Speech custom domain": found(settings.azure_speech_endpoint),
+        "Speech authentication": "ENTRA",
+        "Speech live validation": "SEPARATE_EXPLICIT_TEST",
         "Azure CLI executable": found(shutil.which("az")),
         "Azure CLI signed in": signed_in,
         "Local MCP": report.local_mcp,
         "Private stores": report.private_stores,
-        "Live Azure validated": "YES" if report.live_azure_validated else "NO",
+        "Live Azure text validated": "YES" if report.live_azure_validated else "NO",
         "Local Azure usage enabled": "YES" if report.azure_usage.get("enabled") else "NO",
         "Estimated CAD allowance left": (
             f"{report.azure_usage.get('remaining_estimated_cad', 0):.2f}"
@@ -173,7 +125,7 @@ def rows(settings: Settings, report: ReadinessReport, signed_in: str) -> dict[st
     for name, capability in (
         ("Reasoning", report.reasoning),
         ("Embeddings", report.embeddings),
-        ("Voice", report.voice),
+        ("Speech STT", report.voice),
     ):
         statuses[f"{name} configured"] = "YES" if capability.configured else "NO"
         statuses[f"{name} locally initialized"] = "YES" if capability.locally_initialized else "NO"
@@ -188,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--live",
         action="store_true",
-        help="Explicitly authorize three bounded Azure checks; no microphone/audio streaming.",
+        help="Authorize one bounded Azure OpenAI text request; no Speech or audio request.",
     )
     parser.add_argument(
         "--check-cli",
@@ -214,7 +166,7 @@ def main(argv: list[str] | None = None) -> int:
             print("Live validation                  CONFIGURATION_ERROR")
     for label, status in rows(settings, report, cli_signed_in(args.check_cli)).items():
         print(f"{label:<33}{status}")
-    ready = all(cap.configured for cap in (report.reasoning, report.embeddings, report.voice))
+    ready = report.reasoning.configured and report.embeddings.configured
     success = (not args.live or report.live_azure_validated) and ready
     return 0 if success and local == "READY" and stores == "READY" else 1
 

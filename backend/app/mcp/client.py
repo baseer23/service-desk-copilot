@@ -6,6 +6,8 @@ import asyncio
 import json
 import os
 import sys
+from collections import deque
+from contextlib import asynccontextmanager, suppress
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -26,6 +28,45 @@ class MCPToolError(RuntimeError):
 
 class MCPConnectionError(RuntimeError):
     """Transport or initialization failed."""
+
+
+class CancellableClientSession(ClientSession):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._cancelled_requests = deque(maxlen=256)
+
+    async def _handle_response(self, message):
+        import anyio
+
+        if self._normalize_request_id(message.message.root.id) in self._cancelled_requests:
+            return
+        try:
+            await super()._handle_response(message)
+        except (anyio.BrokenResourceError, anyio.ClosedResourceError):
+            # The SDK pops a per-request stream before awaiting delivery. A
+            # concurrent caller cancellation may close that stream in between.
+            # This late reply must not close the shared session receive loop.
+            return
+
+    async def send_request(self, request, *args, **kwargs):
+        # The installed MCP SDK allocates this ID synchronously at the start of
+        # send_request but does not notify the server when its caller cancels.
+        # Capture it before the first await; concurrent requests get distinct IDs.
+        request_id = self._request_id
+        try:
+            return await super().send_request(request, *args, **kwargs)
+        except asyncio.CancelledError:
+            self._cancelled_requests.append(request_id)
+            from mcp import types
+            import anyio
+            with anyio.CancelScope(shield=True):
+                with suppress(Exception):
+                    await asyncio.wait_for(self.send_notification(types.ClientNotification(
+                        types.CancelledNotification(params=types.CancelledNotificationParams(
+                            requestId=request_id, reason="Investigation cancelled by caller",
+                        ))
+                    )), 1)
+            raise
 
 
 class DeskMateMCPClient:
@@ -138,18 +179,34 @@ class DeskMateMCPClient:
                 self._task = None
                 raise
 
+    @asynccontextmanager
+    async def transport(self):
+        params = StdioServerParameters(
+            command=self.server_command, args=["-m", "backend.app.mcp.server"],
+            cwd=self.cwd, env=self.subprocess_env(),
+        )
+        async with stdio_client(params, errlog=self.stderr or sys.stderr) as streams:
+            yield streams
+
+    def request_meta(self):
+        from backend.app.core.principal import current_principal, sign_principal
+        return {"deskmate_authority": sign_principal(self.settings, current_principal(self.settings))} if self.settings.voice_session_signing_key else None
+
+    def safe_retry_tools(self):
+        return {
+            "__list_tools__", "get_local_storage_status", "get_case", "list_cases",
+            "get_case_history", "get_document", "list_documents", "search_memory",
+            "search_remembered_facts", "get_user_context", "get_company_context",
+            "get_site_context", "get_device_context", "get_active_alerts",
+            "get_recent_changes", "list_available_context", "search_previous_tickets",
+        }
+
     async def _own_session(self):
         # AnyIO scopes are entered and exited by this same long-lived task.
         active = None
         try:
-            params = StdioServerParameters(
-                command=self.server_command,
-                args=["-m", "backend.app.mcp.server"],
-                cwd=self.cwd,
-                env=self.subprocess_env(),
-            )
-            async with stdio_client(params, errlog=self.stderr or sys.stderr) as (read, write):
-                async with ClientSession(
+            async with self.transport() as (read, write):
+                async with CancellableClientSession(
                     read,
                     write,
                     read_timeout_seconds=timedelta(
@@ -181,10 +238,14 @@ class DeskMateMCPClient:
                                     )
                             if not future.done():
                                 future.set_result(value)
+                        except asyncio.CancelledError:
+                            if not future.done():
+                                future.cancel()
+                            raise
                         except MCPToolError as exc:
                             if not future.done():
                                 future.set_exception(exc)
-                        except BaseException:
+                        except Exception:
                             if not future.done():
                                 future.set_exception(
                                     MCPConnectionError("DeskMate MCP request failed")
@@ -195,9 +256,19 @@ class DeskMateMCPClient:
                             item = await self._queue.get()
                             if item is None:
                                 break
+                            if item[2].cancelled():
+                                continue  # Never dispatch an abandoned queued write/read.
                             task = asyncio.create_task(dispatch(*item))
+                            future = item[2]
+                            def cancel_dispatch(completed, dispatch_task=task):
+                                if completed.cancelled():
+                                    dispatch_task.cancel()
+                            future.add_done_callback(cancel_dispatch)
+                            def finished(completed, response=future, callback=cancel_dispatch):
+                                pending.discard(completed)
+                                response.remove_done_callback(callback)
                             pending.add(task)
-                            task.add_done_callback(pending.discard)
+                            task.add_done_callback(finished)
                     finally:
                         if pending:
                             await asyncio.gather(*pending, return_exceptions=True)
@@ -220,29 +291,13 @@ class DeskMateMCPClient:
             try:
                 await self.start()
                 future = asyncio.get_running_loop().create_future()
-                from backend.app.core.principal import current_principal, sign_principal
-
-                meta = (
-                    {
-                        "deskmate_authority": sign_principal(
-                            self.settings, current_principal(self.settings)
-                        )
-                    }
-                    if self.settings.voice_session_signing_key
-                    else None
-                )
+                meta = self.request_meta()
                 self._queue.put_nowait((tool_name, params, future, meta))
                 return await future
             except MCPConnectionError:
                 await self.close()
                 # Do not repeat a write after an ambiguous transport failure.
-                if attempt or tool_name not in {
-                    "__list_tools__", "get_local_storage_status", "get_case", "list_cases",
-                    "get_case_history", "get_document", "list_documents", "search_memory",
-                    "search_remembered_facts", "get_user_context", "get_company_context",
-                    "get_site_context", "get_device_context", "get_active_alerts",
-                    "get_recent_changes", "list_available_context", "search_previous_tickets",
-                }:
+                if attempt or tool_name not in self.safe_retry_tools():
                     raise
 
     async def close(self):

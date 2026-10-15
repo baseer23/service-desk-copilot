@@ -22,7 +22,10 @@ async def document_worker(settings, harness):
                         enabled = await asyncio.to_thread(
                             lambda: AzureUsageGuard(settings).snapshot()["enabled"]
                         )
-                        if not enabled and not (
+                        # Local embeddings and local extraction never depend on
+                        # Azure allowance. The extractor checks the guard itself
+                        # immediately before any paid Document Intelligence call.
+                        if not enabled and settings.embed_provider != "sentence_transformers" and not (
                             document.get("phase") == "extract"
                             and document.get("media_type") in {"text/plain", "text/markdown"}
                         ):

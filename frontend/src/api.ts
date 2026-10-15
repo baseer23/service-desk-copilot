@@ -1,6 +1,10 @@
+import { providerHeaders } from './providerSelection'
+export { providerHeaders } from './providerSelection'
+
 const base = import.meta.env.VITE_API_BASE ?? ''
 
 export function publicErrorMessage(message: string): string {
+  if (/^(?:Groq (?:is not configured|is rate limited|capacity|request (?:failed|exceeds)|returned invalid structured))/.test(message)) return message
   if (/Azure|MCP|LangGraph|SQLite|Chroma|Cosmos|managed state|managed usage|Key.?Vault|rate_limit|[A-Z]+_[A-Z_]{3,}|provider|deployment|usage guard|pdftoppm|Tesseract/i.test(message))
     return 'DeskMate cannot complete this request right now. Your saved work is available. Please try again later or contact your administrator.'
   return message
@@ -9,7 +13,7 @@ export function publicErrorMessage(message: string): string {
 export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response
   try {
-    response = await fetch(base + path, init)
+    response = await fetch(base + path, { ...init, headers: providerHeaders(init?.headers) })
   } catch {
     throw new Error('DeskMate could not connect to the server. Please try again.')
   }

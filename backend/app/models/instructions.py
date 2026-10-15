@@ -1,4 +1,4 @@
-"""Shared, version-controlled instructions for Azure structured case reasoning."""
+"""Shared, version-controlled instructions for structured case reasoning."""
 
 import json
 
@@ -135,6 +135,10 @@ def stage_instructions(stage: str, context: dict) -> str:
                 " general geography, explanations and questions that do not refer to uploaded"
                 " or internal documents, use workflow=knowledge and knowledge_source=general."
                 " For uploaded/internal document questions use knowledge_source=documents."
+                " Comparing conflicting KB entries, internal procedures or reported system evidence"
+                " requires retrieval and verification through a knowledge or service-desk subgraph,"
+                " even when no documents have been uploaded. Use knowledge_source=documents for"
+                " an internal KB investigation; never route it through general chat."
                 " A question explicitly asking what an uploaded guide/document says always uses"
                 " workflow=knowledge and knowledge_source=documents, even if that guide concerns"
                 " VPN, MFA, Outlook or printer failures. Use service_desk only when the user asks"
@@ -158,35 +162,6 @@ def stage_instructions(stage: str, context: dict) -> str:
             "topical match does not establish relevance. Search snippets are discovery only. "
             "Prefer configured primary sources; label third-party content as untrusted."
         )
-    if stage.startswith("voice_"):
-        purpose = {
-            "voice_greeting": (
-                "Introduce yourself as an AI service-desk assistant and ask one useful "
-                "opening question. Return JSON reply only."
-            ),
-            "voice_extract": (
-                "Extract contact raw quotes and service-desk issue details only from the current"
-                " turn. JSON."
-            ),
-            "voice_plan": (
-                "Select at most four permitted read MCP tools when evidence is required. JSON."
-            ),
-            "voice_reply": (
-                "Return one grounded safe action with evidence IDs or one useful question. Never"
-                " claim resolution. JSON."
-            ),
-            "voice_turn": (
-                "In one JSON object, extract contact raw quotes and issue details ONLY from the "
-                "current turn, and select at most four permitted read MCP calls if evidence is "
-                "needed now. For a missing diagnostic fact or contact detail, return an empty "
-                "tool_calls list and one short clarification_question instead. Do not retrieve "
-                "knowledge just to ask a basic question. Questions must ask for information, "
-                "never prescribe a technical step, assert a diagnosis, or claim resolution. "
-                "Use recent turns and confirmed details; never greet again or repeat a question "
-                "the user already answered. Do not answer the issue in this proposal."
-            ),
-        }
-        return context.get("instructions", "") + "\n" + purpose.get(stage, "Return JSON.")
     if stage == "verify" and context.get("verification_target") == "clarification":
         return (
             "Independently review this proposed clarification, its materiality and factual"

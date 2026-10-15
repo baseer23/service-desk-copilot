@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import hashlib
+import logging
 from typing import Any, Callable, Dict, Iterable, List, MutableMapping, Optional, Sequence, Set, TypeVar
 from typing import TYPE_CHECKING
 
@@ -18,9 +20,21 @@ ChunkRecord = Dict[str, object]
 class GraphRepository:
     """Persistence adapter for document, chunk, and entity metadata in Neo4j."""
 
-    def __init__(self, driver: Driver) -> None:
+    def __init__(self, driver: Driver, *, tenant_provider=None, optional=False, allow_fixtures=True) -> None:
         """Store the Neo4j driver for subsequent transactional work."""
         self._driver: Driver = driver
+        self.tenant_provider = tenant_provider
+        self.optional = optional
+        self.allow_fixtures = allow_fixtures
+        self.available = True
+
+    def scope(self, identifier):
+        if self.tenant_provider is None:
+            return identifier
+        return hashlib.sha256(self.tenant_provider().encode()).hexdigest() + ":" + identifier
+
+    def tenant(self):
+        return self.tenant_provider() if self.tenant_provider else None
 
     def ensure_constraints(self) -> None:
         """Create Neo4j constraints and indexes required for ingest operations."""
@@ -41,10 +55,9 @@ class GraphRepository:
         def _tx(tx: Transaction) -> None:
             tx.run(
                 "MERGE (d:Document {id: $doc_id}) "
-                "SET d.title = $title, d.source = $source, d.updated_at = timestamp()",
-                doc_id=doc_id,
-                title=title,
-                source=source,
+                "SET d.title = $title, d.source = $source, d.updated_at = timestamp(), d.original_id=$original_id, d.tenant_id=$tenant_id",
+                doc_id=self.scope(doc_id),
+                title=title, source=source, original_id=doc_id, tenant_id=self.tenant(),
             )
 
         self._execute_write(_tx)
@@ -55,11 +68,11 @@ class GraphRepository:
         def _tx(tx: Transaction) -> None:
             tx.run(
                 "MERGE (c:Chunk {id: $chunk_id}) "
-                "SET c.ord = $ord, c.text = $text, c.tokens = $token_count, c.updated_at = timestamp()",
-                chunk_id=chunk_id,
+                "SET c.ord = $ord, c.text = $text, c.tokens = $token_count, c.updated_at = timestamp(), c.original_id=$original_id, c.tenant_id=$tenant_id",
+                chunk_id=self.scope(chunk_id),
                 ord=ord,
                 text=text,
-                token_count=token_count,
+                token_count=token_count, original_id=chunk_id, tenant_id=self.tenant(),
             )
 
         self._execute_write(_tx)
@@ -71,8 +84,8 @@ class GraphRepository:
             tx.run(
                 "MATCH (d:Document {id: $doc_id}), (c:Chunk {id: $chunk_id}) "
                 "MERGE (d)-[:HAS_CHUNK]->(c)",
-                doc_id=doc_id,
-                chunk_id=chunk_id,
+                doc_id=self.scope(doc_id),
+                chunk_id=self.scope(chunk_id),
             )
 
         self._execute_write(_tx)
@@ -82,19 +95,18 @@ class GraphRepository:
 
         def _tx(tx: Transaction) -> str:
             result = tx.run(
-                "MERGE (e:Entity {id: toLower($name)}) "
-                "SET e.name = $name, e.type = $type, e.updated_at = timestamp() "
+                "MERGE (e:Entity {id: $entity_id}) "
+                "SET e.name = $name, e.type = $type, e.updated_at = timestamp(), e.tenant_id=$tenant_id "
                 "RETURN e.id AS id",
-                name=name,
-                type=type,
+                name=name, type=type, entity_id=self.scope(name.lower()), tenant_id=self.tenant(),
             )
-            record = result.single()
-            return record["id"] if record else name.lower()
+            result.single()
+            return name.lower()
 
         result = self._execute_write(_tx)
         if isinstance(result, str):
             return result
-        return str(result)
+        return name.lower()
 
     def link_chunk_entity(self, chunk_id: str, entity_id: str, rel: str = "ABOUT") -> None:
         """Create a relationship between a chunk and an entity."""
@@ -105,8 +117,8 @@ class GraphRepository:
             tx.run(
                 f"MATCH (c:Chunk {{id: $chunk_id}}), (e:Entity {{id: $entity_id}}) "
                 f"MERGE (c)-[:{rel_type}]->(e)",
-                chunk_id=chunk_id,
-                entity_id=entity_id,
+                chunk_id=self.scope(chunk_id),
+                entity_id=self.scope(entity_id),
             )
 
         self._execute_write(_tx)
@@ -118,7 +130,7 @@ class GraphRepository:
         if not name_list:
             return {}
 
-        lower_names = [name.lower() for name in name_list]
+        lower_names = [self.scope(name.lower()) for name in name_list]
 
         def _tx(tx: Transaction) -> Dict[str, int]:
             result = tx.run(
@@ -130,7 +142,7 @@ class GraphRepository:
             return {record["id"]: record["degree"] for record in result}
 
         degrees = self._execute_read(_tx)
-        return {name: degrees.get(name.lower(), 0) for name in name_list}
+        return {name: (degrees or {}).get(self.scope(name.lower()), 0) for name in name_list}
 
     def fetch_chunks_for_entities(self, names: Sequence[str], limit: int) -> List[ChunkRecord]:
         """Fetch chunks connected to any of the provided entity names."""
@@ -138,17 +150,20 @@ class GraphRepository:
         if not names:
             return []
 
-        lower_names = [name.lower() for name in names]
+        lower_names = [self.scope(name.lower()) for name in names]
 
         def _tx(tx: Transaction) -> List[ChunkRecord]:
             result = tx.run(
                 "MATCH (e:Entity) WHERE e.id IN $ids "
                 "MATCH (e)<-[:ABOUT]-(c:Chunk)<-[:HAS_CHUNK]-(d:Document) "
-                "RETURN c.id AS chunk_id, c.text AS text, c.ord AS ord, d.id AS doc_id, d.title AS title",
+                "RETURN coalesce(c.original_id,c.id) AS chunk_id, c.text AS text, c.ord AS ord, coalesce(d.original_id,d.id) AS doc_id, d.title AS title",
                 ids=lower_names,
             )
             records: List[ChunkRecord] = []
             for record in result:
+                from backend.app.services.knowledge_policy import is_test_knowledge
+                if not self.allow_fixtures and is_test_knowledge({"title": record.get("title")}):
+                    continue
                 records.append(
                     {
                         "id": record["chunk_id"],
@@ -164,21 +179,25 @@ class GraphRepository:
             return records
 
         records = self._execute_read(_tx)
-        return records[:limit]
+        return (records or [])[:limit]
 
     def upsert_relationships(self, relations):
-        """Store labeled enterprise relationships with explicit fixture provenance."""
+        """Store only supplied relationships with explicit source provenance."""
         for item in relations:
             rel = _safe_rel(item["predicate"])
+            if not self.allow_fixtures and item.get("source_system") == "local_fixture":
+                continue
 
             def write(tx):
                 tx.run(
-                    f"MERGE (a:Entity {{id: toLower($subject)}}) SET a.name=$subject "
-                    f"MERGE (b:Entity {{id: toLower($object)}}) SET b.name=$object "
+                    f"MERGE (a:Entity {{id: $subject_id}}) SET a.name=$subject, a.tenant_id=$tenant "
+                    f"MERGE (b:Entity {{id: $object_id}}) SET b.name=$object, b.tenant_id=$tenant "
                     f"MERGE (a)-[r:{rel}]->(b) "
-                    'SET r.source_system="local_fixture", r.observed_at=datetime() ',
+                    "SET r.source_system=$source_system, r.observed_at=datetime() ",
                     subject=item["subject"],
-                    object=item["object"],
+                    object=item["object"], subject_id=self.scope(item["subject"].lower()),
+                    object_id=self.scope(item["object"].lower()), tenant=self.tenant(),
+                    source_system=item.get("source_system", "knowledge_graph"),
                 )
 
             self._execute_write(write)
@@ -191,20 +210,21 @@ class GraphRepository:
 
         def read(tx):
             rows = tx.run(
-                "MATCH (seed:Entity) WHERE any(term IN $terms WHERE seed.id CONTAINS term) "
+                "MATCH (seed:Entity) WHERE any(term IN $terms WHERE toLower(seed.name) CONTAINS term) "
+                "AND ($tenant IS NULL OR seed.tenant_id=$tenant) "
                 "MATCH path=(seed)-[*1..2]-(neighbor:Entity) "
                 "UNWIND relationships(path) AS r "
-                "WITH r "
-                'WHERE type(r) IN ["WORKS_AT","HAS_SITE","USES","AFFECTS","APPLIES_TO","INVOLVES","ASSOCIATED_WITH"] '
+                "WITH r WHERE ($tenant IS NULL OR (startNode(r).tenant_id=$tenant AND endNode(r).tenant_id=$tenant)) "
+                'AND type(r) IN ["WORKS_AT","HAS_SITE","USES","AFFECTS","APPLIES_TO","INVOLVES","ASSOCIATED_WITH"] '
+                "AND ($allow_fixtures OR coalesce(r.source_system, '') <> 'local_fixture') "
                 "RETURN DISTINCT startNode(r).name AS subject, type(r) AS predicate, "
                 "endNode(r).name AS object, r.source_system AS source_system, "
                 "toString(r.observed_at) AS observed_at LIMIT $limit",
-                terms=terms,
-                limit=limit,
+                terms=terms, limit=min(max(limit, 1), 50), tenant=self.tenant(), allow_fixtures=self.allow_fixtures,
             )
             return [dict(row) for row in rows]
 
-        return self._execute_read(read)
+        return self._execute_read(read) or []
 
     def ping(self) -> bool:
         """Return True when the database responds to a trivial read."""
@@ -219,20 +239,69 @@ class GraphRepository:
             return False
 
     def _execute_write(self, func: Callable[[Transaction], T]) -> T:
-        """Execute a write transaction using the best available driver API."""
-
-        if hasattr(self._driver, "execute_write"):
-            return self._driver.execute_write(func)
-        with self._driver.session() as session:  # pragma: no cover - legacy driver path
-            return session.execute_write(func)  # type: ignore[call-arg]
+        try:
+            if hasattr(self._driver, "execute_write"):
+                return self._driver.execute_write(func)
+            with self._driver.session() as session:
+                return session.execute_write(func)
+        except Exception:
+            if not self.optional:
+                raise
+            self.available = False
+            logging.getLogger(__name__).warning("Aura graph write unavailable; local knowledge preserved")
+            return None
 
     def _execute_read(self, func: Callable[[Transaction], T]) -> T:
-        """Execute a read transaction using the best available driver API."""
+        try:
+            if hasattr(self._driver, "execute_read"):
+                return self._driver.execute_read(func)
+            with self._driver.session() as session:
+                return session.execute_read(func)
+        except Exception:
+            if not self.optional:
+                raise
+            self.available = False
+            logging.getLogger(__name__).warning("Aura graph read unavailable; using local vector evidence")
+            return None
 
-        if hasattr(self._driver, "execute_read"):
-            return self._driver.execute_read(func)
-        with self._driver.session() as session:  # pragma: no cover - legacy driver path
-            return session.execute_read(func)  # type: ignore[call-arg]
+
+class UnavailableGraphRepository:
+    """Honest vector-only fallback; never supplies synthetic graph evidence."""
+
+    available = False
+
+    def ensure_constraints(self):
+        pass
+
+    def upsert_document(self, *args, **kwargs):
+        pass
+
+    def upsert_chunk(self, *args, **kwargs):
+        pass
+
+    def link_doc_chunk(self, *args, **kwargs):
+        pass
+
+    def upsert_entity(self, name, **kwargs):
+        return name.casefold()
+
+    def link_chunk_entity(self, *args, **kwargs):
+        pass
+
+    def upsert_relationships(self, *args, **kwargs):
+        pass
+
+    def get_entity_degrees(self, names):
+        return {name: 0 for name in names}
+
+    def fetch_chunks_for_entities(self, names, limit):
+        return []
+
+    def search_relationships(self, entities, limit=12):
+        return []
+
+    def ping(self):
+        return False
 
 
 class InMemoryGraphRepository:

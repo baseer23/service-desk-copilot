@@ -35,7 +35,6 @@ def test_hosted_mcp_subprocess_keeps_installed_library_path(settings, monkeypatc
         "save_case",
         "save_fact",
         "search_knowledge",
-        "create_case_from_voice_session",
     ],
 )
 async def test_ambiguous_write_or_paid_retrieval_transport_failure_is_not_replayed(
