@@ -2,6 +2,7 @@ import asyncio
 import json
 import pytest
 from backend.app.agent.activity import activity_scope, instrument
+from backend.app.agent.models import InvestigationPlan
 from backend.app.models.provider_routing import provider_scope
 
 
@@ -93,3 +94,73 @@ def test_disconnected_sources_are_not_offered_to_the_model(make_client):
     # metadata never manufactures a connected service-desk integration.
     result=client.portal.call(harness.invoke,'get_user_context',{'user_name':'unconnected'})
     assert result['status']=='unavailable'
+
+
+def test_plan_streams_objective_and_agent_generated_research_questions(make_client):
+    client = make_client({'MAX_RESEARCH_ROUNDS': '0'})
+    agent = client.app.state.agent
+
+    async def planned(stage, context, schema):
+        assert stage == 'plan'
+        return InvestigationPlan(
+            goal='Assess the documented eligibility requirements',
+            known_facts=['The occupation is support technician'],
+            unknowns=['Which Nova Scotia stream applies?', 'Does the job offer meet the stream rules?'],
+            tool_calls=[{
+                'name': 'search_knowledge',
+                'arguments': {'question': 'Nova Scotia graduate stream eligibility'},
+                'reason': 'Check existing authoritative workspace material first',
+            }],
+            stop_condition='Official requirements and applicant-specific gaps are identified',
+        )
+
+    agent.provider.generate_structured = planned
+    events = []
+    state = {
+        'case_id': 'visible-plan', 'persist_case': False, 'workflow': 'knowledge',
+        'ticket': {'summary': 'Am I eligible?'}, 'evidence': [],
+    }
+    async def run():
+        with activity_scope(events.append):
+            return await agent.plan(state)
+
+    update = client.portal.call(run)
+
+    assert update['research_questions'] == [
+        'Which Nova Scotia stream applies?', 'Does the job offer meet the stream rules?'
+    ]
+    event = next(row for row in events if row['stage'] == 'research_plan')
+    assert event['objective'] == 'Assess the documented eligibility requirements'
+    assert event['research_questions'] == update['research_questions']
+
+
+def test_tool_completion_streams_concise_observations(make_client):
+    client = make_client({'MAX_RESEARCH_ROUNDS': '0'})
+    agent = client.app.state.agent
+    original = agent.harness.invoke
+
+    async def invoke(name, arguments):
+        if name == 'search_knowledge':
+            return {
+                'items': [{'title': 'Graduate stream policy', 'text': 'Eligibility requirements'}],
+                'source_system': 'local_knowledge', 'timestamp': '2026-10-14T00:00:00Z',
+                'reliability': 0.9,
+            }
+        return await original(name, arguments)
+
+    agent.harness.invoke = invoke
+    events = []
+    async def run():
+        with activity_scope(events.append):
+            await agent._call(
+                {'case_id': 'visible-tool', 'persist_case': False},
+                'search_knowledge', {'question': 'graduate stream eligibility'},
+            )
+
+    client.portal.call(run)
+    event = next(
+        row for row in events
+        if row['stage'] == 'tool:search_knowledge' and row['status'] == 'completed'
+    )
+    assert event['query'] == 'graduate stream eligibility'
+    assert event['findings'] == ['Graduate stream policy']

@@ -132,6 +132,11 @@ SCENARIOS = [
         "Question requiring the assistant to challenge an incorrect premise",
         "Since DNS always encrypts website traffic, why did HTTPS fail?",
     ),
+    (
+        "ns_graduate_eligibility",
+        "Current Nova Scotia graduate immigration eligibility",
+        "Am I eligible for the Nova Scotia graduate immigration stream as a support technician?",
+    ),
 ]
 
 EVALUATION_METRICS = {

@@ -126,10 +126,12 @@ test('Jake investigation interrupts twice, resumes one case and remembers facts 
   await expect(page.locator('.case-heading .status-pill')).toHaveText('assessment ready')
   await page.getByText('Investigation details',{exact:true}).click()
   await expect(
-    page.getByText(/The required update is confirmed installed. Refresh the client profile/),
+    page.locator('dd.next-action').getByText(
+      /The required update is confirmed installed. Refresh the client profile/,
+    ),
   ).toBeVisible()
-  await expect(page.getByText('B99 2nd floor', { exact: true })).toBeVisible()
-  await expect(page.getByText('Yes', { exact: true })).toBeVisible()
+  await expect(page.locator('.assessment strong').filter({ hasText: /^B99 2nd floor$/ })).toBeVisible()
+  await expect(page.locator('.assessment strong').filter({ hasText: /^Yes$/ })).toBeVisible()
   const final = await (await request.get(`/cases/${caseID}`)).json()
   expect(final.thread_id).toBe(caseID)
   expect(final.confirmed_facts).toHaveLength(2)

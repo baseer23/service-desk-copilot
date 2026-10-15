@@ -12,8 +12,12 @@ export interface ActivityEvent {
   event_id?: string
   query?: string
   rationale?: string
+  objective?: string
   research_queries?: string[]
+  research_questions?: string[]
+  findings?: string[]
   missing_information?: string[]
+  next_action?: string
   actions?: Array<{ tool: string; reason: string }>
   sources?: Array<{ title: string; url?: string | null }>
   category?: string

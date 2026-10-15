@@ -181,8 +181,8 @@ class ServiceDeskAgent:
             raise MCPToolError("Public source excluded by configured policy")
         summary = "Searching local knowledge" if name == "search_knowledge" else "Querying knowledge relationships" if name == "search_graph" else "Searching the public web" if name == "search_web" else "Reading a public source" if name == "fetch_web_page" else "Reading connected tool evidence"
         details = {"tool": name}
-        if name == "search_web":
-            details["query"] = str(arguments.get("query", ""))[:500]
+        if name in {"search_web", "search_knowledge"}:
+            details["query"] = str(arguments.get("query") or arguments.get("question") or "")[:500]
         elif name == "fetch_web_page":
             details["source_host"] = urlsplit(str(arguments.get("url", ""))).hostname or "public source"
         await emit("tool:" + name, "running", summary, **details)
@@ -193,8 +193,18 @@ class ServiceDeskAgent:
             raise
         result_items = result.get("items", []) if isinstance(result, dict) else result
         result_count = len(result_items) if isinstance(result_items, list) else 0
+        findings = []
+        if isinstance(result_items, list):
+            for item in result_items[:3]:
+                if not isinstance(item, dict):
+                    continue
+                label = item.get("title") or item.get("name") or item.get("source")
+                if not label and item.get("url"):
+                    label = item["url"]
+                if label:
+                    findings.append(str(label)[:240])
         await emit("tool:" + name, "completed", summary, **details,
-                   result_count=result_count)
+                   result_count=result_count, findings=findings)
         if name == "fetch_web_page" and isinstance(result, dict):
             page = result.get("result") or result
             if not permits(page.get("url", arguments.get("url", "")), self.settings):
@@ -622,13 +632,20 @@ class ServiceDeskAgent:
             "research_plan",
             "completed",
             f"Research plan: {plan.goal[:240]}",
+            objective=plan.goal[:500],
             rationale=plan.stop_condition[:500],
+            research_questions=plan.unknowns[:6],
             actions=[
                 {"tool": call.name, "reason": call.reason[:300]}
                 for call in plan.tool_calls
             ],
         )
-        return {"plan": plan.model_dump(), "plan_executed": False, "tools_discovered": True}
+        return {
+            "plan": plan.model_dump(),
+            "research_questions": plan.unknowns,
+            "plan_executed": False,
+            "tools_discovered": True,
+        }
 
     async def execute_tools(self, state):
         plan = InvestigationPlan.model_validate(state["plan"])
@@ -898,6 +915,12 @@ class ServiceDeskAgent:
             rationale=(decision.decision_justification or decision.evidence_summary)[:600],
             research_queries=decision.research_queries,
             missing_information=[item.description for item in decision.missing_information[:4]],
+            next_action=(
+                decision.question_for_human
+                or ("Research the remaining evidence gaps" if decision.needs_web_research else None)
+                or decision.recommended_next_action
+                or ("Verify the candidate answer" if decision.enough_information else "Revise the investigation plan")
+            ),
         )
         return {
             "decision": decision.model_dump(),

@@ -33,6 +33,9 @@ export type Case = {
   ticket: { summary: string }
   status: string
   pending_question: string | null
+  plan?: { goal?: string }
+  research_questions?: string[]
+  missing_information?: Array<string | { description: string }>
   likely_issue: string | null
   workflow?: string
   transient?: boolean
@@ -271,7 +274,7 @@ export default function App(): JSX.Element {
             <label htmlFor="ticket">Question or ticket</label>
             <textarea id="ticket" rows={3} placeholder="Message DeskMate…" value={ticket} onChange={e => setTicket(e.target.value)} required />
             <div className="composer-actions"><button type="button" className="button button-neutral" onClick={() => navigate('Voice', 'voice')} aria-label="Open voice support"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8"/></svg></button>
-              <div><button type="button" className="button button-subtle" disabled={busy || !ticket.trim()} onClick={() => void saveRequest()}>Save request</button><button className="button button-primary" disabled={busy || !ticket.trim() || (readiness !== null && !readiness.text_ready)} aria-busy={busy}>{busy ? 'Thinking…' : 'Send'}</button></div>
+              <div><button type="button" className="button button-subtle" disabled={busy || !ticket.trim()} onClick={() => void saveRequest()}>Save request</button><button className="button button-primary" disabled={busy || !ticket.trim() || (readiness !== null && !readiness.text_ready)} aria-busy={busy}>{busy ? 'Investigating…' : 'Send'}</button></div>
             </div>
             {blocker && <div className="availability-note"><p role="status">{blocker}</p><button type="button" className="button button-subtle" disabled={checking || busy} onClick={() => void refresh()}>Check availability</button></div>}
           </form>
@@ -335,6 +338,8 @@ export default function App(): JSX.Element {
                 <h2>
                   {active.workflow === 'knowledge' ? 'Research summary' : 'Investigation Timeline'}
                 </h2>
+                {active.plan?.goal && <p><strong>Objective:</strong> {active.plan.goal}</p>}
+                {!!active.research_questions?.length && <><h3>Research questions</h3><ul>{active.research_questions.map(question => <li key={question}>{question}</li>)}</ul></>}
                 <InvestigationTimeline events={active.workflow==='knowledge' ? events.filter(event=>/^(search_|fetch_|ingest_|evaluate_sources$|verify$)/.test(event.tool ?? '')) : events} />
                 {busy && (
                   <p className="muted" role="status">
@@ -364,6 +369,7 @@ export default function App(): JSX.Element {
                   <span className="eyebrow">YOUR INPUT IS NEEDED</span>
                   <h2>Human Input</h2>
                   <p className="question">{active.pending_question}</p>
+                  {!!active.missing_information?.length && <p className="muted">This answer will resolve a remaining evidence gap in the same saved investigation.</p>}
                   <form onSubmit={resume}>
                     <label htmlFor="answer">Your answer</label>
                     <input

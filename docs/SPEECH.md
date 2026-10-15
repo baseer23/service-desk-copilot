@@ -66,3 +66,7 @@ PYTHONPATH=. .venv/bin/python scripts/verify_speech.py \
 Optionally provide `--expected-text-file /private/tmp/expected-speech.txt` to verify a substring without placing transcript text in command arguments. The full recognized text is written only to the new mode-0600 report. Console output contains numeric results and safe status codes. The default timeout is 90 seconds; longer test audio requires `--timeout-seconds` covering its duration plus ten seconds. The runner's bounded acceptance fixture is separate from the unlimited-until-Stop browser feature.
 
 A prerecorded SDK success does not prove physical microphone capture. For browser acceptance, authorize microphone access, speak multiple sentences separated by silence, verify partial/final text, mute/unmute, speak a sentence containing “stop”, then say standalone “Stop”. Verify the microphone indicator turns off, usage stops increasing, completed text can be submitted, and another recording starts. Do not claim this passed unless it was actually observed.
+
+### 2026-10-14 investigation-visibility revision
+
+No Speech transport, recognition, usage-accounting or microphone code changed in the observable-investigation revision. The complete backend suite passed (338 tests, with two unrelated opt-in Aura tests skipped) and all 51 frontend unit tests passed, including the existing voice component/audio coverage. No live Speech SDK or physical microphone check was rerun, so the live acceptance status above is unchanged.

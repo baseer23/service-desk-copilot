@@ -14,6 +14,7 @@ class InvestigationState(TypedDict, total=False):
     intent: dict[str, Any]
     analysis: dict[str, Any]
     plan: dict[str, Any]
+    research_questions: list[str]
     plan_executed: bool
     decision_issues: list[str]
     decision: dict[str, Any]

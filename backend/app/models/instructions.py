@@ -132,8 +132,12 @@ def stage_instructions(stage: str, context: dict) -> str:
         if context.get("knowledge_scope") == "broad":
             return INSTRUCTIONS[stage] + (
                 "\nGeneral conversation is enabled. Set in_scope=true. For ordinary conversation,"
-                " general geography, explanations and questions that do not refer to uploaded"
+                " general geography, explanations and stable questions that do not refer to uploaded"
                 " or internal documents, use workflow=knowledge and knowledge_source=general."
+                " Questions about current eligibility, laws, government programs, vendor support,"
+                " or other changing published guidance require authoritative research: use"
+                " workflow=knowledge and knowledge_source=documents so the investigation subgraph"
+                " can retrieve, evaluate and cite sources."
                 " For uploaded/internal document questions use knowledge_source=documents."
                 " Comparing conflicting KB entries, internal procedures or reported system evidence"
                 " requires retrieval and verification through a knowledge or service-desk subgraph,"
@@ -219,6 +223,8 @@ def stage_instructions(stage: str, context: dict) -> str:
         instructions += (
             " Use available_context.knowledge_chunks to assess whether indexed internal guidance"
             " can address a diagnostic gap, and consider a relevant search_knowledge query before"
-            " public research."
+            " public research. Populate unknowns with the concrete research questions that must be"
+            " answered; these are shown to the user, so keep them concise and do not include hidden"
+            " reasoning."
         )
     return instructions
