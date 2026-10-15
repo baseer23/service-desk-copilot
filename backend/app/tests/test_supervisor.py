@@ -1,6 +1,8 @@
 import asyncio
 from datetime import datetime, timezone
 import pytest
+
+from backend.app.agent.graph import concise_answer_line
 from langchain_core.tools import StructuredTool
 from backend.app.agent.models import InvestigationPlan, VerificationResult, MemoryFact
 from backend.app.mcp.client import DeskMateMCPClient
@@ -439,3 +441,6 @@ def test_unjustified_mfa_location_question_is_revised_before_interrupt(make_clie
     assert count == 2
     events = c.get(f"/cases/{cid}/events").json()
     assert not any(e["tool"] == "human_input_requested" for e in events)
+def test_final_answer_is_one_short_plain_line():
+    assert concise_answer_line("**Check the logs.**\n\nThen retry later.") == "Check the logs. Then retry later."
+    assert "\n" not in concise_answer_line("Review evidence\nfrom the verified source")

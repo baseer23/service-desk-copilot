@@ -177,7 +177,7 @@ test('resume question uses knowledge and never asks for a floor', async ({ page,
   await page.getByRole('button', { name: 'Chat', exact: true }).click()
   await page.getByLabel('Question or ticket').fill('What year did Abdul graduate?')
   await page.getByRole('button', { name: 'Send', exact: true }).click()
-  await expect(page.getByRole('heading', { name: 'Answer', exact: true })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Final Answer', exact: true })).toBeVisible()
   await expect(page.getByText('Abdul graduated in 2022.', { exact: true })).toBeVisible()
   await expect(page.getByLabel('Your answer')).toHaveCount(0)
   const response = await readWorkflowResponse(await answerResponse)

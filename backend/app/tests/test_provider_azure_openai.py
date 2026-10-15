@@ -5,6 +5,7 @@ import pytest
 from backend.app.agent.models import InvestigationPlan, RequestIntent
 from backend.app.models.provider import LLMError
 from backend.app.models.provider_azure_openai import AzureOpenAIProvider
+from backend.app.core.azure_usage import AzureUsageBlocked
 from pydantic import BaseModel
 
 
@@ -116,6 +117,19 @@ async def test_azure_failure_is_explicit_and_private(settings):
     with pytest.raises(LLMError, match="invalid structured"):
         await model.generate_structured("classify_intent", {}, RequestIntent)
     assert len(payloads) == 2
+
+
+@pytest.mark.asyncio
+async def test_azure_cost_control_failure_is_categorized_before_dispatch(settings):
+    model, payloads = provider(settings, ['{"status":"ok"}'])
+    model.usage_guard.request_delay = lambda kind: (_ for _ in ()).throw(
+        AzureUsageBlocked("Estimated monthly Azure application allowance exhausted")
+    )
+    with pytest.raises(LLMError) as caught:
+        await model.generate_structured("readiness", {}, Probe)
+    assert caught.value.category == "cost_control"
+    assert "approved application allowance" in str(caught.value)
+    assert payloads == []
 
 
 @pytest.mark.asyncio

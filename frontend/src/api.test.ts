@@ -7,7 +7,7 @@ test.each(['Managed state could not be read', 'Managed usage ledger unavailable'
   expect(publicErrorMessage(message)).toBe('DeskMate cannot complete this request right now. Your saved work is available. Please try again later or contact your administrator.')
 })
 
-test('shows the structured readiness explanation and safe code', async () => {
+test('shows an actionable Azure cost-control explanation and safe code', async () => {
   vi.stubGlobal(
     'fetch',
     vi.fn(async () =>
@@ -15,7 +15,7 @@ test('shows the structured readiness explanation and safe code', async () => {
         {
           detail: {
             code: 'AZURE_REASONING_NOT_READY',
-            message: 'Azure disabled; save a request locally.',
+            message: 'Azure OpenAI is blocked by DeskMate’s approved application allowance. Ask an operator to review the usage ledger.',
           },
         },
         { status: 503 },
@@ -23,7 +23,7 @@ test('shows the structured readiness explanation and safe code', async () => {
     ),
   )
   await expect(request('/ask')).rejects.toMatchObject({
-    message: 'DeskMate cannot complete this request right now. Your saved work is available. Please try again later or contact your administrator.',
+    message: 'Azure OpenAI is blocked by DeskMate’s approved application allowance. Ask an operator to review the usage ledger.',
     code: 'AZURE_REASONING_NOT_READY',
     status: 503,
   })

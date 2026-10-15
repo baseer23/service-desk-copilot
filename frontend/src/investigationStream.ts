@@ -18,8 +18,15 @@ export interface ActivityEvent {
   findings?: string[]
   missing_information?: string[]
   next_action?: string
+  question?: string
+  conclusion?: string
   actions?: Array<{ tool: string; reason: string }>
-  sources?: Array<{ title: string; url?: string | null }>
+  sources?: Array<{
+    title: string
+    url?: string | null
+    page?: number | null
+    extraction_method?: string | null
+  }>
   category?: string
   request_id?: string | null
 }

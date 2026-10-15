@@ -70,3 +70,11 @@ A prerecorded SDK success does not prove physical microphone capture. For browse
 ### 2026-10-14 investigation-visibility revision
 
 No Speech transport, recognition, usage-accounting or microphone code changed in the observable-investigation revision. The complete backend suite passed (338 tests, with two unrelated opt-in Aura tests skipped) and all 51 frontend unit tests passed, including the existing voice component/audio coverage. No live Speech SDK or physical microphone check was rerun, so the live acceptance status above is unchanged.
+
+### 2026-10-14 document-evidence revision
+
+The document extraction/indexing changes do not alter Speech transport, transcript handling, reservations, cost accounting or microphone behavior. The complete backend suite passed (339 tests, with two unrelated opt-in Aura tests skipped), all 51 frontend tests passed, and the production build passed. No live Speech SDK or physical microphone check was run; the live blockers and acceptance status above are unchanged.
+
+### 2026-10-15 Azure OpenAI diagnostics revision
+
+The reasoning-provider error and investigation-timeline changes do not alter Speech SDK transport, continuous recognition, transcript ownership, reservation settlement or microphone behavior. No live Speech request or physical microphone check was run; prior Speech acceptance status remains unchanged.

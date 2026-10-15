@@ -51,6 +51,14 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def concise_answer_line(value: str | None, limit: int = 280) -> str | None:
+    """Return one display-safe conclusion line; evidence remains in the timeline."""
+    if not value:
+        return None
+    line = " ".join(value.replace("**", "").split())
+    return line if len(line) <= limit else line[: limit - 1].rstrip() + "…"
+
+
 class ServiceDeskAgent:
     def __init__(self, settings, mcp, provider, checkpointer):
         self.settings, self.provider = settings, provider
@@ -194,17 +202,30 @@ class ServiceDeskAgent:
         result_items = result.get("items", []) if isinstance(result, dict) else result
         result_count = len(result_items) if isinstance(result_items, list) else 0
         findings = []
+        sources = []
         if isinstance(result_items, list):
             for item in result_items[:3]:
                 if not isinstance(item, dict):
                     continue
-                label = item.get("title") or item.get("name") or item.get("source")
+                metadata = item.get("metadata", {})
+                label = (
+                    item.get("title") or metadata.get("title")
+                    or item.get("name") or item.get("source")
+                )
                 if not label and item.get("url"):
                     label = item["url"]
                 if label:
                     findings.append(str(label)[:240])
+                    sources.append(
+                        {
+                            "title": str(label)[:200],
+                            "url": item.get("url") or metadata.get("url") or metadata.get("source"),
+                            "page": metadata.get("page"),
+                            "extraction_method": metadata.get("extraction_method"),
+                        }
+                    )
         await emit("tool:" + name, "completed", summary, **details,
-                   result_count=result_count, findings=findings)
+                   result_count=result_count, findings=findings, sources=sources)
         if name == "fetch_web_page" and isinstance(result, dict):
             page = result.get("result") or result
             if not permits(page.get("url", arguments.get("url", "")), self.settings):
@@ -490,6 +511,7 @@ class ServiceDeskAgent:
             },
             GeneralAnswer,
         )
+        answer.answer = concise_answer_line(answer.answer) or answer.answer
         messages = [*state.get("chat_messages", []),
             {"role": "user", "content": state["ticket"]["summary"]},
             {"role": "assistant", "content": answer.answer},
@@ -963,6 +985,14 @@ class ServiceDeskAgent:
 
     async def ask_human(self, state):
         # The request event has a stable key, so interrupt replay cannot duplicate it.
+        await emit(
+            "follow_up",
+            "waiting",
+            "A specific answer is needed to continue",
+            question=state["pending_question"],
+            rationale=state["decision"].get("question_reason"),
+            next_action="Resume this saved investigation after the answer is submitted",
+        )
         await self.note(
             state,
             "human_input_requested",
@@ -1354,7 +1384,11 @@ class ServiceDeskAgent:
             else "Final assessment retains unresolved evidence gaps",
             confidence=confidence,
             source_count=len(response.sources),
+            conclusion=concise_answer_line(d.answer or d.recommended_next_action)
+            if supported else None,
         )
+        final_answer = concise_answer_line(d.answer or d.recommended_next_action) if supported else None
+        response.answer = concise_answer_line(response.answer)
         return {
             "status": "assessment_ready" if supported else "insufficient_information",
             "confidence": confidence,
@@ -1362,7 +1396,7 @@ class ServiceDeskAgent:
             "pending_field": None,
             "uncertainty": uncertainty,
             "final_response": response.model_dump(),
-            "final_answer": d.answer or d.recommended_next_action if supported else None,
+            "final_answer": final_answer,
             "likely_issue": d.likely_issue if not v.get("unsupported_claims") else None,
             "recommended_next_action": response.recommended_next_action,
             "actions_already_taken": response.actions_already_taken,

@@ -7,7 +7,14 @@ interface Match {
   id: string
   text: string
   storage: string
-  metadata: { title?: string; doc_id?: string; page?: number; source?: string }
+  metadata: {
+    title?: string
+    doc_id?: string
+    page?: number
+    source?: string
+    extraction_method?: string
+    table_count?: number
+  }
 }
 
 export default function KnowledgePanel({
@@ -272,6 +279,8 @@ export default function KnowledgePanel({
             <p>{match.text}</p>
             <small>
               Source: {match.metadata.title ?? 'Untitled'} · Document excerpt{match.metadata.page ? ` · Page ${match.metadata.page}` : ''}
+              {match.metadata.extraction_method === 'document_intelligence' ? ' · Azure Document Intelligence layout' : ''}
+              {match.metadata.table_count ? ` · ${match.metadata.table_count} table${match.metadata.table_count === 1 ? '' : 's'}` : ''}
               {match.metadata.doc_id && readiness?.managed_documents && <a href={`/documents/${encodeURIComponent(match.metadata.doc_id)}/download`}>View source</a>}
             </small>
           </article>

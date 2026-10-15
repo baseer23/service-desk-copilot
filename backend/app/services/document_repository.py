@@ -119,6 +119,7 @@ class DocumentRepository:
                     "document", identifier, state, previous=row, fields={"status": "processing"}
                 )
             result = json.loads(self.blobs.get(identifier, "extraction.json"))
+            extraction_metadata = result.get("metadata", {})
             chunks = []
             ordinal = 0
             for page in result["pages"]:
@@ -127,10 +128,17 @@ class DocumentRepository:
                     table for table in result["tables"] if table["page"] == page["page"]
                 ]
                 if matching_tables:
-                    text += "\n" + "\n".join(
-                        " | ".join(cell["text"] for cell in table["cells"])
-                        for table in matching_tables
-                    )
+                    rendered_tables = []
+                    for table in matching_tables:
+                        rows = {}
+                        for cell in sorted(
+                            table["cells"], key=lambda item: (item["row"], item["column"])
+                        ):
+                            rows.setdefault(cell["row"], []).append(cell["text"])
+                        rendered_tables.append(
+                            "\n".join(" | ".join(cells) for cells in rows.values())
+                        )
+                    text += "\n" + "\n\n".join(rendered_tables)
                 for chunk in split_text(
                     text, self.settings.chunk_tokens, self.settings.chunk_overlap
                 ):
@@ -144,6 +152,14 @@ class DocumentRepository:
                                 "title": state["title"],
                                 "source_type": state["source_type"],
                                 "page": page["page"],
+                                "extraction_method": result.get("method", "unknown"),
+                                "document_classification": extraction_metadata.get(
+                                    "classification", "text_document"
+                                ),
+                                "table_count": sum(
+                                    1 for table in result["tables"]
+                                    if table["page"] == page["page"]
+                                ),
                                 "source": "/documents/" + identifier + "/download",
                                 "content_hash": identifier,
                                 "version": state.get("version", 1),
@@ -182,7 +198,13 @@ class DocumentRepository:
             for chunk, vector in zip(chunks, vectors, strict=True):
                 chunk["embedding"] = vector
             self.search_store.upsert(chunks)
-            state.update(status="ready", phase="complete", chunks=len(chunks))
+            state.update(
+                status="ready",
+                phase="complete",
+                chunks=len(chunks),
+                extraction_method=result.get("method", "unknown"),
+                tables=len(result["tables"]),
+            )
             self.records.write(
                 "document", identifier, state, previous=row, fields={"status": "ready"}
             )

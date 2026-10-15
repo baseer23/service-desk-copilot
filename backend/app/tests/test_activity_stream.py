@@ -20,9 +20,33 @@ def test_http_stream_contains_real_node_events_and_final_response(make_client):
     assert any(value['stage']=='classify_intent' and value['status']=='completed' for value in activities)
     assert any(value['stage']=='discover_tools' for value in activities)
     assert any(value['stage'].startswith('tool:') for value in activities)
+    stages = [value['stage'] for value in activities]
+    assert stages.index('understanding_summary') < stages.index('research_plan')
+    assert stages.index('research_plan') < stages.index('evidence_evaluation')
+    assert next(index for index, stage in enumerate(stages) if stage.startswith('tool:')) < stages.index('evidence_evaluation')
     assert len({value['sequence'] for value in activities})==len(activities)
     assert events[-1][0]=='result'
     assert not any('prompt' in value or 'chain_of_thought' in value for value in activities)
+
+
+def test_follow_up_event_contains_the_real_question_before_result(make_client):
+    client = make_client({'MAX_RESEARCH_ROUNDS': '0'})
+    response = client.post(
+        '/ask', json={'summary': 'my vpn isnt working'},
+        headers={'Accept': 'text/event-stream'},
+    )
+    blocks = [block for block in response.text.split('\n\n') if block]
+    events = []
+    for block in blocks:
+        lines = block.splitlines()
+        name = lines[0][7:]
+        data = json.loads(lines[1][6:])
+        events.append((name, data))
+    follow_up = next(data for name, data in events if name == 'activity' and data['stage'] == 'follow_up')
+    assert follow_up['question'] == 'What exact error message or code appears when the VPN connection fails?'
+    assert events.index(('activity', follow_up)) < next(
+        index for index, (name, _) in enumerate(events) if name == 'result'
+    )
 
 
 @pytest.mark.asyncio
@@ -142,7 +166,14 @@ def test_tool_completion_streams_concise_observations(make_client):
     async def invoke(name, arguments):
         if name == 'search_knowledge':
             return {
-                'items': [{'title': 'Graduate stream policy', 'text': 'Eligibility requirements'}],
+                'items': [{
+                    'title': 'Graduate stream policy', 'text': 'Eligibility requirements',
+                    'metadata': {
+                        'title': 'Graduate stream policy', 'page': 4,
+                        'source': '/documents/abc/download',
+                        'extraction_method': 'document_intelligence',
+                    },
+                }],
                 'source_system': 'local_knowledge', 'timestamp': '2026-10-14T00:00:00Z',
                 'reliability': 0.9,
             }
@@ -164,3 +195,9 @@ def test_tool_completion_streams_concise_observations(make_client):
     )
     assert event['query'] == 'graduate stream eligibility'
     assert event['findings'] == ['Graduate stream policy']
+    assert event['sources'] == [{
+        'title': 'Graduate stream policy',
+        'url': '/documents/abc/download',
+        'page': 4,
+        'extraction_method': 'document_intelligence',
+    }]

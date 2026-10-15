@@ -51,8 +51,9 @@ test('large evidence is previewed; full content remains available only after exp
 
 test('document evidence links to the authenticated original without exposing storage credentials', () => {
   const id = 'a'.repeat(64)
-  render(<EvidenceList evidence={[{ tool: 'search_knowledge', source: 'Fictional handbook', source_system: 'azure_search', observed_at: '2026-10-13T00:00:00Z', content: { text: 'Fictional VPN guidance', metadata: { doc_id: id, title: 'VPN handbook', page: 2, embedding_model: 'private-model', tenant_id: 'private-tenant' } } }]} />)
+  render(<EvidenceList evidence={[{ tool: 'search_knowledge', source: 'Fictional handbook', source_system: 'azure_search', observed_at: '2026-10-13T00:00:00Z', content: { text: 'Fictional VPN guidance', metadata: { doc_id: id, title: 'VPN handbook', page: 2, extraction_method: 'document_intelligence', table_count: 1, embedding_model: 'private-model', tenant_id: 'private-tenant' } } }]} />)
   expect(screen.getByRole('link', { name: 'Download original document' })).toHaveAttribute('href', `/documents/${id}/download`)
   expect(screen.getByText(/Page 2/)).toBeInTheDocument()
+  expect(screen.getByText(/Azure Document Intelligence layout · 1 table/)).toBeInTheDocument()
   expect(screen.queryByText(/azure_search|private-model|private-tenant/)).not.toBeInTheDocument()
 })

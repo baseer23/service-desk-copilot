@@ -53,6 +53,12 @@ async def validate_live(settings: Settings, report: ReadinessReport) -> Readines
         logger = logging.getLogger(namespace)
         logger.addHandler(logging.NullHandler())
         logger.propagate = False
+    # A previous successful validation is historical evidence, not the result of
+    # this explicitly requested probe. Never leave stale success flags behind.
+    report.reasoning.authenticated = "NOT_CHECKED"
+    report.reasoning.reachable = "NOT_CHECKED"
+    report.reasoning.live_validated = False
+    report.live_azure_validated = False
     reasoning = None
     try:
         reasoning = AzureOpenAIProvider(settings)
@@ -71,7 +77,10 @@ async def validate_live(settings: Settings, report: ReadinessReport) -> Readines
         report.live_azure_validated = True
         return report
     except Exception:  # noqa: BLE001 - Never print native auth/model diagnostics.
+        report.reasoning.authenticated = "NOT_CHECKED"
         report.reasoning.reachable = "NO"
+        report.reasoning.live_validated = False
+        report.live_azure_validated = False
         return report
     finally:
         if reasoning:

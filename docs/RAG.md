@@ -22,6 +22,8 @@ The lifespan owns the built-in MCP stdio transport. Additional explicitly config
 
 Checkpoint state uses a stable conversation thread and tenant namespace. Human input resumes the persisted interrupt. Saved confirmed facts retain their provenance; model guesses do not become facts. Restart verification must read the same original file hashes, vector counts, case IDs and checkpoint payloads.
 
+Document uploads use the existing local-first managed pipeline. Native text and text-bearing PDF pages are extracted locally. When configured and required for scans, screenshots, images, TIFF or Word layout, Azure Document Intelligence uses guarded `prebuilt-layout` requests with the existing free-tier segmentation and page reservation. Originals and extraction artifacts stay local. Chroma chunks include authenticated document provenance, page number, extraction method, document classification and per-page table count; table cells are ordered by row and column before indexing. Investigations retrieve these chunks only through MCP `search_knowledge`, and the UI presents page/extraction provenance without exposing private storage locations or credentials.
+
 ## Progress and limits
 
 Authenticated SSE carries actual node/tool/capacity events to the expandable Investigation Activity panel. It preserves completed steps, distinguishes waiting from running and supports cancellation. It never transmits hidden internal model reasoning. Groq's documented headers supply daily-request and minute-token capacity; account-specific optional RPM/TPD limits must be configured from the current account rather than copied from illustrative documentation.

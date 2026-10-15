@@ -35,7 +35,15 @@ def azure_failure(exc: Exception) -> tuple[str, str, bool, str | None]:
     status = getattr(exc, "status_code", getattr(exc, "status", None))
     code = azure_error_code(exc)
     folded = code.casefold()
-    if status == 401:
+    authentication_error = type(exc).__name__ in {
+        "AuthenticationError", "ClientAuthenticationError", "CredentialUnavailableError"
+    }
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None and type(cause).__name__ in {
+        "AuthenticationError", "ClientAuthenticationError", "CredentialUnavailableError"
+    }:
+        authentication_error = True
+    if status == 401 or authentication_error:
         category, action, recoverable = (
             "authentication",
             "Verify the Entra sign-in or credential configured for Azure OpenAI.",
@@ -289,7 +297,12 @@ class AzureOpenAIProvider:
                         break
                     await asyncio.sleep(min(delay, 1))
             except AzureUsageBlocked as exc:
-                raise LLMError(str(exc)) from None
+                raise LLMError(
+                    "Azure OpenAI is blocked by DeskMate's approved application allowance. "
+                    "Ask an operator to review the usage ledger.",
+                    category="cost_control",
+                    recoverable=False,
+                ) from None
             input_bound = estimate_request_tokens(
                 {"messages": messages, "response_format": response_format}
             ) + 256
@@ -337,7 +350,12 @@ class AzureOpenAIProvider:
                     usage={key: value for key, value in usage.items() if isinstance(value, int)},
                 )
             except AzureUsageBlocked as exc:
-                raise LLMError(str(exc)) from None
+                raise LLMError(
+                    "Azure OpenAI is blocked by DeskMate's approved application allowance. "
+                    "Ask an operator to review the usage ledger.",
+                    category="cost_control",
+                    recoverable=False,
+                ) from None
             except Exception as exc:  # noqa: BLE001 - sanitized provider boundary
                 code = azure_error_code(exc)
                 category, action, recoverable, request_id = azure_failure(exc)

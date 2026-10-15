@@ -100,6 +100,11 @@ function EvidenceCard({ evidence }: { evidence: EvidenceRecord }): JSX.Element {
     row?.metadata && typeof row.metadata === 'object'
       ? (row.metadata as Record<string, unknown>)
       : null
+  const extractionMethod = meta?.extraction_method === 'document_intelligence'
+    ? 'Azure Document Intelligence layout'
+    : typeof meta?.extraction_method === 'string'
+      ? meta.extraction_method.replace(/_/g, ' ')
+      : null
   const title =
     typeof meta?.title === 'string'
       ? meta.title
@@ -123,6 +128,8 @@ function EvidenceCard({ evidence }: { evidence: EvidenceRecord }): JSX.Element {
         {timestamp(evidence.observed_at)} · {evidence.tool.replace(/_/g, ' ')}
         {evidence.source_type ? ' · ' + evidence.source_type.replace(/_/g, ' ') : ''}
         {typeof meta?.page === 'number' ? ` · Page ${meta.page}` : ''}
+        {extractionMethod ? ` · ${extractionMethod}` : ''}
+        {typeof meta?.table_count === 'number' && meta.table_count > 0 ? ` · ${meta.table_count} table${meta.table_count === 1 ? '' : 's'}` : ''}
       </small>
       {documentPath && <p className="source-link"><a href={documentPath}>Download original document</a></p>}
       {evidence.url && /^https?:\/\//i.test(evidence.url) && (

@@ -164,3 +164,43 @@ def test_local_embedding_failure_can_be_retried_without_reextracting_or_losing_o
     assert repository.process(document["id"])["status"] == "ready"
     assert len(calls) == 2
     assert files.get(document["id"], "original") == b"Preserved local instructions"
+
+
+def test_layout_tables_and_extraction_provenance_are_indexed_by_page(settings):
+    records, files, indexed = LocalRecords(settings), Blobs(), []
+
+    class Search:
+        def upsert(self, chunks):
+            indexed[:] = chunks
+
+    extraction = {
+        "pages": [{"page": 3, "text": "Support matrix"}],
+        "tables": [{
+            "page": 3,
+            "cells": [
+                {"row": 0, "column": 0, "text": "Product"},
+                {"row": 0, "column": 1, "text": "Supported"},
+                {"row": 1, "column": 0, "text": "DeskMate"},
+                {"row": 1, "column": 1, "text": "Yes"},
+            ],
+        }],
+        "method": "document_intelligence",
+        "metadata": {"classification": "table_document", "table_count": 1},
+    }
+    repository = DocumentRepository(
+        settings, records, files, Search(),
+        SimpleNamespace(extract=lambda *_: extraction),
+        SimpleNamespace(
+            provider="sentence_transformers", model_name="all-MiniLM-L6-v2",
+            embed_texts=lambda texts: [[1.0] + [0.0] * 383 for _ in texts],
+        ),
+    )
+    document = repository.upload(b"fictional-image", "Support screenshot", "image/png")
+    result = repository.process(document["id"])
+
+    assert result["status"] == "ready"
+    assert "Product | Supported DeskMate | Yes" in indexed[0]["text"]
+    assert indexed[0]["metadata"]["page"] == 3
+    assert indexed[0]["metadata"]["extraction_method"] == "document_intelligence"
+    assert indexed[0]["metadata"]["document_classification"] == "table_document"
+    assert indexed[0]["metadata"]["table_count"] == 1

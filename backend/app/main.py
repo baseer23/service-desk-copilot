@@ -42,6 +42,36 @@ from backend.app.services.web import FetchError, UnsafeURL
 from backend.app.store.vector_chroma import StorageError
 
 
+def llm_error_detail(error: LLMError) -> dict[str, Any]:
+    """Return an actionable, secret-free provider diagnostic for the UI."""
+    messages = {
+        "cost_control": (
+            "Azure OpenAI is blocked by DeskMate's approved application allowance. "
+            "Ask an operator to review the usage ledger."
+        ),
+        "authentication": "Azure OpenAI authentication failed. Sign in to Entra again and retry.",
+        "authorization": (
+            "Azure OpenAI denied this identity. Ask an administrator to verify the resource role assignment."
+        ),
+        "configuration": (
+            "Azure OpenAI could not find the configured resource or deployment. "
+            "Verify the endpoint, deployment, and API version."
+        ),
+        "capacity": "Azure OpenAI is rate limited or out of quota. Retry after the service reset.",
+        "timeout": "Azure OpenAI timed out. The request was not automatically retried.",
+        "context_length": "The Azure OpenAI request was too large after bounded compaction.",
+        "structured_output": "Azure OpenAI returned an invalid structured response. Retry the investigation.",
+    }
+    return {
+        "code": "AZURE_OPENAI_" + error.category.upper(),
+        "message": messages.get(
+            error.category,
+            "Azure OpenAI could not complete the request. Ask an operator to inspect provider diagnostics.",
+        ),
+        **({"request_id": error.request_id} if error.request_id else {}),
+    }
+
+
 def case_response(state):
     data = {**state, "thread_id": state["case_id"]}
     resolution = state.get("voice_intake", {}).get("resolution_status", "unconfirmed")
@@ -304,6 +334,16 @@ def create_app(settings: Settings | None = None):
     async def require_reasoning() -> None:
         report = await app.state.voice.store(readiness)
         if not report.text_ready:
+            if selected_provider(s) == "azure_openai" and any(
+                item == "AZURE_USAGE_GUARD_OR_ALLOWANCE" for item in report.reasoning.missing
+            ):
+                raise HTTPException(503, {
+                    "code": "AZURE_OPENAI_COST_CONTROL",
+                    "message": (
+                        "Azure OpenAI is blocked by DeskMate's approved application allowance. "
+                        "Ask an operator to review the usage ledger."
+                    ),
+                })
             raise HTTPException(503, {
                 "code": "REASONING_NOT_READY",
                 "message": "The selected AI service is unavailable. Check its configuration or choose another provider. Your saved work is preserved.",
@@ -464,7 +504,26 @@ def create_app(settings: Settings | None = None):
             raise HTTPException(409, str(exc)) from exc
         except KeyError:
             raise HTTPException(404, "Conversation not found") from None
-        except (LLMError, MCPToolError, MCPConnectionError, StorageError) as exc:
+        except LLMError as exc:
+            from fastapi.responses import JSONResponse
+
+            stored = (await app.state.agent.harness.invoke("get_case", {"case_id": request_id}))[
+                "result"
+            ]
+            return JSONResponse(
+                status_code=503 if exc.category == "cost_control" else 502,
+                content={
+                    "detail": llm_error_detail(exc)
+                    if selected_provider(s) == "azure_openai"
+                    else (
+                        "The investigation could not finish. Your saved work is preserved."
+                        if s.deployment_mode == "production"
+                        else str(exc)
+                    ),
+                    "case_id": request_id if stored else None,
+                },
+            )
+        except (MCPToolError, MCPConnectionError, StorageError) as exc:
             from fastapi.responses import JSONResponse
 
             stored = (await app.state.agent.harness.invoke("get_case", {"case_id": request_id}))[
@@ -583,7 +642,18 @@ def create_app(settings: Settings | None = None):
             return case_response(await app.state.agent.run_case(case_id, answer))
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
-        except (LLMError, MCPToolError, MCPConnectionError, StorageError) as exc:
+        except LLMError as exc:
+            raise HTTPException(
+                503 if exc.category == "cost_control" else 502,
+                llm_error_detail(exc)
+                if selected_provider(s) == "azure_openai"
+                else (
+                    "The investigation could not finish. Please try again later."
+                    if s.deployment_mode == "production"
+                    else str(exc)
+                ),
+            ) from exc
+        except (MCPToolError, MCPConnectionError, StorageError) as exc:
             raise HTTPException(
                 502,
                 "The investigation could not finish. Please try again later."

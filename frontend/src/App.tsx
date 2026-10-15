@@ -311,27 +311,24 @@ export default function App(): JSX.Element {
                 </span>
               </div>
               <p className="ticket-summary">{active.ticket.summary}</p>
-              {active.workflow === 'knowledge' && !active.chat_messages?.length && (
+              {!active.chat_messages?.length && (active.final_response?.answer || active.final_answer) && (
                 <section className="card knowledge-answer">
-                  <h2>Answer</h2>
-                  <p>
-                    {active.final_response?.answer ||
-                      active.final_answer ||
-                      (active.status === 'insufficient_information'
-                        ? 'The available evidence does not support an answer yet.'
-                        : 'Gathering and verifying supporting documents…')}
-                  </p>
+                  <h2>Final Answer</h2>
+                  <p><strong>{active.final_response?.answer || active.final_answer}</strong></p>
                 </section>
+              )}
+              {active.workflow === 'knowledge' && !active.chat_messages?.length && !active.final_response?.answer && !active.final_answer && (
+                <section className="card knowledge-answer"><h2>Answer</h2><p>{active.status === 'insufficient_information' ? 'The available evidence does not support an answer yet.' : 'Gathering and verifying supporting documents…'}</p></section>
               )}
               {!!active.chat_messages?.length && <section className="card conversation-card" aria-label="Conversation">
                 <h2 className="sr-only">Conversation</h2>
                 <div className="chat-history" role="log" aria-live="polite">
-                  {active.chat_messages.map((message, index) => <div key={index} className={`chat-message ${message.role}`}><strong>{message.role === 'user' ? 'You' : 'DeskMate'}</strong><p>{message.content}</p></div>)}
+                  {active.chat_messages.map((message, index) => <div key={index} className={`chat-message ${message.role}`}><strong>{message.role === 'user' ? 'You' : 'DeskMate'}</strong><p>{message.role === 'assistant' ? <strong>{message.content}</strong> : message.content}</p></div>)}
                 </div>
                 <form onSubmit={continueChat} className="chat-reply">
                   <label htmlFor="chat-reply">Reply to this conversation</label>
                   <textarea id="chat-reply" rows={2} value={answer} onChange={event => setAnswer(event.target.value)} required />
-                  <button className="primary" disabled={busy || !answer.trim()}>{busy ? 'Thinking…' : 'Send message'}</button>
+                  <button className="primary" disabled={busy || !answer.trim()}>{busy ? 'Investigating…' : 'Send message'}</button>
                 </form>
               </section>}
               {!active.chat_messages?.length && <><details className="card investigation-activity"><summary>Investigation progress</summary>
