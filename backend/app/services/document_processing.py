@@ -4,7 +4,6 @@ import time
 from io import BytesIO
 from typing import Any
 
-from backend.app.core.azure_usage import AzureUsageGuard
 from backend.app.core.config import Settings
 from backend.app.core.azure_identity import azure_credential
 from backend.app.store.records import ManagedStoreError
@@ -29,7 +28,6 @@ class AzureDocumentExtractor:
         self.client = client
 
     def extract(self, data: bytes, media_type: str):
-        AzureUsageGuard(self.settings).require_enabled()
         segments = [(data, 0)]
         if (
             media_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -65,19 +63,8 @@ class AzureDocumentExtractor:
         pages, tables = [], []
         deadline = time.monotonic() + 90
         for segment, offset in segments:
-            AzureUsageGuard(self.settings).require_enabled()
             if len(segment) > 4_000_000 or time.monotonic() >= deadline:
                 raise ValueError("Document processing limit reached; use smaller document sections")
-            with self.records.locked(
-                "document_quota", time.strftime("%Y-%m", time.gmtime()), tenant="system:documents"
-            ) as quota:
-                charged = 2 if self.settings.azure_document_free_tier else 100
-                if (
-                    quota.get("pages", 0) + charged
-                    > self.settings.azure_document_monthly_page_limit
-                ):
-                    raise ManagedStoreError("Document processing allowance is full")
-                quota["pages"] = quota.get("pages", 0) + charged
             try:
                 result = self.client.begin_analyze_document(
                     "prebuilt-layout",

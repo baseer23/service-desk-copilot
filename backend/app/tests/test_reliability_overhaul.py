@@ -124,7 +124,6 @@ def azure_provider(settings, error):
         update={
             "azure_foundry_endpoint": "https://example.openai.azure.com",
             "azure_model_deployment": "missing-deployment",
-            "azure_usage_guard_enabled": True,
         }
     )
     return AzureOpenAIProvider(

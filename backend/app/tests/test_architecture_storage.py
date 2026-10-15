@@ -26,10 +26,9 @@ def test_retired_cloud_database_modules_and_dependencies_are_absent():
         assert dependency not in requirements
 
 
-def test_native_pdf_and_local_vectors_ignore_azure_emergency_without_losing_original(settings):
+def test_native_pdf_and_local_vectors_keep_original_local(settings):
     config = settings.model_copy(update={
         "local_persistence_enabled": True, "local_documents_dir": settings.case_db_path.parent / "originals",
-        "azure_usage_guard_enabled": True, "azure_emergency_disable": True,
     })
     embeddings = SimpleNamespace(provider="stub", model_name="sha256-unit-vector-v1", embed_texts=lambda values: [[1.0] + [0.0] * 383 for value in values])
     with principal_scope(Principal("tenant", "owner")):

@@ -6,7 +6,6 @@ The former generated-audio runtime is retired. Historical case links remain usab
 import asyncio
 import sqlite3
 
-from backend.app.core.azure_usage import AzureUsageGuard
 from backend.app.speech.api import browser_guard as speech_browser_guard
 from .auth import VoiceError
 
@@ -25,7 +24,6 @@ class VoiceHistory:
     def __init__(self, settings):
         self.settings = settings
         self.repository = self
-        self.usage_guard = AzureUsageGuard(settings)
 
     async def store(self, function, *args):
         return await asyncio.to_thread(function, *args)

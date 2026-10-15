@@ -53,7 +53,6 @@ def snapshot_sources(settings, output: Path):
     candidates = [
         settings.case_db_path,
         Path(str(settings.case_db_path) + ".supervisor.checkpoints.sqlite3"),
-        settings.azure_usage_db_path,
     ]
     visited = set()
     for source in candidates:

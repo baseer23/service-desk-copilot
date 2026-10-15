@@ -120,7 +120,7 @@ def test_public_readiness_hides_operator_details(make_client):
         "private_stores",
         "live_azure_validated",
     }.intersection(public)
-    assert "azure_usage" in client.get("/admin/readiness").json()
+    assert "azure_usage" not in client.get("/admin/readiness").json()
 
 
 def test_unresolved_signing_reference_and_unscoped_production_storage_are_rejected(settings):

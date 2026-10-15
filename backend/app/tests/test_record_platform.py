@@ -1,10 +1,7 @@
-import sqlite3
 from typing import TypedDict
 
 import pytest
 from backend.app.agent.checkpoints_records import LocalCheckpointSaver
-from backend.app.core.record_usage import TABLES, LocalUsageGuard
-from backend.app.core.azure_usage import AzureUsageBlocked, AzureUsageGuard
 from backend.app.core.principal import Principal, principal_scope, sign_principal, verify_principal
 from backend.app.repositories.record_memory import RecordCaseMemoryStore
 from backend.app.store.local_records import LocalRecords
@@ -68,18 +65,6 @@ def test_failed_managed_transaction_discards_changes_and_releases_own_lease(sett
         assert payload["value"] == "preserved"
     policy = data.read("usage_policy", "subscription", tenant="system:usage")
     assert policy["payload"]["lock_until"] == 0
-
-
-def test_cloud_usage_diagnostics_do_not_acquire_writer_lease(settings, monkeypatch):
-    config = settings.model_copy(update={"azure_usage_guard_enabled": True})
-    data = records(config)
-    guard = LocalUsageGuard(config, data)
-    guard.enable_demo(8, "authorized-test")
-    def forbidden(*args, **kwargs):
-        raise AssertionError("Diagnostics must only read committed state")
-    monkeypatch.setattr(data, "locked", forbidden)
-    assert guard.snapshot()["enabled"]
-    assert guard.checks() == {}
 
 
 def test_managed_lease_waits_for_normal_network_latency(settings):
@@ -165,44 +150,6 @@ def test_checkpoint_keys_do_not_alias_threads_and_namespaces():
     assert LocalCheckpointSaver._key(a, "same") != LocalCheckpointSaver._key(b, "same")
 
 
-def test_managed_demo_policy_caps_both_fast_checks_and_atomic_reservations(settings):
-    config = settings.model_copy(update={
-        "azure_usage_guard_enabled": True, "azure_estimated_monthly_app_limit_cad": 50,
-    })
-    data = records(config)
-    guard = LocalUsageGuard(config, data)
-    guard.enable_demo(0.01, "user-authorized-demo")
-    token = guard.reserve("reasoning", 500, 100)
-    guard.finish(token)
-    restored = LocalUsageGuard(config, data)
-    assert restored.snapshot()["limit_cad"] == 0.01
-    restored.require_enabled()
-    with pytest.raises(AzureUsageBlocked, match="allowance"):
-        restored.reserve("reasoning", 2000, 100)
-    with restored.transaction() as db:
-        db.execute("UPDATE azure_usage SET estimate=10000 WHERE id=?", (token,))
-    with pytest.raises(AzureUsageBlocked, match="allowance"):
-        restored.require_enabled()
-
-
-def test_updated_infrastructure_forecast_cannot_bypass_the_persistent_allowance(settings):
-    config = settings.model_copy(update={
-        "azure_usage_guard_enabled": True, "azure_estimated_monthly_app_limit_cad": 150,
-    })
-    data = records(config)
-    initial = LocalUsageGuard(config, data)
-    initial.enable_demo(50, "approved-original-allowance")
-    expanded = LocalUsageGuard(
-        config.model_copy(update={"test_mode": False, "azure_estimated_infrastructure_cad": 90}),
-        data,
-    )
-    assert not expanded.snapshot()["enabled"]
-    with pytest.raises(AzureUsageBlocked, match="allowance"):
-        expanded.require_enabled()
-    stored = data.read("usage_policy", "subscription", tenant="system:usage")
-    assert stored["payload"]["tables"]["azure_usage"] == []
-
-
 def test_managed_voice_case_history_remains_owner_scoped_behind_mcp(settings):
     data = records(settings)
     memory = RecordCaseMemoryStore(data)
@@ -219,27 +166,6 @@ def test_managed_voice_case_history_remains_owner_scoped_behind_mcp(settings):
             memory.list_events("voice-one")
 
 
-def test_cloud_usage_preserves_original_ledger_emergency_and_estimates(settings):
-    local = settings.model_copy(update={"azure_usage_guard_enabled": True})
-    guard = AzureUsageGuard(local)
-    token = guard.reserve("reasoning", 100, 50)
-    guard.finish(token, {"prompt_tokens": 20, "completion_tokens": 10})
-    guard.disable()
-    with sqlite3.connect(guard.path) as db:
-        tables = {}
-        for table in TABLES:
-            cursor = db.execute(f"SELECT * FROM {table}")
-            names = [column[0] for column in cursor.description]
-            tables[table] = [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
-    data = records(settings)
-    data.write("usage_policy", "subscription", {"tables": tables}, tenant="system:usage")
-    native = LocalUsageGuard(local.model_copy(update={"local_persistence_enabled": True}), data)
-    assert native.snapshot()["estimated_used_cad"] == guard.snapshot()["estimated_used_cad"]
-    assert not native.snapshot()["enabled"]
-    with pytest.raises(AzureUsageBlocked, match="disabled"):
-        native.reserve("reasoning", 10, 10)
-
-
 def test_signed_authority_cannot_be_forged_or_switched(settings):
     from pydantic import SecretStr
 
@@ -254,32 +180,6 @@ def test_signed_authority_cannot_be_forged_or_switched(settings):
         verify_principal(config, signed.replace(".", "A.", 1))
     with pytest.raises(PermissionError):
         verify_principal(config, sign_principal(config, Principal("tenant-a", "user-a"), 1))
-
-
-def test_managed_guard_reserves_each_months_infrastructure_without_enabling_dispatch(
-    settings, monkeypatch
-):
-    from datetime import UTC, datetime
-
-    from backend.app.core import record_usage
-
-    data = records(settings)
-    config = settings.model_copy(update={"test_mode": False, "azure_usage_guard_enabled": True})
-    guard = LocalUsageGuard(config, data)
-    assert guard.snapshot()["estimated_used_cad"] == 0.25
-    assert not guard.snapshot()["enabled"]
-
-    class NextMonth(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return cls(2027, 1, 1, tzinfo=UTC)
-
-    monkeypatch.setattr(record_usage, "datetime", NextMonth)
-    from backend.app.core import azure_usage
-
-    monkeypatch.setattr(azure_usage, "datetime", NextMonth)
-    assert guard.snapshot()["estimated_used_cad"] == 0.25
-    assert not guard.snapshot()["enabled"]
 
 
 def test_cloud_voice_owner_leases_terminal_updates_and_duplicate_events(settings):

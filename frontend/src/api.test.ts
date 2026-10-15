@@ -3,30 +3,8 @@ import { publicErrorMessage, request } from './api'
 
 afterEach(() => vi.unstubAllGlobals())
 
-test.each(['Managed state could not be read', 'Managed usage ledger unavailable', 'Cosmos service timeout'])('keeps infrastructure errors out of the normal interface: %s', message => {
+test.each(['Managed state could not be read', 'SQLite storage is unavailable', 'Cosmos service timeout'])('keeps infrastructure errors out of the normal interface: %s', message => {
   expect(publicErrorMessage(message)).toBe('DeskMate cannot complete this request right now. Your saved work is available. Please try again later or contact your administrator.')
-})
-
-test('shows an actionable Azure cost-control explanation and safe code', async () => {
-  vi.stubGlobal(
-    'fetch',
-    vi.fn(async () =>
-      Response.json(
-        {
-          detail: {
-            code: 'AZURE_REASONING_NOT_READY',
-            message: 'Azure OpenAI is blocked by DeskMate’s approved application allowance. Ask an operator to review the usage ledger.',
-          },
-        },
-        { status: 503 },
-      ),
-    ),
-  )
-  await expect(request('/ask')).rejects.toMatchObject({
-    message: 'Azure OpenAI is blocked by DeskMate’s approved application allowance. Ask an operator to review the usage ledger.',
-    code: 'AZURE_REASONING_NOT_READY',
-    status: 503,
-  })
 })
 
 test('shows input validation errors instead of a generic HTTP code', async () => {

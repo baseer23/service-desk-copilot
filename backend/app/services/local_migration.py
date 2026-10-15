@@ -230,12 +230,6 @@ def import_legacy_database(path, records, tenant, report):
                         for chunk in split_text(row["text"])
                     ]
                 )
-        if "azure_usage" in tables:
-            current = records.read("usage_policy", "subscription", tenant="system:usage")
-            cloud = {row["id"]: row for row in current["payload"]["tables"]["azure_usage"]}
-            for row in db.execute("SELECT * FROM azure_usage"):
-                if row["id"] not in cloud or dict(row) != cloud[row["id"]]:
-                    raise ValueError("An older financial ledger contains unreconciled history")
         # The immutable complete database snapshot also preserves auxiliary tables.
 
 

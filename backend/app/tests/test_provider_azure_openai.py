@@ -5,7 +5,6 @@ import pytest
 from backend.app.agent.models import InvestigationPlan, RequestIntent
 from backend.app.models.provider import LLMError
 from backend.app.models.provider_azure_openai import AzureOpenAIProvider
-from backend.app.core.azure_usage import AzureUsageBlocked
 from pydantic import BaseModel
 
 
@@ -27,7 +26,6 @@ def provider(settings, responses):
         update={
             "azure_foundry_endpoint": "https://example.openai.azure.com",
             "azure_model_deployment": "test-deployment",
-            "azure_usage_guard_enabled": True,
         }
     )
     return (
@@ -50,7 +48,6 @@ async def test_overlapping_structured_calls_queue_without_reservation_conflict(s
         update={
             "azure_foundry_endpoint": "https://example.openai.azure.com",
             "azure_model_deployment": "test-deployment",
-            "azure_usage_guard_enabled": True,
         }
     )
 
@@ -120,16 +117,10 @@ async def test_azure_failure_is_explicit_and_private(settings):
 
 
 @pytest.mark.asyncio
-async def test_azure_cost_control_failure_is_categorized_before_dispatch(settings):
+async def test_azure_dispatch_has_no_application_financial_gate(settings):
     model, payloads = provider(settings, ['{"status":"ok"}'])
-    model.usage_guard.request_delay = lambda kind: (_ for _ in ()).throw(
-        AzureUsageBlocked("Estimated monthly Azure application allowance exhausted")
-    )
-    with pytest.raises(LLMError) as caught:
-        await model.generate_structured("readiness", {}, Probe)
-    assert caught.value.category == "cost_control"
-    assert "approved application allowance" in str(caught.value)
-    assert payloads == []
+    result = await model.generate_structured("readiness", {}, Probe)
+    assert result.status == "ok" and len(payloads) == 1
 
 
 @pytest.mark.asyncio

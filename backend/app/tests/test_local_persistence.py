@@ -7,7 +7,6 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
-from backend.app.core.azure_usage import AzureUsageBlocked, AzureUsageGuard
 from backend.app.core.principal import Principal, principal_scope
 from backend.app.services.local_backup import snapshot_sqlite
 from backend.app.services.capabilities import knowledge_stores
@@ -140,8 +139,8 @@ def test_chroma_roundtrip_tenant_filter_metadata_and_vectors(settings):
         assert restarted.contains_hash("digest")
 
 
-def test_local_embedding_works_during_azure_emergency_and_survives_restart(settings):
-    cfg = config(settings, azure_usage_guard_enabled=True, azure_emergency_disable=True)
+def test_local_embedding_survives_restart(settings):
+    cfg = config(settings)
     embeddings = SimpleNamespace(
         provider="stub", model_name="sha256-unit-vector-v1",
         embed_texts=lambda texts: [[1.0] + [0.0] * 383 for text in texts],
@@ -170,26 +169,6 @@ def test_snapshot_has_no_ephemeral_wal_files_and_stable_hash(settings, tmp_path)
         with sqlite3.connect(target) as backup:
             assert backup.execute("SELECT value FROM evidence").fetchone()[0] == "preserved"
         assert hashlib.sha256(target.read_bytes()).hexdigest() == report["sha256"]
-
-
-def test_local_usage_ledger_preserves_spending_and_genuine_emergency_controls(settings):
-    cfg = config(settings, azure_usage_guard_enabled=True, azure_estimated_monthly_app_limit_cad=8)
-    guard = AzureUsageGuard(cfg)
-    with pytest.raises(AzureUsageBlocked):
-        guard.reserve("reasoning", 100, 100)
-    records = LocalRecords(cfg)
-    records.write("usage_policy", "subscription", {
-        "tables": {"azure_policy": [{"id": 1, "disabled": 0}]}
-    }, tenant="system:usage")
-    for _ in range(3):
-        token = guard.reserve("reasoning", 100, 100)
-        guard.finish(token, {"prompt_tokens": 100, "completion_tokens": 100})
-    before = guard.snapshot()
-    assert before["enabled"] and before["estimated_used_cad"] > 0
-    guard.disable()
-    with pytest.raises(AzureUsageBlocked, match="disabled"):
-        guard.reserve("reasoning", 100, 100)
-    assert guard.snapshot()["estimated_used_cad"] == before["estimated_used_cad"]
 
 
 @pytest.mark.asyncio
@@ -279,12 +258,13 @@ async def test_local_pdf_pipeline_keeps_original_and_legacy_ingest_response(sett
     assert duplicate.result["duplicate"] and calls == ["extract", "embed"]
 
 
-def test_local_document_processing_retains_free_tier_cost_policy():
+def test_local_document_processing_does_not_require_a_cost_policy():
     from backend.app.core.config import Settings
-    from pydantic import ValidationError
 
-    with pytest.raises(ValidationError, match="Paid document analysis"):
-        Settings(_env_file=None, local_persistence_enabled=True, azure_document_free_tier=False)
+    settings = Settings(
+        _env_file=None, local_persistence_enabled=True, azure_document_free_tier=False
+    )
+    assert not settings.azure_document_free_tier
 
 
 def test_migration_artifact_paths_cannot_escape_local_storage():

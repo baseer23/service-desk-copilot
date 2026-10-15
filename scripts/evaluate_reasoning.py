@@ -212,16 +212,8 @@ def summarize(scenario, provider, state, activity, calls, elapsed, settings):
         "resolution_not_claimed_verified": state.get("resolution_status", "unconfirmed")
         != "user_confirmed_resolved",
     }
-    input_rate = (
-        settings.azure_estimated_input_cad_per_million
-        if provider == "azure_openai"
-        else settings.groq_input_cad_per_million
-    )
-    output_rate = (
-        settings.azure_estimated_output_cad_per_million
-        if provider == "azure_openai"
-        else settings.groq_output_cad_per_million
-    )
+    input_rate = None if provider == "azure_openai" else settings.groq_input_cad_per_million
+    output_rate = None if provider == "azure_openai" else settings.groq_output_cad_per_million
     estimate = (
         (usage["input_tokens"] * input_rate + usage["output_tokens"] * output_rate) / 1_000_000
         if usage_calls and input_rate is not None and output_rate is not None

@@ -57,11 +57,7 @@ class Transport(HttpTransport):
         return self.callback(request)
 
 
-def test_real_document_sdk_sends_binary_stream_and_polls_layout_tables(settings, monkeypatch):
-    monkeypatch.setattr(
-        "backend.app.services.document_processing.AzureUsageGuard",
-        lambda settings: SimpleNamespace(require_enabled=lambda: None),
-    )
+def test_real_document_sdk_sends_binary_stream_and_polls_layout_tables(settings):
     endpoint = "https://fictional.cognitiveservices.azure.com"
 
     def reply(request):

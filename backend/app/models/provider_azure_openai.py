@@ -9,7 +9,6 @@ from typing import Any, TypeVar
 from pydantic import BaseModel, ValidationError
 
 from backend.app.core.azure_errors import azure_error_code
-from backend.app.core.azure_usage import AzureUsageBlocked, AzureUsageGuard
 from backend.app.core.config import Settings
 
 from .instructions import stage_instructions
@@ -208,8 +207,8 @@ class AzureOpenAIProvider:
         if not settings.azure_foundry_endpoint or not settings.azure_model_deployment:
             raise LLMError("Azure OpenAI endpoint and deployment must be configured")
         self.settings = settings
-        self.usage_guard = AzureUsageGuard(settings)
         self.request_lock = asyncio.Lock()
+        self.next_request_at = 0.0
         self.credential: Any = None
         if client is not None:
             self.client = client
@@ -284,47 +283,27 @@ class AzureOpenAIProvider:
                 original_tokens=report.original_tokens,
                 final_tokens=report.final_tokens,
             )
-        attempts = 1 if stage == "readiness" or self.settings.azure_setup_validation_mode else 2
+        attempts = 1 if stage == "readiness" else 2
         for attempt in range(attempts):
-            try:
-                while True:
-                    delay = (
-                        await asyncio.to_thread(self.usage_guard.request_delay, "reasoning")
-                        if self.settings.uses_record_store
-                        else self.usage_guard.request_delay("reasoning")
-                    )
-                    if not delay:
-                        break
-                    await asyncio.sleep(min(delay, 1))
-            except AzureUsageBlocked as exc:
-                raise LLMError(
-                    "Azure OpenAI is blocked by DeskMate's approved application allowance. "
-                    "Ask an operator to review the usage ledger.",
-                    category="cost_control",
-                    recoverable=False,
-                ) from None
+            delay = self.next_request_at - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self.next_request_at = (
+                time.monotonic() + self.settings.azure_reasoning_min_interval_seconds
+            )
             input_bound = estimate_request_tokens(
                 {"messages": messages, "response_format": response_format}
             ) + 256
 
-            def request(input_bound: int = input_bound, output_bound: int = output_bound) -> Any:
-                reservation = self.usage_guard.reserve("reasoning", input_bound, output_bound)
-                response = None
-                try:
-                    # Recheck the persistent emergency switch immediately before dispatch.
-                    self.usage_guard.require_enabled()
-                    response = self.client.chat.completions.create(
-                        model=self.settings.azure_model_deployment,
-                        messages=messages,
-                        response_format=response_format,
-                        max_completion_tokens=output_bound,
-                        temperature=0,
-                        timeout=self.settings.model_timeout_sec,
-                    )
-                    return response
-                finally:
-                    # Runs inside the SDK thread even if the awaiting task times out.
-                    self.usage_guard.finish(reservation, getattr(response, "usage", None))
+            def request(output_bound: int = output_bound) -> Any:
+                return self.client.chat.completions.create(
+                    model=self.settings.azure_model_deployment,
+                    messages=messages,
+                    response_format=response_format,
+                    max_completion_tokens=output_bound,
+                    temperature=0,
+                    timeout=self.settings.model_timeout_sec,
+                )
 
             try:
                 started = time.monotonic()
@@ -349,13 +328,6 @@ class AzureOpenAIProvider:
                     summary="Azure OpenAI request completed",
                     usage={key: value for key, value in usage.items() if isinstance(value, int)},
                 )
-            except AzureUsageBlocked as exc:
-                raise LLMError(
-                    "Azure OpenAI is blocked by DeskMate's approved application allowance. "
-                    "Ask an operator to review the usage ledger.",
-                    category="cost_control",
-                    recoverable=False,
-                ) from None
             except Exception as exc:  # noqa: BLE001 - sanitized provider boundary
                 code = azure_error_code(exc)
                 category, action, recoverable, request_id = azure_failure(exc)

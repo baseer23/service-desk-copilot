@@ -125,11 +125,6 @@ def rows(settings: Settings, report: ReadinessReport, signed_in: str) -> dict[st
         "Local MCP": report.local_mcp,
         "Private stores": report.private_stores,
         "Live Azure text validated": "YES" if report.live_azure_validated else "NO",
-        "Local Azure usage enabled": "YES" if report.azure_usage.get("enabled") else "NO",
-        "Estimated CAD allowance left": (
-            f"{report.azure_usage.get('remaining_estimated_cad', 0):.2f}"
-        ),
-        "Azure invoice hard cap": "NO",
     }
     for name, capability in (
         ("Reasoning", report.reasoning),

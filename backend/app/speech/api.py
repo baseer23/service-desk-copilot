@@ -14,7 +14,6 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 
 from backend.app.core.authentication import SESSION_COOKIE, authenticate
-from backend.app.core.azure_usage import AzureUsageBlocked, AzureUsageGuard
 from backend.app.core.principal import current_principal, principal_scope, verify_principal
 from backend.app.speech.azure_stt import AzureSpeechRecognizer
 from backend.app.speech.transcript import Transcript, standalone_stop
@@ -42,18 +41,7 @@ def browser_guard(request, settings):
 
 def speech_readiness(settings):
     configured = bool(settings.speech_enabled and settings.azure_speech_endpoint)
-    enabled = False
-    if configured:
-        try:
-            guard = AzureUsageGuard(settings)
-            guard.require_enabled()
-            enabled = (
-                guard.snapshot()["remaining_estimated_cad"]
-                >= settings.azure_speech_estimated_cad_per_hour / 60
-            )
-        except AzureUsageBlocked:
-            pass
-    return {"configured": configured, "ready": configured and enabled, "recognition_only": True}
+    return {"configured": configured, "ready": configured, "recognition_only": True}
 
 
 class SpeechService:
@@ -234,7 +222,7 @@ class SpeechService:
                     "error",
                     message=(
                         "Speech recognition stopped. Check microphone access, service availability "
-                        "and your usage allowance, then try again."
+                        "and service availability, then try again."
                     ),
                 )
         finally:
@@ -260,18 +248,7 @@ class SpeechService:
                             )
             if not adapter.confirmed_closed:
                 reason = "error"
-            try:
-                await asyncio.to_thread(meter.finish, confirmed_closed=adapter.confirmed_closed)
-            except Exception:  # noqa: BLE001 - Never disclose SDK or ledger diagnostics.
-                reason = "error"
-                with suppress(Exception):
-                    await send(
-                        "error",
-                        message=(
-                            "Recognition stopped, but speech usage could not be finalized. "
-                            "Contact your administrator before restarting."
-                        ),
-                    )
+            await asyncio.to_thread(meter.finish, confirmed_closed=adapter.confirmed_closed)
             with suppress(Exception):
                 await send(
                     "state",

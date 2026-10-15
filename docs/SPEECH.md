@@ -10,21 +10,20 @@ Partial recognition replaces the unfinished phrase. Final phrases accumulate in 
 
 Click **Stop session** or say the standalone command to release the microphone. The backend stops the SDK recognizer and settles connected usage. The browser briefly keeps the WebSocket for a finalized last phrase and usage receipt. If the network fails, local microphone cleanup still happens immediately. You can edit the completed transcript and click **Send message**. This uses the ordinary stateful LangGraph investigation routes and the provider currently selected in the top bar. No LLM sees microphone audio.
 
-The listening timer counts elapsed recording time. Connected Speech seconds and the CAD estimate count the connected SDK interval, including silence and mute. Reconnect backoff is excluded. No short recording-duration or daily-session-count limit is imposed; real service errors, authentication expiry, spending safety and the single-session concurrency rule still apply.
+The listening timer counts elapsed recording time. Connected Speech seconds cover the connected SDK interval, including silence and mute. Reconnect backoff is excluded. No short recording-duration or daily-session-count limit is imposed; real service errors, authentication expiry and the single-session concurrency rule still apply.
 
 ## Configuration and credentials
 
-Set these privately in the existing local configuration, retaining the current usage ledger:
+Set these privately in the existing local configuration:
 
 ```dotenv
 SPEECH_ENABLED=true
 AZURE_SPEECH_ENDPOINT=https://<existing-resource-custom-domain>.cognitiveservices.azure.com/
 AZURE_SPEECH_LANGUAGE=en-US
-AZURE_SPEECH_ESTIMATED_CAD_PER_HOUR=2.0
 SPEECH_MAX_CONCURRENT_SESSIONS=1
 ```
 
-`AZURE_SPEECH_ESTIMATED_CAD_PER_HOUR` is a configurable conservative estimate, not a published price quote. Check the resource's current tier, region and currency before changing it. The application deliberately reserves an estimate even for F0 unless remaining free allowance is independently verified. F0 allowances and concurrency limits are service constraints; [Microsoft's quotas documentation](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/speech-services-quotas-and-limits) and [Speech pricing](https://azure.microsoft.com/en-us/pricing/details/speech/) describe them.
+Speech billing, quotas and concurrency are controlled by Azure. DeskMate neither estimates charges nor reserves or blocks application budget. [Microsoft's quotas documentation](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/speech-services-quotas-and-limits) and [Speech pricing](https://azure.microsoft.com/en-us/pricing/details/speech/) describe the provider limits.
 
 Use a compatible existing Speech or Foundry resource and its custom-domain endpoint. The backend uses an Azure CLI credential on the Mac and a managed/default credential in production. It passes the credential directly to the Speech SDK, which refreshes tokens. Entra authentication requires the custom domain and appropriate resource RBAC; no API key is retrieved or sent to React. See [Microsoft's Speech SDK Entra guide](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/how-to-configure-azure-ad-auth).
 
@@ -40,7 +39,7 @@ Changing backend environment configuration requires restarting `make dev`. The L
 
 The server holds at most two seconds of PCM in an in-memory reconnect buffer and clears it on close. SDK audio/content logging is never enabled. No audio file is written by the recognition gateway. Text persistence happens only when the user submits a request through the investigation workflow.
 
-The shared persistent usage ledger records `speech_stt` independently from reasoning and historical voice charges. It reserves the next minute before dispatch and renews ahead of connected-time expiry. Confirmed SDK closure settles the reservation to actual connected time. A failed or uncertain shutdown retains its reservation and active flag for operator review. Normal completion never disables the guard. Emergency disablement is checked every second. These application estimates are **not a hard Azure invoice cap**; historical charges and the approved allowance remain intact.
+DeskMate records connected recognition time in memory for session diagnostics. It does not persist a cost ledger, make reservations, or reject a session based on an internal allowance. Confirmed SDK closure ends the local meter; Azure remains responsible for usage accounting.
 
 ## Tests and explicit live acceptance
 
@@ -52,7 +51,7 @@ npm --prefix frontend test -- src/VoiceSupport.test.tsx src/voiceAudio.test.ts
 npm --prefix frontend run typecheck
 ```
 
-The SDK contract test checks keyless endpoint construction, continuous recognition, PCM format, stop flushing and release. Gateway tests cover multiple finalized sentences, reconnect overlap, standalone Stop, origin rejection, silence accounting, conservative failed shutdown, emergency disablement and immediate subsequent sessions. These tests do not establish live Azure success.
+The SDK contract test checks keyless endpoint construction, continuous recognition, PCM format, stop flushing and release. Gateway tests cover multiple finalized sentences, reconnect overlap, standalone Stop, origin rejection, silence accounting and immediate subsequent sessions. These tests do not establish live Azure success.
 
 For an explicitly authorized live SDK test, prepare a non-sensitive spoken WAV (mono 16 kHz PCM16LE) and a **new** private report path. The runner never provisions resources, retrieves keys, changes configuration, enables a guard, or calls an LLM:
 
@@ -73,8 +72,8 @@ No Speech transport, recognition, usage-accounting or microphone code changed in
 
 ### 2026-10-14 document-evidence revision
 
-The document extraction/indexing changes do not alter Speech transport, transcript handling, reservations, cost accounting or microphone behavior. The complete backend suite passed (339 tests, with two unrelated opt-in Aura tests skipped), all 51 frontend tests passed, and the production build passed. No live Speech SDK or physical microphone check was run; the live blockers and acceptance status above are unchanged.
+The document extraction/indexing changes do not alter Speech transport, transcript handling or microphone behavior. DeskMate does not reserve or cost-account Speech sessions. No live Speech SDK or physical microphone check was run; the live acceptance status above is unchanged.
 
 ### 2026-10-15 Azure OpenAI diagnostics revision
 
-The reasoning-provider error and investigation-timeline changes do not alter Speech SDK transport, continuous recognition, transcript ownership, reservation settlement or microphone behavior. No live Speech request or physical microphone check was run; prior Speech acceptance status remains unchanged.
+The reasoning-provider error and investigation-timeline changes do not alter Speech SDK transport, continuous recognition, transcript ownership or microphone behavior. No live Speech request or physical microphone check was run; prior Speech acceptance status remains unchanged.

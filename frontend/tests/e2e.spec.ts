@@ -343,7 +343,7 @@ test('isolated Speech transport verifies continuous partials, reconnect, Stop ex
     const emit = Reflect.get(window, 'speechTestEmit')
     emit('state', { state: 'listening' })
     emit('transcript.final', { id: '2:b', text: 'The application will stop responding.' })
-    emit('usage', { connected_seconds: 45, estimated_cad: 0.025 })
+    emit('usage', { connected_seconds: 45 })
   })
   await expect(page.getByTestId('voice-message')).toHaveCount(2)
   await expect(page.getByLabel('Speech usage')).toContainText('Connected speech 45s')

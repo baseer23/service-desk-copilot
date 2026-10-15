@@ -5,7 +5,7 @@ const base = import.meta.env.VITE_API_BASE ?? ''
 
 export function publicErrorMessage(message: string): string {
   if (/^(?:Groq (?:is not configured|is rate limited|capacity|request (?:failed|exceeds)|returned invalid structured))/.test(message)) return message
-  if (/^Azure OpenAI (?:is blocked by DeskMate['’]s approved application allowance|authentication failed|denied this identity|could not find the configured resource or deployment|is rate limited or out of quota|timed out|request was too large|returned an invalid structured response|could not complete the request)/.test(message)) return message
+  if (/^Azure OpenAI (?:authentication failed|denied this identity|could not find the configured resource or deployment|is rate limited or out of quota|timed out|request was too large|returned an invalid structured response|could not complete the request)/.test(message)) return message
   if (/Azure|MCP|LangGraph|SQLite|Chroma|Cosmos|managed state|managed usage|Key.?Vault|rate_limit|[A-Z]+_[A-Z_]{3,}|provider|deployment|usage guard|pdftoppm|Tesseract/i.test(message))
     return 'DeskMate cannot complete this request right now. Your saved work is available. Please try again later or contact your administrator.'
   return message

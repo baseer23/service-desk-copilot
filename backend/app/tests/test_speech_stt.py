@@ -4,7 +4,6 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
-from backend.app.core.azure_usage import AzureUsageBlocked, AzureUsageGuard
 from backend.app.core.config import Settings
 from backend.app.speech.api import register_speech_routes
 from backend.app.speech.azure_stt import AzureSpeechRecognizer
@@ -23,10 +22,6 @@ def settings(tmp_path, **changes):
         embedding_provider="stub",
         case_db_path=tmp_path / "cases.sqlite",
         chroma_dir=tmp_path / "chroma",
-        azure_usage_guard_enabled=True,
-        azure_emergency_disable=False,
-        azure_estimated_monthly_app_limit_cad=155,
-        azure_speech_estimated_cad_per_hour=2,
         speech_enabled=True,
         azure_speech_endpoint="https://example.cognitiveservices.azure.com/",
         **changes,
@@ -55,22 +50,14 @@ def test_final_duplicates_and_reconnect_overlap_do_not_duplicate_transcript():
     assert transcript.accept(3, "id-4", "Different final words")
 
 
-def test_speech_meter_counts_silence_reserves_ahead_and_preserves_history(tmp_path):
+def test_speech_meter_counts_connected_time_without_financial_reservations(tmp_path):
     s = settings(tmp_path)
-    guard = AzureUsageGuard(s)
-    guard.enable_demo(155, "isolated-test")
-    with guard.transaction() as db:
-        db.execute(
-            "INSERT INTO azure_usage(id,month,day,kind,estimate,active) "
-            "VALUES('historical','2026-01','2026-01-01','session_voice',500000,0)"
-        )
     clock = [0.0]
-    meter = SpeechMeter(s, guard, clock=lambda: clock[0])
+    meter = SpeechMeter(s, clock=lambda: clock[0])
     meter.start()
     meter.connected()
     clock[0] = 56
     meter.heartbeat()
-    assert meter.reserved_seconds == 120
     clock[0] = 90
     meter.disconnected()
     clock[0] = 100  # reconnect backoff is not connected billable time
@@ -78,48 +65,19 @@ def test_speech_meter_counts_silence_reserves_ahead_and_preserves_history(tmp_pa
     clock[0] = 130
     meter.finish(confirmed_closed=True)
     assert meter.seconds == 120
-    with guard.inspection() as db:
-        assert db.execute(
-            "SELECT seconds,estimate,active FROM azure_usage WHERE id=?", (meter.id,)
-        ).fetchone() == (120, 66667, 0)
-        assert (
-            db.execute("SELECT estimate FROM azure_usage WHERE id='historical'").fetchone()[0]
-            == 500000
-        )
-    assert guard.snapshot()["enabled"]
-    second = SpeechMeter(s, guard)
+    assert meter.snapshot() == {"connected_seconds": 120.0}
+    second = SpeechMeter(s)
     second.start()
     second.finish(confirmed_closed=True)
 
 
-def test_unconfirmed_sdk_close_retains_budget_and_concurrency_guard(tmp_path):
+def test_unconfirmed_sdk_close_does_not_block_a_later_session(tmp_path):
     s = settings(tmp_path)
-    guard = AzureUsageGuard(s)
-    guard.enable_demo(155, "isolated-test")
-    meter = SpeechMeter(s, guard)
+    meter = SpeechMeter(s)
     meter.start()
     meter.connected()
     meter.finish(confirmed_closed=False)
-    with guard.inspection() as db:
-        assert (
-            db.execute("SELECT active FROM azure_usage WHERE id=?", (meter.id,)).fetchone()[0] == 1
-        )
-    with pytest.raises(AzureUsageBlocked, match="still active"):
-        SpeechMeter(s, guard).start()
-
-
-def test_emergency_stop_is_not_cleared_by_speech_completion(tmp_path):
-    s = settings(tmp_path)
-    guard = AzureUsageGuard(s)
-    guard.enable_demo(155, "isolated-test")
-    meter = SpeechMeter(s, guard)
-    meter.start()
-    meter.connected()
-    guard.disable()
-    with pytest.raises(AzureUsageBlocked):
-        meter.heartbeat()
-    meter.finish(confirmed_closed=True)
-    assert not guard.snapshot()["enabled"]
+    SpeechMeter(s).start()
 
 
 class Signal:
@@ -295,8 +253,6 @@ def receive_until(ws, predicate, seen=None):
 
 def test_gateway_continues_after_sentences_recovers_and_settles_actual_usage(tmp_path):
     s = settings(tmp_path)
-    guard = AzureUsageGuard(s)
-    guard.enable_demo(155, "isolated-test")
     app = FastAPI()
     register_speech_routes(app, s)
     app.state.speech.recognizer_factory = GatewayRecognizer
@@ -325,12 +281,6 @@ def test_gateway_continues_after_sentences_recovers_and_settles_actual_usage(tmp
                 receive_until(ws, lambda v: v.get("state") == "stopped")["reason"]
                 == "explicit_stop"
             )
-    with guard.inspection() as db:
-        rows = db.execute(
-            "SELECT active,seconds,estimate FROM azure_usage WHERE kind='speech_stt'"
-        ).fetchall()
-        assert len(rows) == 1 and rows[0][0] == 0 and rows[0][1] > 0
-    assert guard.snapshot()["enabled"]
 
 
 def test_gateway_spoken_stop_never_becomes_transcript(tmp_path):
@@ -341,8 +291,6 @@ def test_gateway_spoken_stop_never_becomes_transcript(tmp_path):
             )
 
     s = settings(tmp_path)
-    guard = AzureUsageGuard(s)
-    guard.enable_demo(155, "isolated-test")
     app = FastAPI()
     register_speech_routes(app, s)
     app.state.speech.recognizer_factory = StopRecognizer
@@ -358,7 +306,6 @@ def test_gateway_spoken_stop_never_becomes_transcript(tmp_path):
                 == "spoken_stop"
             )
             assert not any(v["type"].startswith("transcript.") for v in observed)
-    assert guard.snapshot()["enabled"]
 
 
 def test_reconnect_replay_suffix_is_removed_without_losing_new_words():
@@ -391,25 +338,6 @@ def test_speech_endpoint_is_a_keyless_custom_domain_origin(tmp_path, endpoint):
 
     with pytest.raises(ValidationError):
         Settings(_env_file=None, azure_speech_endpoint=endpoint)
-
-
-def test_speech_meter_preserves_separate_setup_spending_cap(tmp_path):
-    s = settings(tmp_path, azure_setup_validation_mode=True, azure_estimated_setup_limit_cad=0.04)
-    guard = AzureUsageGuard(s)
-    guard.enable_demo(155, "isolated-test")
-    clock = [0.0]
-    meter = SpeechMeter(s, guard, clock=lambda: clock[0])
-    meter.start()
-    meter.connected()
-    clock[0] = 56
-    with pytest.raises(AzureUsageBlocked, match="setup allowance"):
-        meter.heartbeat()
-    meter.finish(confirmed_closed=True)
-    with guard.inspection() as db:
-        assert (
-            db.execute("SELECT phase FROM azure_usage WHERE id=?", (meter.id,)).fetchone()[0]
-            == "setup"
-        )
 
 
 @pytest.mark.asyncio

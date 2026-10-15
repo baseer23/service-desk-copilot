@@ -45,10 +45,6 @@ from backend.app.store.vector_chroma import StorageError
 def llm_error_detail(error: LLMError) -> dict[str, Any]:
     """Return an actionable, secret-free provider diagnostic for the UI."""
     messages = {
-        "cost_control": (
-            "Azure OpenAI is blocked by DeskMate's approved application allowance. "
-            "Ask an operator to review the usage ledger."
-        ),
         "authentication": "Azure OpenAI authentication failed. Sign in to Entra again and retry.",
         "authorization": (
             "Azure OpenAI denied this identity. Ask an administrator to verify the resource role assignment."
@@ -172,10 +168,6 @@ def create_app(settings: Settings | None = None):
                 await provider.aclose()
             elif provider and hasattr(provider, "close"):
                 await asyncio.wait_for(asyncio.to_thread(provider.close), 5)
-            if s.uses_record_store:
-                from backend.app.core.record_usage import close_usage_clients
-
-                await asyncio.to_thread(close_usage_clients)
 
     app = FastAPI(
         title="DeskMate Case API",
@@ -264,16 +256,6 @@ def create_app(settings: Settings | None = None):
             raise HTTPException(403, "This action requires an administrator.")
         return (await app.state.voice.store(readiness)).model_dump()
 
-    @app.post("/admin/azure/usage/disable")
-    async def operator_disable(request: Request):
-        from backend.app.speech.api import browser_guard
-        browser_guard(request, s)
-        if not current_principal(s).operator:
-            raise HTTPException(403, "This action requires an administrator.")
-        await asyncio.to_thread(app.state.voice.usage_guard.disable)
-        await app.state.speech.close()
-        return {"disabled": True}
-
     def readiness() -> ReadinessReport:
         from backend.app.diagnostics.readiness import configuration_readiness
 
@@ -334,16 +316,6 @@ def create_app(settings: Settings | None = None):
     async def require_reasoning() -> None:
         report = await app.state.voice.store(readiness)
         if not report.text_ready:
-            if selected_provider(s) == "azure_openai" and any(
-                item == "AZURE_USAGE_GUARD_OR_ALLOWANCE" for item in report.reasoning.missing
-            ):
-                raise HTTPException(503, {
-                    "code": "AZURE_OPENAI_COST_CONTROL",
-                    "message": (
-                        "Azure OpenAI is blocked by DeskMate's approved application allowance. "
-                        "Ask an operator to review the usage ledger."
-                    ),
-                })
             raise HTTPException(503, {
                 "code": "REASONING_NOT_READY",
                 "message": "The selected AI service is unavailable. Check its configuration or choose another provider. Your saved work is preserved.",
@@ -511,7 +483,7 @@ def create_app(settings: Settings | None = None):
                 "result"
             ]
             return JSONResponse(
-                status_code=503 if exc.category == "cost_control" else 502,
+                status_code=502,
                 content={
                     "detail": llm_error_detail(exc)
                     if selected_provider(s) == "azure_openai"
@@ -644,7 +616,7 @@ def create_app(settings: Settings | None = None):
             raise HTTPException(409, str(exc)) from exc
         except LLMError as exc:
             raise HTTPException(
-                503 if exc.category == "cost_control" else 502,
+                502,
                 llm_error_detail(exc)
                 if selected_provider(s) == "azure_openai"
                 else (

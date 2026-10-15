@@ -274,7 +274,7 @@ class RecordVoiceConversationRepository:
                     or sum(sizes.values()) - sizes.get(document["id"], 0) + size > 100_000_000
                     or (document["id"] not in sizes and len(sizes) >= 5000)
                 ):
-                    raise VoiceError("Managed data allowance is full")
+                    raise VoiceError("Local data capacity is full")
                 sizes[document["id"]] = max(size, sizes.get(document["id"], 0))
         try:
             self.records.atomic_batch(operations, tenant=actor.tenant_id)

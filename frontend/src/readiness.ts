@@ -27,16 +27,7 @@ export interface ReadinessReport {
   semantic_ingestion_ready?: boolean
   semantic_ingestion_blocker?: string | null
   url_ingestion_enabled?: boolean
-  azure_validation?: Record<string, { passed: boolean; code: string }>
   voice_validation_scope?: 'not_checked' | 'configuration' | 'transport'
-  azure_usage?: {
-    enabled: boolean
-    remaining_estimated_cad: number
-    estimated_used_cad: number
-    limit_cad: number
-    invoice_cap: false
-    ledger_error: boolean
-  }
 }
 export function reasoningBlocker(report: ReadinessReport | null): string | null {
   if (!report || report.text_ready) return null
@@ -67,9 +58,8 @@ export function useReadiness(supplied?: ReadinessReport | null): {
   }, [supplied, refresh])
   useEffect(() => {
     const update = () => void refresh()
-    window.addEventListener('azure-usage-disabled', update)
     window.addEventListener(providerChangedEvent, update)
-    return () => { window.removeEventListener('azure-usage-disabled', update); window.removeEventListener(providerChangedEvent, update) }
+    return () => window.removeEventListener(providerChangedEvent, update)
   }, [refresh])
   return { readiness, refresh, checking }
 }

@@ -3,7 +3,6 @@
 from unittest.mock import AsyncMock
 
 import pytest
-from backend.app.core.azure_usage import AzureUsageGuard
 from backend.app.diagnostics import azure_readiness
 from backend.app.diagnostics.readiness import configuration_readiness
 from pydantic import SecretStr
@@ -13,8 +12,6 @@ def azure_settings(settings, **extra):
     s = settings.model_copy(
         update={
             "test_mode": False,
-            "azure_usage_guard_enabled": True,
-            "azure_emergency_disable": False,
             "generation_provider": "azure_openai",
             "embed_provider": "sentence_transformers",
             "azure_foundry_endpoint": "https://private-resource.openai.azure.com",
@@ -26,9 +23,6 @@ def azure_settings(settings, **extra):
             "voice_session_signing_key": SecretStr("never-print-signing-xxxxxxxxxxxxxxxxxxxxxxxx"),
             **extra,
         }
-    )
-    AzureUsageGuard(s).enable_demo(
-        s.azure_estimated_monthly_app_limit_cad, "isolated-readiness-test"
     )
     return s
 

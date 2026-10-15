@@ -18,14 +18,14 @@ npm --prefix frontend ci
 make dev
 ```
 
-For a new installation, review `.env.example` and privately configure the required values. Preserve an existing `.env`, signing key, database, Chroma directory and usage ledger. Never replace an existing ledger with an empty store to enable paid usage.
+For a new installation, review `.env.example` and privately configure the required values. Preserve an existing `.env`, signing key, database and Chroma directory.
 
 Open **http://127.0.0.1:5173**. FastAPI runs on port 8000 and owns its MCP subprocess. A separate MCP terminal is unnecessary. Stop the stack with Ctrl+C. Backend environment changes require restarting the stack; the model selector applies without restarting. LangGraph pauses for missing information and resumes the same stored conversation when you answer.
 
 ## Configure
 
 - Groq: private `GROQ_API_KEY` and `GROQ_MODEL_NAME`. Account/model rate limits are discovered from response headers; exact optional RPM/TPD settings come from the account's current Limits page.
-- Azure OpenAI: `AZURE_FOUNDRY_ENDPOINT`, `AZURE_MODEL_DEPLOYMENT` and preferably Azure CLI/Entra authentication. The finite usage allowance and persistent emergency switch remain binding.
+- Azure OpenAI: `AZURE_FOUNDRY_ENDPOINT`, `AZURE_MODEL_DEPLOYMENT` and preferably Azure CLI/Entra authentication. Provider quotas, rate limits and authentication remain in effect; DeskMate does not impose a spending ledger or fallback provider.
 - Local persistence: `LOCAL_PERSISTENCE_ENABLED=true`, `CASE_DB_PATH`, `CHROMA_DIR`, `LOCAL_DOCUMENTS_DIR`; keep `store/local/` and `store/backups/` private and ignored.
 - Optional graph: `NEO4J_URI`, `NEO4J_USER`, private `NEO4J_PASSWORD`. Unavailable Aura is reported honestly; no production graph fixtures are substituted.
 - Continuous transcription: `SPEECH_ENABLED`, `AZURE_SPEECH_ENDPOINT`, language and conservative estimated CAD/hour. Use a compatible existing resource and Entra role assignments; see [Speech](docs/SPEECH.md).

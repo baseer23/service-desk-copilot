@@ -29,7 +29,6 @@ class Settings(BaseSettings):
     azure_document_endpoint: str = ""
     azure_document_api_version: str = "2024-11-30"
     azure_document_free_tier: bool = True
-    azure_document_monthly_page_limit: int = Field(default=500, ge=1, le=500)
     azure_key_vault_url: str = ""
     azure_session_secret_name: str = "deskmate-session-signing-key"
     auth_client_id: str = ""
@@ -55,7 +54,6 @@ class Settings(BaseSettings):
     speech_enabled: bool = False
     azure_speech_endpoint: str = ""
     azure_speech_language: str = "en-US"
-    azure_speech_estimated_cad_per_hour: float = Field(default=2.0, gt=0, le=20)
     speech_max_concurrent_sessions: int = Field(default=1, ge=1, le=1)
     model_timeout_sec: int = Field(default=30, ge=1, le=120)
     azure_foundry_endpoint: str = Field(
@@ -70,21 +68,9 @@ class Settings(BaseSettings):
     azure_openai_api_key: SecretStr | None = Field(default=None, repr=False)
     azure_use_entra_id: bool = True
     azure_structured_outputs: bool = True
-    # Independent local estimate guard, never an Azure invoice guarantee.
-    azure_usage_guard_enabled: bool = False
-    azure_emergency_disable: bool = False
-    azure_setup_validation_mode: bool = False
-    azure_estimated_setup_limit_cad: float = Field(default=2.0, gt=0, le=2)
-    azure_setup_validation_id: str = ""
     azure_reasoning_min_interval_seconds: float = Field(default=0, ge=0, le=120)
-    azure_estimated_monthly_app_limit_cad: float = Field(default=8.0, gt=0, le=250)
-    azure_estimated_infrastructure_cad: float = Field(default=0.25, ge=0, le=200)
-    azure_usage_db_path: Path | None = None
     azure_max_input_tokens: int = Field(default=32768, ge=256, le=32768)
     azure_max_output_tokens: int = Field(default=1500, ge=80, le=1500)
-    # Deliberately conservative assumptions in CAD, not published Azure prices.
-    azure_estimated_input_cad_per_million: float = Field(default=10, ge=10, allow_inf_nan=False)
-    azure_estimated_output_cad_per_million: float = Field(default=40, ge=40, allow_inf_nan=False)
     embed_model_name: str = "all-MiniLM-L6-v2"
     voice_tenant_id: str = Field(default="local-demo", min_length=1, max_length=100)
     voice_session_signing_key: SecretStr | None = Field(default=None, repr=False)
@@ -163,17 +149,10 @@ class Settings(BaseSettings):
     def empty_secret(cls, value: str | SecretStr | None) -> str | SecretStr | None:
         return None if value == "" else value
 
-    @field_validator("azure_usage_db_path", mode="before")
-    @classmethod
-    def empty_usage_path(cls, value: Any) -> Any:
-        return None if value == "" else value
-
     @model_validator(mode="after")
     def validate_runtime(self) -> "Settings":
         if len(self.auth_allowed_tenants) > 8:
             raise ValueError("The pilot supports at most eight authorized tenants")
-        if self.uses_record_store and not self.azure_document_free_tier:
-            raise ValueError("Paid document analysis requires an explicitly approved cost policy")
         if self.deployment_mode == "production":
             if not self.local_persistence_enabled:
                 raise ValueError("Production requires tenant-scoped persistent local records")

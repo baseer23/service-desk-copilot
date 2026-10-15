@@ -97,7 +97,6 @@ export default function VoiceSupport({
   const [usage, setUsage] = useState({
     listening_seconds: 0,
     connected_seconds: 0,
-    estimated_cad: 0,
   })
   const audio = useRef<VoiceAudio | null>(null)
   const socket = useRef<WebSocket | null>(null)
@@ -109,8 +108,8 @@ export default function VoiceSupport({
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const connectingTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const started = useRef(0)
-  const elapsedUsage = useRef({ connected_seconds: 0, estimated_cad: 0 })
-  const connectionUsage = useRef({ connected_seconds: 0, estimated_cad: 0 })
+  const elapsedUsage = useRef({ connected_seconds: 0 })
+  const connectionUsage = useRef({ connected_seconds: 0 })
   const lastMeter = useRef(0)
   const lastRequest = useRef<{ id: string; transient: boolean; needsInput: boolean } | null>(null)
 
@@ -214,7 +213,7 @@ export default function VoiceSupport({
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
     const ws = new WebSocket(url)
     socket.current = ws
-    connectionUsage.current = { connected_seconds: 0, estimated_cad: 0 }
+    connectionUsage.current = { connected_seconds: 0 }
     ws.onmessage = (event) => {
       if (socket.current !== ws || !mounted.current) return
       try {
@@ -225,22 +224,17 @@ export default function VoiceSupport({
           text?: string
           message?: string
           connected_seconds?: number
-          estimated_cad?: number
         }
         if (
-          typeof value.connected_seconds === 'number' &&
-          typeof value.estimated_cad === 'number'
+          typeof value.connected_seconds === 'number'
         ) {
           connectionUsage.current = {
             connected_seconds: value.connected_seconds,
-            estimated_cad: value.estimated_cad,
           }
           setUsage((old) => ({
             ...old,
             connected_seconds:
               elapsedUsage.current.connected_seconds + connectionUsage.current.connected_seconds,
-            estimated_cad:
-              elapsedUsage.current.estimated_cad + connectionUsage.current.estimated_cad,
           }))
         }
         if (value.type === 'state') {
@@ -301,7 +295,6 @@ export default function VoiceSupport({
       socket.current = null
       clearTimeout(connectingTimer.current)
       elapsedUsage.current.connected_seconds += connectionUsage.current.connected_seconds
-      elapsedUsage.current.estimated_cad += connectionUsage.current.estimated_cad
       if (!active.current) {
         setStatus('stopped')
         return
@@ -334,10 +327,10 @@ export default function VoiceSupport({
     active.current = true
     retry.current = 0
     seen.current.clear()
-    elapsedUsage.current = { connected_seconds: 0, estimated_cad: 0 }
-    connectionUsage.current = { connected_seconds: 0, estimated_cad: 0 }
+    elapsedUsage.current = { connected_seconds: 0 }
+    connectionUsage.current = { connected_seconds: 0 }
     started.current = Date.now()
-    setUsage({ listening_seconds: 0, connected_seconds: 0, estimated_cad: 0 })
+    setUsage({ listening_seconds: 0, connected_seconds: 0 })
     setError('')
     setStatus('connecting')
     setMuted(false)
@@ -556,12 +549,10 @@ export default function VoiceSupport({
           text.
         </p>
         <p aria-label="Speech usage">
-          Listening {duration} · Connected speech {usage.connected_seconds.toFixed(0)}s · Estimated
-          CAD ${usage.estimated_cad.toFixed(4)}
+          Listening {duration} · Connected speech {usage.connected_seconds.toFixed(0)}s
         </p>
         <p className="readiness-note">
-          Connected recognition includes pauses, silence and mute time. This estimate is not an
-          invoice or billing cap.
+          Connected recognition includes pauses, silence and mute time.
         </p>
         {!connected && (
           <>

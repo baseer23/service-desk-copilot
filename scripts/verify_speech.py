@@ -3,7 +3,7 @@
 Run with PYTHONPATH=. .venv/bin/python scripts/verify_speech.py --help.
 The full transcript is written only to a new private report file. No LLM request,
 resource provisioning, microphone access, cloud persistence, key retrieval or
-policy enablement is performed. All Azure usage uses the configured shared ledger.
+policy mutation is performed.
 """
 
 import argparse
@@ -14,7 +14,6 @@ import time
 import wave
 from pathlib import Path
 
-from backend.app.core.azure_usage import AzureUsageBlocked
 from backend.app.core.config import get_settings
 from backend.app.speech.azure_stt import AzureSpeechRecognizer
 from backend.app.speech.transcript import Transcript, standalone_stop
@@ -91,7 +90,7 @@ async def verify(settings, data, seconds, expected, timeout):
     tasks = []
     try:
         if not settings.speech_enabled or not settings.azure_speech_endpoint:
-            raise AzureUsageBlocked("Speech is not configured")
+            raise ValueError("Speech is not configured")
         await asyncio.to_thread(meter.start)
         meter.connected()
         await adapter.start()
@@ -103,8 +102,6 @@ async def verify(settings, data, seconds, expected, timeout):
             raise TimeoutError
         for task in done:
             task.result()
-    except AzureUsageBlocked:
-        error = "SPEECH_USAGE_BLOCKED"
     except Exception:  # noqa: BLE001 - Acceptance reports never expose native diagnostics.
         error = "SPEECH_ACCEPTANCE_FAILED"
     finally:

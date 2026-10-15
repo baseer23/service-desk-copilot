@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { post, request } from './api'
+import { request } from './api'
 
 /** Infrastructure details are available only after the protected operator API grants access. */
 export default function AdminConsole(): JSX.Element {
@@ -10,10 +10,6 @@ export default function AdminConsole(): JSX.Element {
   return <main className="card"><h1>DeskMate administration</h1><a href="/">Back to investigations</a>
     {error && <p role="alert">{error}</p>}
     {report !== null && <><pre>{JSON.stringify(report, null, 2)}</pre>
-      <button type="button" onClick={() => {
-        void request('/admin/azure/usage/disable', post()).then(refresh)
-          .catch(() => setError('Shutdown could not be confirmed. Retry or use the documented operator stop procedure.'))
-      }}>Disable Azure usage</button>
       <button type="button" onClick={() => void refresh()}>Refresh diagnostics</button></>}
   </main>
 }

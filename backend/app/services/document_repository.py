@@ -4,7 +4,6 @@ import hashlib
 import json
 
 from backend.app.adapters.embeddings import get_embedding_provider
-from backend.app.core.azure_usage import AzureUsageBlocked
 from backend.app.core.config import Settings
 from backend.app.services.chunking import split_text
 from backend.app.store.records import ManagedStoreError
@@ -210,17 +209,6 @@ class DocumentRepository:
             )
             self.records.write("indexed_hash", identifier, {"chunks": len(chunks)})
             return state
-        except AzureUsageBlocked:
-            # Safe pre-dispatch waiting is resumable; no inference has occurred.
-            if state["phase"] in {"extract", "embed"}:
-                self.records.write(
-                    "document",
-                    identifier,
-                    {**state, "status": "waiting"},
-                    previous=row,
-                    fields={"status": "waiting"},
-                )
-            raise
         except Exception:
             # Preserve the in-flight phase when completion/accounting is ambiguous.
             failed = {**row["payload"], "status": "error"}

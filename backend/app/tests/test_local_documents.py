@@ -65,7 +65,7 @@ def test_local_store_restart_dedup_concurrency_and_case_preservation(tmp_path):
         assert db.execute("SELECT COUNT(*) FROM knowledge_search").fetchone()[0] == 1
 
 
-def test_emergency_disabled_http_mcp_local_paths_no_azure_calls(make_client):
+def test_local_http_mcp_paths_do_not_depend_on_retired_financial_controls(make_client):
     client = make_client(
         {
             "TEST_MODE": "true",
@@ -75,8 +75,6 @@ def test_emergency_disabled_http_mcp_local_paths_no_azure_calls(make_client):
             "AZURE_FOUNDRY_ENDPOINT": "https://example.openai.azure.com",
             "AZURE_MODEL_DEPLOYMENT": "test-reasoning",
             "AZURE_USE_ENTRA_ID": "true",
-            "AZURE_USAGE_GUARD_ENABLED": "true",
-            "AZURE_EMERGENCY_DISABLE": "true",
         }
     )
     assert client.get("/readiness").json()["local_documents_ready"]
@@ -91,11 +89,13 @@ def test_emergency_disabled_http_mcp_local_paths_no_azure_calls(make_client):
     found = client.get("/knowledge/search", params={"question": "Hello PDF"}).json()
     assert not found["generated_answer"] and found["mode"] == "keyword"
     assert found["items"][0]["metadata"]["title"] == "Isolated PDF policy"
-    assert client.post("/ask", json={"summary": "Fictional VPN failure"}).status_code == 503
+    # An explicitly selected Azure provider is attempted; no local allowance gate
+    # short-circuits the request before normal upstream error handling.
+    assert client.post("/ask", json={"summary": "Fictional VPN failure"}).status_code == 502
     case = client.post("/cases", json={"summary": "Fictional VPN failure"}).json()
     assert case["status"] == "new" and not case["final_answer"]
     assert client.get(f"/cases/{case['case_id']}").status_code == 200
-    assert client.get("/admin/readiness").json()["azure_usage"]["estimated_used_cad"] == 0
+    assert "azure_usage" not in client.get("/admin/readiness").json()
     bad = client.post(
         "/documents/extract", files={"file": ("bad.pdf", b"%PDF-invalid", "application/pdf")}
     )

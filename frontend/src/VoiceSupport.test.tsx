@@ -127,12 +127,12 @@ test('SDK reconnect state preserves accumulated transcript and keeps microphone;
   act(() => {
     ws.emit('transcript.final', { id: '1:a', text: 'First words.' })
     ws.emit('state', { state: 'reconnecting' })
-    ws.emit('usage', { listening_seconds: 120, connected_seconds: 115.4, estimated_cad: 0.0641 })
+    ws.emit('usage', { listening_seconds: 120, connected_seconds: 115.4 })
   })
   expect(screen.getByTestId('voice-status')).toHaveTextContent('Reconnecting')
   expect(screen.getByLabelText('Message DeskMate')).toHaveValue('First words.')
   expect(screen.getByLabelText('Speech usage')).toHaveTextContent(
-    'Connected speech 115s · Estimated CAD $0.0641',
+    'Connected speech 115s',
   )
   expect(VoiceAudio.prototype.close).not.toHaveBeenCalled()
   act(() => {
