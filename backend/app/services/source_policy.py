@@ -23,11 +23,20 @@ def quality(url: str, settings: Settings) -> Literal["primary", "third_party"]:
 
 
 def rank_sources(rows: list[dict[str, Any]], settings: Settings) -> list[dict[str, Any]]:
-    allowed = [
-        {**row, "source_quality": quality(row.get("url", ""), settings)}
-        for row in rows
-        if permits(row.get("url", ""), settings)
-    ]
+    allowed = []
+    seen = set()
+    for row in rows:
+        url = row.get("url", "")
+        if not isinstance(url, str) or not permits(url, settings):
+            continue
+        parsed = urlsplit(url)
+        canonical = parsed._replace(
+            scheme=parsed.scheme.lower(), netloc=parsed.netloc.lower(), fragment=""
+        ).geturl()
+        if not canonical or canonical in seen:
+            continue
+        seen.add(canonical)
+        allowed.append({**row, "source_quality": quality(url, settings)})
     if settings.research_source_policy == "allow_third_party":
         return allowed
     return sorted(allowed, key=lambda row: 0 if row["source_quality"] == "primary" else 1)

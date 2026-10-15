@@ -9,6 +9,21 @@ export interface ActivityEvent {
   duration_ms?: number
   wait_seconds?: number
   result_count?: number
+  event_id?: string
+  query?: string
+  rationale?: string
+  research_queries?: string[]
+  missing_information?: string[]
+  actions?: Array<{ tool: string; reason: string }>
+  sources?: Array<{ title: string; url?: string | null }>
+  category?: string
+  request_id?: string | null
+}
+
+export function mergeActivity(current: ActivityEvent[], event: ActivityEvent): ActivityEvent[] {
+  if (current.some(item => item.sequence === event.sequence)) return current
+  if (event.event_id && current.some(item => item.event_id === event.event_id)) return current
+  return [...current, event]
 }
 
 export async function streamInvestigation<T>(path: string, body: unknown, onActivity: (event: ActivityEvent) => void, signal?: AbortSignal): Promise<T> {

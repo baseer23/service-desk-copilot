@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     enable_public_web_tools: bool = False
     groq_api_key: SecretStr | None = Field(default=None, repr=False)
     groq_model_name: str = "openai/gpt-oss-120b"
+    groq_context_window_tokens: int = Field(default=0, ge=0, le=1_000_000)
     groq_max_output_tokens: int = Field(default=1500, ge=80, le=8192)
     groq_input_cad_per_million: float | None = Field(default=None, ge=0)
     groq_output_cad_per_million: float | None = Field(default=None, ge=0)
@@ -49,6 +50,7 @@ class Settings(BaseSettings):
     groq_requests_per_day: int = Field(default=0, ge=0)
     groq_tokens_per_minute: int = Field(default=0, ge=0)
     groq_tokens_per_day: int = Field(default=0, ge=0)
+    provider_fallback_enabled: bool = False
     mcp_servers: Annotated[list[dict[str, Any]], NoDecode] = []
     speech_enabled: bool = False
     azure_speech_endpoint: str = ""

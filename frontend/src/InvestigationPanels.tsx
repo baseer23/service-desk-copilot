@@ -32,7 +32,14 @@ const safeActivity = (event: ActivityEvent): string => {
   if (event.tool?.startsWith('ingest_')) return 'Saving knowledge'
   if (event.tool === 'human_input') return 'User confirmation received'
   if (event.tool === 'error') return 'Evidence source unavailable'
-  return 'Preparing response'
+  if (event.tool === 'classify_intent') return 'Understanding question'
+  if (event.tool === 'understand_question') return 'Question understood'
+  if (event.tool === 'plan') return 'Research plan created'
+  if (event.tool === 'observe') return 'Evidence collected and compared'
+  if (event.tool === 'reason') return 'Evaluating evidence'
+  if (event.tool === 'evaluate_sources') return 'Checking source relevance'
+  if (event.tool === 'finalize') return 'Final assessment prepared'
+  return 'Investigation updated'
 }
 export function InvestigationTimeline({ events }: { events: ActivityEvent[] }): JSX.Element {
   return (

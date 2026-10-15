@@ -1,6 +1,6 @@
 import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react'
 import { request } from './api'
-import { type ActivityEvent, streamInvestigation } from './investigationStream'
+import { mergeActivity, type ActivityEvent, streamInvestigation } from './investigationStream'
 import InvestigationActivity from './InvestigationActivity'
 import { VoiceAudio } from './voiceAudio'
 import { type ReadinessReport } from './readiness'
@@ -393,7 +393,7 @@ export default function VoiceSupport({
     const controller = new AbortController()
     investigation.current = controller
     const progress = (event: ActivityEvent) => {
-      if (mounted.current) setActivity((old) => [...old, event])
+      if (mounted.current) setActivity((old) => mergeActivity(old, event))
     }
     try {
       const previous = lastRequest.current

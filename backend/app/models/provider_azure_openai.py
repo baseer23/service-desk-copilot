@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import re
+import time
 from typing import Any, TypeVar
 
 from pydantic import BaseModel, ValidationError
@@ -11,6 +13,7 @@ from backend.app.core.azure_usage import AzureUsageBlocked, AzureUsageGuard
 from backend.app.core.config import Settings
 
 from .instructions import stage_instructions
+from .context_budget import bounded_context, estimate_request_tokens
 from .provider import LLMError
 from .provider_routing import model_event
 
@@ -25,6 +28,67 @@ TOKEN_LIMITS = {
     "verify": 800,
     "evaluate_sources": 350,
 }
+
+
+def azure_failure(exc: Exception) -> tuple[str, str, bool, str | None]:
+    """Return a sanitized category, action, retryability and request identifier."""
+    status = getattr(exc, "status_code", getattr(exc, "status", None))
+    code = azure_error_code(exc)
+    folded = code.casefold()
+    if status == 401:
+        category, action, recoverable = (
+            "authentication",
+            "Verify the Entra sign-in or credential configured for Azure OpenAI.",
+            False,
+        )
+    elif status == 403:
+        category, action, recoverable = (
+            "authorization",
+            "Verify the Azure OpenAI role assignment for this identity and resource.",
+            False,
+        )
+    elif status == 404 or "deployment" in folded or "model_not_found" in folded:
+        category, action, recoverable = (
+            "configuration",
+            "Verify the Azure resource endpoint, deployment name and API version.",
+            False,
+        )
+    elif status == 429 or any(word in folded for word in ("quota", "ratelimit", "capacity")):
+        category, action, recoverable = (
+            "capacity",
+            "Azure quota or rate capacity is unavailable; retry after the service reset.",
+            True,
+        )
+    elif any(word in folded for word in ("context", "tokenlimit", "max_tokens")):
+        category, action, recoverable = (
+            "context_length",
+            "The request exceeded the deployment context limit; retry with less evidence.",
+            True,
+        )
+    elif isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+        category, action, recoverable = (
+            "timeout",
+            "Azure did not finish before the timeout; retry when the service is responsive.",
+            True,
+        )
+    elif isinstance(status, int) and status >= 500:
+        category, action, recoverable = (
+            "service_unavailable",
+            "Azure is temporarily unavailable; retry later.",
+            True,
+        )
+    else:
+        category, action, recoverable = (
+            "request_failed",
+            "Verify the deployment configuration and Azure service status.",
+            False,
+        )
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", {}) or {}
+    request_id = headers.get("x-request-id") or headers.get("apim-request-id")
+    if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", request_id):
+        request_id = None
+    return category, action, recoverable, request_id
 
 
 def compact_schema(value: Any) -> Any:
@@ -196,7 +260,22 @@ class AzureOpenAIProvider:
             return await self._generate_structured(stage, context, schema)
 
     async def _generate_structured(self, stage: str, context: dict, schema: type[T]) -> T:
-        messages, response_format = structured_request(self.settings, stage, context, schema)
+        output_bound = min(TOKEN_LIMITS.get(stage, 1200), self.settings.azure_max_output_tokens)
+        packed, report = bounded_context(
+            context,
+            max(256, self.settings.azure_max_input_tokens - output_bound - 1536),
+        )
+        messages, response_format = structured_request(self.settings, stage, packed, schema)
+        if report.compacted:
+            await model_event(
+                kind="context_compaction",
+                status="completed",
+                provider="azure_openai",
+                stage=stage,
+                summary="Azure model context compacted while retaining source references",
+                original_tokens=report.original_tokens,
+                final_tokens=report.final_tokens,
+            )
         attempts = 1 if stage == "readiness" or self.settings.azure_setup_validation_mode else 2
         for attempt in range(attempts):
             try:
@@ -211,12 +290,9 @@ class AzureOpenAIProvider:
                     await asyncio.sleep(min(delay, 1))
             except AzureUsageBlocked as exc:
                 raise LLMError(str(exc)) from None
-            input_bound = (
-                len(json.dumps(messages, ensure_ascii=False).encode())
-                + len(json.dumps(response_format, ensure_ascii=False).encode())
-                + 1024
-            )
-            output_bound = min(TOKEN_LIMITS.get(stage, 1200), self.settings.azure_max_output_tokens)
+            input_bound = estimate_request_tokens(
+                {"messages": messages, "response_format": response_format}
+            ) + 256
 
             def request(input_bound: int = input_bound, output_bound: int = output_bound) -> Any:
                 reservation = self.usage_guard.reserve("reasoning", input_bound, output_bound)
@@ -238,6 +314,7 @@ class AzureOpenAIProvider:
                     self.usage_guard.finish(reservation, getattr(response, "usage", None))
 
             try:
+                started = time.monotonic()
                 response = await asyncio.wait_for(
                     asyncio.to_thread(request),
                     timeout=self.settings.model_timeout_sec,
@@ -263,8 +340,28 @@ class AzureOpenAIProvider:
                 raise LLMError(str(exc)) from None
             except Exception as exc:  # noqa: BLE001 - sanitized provider boundary
                 code = azure_error_code(exc)
+                category, action, recoverable, request_id = azure_failure(exc)
+                await model_event(
+                    kind="llm_error",
+                    status="failed",
+                    provider="azure_openai",
+                    stage=stage,
+                    category=category,
+                    request_id=request_id,
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                    summary=f"Azure OpenAI {category.replace('_', ' ')}: {action}",
+                )
+                if category == "context_length" and attempt + 1 < attempts:
+                    packed, report = bounded_context(packed, max(128, input_bound // 2))
+                    messages, response_format = structured_request(
+                        self.settings, stage, packed, schema
+                    )
+                    continue
                 raise LLMError(
-                    f"Azure OpenAI request failed or returned no message [{code}]"
+                    f"Azure OpenAI request failed [{category}]: {action} [{code}]",
+                    category=category,
+                    recoverable=recoverable,
+                    request_id=request_id,
                 ) from None
             try:
                 return schema.model_validate_json(content)
@@ -282,7 +379,9 @@ class AzureOpenAIProvider:
                     )
                     continue
                 raise LLMError(
-                    "Azure OpenAI returned invalid structured " + schema.__name__
+                    "Azure OpenAI returned invalid structured " + schema.__name__,
+                    category="structured_output",
+                    recoverable=True,
                 ) from None
         raise LLMError("Azure OpenAI structured validation failed")
 

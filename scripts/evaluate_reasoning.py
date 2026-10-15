@@ -41,9 +41,8 @@ SCENARIOS = [
     ),
     (
         "vpn",
-        "VPN authentication failure",
-        "The VPN client reports authentication failed. Other internet access works. "
-        "I do not yet have the VPN server logs or an exact error code.",
+        "Terse VPN failure requiring clarification",
+        "my vpn isnt working",
     ),
     (
         "printer",
@@ -98,7 +97,55 @@ SCENARIOS = [
         "an application, symptoms, scope or error message. "
         "There is no matching knowledge supplied.",
     ),
+    (
+        "ambiguous_fix",
+        "Ambiguous request requiring one focused clarification",
+        "fix it pls",
+    ),
+    (
+        "factual_dns",
+        "Straightforward factual question where web research is unnecessary",
+        "What does a DNS cache do on a laptop?",
+    ),
+    (
+        "current_vendor_support",
+        "Current vendor-support question where public research is essential",
+        "Which currently supported Windows versions can run the newest public WireGuard client?",
+    ),
+    (
+        "multi_source_security",
+        "Complex security question requiring multiple authoritative sources",
+        "Compare current CISA and Microsoft guidance for responding to a stolen MFA device.",
+    ),
+    (
+        "misspelled_wifi",
+        "Misspelled incomplete troubleshooting request",
+        "wirless keeps disconecting after slep",
+    ),
+    (
+        "unavailable_fact",
+        "Question where reliable public information may be unavailable",
+        "What caused the private outage at an unnamed company ten minutes ago?",
+    ),
+    (
+        "incorrect_premise",
+        "Question requiring the assistant to challenge an incorrect premise",
+        "Since DNS always encrypts website traffic, why did HTTPS fail?",
+    ),
 ]
+
+EVALUATION_METRICS = {
+    "understanding": "The objective and request type are represented accurately.",
+    "clarification": "A focused question is asked only when a material fact is missing.",
+    "tool_selection": "Only a relevant, authorized MCP capability is selected.",
+    "search_quality": "Public queries target a specific evidence gap.",
+    "evidence_quality": "Fetched primary or authoritative content is preferred and inspected.",
+    "reasoning_quality": "Conclusions follow from cited evidence and distinguish inference.",
+    "citation_accuracy": "Every reported source comes from collected provenance.",
+    "efficiency": "Configured model, tool, iteration and time budgets are respected.",
+    "resilience": "Partial provider or source failures preserve a useful result.",
+    "explainability": "The activity stream records actual decisions and outcomes.",
+}
 
 
 def write_private(path: Path, report: dict) -> None:
@@ -218,6 +265,18 @@ def summarize(scenario, provider, state, activity, calls, elapsed, settings):
             if scenario_id == "conflicting_guidance"
             else []
         ),
+        "metric_scores": {
+            "understanding": bool(state.get("intent") or state.get("analysis")),
+            "clarification": bool(question) if status == "needs_input" else None,
+            "tool_selection": bool(calls),
+            "search_quality": any(call.get("tool") == "search_web" for call in calls) or None,
+            "evidence_quality": bool(diagnostic) or None,
+            "reasoning_quality": not unsupported if unsupported is not None else None,
+            "citation_accuracy": not unsupported if unsupported is not None else None,
+            "efficiency": state.get("research_iteration", 0) <= settings.max_investigation_cycles,
+            "resilience": status != "error",
+            "explainability": bool(stages),
+        },
     }
 
 
@@ -259,6 +318,7 @@ async def evaluate(
         "private_connected_graph_read": False,
         "azure_financial_history_preserved": True,
         "scenarios": [],
+        "scoring_criteria": EVALUATION_METRICS,
     }
     router = SelectableReasoningProvider(settings)
     if "azure_openai" in providers:

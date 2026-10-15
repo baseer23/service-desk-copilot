@@ -1,7 +1,7 @@
 import { type FormEvent, useEffect, useRef, useState } from 'react'
 import { ProviderSelector } from './ProviderSelector'
 import InvestigationActivity from './InvestigationActivity'
-import { streamInvestigation, type ActivityEvent } from './investigationStream'
+import { mergeActivity, streamInvestigation, type ActivityEvent } from './investigationStream'
 import VoiceSupport from './VoiceSupport'
 import KnowledgePanel from './KnowledgePanel'
 import InvestigationHistory from './InvestigationHistory'
@@ -98,10 +98,10 @@ export default function App(): JSX.Element {
     investigation.current = controller
     setActivity([])
     try {
-      return await streamInvestigation<T>(path, body, event => setActivity(current => [...current, event]), controller.signal)
+      return await streamInvestigation<T>(path, body, event => setActivity(current => mergeActivity(current, event)), controller.signal)
     } catch (error) {
       if (controller.signal.aborted) {
-        setActivity(current => [...current, { sequence: (current[current.length - 1]?.sequence ?? 0) + 1, kind: 'workflow', stage: 'cancelled', status: 'cancelled', summary: 'Investigation cancelled. Saved work is preserved.' }])
+        setActivity(current => mergeActivity(current, { sequence: (current[current.length - 1]?.sequence ?? 0) + 1, kind: 'workflow', stage: 'cancelled', status: 'cancelled', summary: 'Investigation cancelled. Saved work is preserved.' }))
         throw new Error('Investigation cancelled. Saved work is preserved.')
       }
       throw error

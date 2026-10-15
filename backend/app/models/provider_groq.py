@@ -1,8 +1,6 @@
 """LangChain Groq reasoning with a shared queue and no provider fallback."""
 
 import asyncio
-import json
-import math
 import os
 import random
 import sqlite3
@@ -15,6 +13,7 @@ from pydantic import BaseModel, ValidationError
 
 from backend.app.core.config import Settings
 
+from .context_budget import bounded_context, estimate_request_tokens, model_context_window
 from .groq_limiter import GroqRateLimiter
 from .provider import LLMError
 from .provider_azure_openai import TOKEN_LIMITS, structured_request
@@ -135,14 +134,46 @@ class GroqProvider:
     async def generate_structured(self, stage: str, context: dict, schema: type[T]) -> T:
         # JSON mode works with free-form MCP argument maps, unlike strict schemas.
         config = self.settings.model_copy(update={"azure_structured_outputs": False})
-        messages, response_format = structured_request(config, stage, context, schema)
         output_bound = min(TOKEN_LIMITS.get(stage, 1200), self.settings.groq_max_output_tokens)
-        estimated_tokens = (
-            math.ceil(len(json.dumps(messages, ensure_ascii=False).encode()) / 3)
-            + output_bound
-            + 128
-        )
-        for attempt in range(self.settings.groq_max_retries + 1):
+        window = model_context_window(self.settings)
+
+        def prepare(source: dict, fraction: float = 1.0):
+            # Reserve output, protocol overhead, instructions and schema. The
+            # packed context is a transient view; persisted evidence is untouched.
+            context_budget = max(256, int((window - output_bound - 1536) * fraction))
+            packed, report = bounded_context(source, context_budget)
+            messages, response_format = structured_request(config, stage, packed, schema)
+            estimated = estimate_request_tokens(
+                {"messages": messages, "response_format": response_format}
+            ) + output_bound + 128
+            if estimated > window:
+                packed, report = bounded_context(packed, max(128, context_budget // 2))
+                messages, response_format = structured_request(config, stage, packed, schema)
+                estimated = estimate_request_tokens(
+                    {"messages": messages, "response_format": response_format}
+                ) + output_bound + 128
+            if estimated > window:
+                raise LLMError(
+                    "Groq request cannot fit the configured model context window",
+                    category="context_length",
+                )
+            return packed, report, messages, response_format, estimated
+
+        packed, report, messages, response_format, estimated_tokens = prepare(context)
+        if report.compacted:
+            await model_event(
+                kind="context_compaction",
+                status="completed",
+                provider="groq",
+                stage=stage,
+                summary="Model context compacted while retaining source references",
+                original_tokens=report.original_tokens,
+                final_tokens=report.final_tokens,
+            )
+        rate_attempt = 0
+        overflow_attempt = 0
+        validation_attempt = 0
+        while True:
             async with self.limiter.slot(estimated_tokens, stage) as reservation:
                 started = time.monotonic()
                 try:
@@ -172,7 +203,7 @@ class GroqProvider:
                         await self.limiter.observe(
                             headers,
                             retry=True,
-                            fallback_delay=(2**attempt) + random.SystemRandom().uniform(0, 0.5),
+                            fallback_delay=(2**rate_attempt) + random.SystemRandom().uniform(0, 0.5),
                         )
                         await asyncio.to_thread(
                             self._record_usage,
@@ -181,7 +212,8 @@ class GroqProvider:
                             time.monotonic() - started,
                             "rate_limited",
                         )
-                        if attempt < self.settings.groq_max_retries:
+                        if rate_attempt < self.settings.groq_max_retries:
+                            rate_attempt += 1
                             continue
                         await model_event(
                             kind="llm_capacity",
@@ -191,8 +223,38 @@ class GroqProvider:
                             summary="Groq is rate limited; retry after the reset",
                         )
                         raise LLMError(
-                            "Groq is rate limited; wait for capacity and try again"
+                            "Groq is rate limited; wait for capacity and try again",
+                            category="capacity",
+                            recoverable=True,
                         ) from None
+                    body = getattr(exc, "body", None)
+                    detail = body.get("error", body) if isinstance(body, dict) else {}
+                    error_code = detail.get("code") if isinstance(detail, dict) else None
+                    if (
+                        status == 400
+                        and error_code in {"context_length_exceeded", "context_window_exceeded"}
+                        and overflow_attempt == 0
+                    ):
+                        overflow_attempt += 1
+                        packed, report, messages, response_format, estimated_tokens = prepare(
+                            packed, 0.45
+                        )
+                        await asyncio.to_thread(
+                            self._record_usage,
+                            stage,
+                            None,
+                            time.monotonic() - started,
+                            "context_recovery",
+                        )
+                        await model_event(
+                            kind="context_compaction",
+                            status="completed",
+                            provider="groq",
+                            stage=stage,
+                            summary="Groq rejected the context; retrying once with a smaller evidence view",
+                            final_tokens=report.final_tokens,
+                        )
+                        continue
                     await asyncio.to_thread(
                         self._record_usage, stage, None, time.monotonic() - started, "failed"
                     )
@@ -215,7 +277,9 @@ class GroqProvider:
                         )
                     )
                     raise LLMError(
-                        f"Groq request failed [{code}]; no other model was used"
+                        f"Groq request failed [{code}]; no other model was used",
+                        category=code,
+                        recoverable=status in {498, 502, 503},
                     ) from None
                 usage = getattr(response, "usage_metadata", None)
                 if usage is None:
@@ -254,7 +318,31 @@ class GroqProvider:
                 try:
                     value = schema.model_validate_json(response.content)
                 except (ValidationError, ValueError, TypeError):
-                    raise LLMError("Groq returned invalid structured " + schema.__name__) from None
+                    if validation_attempt == 0:
+                        validation_attempt += 1
+                        packed = {
+                            **packed,
+                            "response_correction": (
+                                "The prior response was not valid JSON for the required schema. "
+                                "Return one complete JSON object and no prose."
+                            ),
+                        }
+                        packed, report, messages, response_format, estimated_tokens = prepare(
+                            packed, 0.75
+                        )
+                        await model_event(
+                            kind="structured_recovery",
+                            status="running",
+                            provider="groq",
+                            stage=stage,
+                            summary="Retrying one malformed model response with a smaller request",
+                        )
+                        continue
+                    raise LLMError(
+                        "Groq returned invalid structured " + schema.__name__,
+                        category="structured_output",
+                        recoverable=True,
+                    ) from None
                 await model_event(
                     kind="llm_capacity",
                     status="completed",
@@ -263,7 +351,6 @@ class GroqProvider:
                     summary="Groq request completed",
                 )
                 return value
-        raise LLMError("Groq capacity is unavailable")
 
     async def aclose(self):
         if self.http_client:

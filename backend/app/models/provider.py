@@ -10,4 +10,17 @@ class CaseReasoningProvider(Protocol):
 
 
 class LLMError(RuntimeError):
-    """Generation or structured validation failed; never silently use a stub."""
+    """Sanitized generation failure with machine-readable recovery semantics."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: str = "unavailable",
+        recoverable: bool = False,
+        request_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.category = category
+        self.recoverable = recoverable
+        self.request_id = request_id

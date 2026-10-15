@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 
-from scripts.evaluate_reasoning import SCENARIOS, summarize, write_private
+from scripts.evaluate_reasoning import EVALUATION_METRICS, SCENARIOS, summarize, write_private
 
 
 def test_report_does_not_claim_unexecuted_verifier_or_known_root_cause(settings):
@@ -84,6 +84,12 @@ def test_private_report_permissions_and_explicit_live_opt_in(tmp_path):
     assert json.loads(output.read_text()) == {"real_inference": False}
 
 
-def test_all_ten_requested_scenarios_are_present():
-    assert len(SCENARIOS) == 10
-    assert len({row[0] for row in SCENARIOS}) == 10
+def test_at_least_fifteen_diverse_scenarios_and_explicit_metrics_are_present():
+    assert len(SCENARIOS) >= 15
+    assert len({row[0] for row in SCENARIOS}) == len(SCENARIOS)
+    assert any(row[2] == "my vpn isnt working" for row in SCENARIOS)
+    assert set(EVALUATION_METRICS) == {
+        "understanding", "clarification", "tool_selection", "search_quality",
+        "evidence_quality", "reasoning_quality", "citation_accuracy", "efficiency",
+        "resilience", "explainability",
+    }

@@ -658,6 +658,9 @@ h1, h2, h3 { font-family: inherit; }
 .chat .human-input > h2, .chat .human-input > .eyebrow { display: none; }
 .investigation-activity summary, .assessment > summary { cursor: pointer; font-size: 13px; color: #506c5a; font-weight: 600; }
 .investigation-activity[open] summary, .assessment[open] > summary { margin-bottom: 22px; }
+.investigation-activity .activity-detail { margin: 6px 0 0; color: #52685a; font-size: 12px; }
+.investigation-activity .activity-detail, .investigation-activity .activity-sources { padding-left: 18px; }
+.investigation-activity .activity-sources { margin: 6px 0 0; font-size: 12px; }
 .history-card { background: white; border: 1px solid #e0e7e2; border-radius: 16px; padding: 24px; }
 .history-filters { display: grid; grid-template-columns: 1fr 140px 160px; gap: 12px; margin-bottom: 20px; }
 .history-filters label { margin-top: 0; }

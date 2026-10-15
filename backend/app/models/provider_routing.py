@@ -11,13 +11,15 @@ from backend.app.core.config import Settings
 from .provider import LLMError
 
 _selection: ContextVar[str | None] = ContextVar("deskmate_model_provider", default=None)
+_route: ContextVar[dict[str, Any] | None] = ContextVar("deskmate_model_route", default=None)
 _events: ContextVar[Callable[[dict], Any] | None] = ContextVar(
     "deskmate_model_events", default=None
 )
 
 
 def selected_provider(settings: Settings) -> str:
-    return _selection.get() or settings.generation_provider
+    route = _route.get()
+    return (route or {}).get("active") or _selection.get() or settings.generation_provider
 
 
 @contextmanager
@@ -27,10 +29,14 @@ def provider_scope(
     if selection is not None and selection not in {"groq", "azure_openai", "stub"}:
         raise LLMError("Choose Groq or Azure OpenAI")
     token = _selection.set(selection)
+    route_token = _route.set(
+        {"selected": selection, "active": selection, "fallback_attempted": False}
+    )
     event_token = _events.set(event_sink)
     try:
         yield
     finally:
+        _route.reset(route_token)
         _events.reset(event_token)
         _selection.reset(token)
 
@@ -86,6 +92,15 @@ class SelectableReasoningProvider:
             )
         return self._providers[name]
 
+    def _provider(self, name: str):
+        if name not in self._providers:
+            from .provider_factory import get_provider
+
+            self._providers[name] = get_provider(
+                self.settings.model_copy(update={"generation_provider": name})
+            )
+        return self._providers[name]
+
     async def generate_structured(self, stage, context, schema):
         return await self.as_runnable().ainvoke(
             {"stage": stage, "context": context, "schema": schema}
@@ -95,9 +110,40 @@ class SelectableReasoningProvider:
         from langchain_core.runnables import RunnableLambda
 
         async def invoke(request):
-            return await self._current().generate_structured(
-                request["stage"], request["context"], request["schema"]
-            )
+            route = _route.get()
+            active = selected_provider(self.settings)
+            try:
+                return await self._provider(active).generate_structured(
+                    request["stage"], request["context"], request["schema"]
+                )
+            except LLMError as error:
+                azure_ready = bool(
+                    self.settings.azure_foundry_endpoint and self.settings.azure_model_deployment
+                )
+                can_fallback = bool(
+                    self.settings.provider_fallback_enabled
+                    and active == "groq"
+                    and error.recoverable
+                    and route is not None
+                    and not route["fallback_attempted"]
+                    and azure_ready
+                )
+                if not can_fallback:
+                    raise
+                route["fallback_attempted"] = True
+                route["active"] = "azure_openai"
+                await model_event(
+                    kind="provider_fallback",
+                    status="running",
+                    provider="azure_openai",
+                    previous_provider="groq",
+                    stage=request["stage"],
+                    category=error.category,
+                    summary="Groq recovery was exhausted; trying the configured Azure fallback",
+                )
+                return await self._provider("azure_openai").generate_structured(
+                    request["stage"], request["context"], request["schema"]
+                )
 
         return RunnableLambda(invoke, name="DeskMate structured reasoning")
 

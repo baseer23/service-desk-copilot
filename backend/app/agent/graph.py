@@ -3,6 +3,7 @@
 import asyncio
 from datetime import datetime, timezone
 from hashlib import sha256
+from urllib.parse import urlsplit
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
@@ -178,15 +179,22 @@ class ServiceDeskAgent:
             and not permits(arguments["url"], self.settings)
         ):
             raise MCPToolError("Public source excluded by configured policy")
-        summary = "Searching local knowledge" if name == "search_knowledge" else "Querying knowledge relationships" if name == "search_graph" else "Reading connected tool evidence"
-        await emit("tool:" + name, "running", summary, tool=name)
+        summary = "Searching local knowledge" if name == "search_knowledge" else "Querying knowledge relationships" if name == "search_graph" else "Searching the public web" if name == "search_web" else "Reading a public source" if name == "fetch_web_page" else "Reading connected tool evidence"
+        details = {"tool": name}
+        if name == "search_web":
+            details["query"] = str(arguments.get("query", ""))[:500]
+        elif name == "fetch_web_page":
+            details["source_host"] = urlsplit(str(arguments.get("url", ""))).hostname or "public source"
+        await emit("tool:" + name, "running", summary, **details)
         try:
             result = await self.harness.invoke(name, arguments)
         except BaseException:
             await emit("tool:" + name, "failed", summary, tool=name)
             raise
-        await emit("tool:" + name, "completed", summary, tool=name,
-                   result_count=len(result.get("items", [])) if isinstance(result, dict) else 0)
+        result_items = result.get("items", []) if isinstance(result, dict) else result
+        result_count = len(result_items) if isinstance(result_items, list) else 0
+        await emit("tool:" + name, "completed", summary, **details,
+                   result_count=result_count)
         if name == "fetch_web_page" and isinstance(result, dict):
             page = result.get("result") or result
             if not permits(page.get("url", arguments.get("url", "")), self.settings):
@@ -439,6 +447,13 @@ class ServiceDeskAgent:
         await self.note(
             state, "classify_intent", f"Request classified: {intent.workflow}", self.provider.name()
         )
+        await emit(
+            "understanding_summary",
+            "completed",
+            f"Understood objective: {intent.goal[:240]}",
+            rationale=intent.justification[:500],
+            workflow=intent.workflow,
+        )
         return {
             "intent": intent.model_dump(), "workflow": intent.workflow,
             "chat_messages": (
@@ -603,6 +618,16 @@ class ServiceDeskAgent:
             f"Plan: {plan.goal}. " + "; ".join(c.name + ": " + c.reason for c in plan.tool_calls),
             self.provider.name(),
         )
+        await emit(
+            "research_plan",
+            "completed",
+            f"Research plan: {plan.goal[:240]}",
+            rationale=plan.stop_condition[:500],
+            actions=[
+                {"tool": call.name, "reason": call.reason[:300]}
+                for call in plan.tool_calls
+            ],
+        )
         return {"plan": plan.model_dump(), "plan_executed": False, "tools_discovered": True}
 
     async def execute_tools(self, state):
@@ -673,6 +698,16 @@ class ServiceDeskAgent:
                 "reliability": 0.6,
             }
         rows = result["items"]
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            rows = [{"error": "Capability returned a malformed result"}]
+            result = {
+                **result,
+                "items": rows,
+                "source_system": "tool_error",
+                "status": "error",
+                "reliability": 0,
+                "timestamp": result.get("timestamp", now()),
+            }
         unavailable = result.get("status") == "unavailable"
         if result.get("status") == "error":
             rows = [{"error": result.get("error")}]
@@ -759,6 +794,20 @@ class ServiceDeskAgent:
             "observe",
             f"Evidence correlated: {len(evidence)} items; {len(contradictions)} contradictions",
         )
+        public_sources = [
+            {
+                "title": str(item["content"].get("title") or item["source"])[:200],
+                "url": item.get("url"),
+            }
+            for item in evidence
+            if item.get("url") and item["source_type"] == "public_documentation"
+        ][-6:]
+        await emit(
+            "evidence_collected",
+            "completed",
+            f"Evidence collected: {len(evidence)} items; {len(contradictions)} contradictions",
+            sources=public_sources,
+        )
         return {"evidence": evidence, "contradictions": contradictions, "tool_results": []}
 
     async def reason(self, state):
@@ -769,6 +818,39 @@ class ServiceDeskAgent:
             # to judge. Application validation takes priority during revision.
             context.pop("verification", None)
         decision = await self.provider.generate_structured("reason", context, InvestigationDecision)
+        summary = state["ticket"]["summary"].casefold()
+        terse_diagnostic_request = (
+            len(summary.split()) <= 8
+            and (
+                len(summary.split()) <= 3
+                or any(word in summary for word in ("vpn", "wifi", "wireless", "wirless"))
+            )
+        )
+        if (
+            state["workflow"] == "service_desk"
+            and not self.usable_evidence(state)
+            and terse_diagnostic_request
+        ):
+            # An underspecified incident cannot be diagnosed by broad web
+            # searching. Ask for one discriminating observation first.
+            if "vpn" in summary:
+                question = "What exact error message or code appears when the VPN connection fails?"
+                field = "vpn_error_message"
+            elif any(word in summary for word in ("wifi", "wireless", "wirless")):
+                question = "What exact message appears when the wireless connection drops or reconnects?"
+                field = "wireless_error_message"
+            else:
+                question = "Which application or service is affected, and what exact error or symptom do you see?"
+                field = "affected_service_and_symptom"
+            decision.question_for_human = question
+            decision.human_field = field
+            decision.question_reason = (
+                "This observation materially narrows the next safe diagnostic step."
+            )
+            decision.needs_web_research = False
+            decision.research_queries = []
+            decision.enough_information = False
+            decision.confidence = 0
         self._validate_evidence_refs(
             state, [i for h in decision.hypotheses for i in h.evidence_ids]
         )
@@ -808,6 +890,14 @@ class ServiceDeskAgent:
             "reason",
             decision.decision_justification or decision.evidence_summary,
             self.provider.name(),
+        )
+        await emit(
+            "evidence_evaluation",
+            "completed",
+            "Evidence evaluated; deciding whether more information is needed",
+            rationale=(decision.decision_justification or decision.evidence_summary)[:600],
+            research_queries=decision.research_queries,
+            missing_information=[item.description for item in decision.missing_information[:4]],
         )
         return {
             "decision": decision.model_dump(),
@@ -949,6 +1039,14 @@ class ServiceDeskAgent:
             await self.note(state, name, "Public research capability unavailable", "tool_error")
 
         for query in queries[:2]:
+            await emit(
+                "research_query",
+                "running",
+                "Searching the web for a specific evidence gap",
+                query=query[:500],
+                rationale=(decision.get("decision_justification") or decision.get("evidence_summary", ""))[:500],
+                event_id=f"research:{state.get('research_rounds', 0)}:{sha256(query.encode()).hexdigest()[:12]}",
+            )
             try:
                 search = await self._call(state, "search_web", {"query": query, "max_results": 3})
             except MCPToolError as exc:
@@ -960,6 +1058,9 @@ class ServiceDeskAgent:
                 if isinstance(search, dict) and "items" in search
                 else search
             )
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                await failed("search_web", MCPToolError("Public search returned malformed results"))
+                continue
             rows = rank_sources(rows, self.settings)
             selection = await self.provider.generate_structured(
                 "evaluate_sources",
@@ -1019,27 +1120,15 @@ class ServiceDeskAgent:
                     )
                     if not useful.selected_urls or not useful.directly_relevant:
                         continue
-                    # Public material stays untrusted, with URL/document provenance.
-                    capability_name = "ingest_text"
-                    await self._call(
-                        state,
-                        "ingest_text",
-                        {
-                            "text": text,
-                            "title": page.get("title"),
-                            "source": page["url"],
-                            "source_type": "web",
-                            "url": page["url"],
-                        },
+                    await emit(
+                        "source_verified",
+                        "completed",
+                        f"Relevant source collected: {str(page.get('title') or urlsplit(page['url']).hostname)[:220]}",
+                        rationale=useful.justification[:500],
+                        sources=[{"title": str(page.get("title") or page["url"])[:200], "url": page["url"]}],
                     )
-                except MCPToolError as exc:
+                except (MCPToolError, ValueError) as exc:
                     await failed(capability_name, exc)
-        knowledge = await self._call(
-            state,
-            "search_knowledge",
-            {"question": state["ticket"]["summary"], "mode": "HYBRID", "top_k": 6},
-        )
-        outputs.append({"name": "search_knowledge", "output": knowledge})
         return {"tool_results": outputs, "research_rounds": state.get("research_rounds", 0) + 1}
 
     def _validate_evidence_refs(self, state, ids):
@@ -1089,6 +1178,14 @@ class ServiceDeskAgent:
             verification.confidence = 0
             verification.unsupported_claims.append("No supporting evidence is available.")
         await self.note(state, "verify", verification.justification, self.provider.name())
+        await emit(
+            "verification_summary",
+            "completed",
+            "Answer candidate verified against collected evidence",
+            rationale=verification.justification[:600],
+            supported_count=len(verification.supported_claims),
+            unsupported_count=len(verification.unsupported_claims),
+        )
         result = {
             "verification": verification.model_dump(),
             "confidence": min(state.get("confidence", 0), verification.confidence),
@@ -1225,6 +1322,15 @@ class ServiceDeskAgent:
             "Assessment ready"
             if supported
             else "Insufficient information; explicit uncertainty retained",
+        )
+        await emit(
+            "final_assessment",
+            "completed",
+            "Final assessment is supported by verified evidence"
+            if supported
+            else "Final assessment retains unresolved evidence gaps",
+            confidence=confidence,
+            source_count=len(response.sources),
         )
         return {
             "status": "assessment_ready" if supported else "insufficient_information",

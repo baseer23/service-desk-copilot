@@ -4,6 +4,7 @@ Use the [repository README](../README.md) for setup and [current architecture](A
 
 - [Continuous Azure Speech-to-Text](SPEECH.md)
 - [Reasoning evaluation results](REASONING_EVALUATION.md)
+- [Reasoning and research reliability](RELIABILITY.md)
 - [Local retrieval and optional graph](RAG.md)
 
 Other review documents retain historical migration and acceptance evidence. Their archived configurations are superseded; they must not be used to recreate retired persistence or realtime audio-model resources.

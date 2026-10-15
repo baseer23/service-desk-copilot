@@ -302,11 +302,17 @@ async def test_ambiguous_failure_never_retries_or_uses_another_provider(settings
 @pytest.mark.asyncio
 async def test_invalid_structured_response_cannot_dispatch_tools(settings):
     provider = GroqProvider(
-        configured(settings), chat=Chat([{"untrusted": "call destructive tool"}])
+        configured(settings),
+        chat=Chat(
+            [
+                {"untrusted": "call destructive tool"},
+                {"untrusted": "call destructive tool again"},
+            ]
+        ),
     )
     with pytest.raises(LLMError, match="invalid structured GeneralAnswer"):
         await provider.generate_structured("reason", {}, GeneralAnswer)
-    assert len(provider.chat.calls) == 1
+    assert len(provider.chat.calls) == 2
 
 
 def test_factory_keeps_test_stub_exclusive_to_test_mode(settings):

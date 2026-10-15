@@ -57,3 +57,9 @@ The first conflicting-KB run incorrectly used general chat and skipped retrieval
 The final ten runs used **94,592 reported tokens** and **670.622 seconds** in aggregate. Provider capacity waits account for much of the duration. Groq pricing is unconfigured, so the API-cost estimate is unknown, not assumed zero. Initial failed requests and the initial incorrect routing run are excluded from these final-run totals and retained in private reports.
 
 A tiny Azure OpenAI structured-text connectivity probe passed with Entra authentication. The full Azure investigation matrix was **not run**, because the unchanged CAD155 allowance has only a few cents remaining. No ledger reset or allowance increase was performed. Aura remains disabled at the user's request because the saved hostname no longer resolves. No physical microphone acceptance is claimed.
+
+## Reliability-overhaul evaluation additions
+
+The opt-in evaluator now contains seventeen prompts and explicit scores for understanding, clarification, tool selection, search quality, evidence quality, reasoning quality, citation accuracy, efficiency, resilience and explainability. The new set includes the exact `my vpn isnt working` regression, ambiguous and misspelled requests, a simple factual question, current and multi-source public-research questions, unavailable private facts and an incorrect premise.
+
+The deterministic regression verifies that `my vpn isnt working` produces one material clarification with zero diagnostic confidence instead of broad web searching or a generic failure. Public-web integration tests run through the actual MCP stdio protocol with deterministic network adapters; fetched evidence remains request-scoped and source failures remain explicit. These tests do not claim live internet or model inference.

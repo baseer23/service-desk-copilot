@@ -12,6 +12,7 @@ from backend.app.services.web import (
 )
 from backend.app.mcp import server
 from backend.app.agent.models import InvestigationDecision
+from backend.app.services.source_policy import rank_sources
 
 
 def test_documentation_table_cells_are_preserved_without_duplicate_paragraphs():
@@ -33,6 +34,19 @@ def test_bounded_source_review_keeps_error_definition_deep_in_long_page():
     assert len(excerpt) <= 1600
     assert "TEST53003: Policy blocked token issuance." in excerpt
     assert "Documentation preface." in excerpt
+
+
+def test_source_ranking_deduplicates_urls_and_prefers_authoritative_sources(settings):
+    rows = rank_sources(
+        [
+            {"url": "https://blog.example/vpn", "title": "Blog"},
+            {"url": "https://learn.microsoft.com/vpn", "title": "Microsoft"},
+            {"url": "https://learn.microsoft.com/vpn#section", "title": "Duplicate"},
+            {"url": "https://blog.example/vpn", "title": "Duplicate blog"},
+        ],
+        settings,
+    )
+    assert [row["title"] for row in rows] == ["Microsoft", "Blog"]
 
 
 @pytest.mark.parametrize(
@@ -129,7 +143,7 @@ async def test_search_and_fetch_server_units(monkeypatch):
     assert (await server.fetch_web_page("https://example.com")).result["text"] == "Body"
 
 
-def test_empty_local_knowledge_research_ingests_and_retrieves(make_client):
+def test_empty_local_knowledge_research_keeps_public_evidence_ephemeral(make_client):
     c = make_client()
     harness = c.app.state.agent.harness
     original = harness.invoke
@@ -155,13 +169,29 @@ def test_empty_local_knowledge_research_ingests_and_retrieves(make_client):
     assert result.status_code == 200
     body = result.json()
     assert any(e["tool"] == "fetch_web_page" for e in body["evidence"])
-    assert any(
-        e["tool"] == "search_knowledge" and e["content"]["metadata"]["source_type"] == "web"
-        for e in body["evidence"]
-    )
     context = c.portal.call(harness.invoke, "list_available_context", {})
-    assert context["result"]["knowledge_chunks"] > 0
-    assert any(e["tool"] == "ingest_text" for e in c.get(f"/cases/{cid}/events").json())
+    assert context["result"]["knowledge_chunks"] == 0
+    assert not any(e["tool"] == "ingest_text" for e in c.get(f"/cases/{cid}/events").json())
+
+
+def test_malformed_mcp_search_result_becomes_error_evidence_instead_of_crashing(make_client):
+    c = make_client()
+    harness = c.app.state.agent.harness
+    original = harness.invoke
+
+    async def malformed(name, arguments):
+        if name == "search_web":
+            return {"items": "not-a-list", "source_system": "public_web"}
+        return await original(name, arguments)
+
+    harness.invoke = malformed
+    cid = c.post("/cases", json={"summary": "A fictional client fails with an unknown code."}).json()["case_id"]
+    response = c.post(f"/cases/{cid}/investigate")
+    assert response.status_code == 200
+    assert any(
+        row["tool"] == "search_web" and row["source_type"] == "tool_error"
+        for row in response.json()["evidence"]
+    )
 
 
 def test_loop_limit_finalizes_without_recursion_failure(make_client):

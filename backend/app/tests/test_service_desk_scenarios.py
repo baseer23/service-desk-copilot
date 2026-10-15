@@ -116,7 +116,7 @@ class ScenarioProvider:
             public = [
                 e
                 for e in diagnostic
-                if e["tool"] == "search_knowledge"
+                if e["tool"] == "fetch_web_page"
                 and e["source_type"] == "public_documentation"
                 and "AADSTS53003" in str(e["content"])
             ]
@@ -396,16 +396,16 @@ def test_service_desk_scenario(scenario, tmp_path, monkeypatch):
                 calls.index("search_knowledge")
                 < calls.index("search_web")
                 < calls.index("fetch_web_page")
-                < calls.index("ingest_text")
             )
-            assert calls.count("search_knowledge") >= 2
+            assert "ingest_text" not in calls
+            assert calls.count("search_knowledge") >= 1
             public = [
                 e
                 for e in result["evidence"]
-                if e["tool"] == "search_knowledge" and e["source_type"] == "public_documentation"
+                if e["tool"] == "fetch_web_page" and e["source_type"] == "public_documentation"
             ]
             assert any(
-                e["url"] == MICROSOFT_URL and e["doc_id"] and "AADSTS53003" in e["content"]["text"]
+                e["url"] == MICROSOFT_URL and "AADSTS53003" in e["content"]["text"]
                 for e in public
             )
             assert MICROSOFT_URL in result["final_response"]["sources"]
@@ -584,7 +584,6 @@ def test_versatility_matrix():
         "search_knowledge",
         "search_web",
         "fetch_web_page",
-        "ingest_text",
         "remember_fact",
         "search_memory",
     } <= set(tools)
