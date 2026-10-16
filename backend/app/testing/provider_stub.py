@@ -24,6 +24,15 @@ class StubProvider:
                     "justification": "Explicit test intent fixture",
                 }
             )
+        if stage == "email_correction":
+            return schema.model_validate(
+                {
+                    "operation": "clarify",
+                    "clarification": "Please say exactly which characters to change.",
+                }
+            )
+        if stage == "general_chat":
+            return schema.model_validate({"answer": "I can help troubleshoot that. What error do you see?"})
         if stage == "analyze_ticket":
             match = re.search(r"([A-Z][a-z]+ [A-Z][a-z]+) from ([\w-]+)", text)
             user = (

@@ -116,3 +116,5 @@ Executed checks: **339 backend tests passed and two opt-in Aura tests skipped; 5
 ## Azure reasoning and local-only persistence — 2026-10-15
 
 The Azure OpenAI deployment and configuration were verified without provisioning or mutation. DeskMate removed its historic CAD155 ledger, CAD90 forecast, request reservations, emergency spending switch and cost-based blocking. Provider errors preserve safe category-specific status through FastAPI and React, while Groq behavior and request-scoped provider selection remain unchanged. Document originals, extraction artifacts, vectors, conversations, cases and checkpoints remain local; Azure receives documents only for requested AI analysis and is not an application persistence backend.
+
+The 2026-10-15 Voice repair keeps ordinary helpdesk conversation independent of MCP startup and routes `/voice-conversation` through Vite to FastAPI. One conversation identifier preserves bounded turn context, while the selected provider remains request-scoped. Real minimal Groq and Azure OpenAI turns succeeded through that browser-facing route; no provider fallback occurred.

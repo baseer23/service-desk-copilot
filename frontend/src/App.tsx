@@ -283,7 +283,7 @@ export default function App(): JSX.Element {
           <InvestigationHistory cases={cases} selected={active?.case_id} busy={busy} onOpen={openCase} allowSamples={readiness?.runtime_mode === 'isolated_demo'} />
         </section>
         <section hidden={section !== 'Knowledge'} id="knowledge-workspace" className="knowledge-workspace" aria-label="Knowledge workspace"><KnowledgePanel readiness={readiness} /></section>
-        <section hidden={section !== 'Voice'} id="voice" className="voice-workspace"><VoiceSupport onCaseCreated={openCase} readiness={readiness} /></section>
+        <section hidden={section !== 'Voice'} id="voice" className="voice-workspace">{section === 'Voice' && <VoiceSupport onCaseCreated={openCase} readiness={readiness} />}</section>
         <div hidden={!['Chat', 'Investigations'].includes(section)}><InvestigationActivity events={activity} busy={busy && investigation.current !== null} onCancel={() => investigation.current?.abort()} /></div>
         <div className="investigation-panel" hidden={!active || !['Chat', 'Investigations'].includes(section)}>
           {!active ? (

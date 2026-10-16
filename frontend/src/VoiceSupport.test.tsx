@@ -15,13 +15,16 @@ class Socket {
   onerror: (() => void) | null = null
   closed = false
   acknowledgeStop = true
+  finalOnStop = ''
   constructor(public url: string) {
     Socket.instances.push(this)
   }
   send(data: string | ArrayBuffer) {
     this.sent.push(data)
-    if (typeof data === 'string' && JSON.parse(data).type === 'stop' && this.acknowledgeStop)
+    if (typeof data === 'string' && JSON.parse(data).type === 'stop' && this.acknowledgeStop) {
+      if (this.finalOnStop) this.emit('transcript.final', { id: 'final-on-stop', text: this.finalOnStop })
       this.emit('state', { state: 'stopped' })
+    }
   }
   close() {
     this.closed = true
@@ -42,13 +45,10 @@ beforeEach(() => {
       json: async () =>
         path === '/speech/readiness'
           ? { ready: true }
+          : path === '/voice-conversation/start'
+            ? { session_id: 'voice1', response: 'Hello, welcome to Digital nGenuity support. How can I help you today?' }
           : {
-              request_id: 'request1',
-              case_id: 'case1',
-              result: {
-                status: 'assessment_ready',
-                final_answer: 'Check the verified VPN authentication result.',
-              },
+              response: 'I can help troubleshoot that. What error do you see?',
             },
     })),
   )
@@ -80,14 +80,14 @@ test('no microphone before click; continuous partial/final speech replaces parti
     ws.emit('transcript.partial', { id: '1:a', text: 'VPN' })
     ws.emit('transcript.partial', { id: '1:a', text: 'VPN fails' })
   })
-  expect(screen.getAllByTestId('voice-message')).toHaveLength(1)
+  expect(screen.getAllByTestId('voice-message')).toHaveLength(2)
   expect(screen.getByText('VPN fails')).toBeInTheDocument()
   act(() => {
     ws.emit('transcript.final', { id: '1:a', text: 'VPN fails.' })
     ws.emit('transcript.final', { id: '1:a', text: 'VPN fails.' })
     ws.emit('transcript.final', { id: '1:b', text: 'I can sign in elsewhere.' })
   })
-  expect(screen.getAllByTestId('voice-message')).toHaveLength(2)
+  expect(screen.getAllByTestId('voice-message')).toHaveLength(1)
   expect(screen.getByLabelText('Message DeskMate')).toHaveValue(
     'VPN fails. I can sign in elsewhere.',
   )
@@ -96,29 +96,28 @@ test('no microphone before click; continuous partial/final speech replaces parti
   expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled()
 })
 
-test('standalone spoken Stop is excluded; a sentence containing stop is preserved; Stop releases microphone and sends only text to common workflow', async () => {
+test('standalone spoken Stop is excluded; a sentence containing stop is preserved; Stop releases microphone and sends only text to email correction', async () => {
   render(<VoiceSupport onCaseCreated={vi.fn()} />)
   const ws = await start()
   act(() => {
     ws.emit('transcript.final', { id: '1:a', text: 'The service will stop responding.' })
     ws.emit('transcript.final', { id: '1:b', text: 'Stop.' })
   })
-  expect(screen.getByTestId('voice-status')).toHaveTextContent('Stopped')
+  expect(screen.getByTestId('voice-status')).toHaveTextContent('Processing')
   expect(screen.queryByText('Stop.')).not.toBeInTheDocument()
   expect(screen.getByLabelText('Message DeskMate')).toHaveValue('The service will stop responding.')
   expect(VoiceAudio.prototype.close).toHaveBeenCalledOnce()
   expect(ws.sent).toContain(JSON.stringify({ type: 'stop' }))
-  await userEvent.click(screen.getByRole('button', { name: 'Send message' }))
+  await screen.findByText('I can help troubleshoot that. What error do you see?')
   expect(fetch).toHaveBeenCalledWith(
-    '/ask',
+    '/voice-conversation/voice1',
     expect.objectContaining({
       body: JSON.stringify({ summary: 'The service will stop responding.' }),
     }),
   )
   expect(
-    await screen.findByText('Check the verified VPN authentication result.'),
+    await screen.findByText('I can help troubleshoot that. What error do you see?'),
   ).toBeInTheDocument()
-  expect(screen.getByRole('button', { name: 'Open investigation' })).toBeInTheDocument()
 })
 
 test('SDK reconnect state preserves accumulated transcript and keeps microphone; genuine usage includes silence', async () => {
@@ -213,10 +212,24 @@ test('Stop releases microphone immediately but the next recording waits for conf
   ws.acknowledgeStop = false
   await userEvent.click(screen.getByRole('button', { name: 'Stop session' }))
   expect(VoiceAudio.prototype.close).toHaveBeenCalledOnce()
-  expect(screen.getByTestId('voice-status')).toHaveTextContent('Stopping')
+  expect(screen.getByTestId('voice-status')).toHaveTextContent('Processing')
   expect(screen.getByRole('button', { name: 'Ready to Talk' })).toBeDisabled()
   act(() => ws.emit('state', { state: 'stopped' }))
   expect(screen.getByRole('button', { name: 'Ready to Talk' })).toBeEnabled()
+})
+
+test('a final transcript flushed by Azure during stop is submitted exactly once', async () => {
+  render(<VoiceSupport onCaseCreated={vi.fn()} />)
+  const ws = await start()
+  ws.finalOnStop = 'My printer is offline.'
+  await userEvent.click(screen.getByRole('button', { name: 'Stop session' }))
+  expect(await screen.findByText('My printer is offline.')).toBeInTheDocument()
+  expect(await screen.findByText('I can help troubleshoot that. What error do you see?')).toBeInTheDocument()
+  const calls = vi.mocked(fetch).mock.calls.filter(([path]) => path === '/voice-conversation/voice1')
+  expect(calls).toHaveLength(1)
+  expect(calls[0]?.[1]).toEqual(expect.objectContaining({
+    body: JSON.stringify({ summary: 'My printer is offline.' }),
+  }))
 })
 
 test('new microphone capture waits while the submitted transcript investigation is in flight', async () => {
@@ -226,6 +239,8 @@ test('new microphone capture waits while the submitted transcript investigation 
     vi.fn(async (path: string) =>
       path === '/speech/readiness'
         ? Response.json({ ready: true })
+        : path === '/voice-conversation/start'
+          ? Response.json({ session_id: 'voice1', response: 'Hello, welcome to Digital nGenuity support. How can I help you today?' })
         : new Promise<Response>((resolve) => {
             finish = resolve
           }),
@@ -241,9 +256,7 @@ test('new microphone capture waits while the submitted transcript investigation 
   await act(async () =>
     finish(
       Response.json({
-        request_id: 'request1',
-        case_id: null,
-        result: { status: 'assessment_ready', final_answer: 'Verified text response' },
+        response: 'Verified text response',
       }),
     ),
   )

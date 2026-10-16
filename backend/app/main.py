@@ -139,8 +139,10 @@ def create_app(settings: Settings | None = None):
                     app.state.agent = ServiceDeskAgent(s, mcp, provider, saver)
                     await app.state.agent.initialize()
                     from backend.app.voice.history import VoiceHistory
+                    from backend.app.email_correction import EmailSessions
 
                     app.state.voice = VoiceHistory(s)
+                    app.state.email_sessions = EmailSessions()
                     app.state.provider_initialized = provider is not None
                     try:
                         local = await app.state.agent.harness.invoke("get_local_storage_status", {})
@@ -437,6 +439,110 @@ def create_app(settings: Settings | None = None):
                 "Cache-Control": "private, no-store",
             },
         )
+
+    async def email_domain(name: str) -> tuple[str | None, str]:
+        """Resolve every email domain through the MCP registry, never a local guess."""
+        checked = await app.state.agent.harness.invoke("validate_company_domain", {"domain": name})
+        value = checked["result"]
+        if value.get("valid"):
+            return value["domain"], "validated"
+        resolved = await app.state.agent.harness.invoke("resolve_company_domain", {"name": name})
+        matches = resolved["result"].get("matches", [])
+        if len(matches) == 1:
+            return matches[0], "resolved"
+        return None, "ambiguous" if len(matches) > 1 else "unknown"
+
+    @app.post("/email-correction/start")
+    async def start_email_correction():
+        try:
+            # Establish the actual MCP registry connection before advertising it
+            # as ready in the Voice UI. The entries themselves stay server-side.
+            await app.state.agent.harness.invoke("list_company_domains", {})
+        except (MCPToolError, MCPConnectionError) as exc:
+            raise HTTPException(503, "Company-domain lookup is unavailable. Retry shortly.") from exc
+        session = app.state.email_sessions.create()
+        return {
+            "session_id": session.session_id,
+            "response": "Hello, welcome to Digital nGenuity support. Could I have your email address, please?",
+            "email": None,
+            "confirmed": False,
+            "provider": selected_provider(s),
+            "domain_lookup": "ready",
+        }
+
+    @app.post("/voice-conversation/start")
+    async def start_voice_conversation():
+        session = app.state.email_sessions.create()
+        return {
+            "session_id": session.session_id,
+            "response": "Hello, welcome to Digital nGenuity support. How can I help you today?",
+            "mode": "helpdesk",
+        }
+
+    @app.post("/voice-conversation/{session_id}")
+    async def voice_conversation(session_id: str, body: CaseCreateRequest):
+        from backend.app.agent.models import GeneralAnswer
+
+        session = app.state.email_sessions.get(session_id)
+        if not session:
+            raise HTTPException(404, "Voice conversation expired. Start a new conversation.")
+        try:
+            answer = await app.state.agent.provider.generate_structured(
+                "general_chat",
+                {"message": body.summary, "conversation": session.conversation[-8:]},
+                GeneralAnswer,
+            )
+        except LLMError as exc:
+            raise HTTPException(502, llm_error_detail(exc)) from exc
+        session.conversation.extend([
+            {"role": "user", "content": body.summary},
+            {"role": "assistant", "content": answer.answer},
+        ])
+        session.conversation = session.conversation[-16:]
+        return {"session_id": session.session_id, "response": answer.answer, "mode": "helpdesk"}
+
+    @app.post("/email-correction/{session_id}")
+    async def correct_email(session_id: str, body: CaseCreateRequest):
+        from backend.app.email_correction import EmailOperation, apply, deterministic_operation, speech_email
+
+        session = app.state.email_sessions.get(session_id)
+        if not session:
+            raise HTTPException(404, "Email correction session expired. Start a new conversation.")
+        message = body.summary.strip()
+        parsed = speech_email(message) if not session.email else None
+        lookup = "not_needed"
+        if parsed:
+            username, hint = parsed
+            domain, lookup = await email_domain(hint)
+            if not domain:
+                response = "I could not match that company domain. Which approved company do you mean?"
+            else:
+                session.history.append((session.username, session.domain))
+                session.username, session.domain, session.confirmed = username, domain, False
+                response = f"I have {session.email}. Is that correct?"
+        else:
+            operation = deterministic_operation(message)
+            if operation is None:
+                try:
+                    operation = await app.state.agent.provider.generate_structured(
+                        "email_correction",
+                        {"request": message, "current_email": session.email, "recent_corrections": session.recent_corrections[-6:]},
+                        EmailOperation,
+                    )
+                except LLMError as exc:
+                    raise HTTPException(502, llm_error_detail(exc)) from exc
+            domain = None
+            if operation.operation == "change_domain":
+                domain, lookup = await email_domain(operation.replacement or "")
+            response = apply(session, operation, domain)
+        return {
+            "session_id": session.session_id,
+            "response": response,
+            "email": session.email,
+            "confirmed": session.confirmed,
+            "provider": selected_provider(s),
+            "domain_lookup": lookup,
+        }
 
     @app.get("/knowledge/search")
     async def search_local_knowledge(question: str):

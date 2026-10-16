@@ -85,3 +85,7 @@ Entra credential failures, HTTP authorization/configuration/capacity errors, tim
 LangGraph now emits actual understanding, planning, MCP query/result, evaluation, follow-up and conclusion data in execution order. Provider mechanics are retained under expandable diagnostics. Follow-up events precede the persistent interrupt and resume the same case checkpoint. Supported final answers are whitespace-normalized, capped to one short line and rendered in bold; evidence and sources remain in the timeline.
 
 Executed verification is recorded with the applicable revision. The browser suite passed 18 scenarios, then exposed a checkpoint-resume stall in an attempted serialized-prefetch change; that change was reverted and the affected two-interrupt/resume scenario passed on focused rerun. Azure availability is determined by its real authentication, service and quota response.
+
+## Voice helpdesk provider check — 2026-10-15
+
+The repaired Voice path used the same conversation session for one minimal real Groq turn followed by one minimal real Azure OpenAI turn. Both providers returned relevant, context-consistent printer troubleshooting replies through the frontend proxy. The deterministic browser regression verifies greeting, stop-boundary transcript flush, exactly-once submission, rendered response and a subsequent recording turn; it does not claim physical microphone or new live Azure Speech recognition.

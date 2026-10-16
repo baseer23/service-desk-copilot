@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import re
 from datetime import datetime, timezone
 from functools import lru_cache, wraps
 from typing import Any, Literal
@@ -14,6 +15,14 @@ from mcp.server.fastmcp import Context, FastMCP
 
 server = FastMCP("deskmate")
 fixtures = FixtureRepository()
+
+# Demonstration registry only. Production deployments supply this through a
+# controlled directory integration; callers never infer domains outside MCP.
+EMAIL_DOMAIN_REGISTRY = {
+    "ngenuity.ca": ("ngenuity", "ingenuity", "n genuity"),
+    "digitalingenuity.com": ("digital ingenuity", "digitalingenuity"),
+    "mdwlaw.ca": ("mdw law", "mdw", "m d w law"),
+}
 
 
 def capability(source_system, reliability=0.9):
@@ -159,6 +168,38 @@ def documents():
     from backend.app.repositories.documents import DocumentRepository
 
     return DocumentRepository(get_settings().case_db_path)
+
+
+@capability("email_domain_registry")
+@lru_cache(maxsize=1)
+def list_company_domains():
+    """List approved demo company email domains and their spoken aliases."""
+    return [
+        {"domain": domain, "aliases": list(aliases), "demo": True}
+        for domain, aliases in EMAIL_DOMAIN_REGISTRY.items()
+    ]
+
+
+@capability("email_domain_registry")
+@lru_cache(maxsize=64)
+def resolve_company_domain(name: str):
+    """Resolve a spoken company/domain name from the approved demo registry."""
+    normalized = " ".join(name.lower().replace(".", " ").split())
+    spoken_name = re.sub(r"\s+(?:ca|com|org)$", "", normalized)
+    matches = [
+        domain
+        for domain, aliases in EMAIL_DOMAIN_REGISTRY.items()
+        if normalized == domain.replace(".", " ") or normalized in aliases or spoken_name in aliases
+    ]
+    return {"matches": matches, "ambiguous": len(matches) > 1}
+
+
+@capability("email_domain_registry")
+@lru_cache(maxsize=64)
+def validate_company_domain(domain: str):
+    """Validate an exact approved demo company domain."""
+    value = domain.lower().strip()
+    return {"domain": value, "valid": value in EMAIL_DOMAIN_REGISTRY, "demo": True}
 
 
 @capability("chroma")

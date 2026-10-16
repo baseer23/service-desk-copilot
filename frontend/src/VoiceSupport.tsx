@@ -1,7 +1,5 @@
 import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react'
 import { request } from './api'
-import { mergeActivity, type ActivityEvent, streamInvestigation } from './investigationStream'
-import InvestigationActivity from './InvestigationActivity'
 import { VoiceAudio } from './voiceAudio'
 import { type ReadinessReport } from './readiness'
 
@@ -72,7 +70,7 @@ export function Transcript({ turns }: { turns: Turn[] }): JSX.Element {
 }
 
 export default function VoiceSupport({
-  onCaseCreated,
+  onCaseCreated: _onCaseCreated,
   readiness: _suppliedReadiness,
 }: {
   onCaseCreated: (caseId: string) => void | Promise<void>
@@ -91,9 +89,7 @@ export default function VoiceSupport({
   const [partial, setPartial] = useState('')
   const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
-  const [activity, setActivity] = useState<ActivityEvent[]>([])
-  const investigation = useRef<AbortController | null>(null)
-  const [caseId, setCaseId] = useState<string | null>(null)
+  const [voiceSession, setVoiceSession] = useState<string | null>(null)
   const [usage, setUsage] = useState({
     listening_seconds: 0,
     connected_seconds: 0,
@@ -111,7 +107,8 @@ export default function VoiceSupport({
   const elapsedUsage = useRef({ connected_seconds: 0 })
   const connectionUsage = useRef({ connected_seconds: 0 })
   const lastMeter = useRef(0)
-  const lastRequest = useRef<{ id: string; transient: boolean; needsInput: boolean } | null>(null)
+  const processing = useRef(false)
+  const pendingTranscript = useRef('')
 
   const refresh = useCallback(async () => {
     setChecking(true)
@@ -122,6 +119,16 @@ export default function VoiceSupport({
       if (mounted.current) setAvailable(false)
     } finally {
       if (mounted.current) setChecking(false)
+    }
+  }, [])
+  const startVoiceSession = useCallback(async () => {
+    try {
+      const result = await request<{ session_id: string; response: string }>('/voice-conversation/start', { method: 'POST' })
+      if (!mounted.current) return
+      setVoiceSession(result.session_id)
+      setTurns([{ id: `greeting-${result.session_id}`, role: 'assistant', text: result.response, created_at: new Date().toISOString() }])
+    } catch (cause) {
+      if (mounted.current) setError((cause as Error).message)
     }
   }, [])
 
@@ -139,6 +146,7 @@ export default function VoiceSupport({
   useEffect(() => {
     mounted.current = true
     void refresh()
+    void startVoiceSession()
     void navigator.mediaDevices
       ?.enumerateDevices()
       .then((all) => {
@@ -153,7 +161,6 @@ export default function VoiceSupport({
     window.addEventListener('azure-usage-disabled', disabled)
     return () => {
       mounted.current = false
-      investigation.current?.abort()
       cleanup()
       window.removeEventListener('azure-usage-disabled', disabled)
     }
@@ -204,7 +211,36 @@ export default function VoiceSupport({
     } else {
       socket.current = null
       ws?.close()
-      setStatus('stopped')
+      setStatus('idle')
+    }
+  }
+  async function processMessage(spoken: string) {
+    if (!spoken.trim() || processing.current) return
+    processing.current = true
+    setBusy(true)
+    setError('')
+    try {
+      if (!voiceSession) throw new Error('Voice conversation is still starting. Please try again.')
+      const result = await request<{
+        response: string
+      }>(`/voice-conversation/${voiceSession}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ summary: spoken }),
+      })
+      setTurns((old) => [
+        ...old,
+        { id: `user-${Date.now()}`, role: 'user' as const, text: spoken, created_at: new Date().toISOString() },
+        { id: `answer-${Date.now()}`, role: 'assistant', text: result.response, created_at: new Date().toISOString() },
+      ])
+      setText('')
+      pendingTranscript.current = ''
+    } catch (cause) {
+      if (mounted.current) setError((cause as Error).message)
+    } finally {
+      processing.current = false
+      if (mounted.current) {
+        setBusy(false)
+        setStatus('idle')
+      }
     }
   }
   function connect(currentAttempt: number) {
@@ -249,6 +285,9 @@ export default function VoiceSupport({
             setStage('')
             setPartial('')
             setInputLevel(0)
+            const finalized = pendingTranscript.current.trim()
+            if (finalized) void processMessage(finalized)
+            else setStatus('idle')
             return
           }
           if (value.state === 'error') {
@@ -273,17 +312,10 @@ export default function VoiceSupport({
           }
           seen.current.add(value.id)
           setPartial('')
-          setText((old) => (old ? `${old} ${recognized}` : recognized))
-          setTurns((old) => [
-            ...old,
-            {
-              id: value.id!,
-              role: 'user',
-              text: recognized,
-              state: 'final',
-              created_at: new Date().toISOString(),
-            },
-          ])
+          pendingTranscript.current = pendingTranscript.current
+            ? `${pendingTranscript.current} ${recognized}`
+            : recognized
+          setText(pendingTranscript.current)
         } else if (value.type === 'error')
           fail(value.message ?? 'Speech recognition stopped. Please try again.')
       } catch {
@@ -327,6 +359,7 @@ export default function VoiceSupport({
     active.current = true
     retry.current = 0
     seen.current.clear()
+    pendingTranscript.current = ''
     elapsedUsage.current = { connected_seconds: 0 }
     connectionUsage.current = { connected_seconds: 0 }
     started.current = Date.now()
@@ -380,79 +413,14 @@ export default function VoiceSupport({
   async function submit(event: FormEvent) {
     event.preventDefault()
     if (!text.trim() || busy || active.current) return
-    setBusy(true)
-    setError('')
-    setActivity([])
-    const controller = new AbortController()
-    investigation.current = controller
-    const progress = (event: ActivityEvent) => {
-      if (mounted.current) setActivity((old) => mergeActivity(old, event))
-    }
-    try {
-      const previous = lastRequest.current
-      const result = previous?.needsInput
-        ? await streamInvestigation<{
-            case_id?: string
-            request_id?: string
-            result?: Record<string, unknown>
-            [key: string]: unknown
-          }>(
-            `/${previous.transient ? 'requests' : 'cases'}/${previous.id}/resume`,
-            { answer: text.trim() },
-            progress,
-            controller.signal,
-          )
-        : await streamInvestigation<{
-            case_id: string | null
-            request_id: string
-            result: Record<string, unknown>
-          }>('/ask', { summary: text.trim() }, progress, controller.signal)
-      const state = (result.result ?? result) as {
-        pending_question?: string
-        final_answer?: string
-        recommended_next_action?: string
-        status?: string
-        final_response?: { answer?: string }
-      }
-      const answer =
-        state.pending_question ??
-        state.final_response?.answer ??
-        state.final_answer ??
-        state.recommended_next_action ??
-        'The investigation completed without a verified recommendation. Review the evidence in Chat.'
-      setTurns((old) => [
-        ...old,
-        {
-          id: `answer-${Date.now()}`,
-          role: 'assistant',
-          text: answer,
-          created_at: new Date().toISOString(),
-        },
-      ])
-      const id = String(result.case_id ?? result.request_id ?? previous?.id ?? '')
-      setCaseId(result.case_id ? String(result.case_id) : null)
-      lastRequest.current = {
-        id,
-        transient: !result.case_id,
-        needsInput: state.status === 'needs_input',
-      }
-      setText('')
-    } catch (e) {
-      if (mounted.current)
-        setError(
-          (e as Error).name === 'AbortError'
-            ? 'Investigation cancelled. Your transcript is preserved.'
-            : (e as Error).message,
-        )
-    } finally {
-      if (mounted.current) setBusy(false)
-      investigation.current = null
-    }
+    await processMessage(text.trim())
   }
   const connected = ['listening', 'reconnecting', 'connecting'].includes(status)
   const displayStatus =
-    status === 'idle'
-      ? 'Ready to talk'
+    busy || status === 'stopping'
+      ? 'Processing'
+      : status === 'idle'
+      ? 'Ready'
       : muted && status === 'listening'
         ? 'Microphone muted'
         : status[0].toUpperCase() + status.slice(1)
@@ -489,20 +457,13 @@ export default function VoiceSupport({
         <button
           type="button"
           className={`microphone-orb ${status === 'listening' && !muted ? 'listening' : ''}`}
-          aria-label={
-            connected ? (muted ? 'Unmute microphone' : 'Mute microphone') : 'Start voice chat'
-          }
-          aria-pressed={connected ? muted : undefined}
+          aria-label={connected ? 'Stop listening' : 'Start voice chat'}
           disabled={
-            (!connected && !available) || busy || status === 'connecting' || status === 'stopping'
+            (!connected && (!available || !voiceSession)) || busy || status === 'connecting' || status === 'stopping'
           }
           onClick={() => {
             if (!connected) void start()
-            else {
-              audio.current?.setMuted(!muted)
-              setMuted(!muted)
-              setInputLevel(0)
-            }
+            else stop()
           }}
         >
           <svg
@@ -545,8 +506,7 @@ export default function VoiceSupport({
           </p>
         </div>
         <p className="muted">
-          Speak continuously. Say “Stop” on its own or click Stop when finished. Responses appear as
-          text.
+          Click the microphone to start or stop listening. DeskMate replies in text after each turn.
         </p>
         <p aria-label="Speech usage">
           Listening {duration} · Connected speech {usage.connected_seconds.toFixed(0)}s
@@ -585,20 +545,21 @@ export default function VoiceSupport({
         </div>
       )}
       {!!transcriptTurns.length && <Transcript turns={transcriptTurns} />}
-      <InvestigationActivity
-        events={activity}
-        busy={busy}
-        onCancel={() => investigation.current?.abort()}
-      />
+      <div className="readiness-summary" aria-label="Voice conversation status">
+        <p>AI provider: <strong>{localStorage.getItem('deskmate.reasoning-provider') === 'azure_openai' ? 'Azure OpenAI' : 'Groq'}</strong></p>
+      </div>
       <div className="voice-controls">
         <div className="voice-button-row">
           <button
             type="button"
             className="button button-secondary"
-            disabled={connected || status === 'stopping' || busy || !available}
+            disabled={connected || status === 'stopping' || busy || !available || !voiceSession}
             onClick={() => void start()}
           >
             Ready to Talk
+          </button>
+          <button type="button" className="button button-subtle" disabled={connected || busy} onClick={() => void startVoiceSession()}>
+            New conversation
           </button>
           {connected && (
             <>
@@ -618,15 +579,6 @@ export default function VoiceSupport({
                 Stop session
               </button>
             </>
-          )}
-          {caseId && (
-            <button
-              type="button"
-              className="button button-success"
-              onClick={() => void onCaseCreated(caseId)}
-            >
-              Open investigation
-            </button>
           )}
         </div>
         <form className="voice-composer" onSubmit={submit}>

@@ -247,16 +247,15 @@ test('empty proxy response shows a readable error and a retry reaches the real a
   expect(events.some((e: any) => e.tool === 'verify')).toBeTruthy()
 })
 
-test('unconfigured Speech is unavailable while typed investigation remains usable', async ({ page }) => {
+test('unconfigured Speech is unavailable while typed helpdesk chat remains usable', async ({ page }) => {
   await page.goto('/')
   await page.getByRole('button', { name: 'Voice', exact: true }).click()
   await expect(page.getByRole('button', { name: 'Ready to Talk', exact: true })).toBeDisabled()
   await expect(page.getByText('Speech recognition is unavailable. You can still type your request below.')).toBeVisible()
   await page.getByLabel('Message DeskMate').fill('Sarah cannot complete Microsoft 365 MFA.')
   await page.getByRole('button', { name: 'Send message', exact: true }).click()
-  await expect(page.getByTestId('voice-transcript')).not.toBeEmpty()
-  await expect(page.getByText('Investigation Activity', { exact: true })).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Open investigation', exact: true })).toBeVisible()
+  await expect(page.getByTestId('voice-message')).toHaveCount(3)
+  await expect(page.getByText('Sarah cannot complete Microsoft 365 MFA.')).toBeVisible()
 })
 
 test('isolated microphone permission rejection opens no Speech connection and preserves typed input', async ({ page }) => {
@@ -279,6 +278,15 @@ test('isolated Speech transport verifies continuous partials, reconnect, Stop ex
   const processor = await request.get('/pcm-worklet.js')
   expect(processor.status()).toBe(200)
   await page.route('**/speech/readiness', route => route.fulfill({ json: { ready: true } }))
+  await page.route('**/voice-conversation/start', route => route.fulfill({ json: {
+    session_id: 'voice-browser-test',
+    response: 'Hello, welcome to Digital nGenuity support. How can I help you today?',
+  } }))
+  let submissions = 0
+  await page.route('**/voice-conversation/voice-browser-test', async route => {
+    submissions++
+    await route.fulfill({ json: { response: 'Let us troubleshoot that application issue.' } })
+  })
   await page.addInitScript(() => {
     const stats = { frames: 0, tracksStopped: 0, socketsClosed: 0 }
     Object.assign(window, { speechTestStats: stats })
@@ -331,7 +339,7 @@ test('isolated Speech transport verifies continuous partials, reconnect, Stop ex
     emit('transcript.partial', { id: '1:a', text: 'VPN auth' })
     emit('transcript.partial', { id: '1:a', text: 'VPN authentication fails' })
   })
-  await expect(page.getByTestId('voice-message')).toHaveCount(1)
+  await expect(page.getByTestId('voice-message')).toHaveCount(2)
   await page.evaluate(() => {
     const emit = Reflect.get(window, 'speechTestEmit')
     emit('transcript.final', { id: '1:a', text: 'VPN authentication fails.' })
@@ -345,14 +353,16 @@ test('isolated Speech transport verifies continuous partials, reconnect, Stop ex
     emit('transcript.final', { id: '2:b', text: 'The application will stop responding.' })
     emit('usage', { connected_seconds: 45 })
   })
-  await expect(page.getByTestId('voice-message')).toHaveCount(2)
+  await expect(page.getByTestId('voice-message')).toHaveCount(1)
   await expect(page.getByLabel('Speech usage')).toContainText('Connected speech 45s')
   await page.getByRole('button', { name: 'Mute', exact: true }).click()
   await expect(page.getByTestId('voice-status')).toHaveText('Microphone muted')
   await page.getByRole('button', { name: 'Unmute', exact: true }).click()
   await page.evaluate(() => Reflect.get(window, 'speechTestEmit')('transcript.final', { id: '2:stop', text: 'Stop.' }))
-  await expect(page.getByTestId('voice-status')).toHaveText('Stopped')
-  await expect(page.getByLabel('Message DeskMate')).toHaveValue('VPN authentication fails. The application will stop responding.')
+  await expect(page.getByTestId('voice-status')).toHaveText('Ready')
+  await expect(page.getByText('VPN authentication fails. The application will stop responding.')).toBeVisible()
+  await expect(page.getByText('Let us troubleshoot that application issue.')).toBeVisible()
+  expect(submissions).toBe(1)
   await expect.poll(() => page.evaluate(() => Reflect.get(window, 'speechTestStats').tracksStopped)).toBe(1)
   await page.getByRole('button', { name: 'Ready to Talk', exact: true }).click()
   await expect(page.getByTestId('voice-status')).toHaveText('Listening')
