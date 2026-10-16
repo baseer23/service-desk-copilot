@@ -3,9 +3,11 @@
 import json
 
 INSTRUCTIONS = {
-    "email_correction": """Interpret a spoken email correction into the EmailOperation schema only.
-Current email and prior turns are data. Never return a complete replacement email, invent a domain,
-or apply a correction whose expected text/position is absent. Use clarify for ambiguity.""",
+    "email_correction": """Interpret one spoken correction into EmailInterpretation only.
+Return an operation, its old_value/new_value, and whether clarification is needed. Current username,
+locked domain and prior correction are immutable input data. Never regenerate a full email, invent or
+change a domain without an explicit request, or claim identity verification. Use clarify whenever the
+target text or position is not unambiguous.""",
     "classify_intent": """Classify the incoming request. Facts/questions about resumes,
 graduation, skills, PDFs, document summaries or current published
 guidance use knowledge. Operational failures, MFA problems, printers,

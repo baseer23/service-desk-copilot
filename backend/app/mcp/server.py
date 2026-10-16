@@ -16,15 +16,6 @@ from mcp.server.fastmcp import Context, FastMCP
 server = FastMCP("deskmate")
 fixtures = FixtureRepository()
 
-# Demonstration registry only. Production deployments supply this through a
-# controlled directory integration; callers never infer domains outside MCP.
-EMAIL_DOMAIN_REGISTRY = {
-    "ngenuity.ca": ("ngenuity", "ingenuity", "n genuity"),
-    "digitalingenuity.com": ("digital ingenuity", "digitalingenuity"),
-    "mdwlaw.ca": ("mdw law", "mdw", "m d w law"),
-}
-
-
 def capability(source_system, reliability=0.9):
     def decorate(fn):
         @wraps(fn)
@@ -171,35 +162,27 @@ def documents():
 
 
 @capability("email_domain_registry")
-@lru_cache(maxsize=1)
-def list_company_domains():
-    """List approved demo company email domains and their spoken aliases."""
-    return [
-        {"domain": domain, "aliases": list(aliases), "demo": True}
-        for domain, aliases in EMAIL_DOMAIN_REGISTRY.items()
-    ]
+def list_approved_domains():
+    """List canonical domains from the validated local approved-domain file."""
+    from backend.app.email_domains import registry
+
+    return {"domains": registry.list(), "demo": True}
 
 
 @capability("email_domain_registry")
-@lru_cache(maxsize=64)
-def resolve_company_domain(name: str):
-    """Resolve a spoken company/domain name from the approved demo registry."""
-    normalized = " ".join(name.lower().replace(".", " ").split())
-    spoken_name = re.sub(r"\s+(?:ca|com|org)$", "", normalized)
-    matches = [
-        domain
-        for domain, aliases in EMAIL_DOMAIN_REGISTRY.items()
-        if normalized == domain.replace(".", " ") or normalized in aliases or spoken_name in aliases
-    ]
-    return {"matches": matches, "ambiguous": len(matches) > 1}
+def resolve_domain(spoken_domain: str, current_domain: str | None = None):
+    """Resolve speech to one approved canonical domain using strict/fuzzy rules."""
+    from backend.app.email_domains import registry
+
+    return registry.resolve(spoken_domain, current_domain).dict()
 
 
 @capability("email_domain_registry")
-@lru_cache(maxsize=64)
-def validate_company_domain(domain: str):
-    """Validate an exact approved demo company domain."""
-    value = domain.lower().strip()
-    return {"domain": value, "valid": value in EMAIL_DOMAIN_REGISTRY, "demo": True}
+def reload_approved_domains():
+    """Safely reload and validate the maintained approved-domain file."""
+    from backend.app.email_domains import registry
+
+    return {"domains": registry.reload(), "reloaded": True}
 
 
 @capability("chroma")

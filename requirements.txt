@@ -37,6 +37,7 @@ defusedxml>=0.7,<1
 langchain-groq>=1,<2
 groq==0.37.1
 azure-cognitiveservices-speech==1.52.0
+rapidfuzz==3.14.3
 sentence-transformers>=3,<6
 
 jsonschema>=4.23,<5

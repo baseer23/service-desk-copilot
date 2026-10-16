@@ -124,6 +124,12 @@ class AskResponse(BaseModel):
     events: list[CaseEvent]
 
 
+class EmailTurnRequest(BaseModel):
+    summary: str = Field(min_length=1, max_length=4000)
+    request_id: str | None = Field(default=None, min_length=8, max_length=100)
+    expected_version: int | None = Field(default=None, ge=0)
+
+
 class HealthResponse(BaseModel):
     status: str
     generation_provider: str

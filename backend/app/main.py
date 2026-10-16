@@ -28,6 +28,7 @@ from backend.app.models.dto import (
     CaseResponse,
     CaseResumeRequest,
     HealthResponse,
+    EmailTurnRequest,
     IngestPasteRequest,
     IngestPasteResponse,
     IngestPdfResponse,
@@ -440,24 +441,20 @@ def create_app(settings: Settings | None = None):
             },
         )
 
-    async def email_domain(name: str) -> tuple[str | None, str]:
-        """Resolve every email domain through the MCP registry, never a local guess."""
-        checked = await app.state.agent.harness.invoke("validate_company_domain", {"domain": name})
-        value = checked["result"]
-        if value.get("valid"):
-            return value["domain"], "validated"
-        resolved = await app.state.agent.harness.invoke("resolve_company_domain", {"name": name})
-        matches = resolved["result"].get("matches", [])
-        if len(matches) == 1:
-            return matches[0], "resolved"
-        return None, "ambiguous" if len(matches) > 1 else "unknown"
+    async def email_domain(name: str, current: str | None = None) -> dict[str, Any]:
+        value = await app.state.agent.harness.invoke(
+            "resolve_domain", {"spoken_domain": name, "current_domain": current}
+        )
+        if value.get("status") != "ok":
+            raise MCPToolError("Approved-domain registry is unavailable")
+        return value["result"]
 
     @app.post("/email-correction/start")
     async def start_email_correction():
         try:
             # Establish the actual MCP registry connection before advertising it
             # as ready in the Voice UI. The entries themselves stay server-side.
-            await app.state.agent.harness.invoke("list_company_domains", {})
+            await app.state.agent.harness.invoke("list_approved_domains", {})
         except (MCPToolError, MCPConnectionError) as exc:
             raise HTTPException(503, "Company-domain lookup is unavailable. Retry shortly.") from exc
         session = app.state.email_sessions.create()
@@ -479,70 +476,114 @@ def create_app(settings: Settings | None = None):
             "mode": "helpdesk",
         }
 
+    async def process_email(session, body: EmailTurnRequest):
+        from backend.app.email_correction import EmailInterpretation, apply, deterministic_operation, speech_email
+
+        request_id = body.request_id or uuid.uuid4().hex
+        with session.lock:
+            if request_id in session.processed_requests:
+                return session.processed_requests[request_id]
+            if body.expected_version is not None and body.expected_version != session.version:
+                raise HTTPException(409, "This correction was based on an older email state. Please retry.")
+            starting_version = session.version
+        message = body.summary.strip()
+        parsed = speech_email(message)
+        operation = None if parsed else deterministic_operation(message)
+        resolution = None
+        if parsed:
+            resolution = await email_domain(parsed[1], session.domain or None)
+        elif operation and operation.operation == "change_domain":
+            resolution = await email_domain(operation.replacement or "", session.domain or None)
+        elif operation is None:
+            try:
+                interpreted = await app.state.agent.provider.generate_structured(
+                    "email_correction",
+                    {"request": message, "current_username": session.username,
+                     "locked_domain": session.domain if session.domain_locked else None,
+                     "pending_clarification": session.pending_clarification,
+                     "previous_correction": session.correction_history[-1].username if session.correction_history else None},
+                    EmailInterpretation,
+                )
+                operation = interpreted.validated_operation()
+            except LLMError as exc:
+                detail = (
+                    llm_error_detail(exc)
+                    if selected_provider(s) == "azure_openai"
+                    else "Groq returned an invalid structured correction. Your email state was preserved; retry or switch providers."
+                )
+                raise HTTPException(502, detail) from exc
+        with session.lock:
+            if session.version != starting_version:
+                raise HTTPException(409, "A newer correction was already applied. Please retry this turn.")
+            previous = session.email
+            lookup = "not_needed"
+            if parsed:
+                username, _hint = parsed
+                if resolution["clarification_required"]:
+                    response = "I could not resolve that approved domain. Which company domain do you mean?"
+                else:
+                    session.correction_history.append(session.snapshot())
+                    session.username = username
+                    if not session.domain_locked:
+                        session.domain = resolution["canonical_domain"]
+                        session.domain_locked = not resolution["requires_confirmation"]
+                    else:
+                        lookup = "locked"
+                    session.email_mode = True
+                    session.email_confirmed = False
+                    if lookup != "locked": lookup = resolution["match_type"]
+                    response = f"I have {session.email}. Is that spelling correct?"
+            else:
+                domain = resolution["canonical_domain"] if resolution and not resolution["clarification_required"] else None
+                if resolution: lookup = resolution["match_type"]
+                response = apply(session, operation, domain, fuzzy_domain=bool(resolution and resolution["requires_confirmation"]))
+            session.version += 1
+            session.conversation_context.append({"role": "user", "content": message})
+            session.conversation_context = session.conversation_context[-12:]
+            result = {"session_id": session.session_id, "response": response, "mode": "email",
+                      "email": session.email, "domain": session.domain or None,
+                      "domain_locked": session.domain_locked, "username_confirmed": session.username_confirmed,
+                      "email_confirmed": session.email_confirmed, "confirmed": session.email_confirmed,
+                      "domain_lookup": lookup, "operation": operation.operation if operation else "capture_email",
+                      "previous_email": previous, "version": session.version, "provider": selected_provider(s)}
+            session.processed_requests[request_id] = result
+            if len(session.processed_requests) > 64: session.processed_requests.pop(next(iter(session.processed_requests)))
+            return result
+
     @app.post("/voice-conversation/{session_id}")
-    async def voice_conversation(session_id: str, body: CaseCreateRequest):
+    async def voice_conversation(session_id: str, body: EmailTurnRequest):
         from backend.app.agent.models import GeneralAnswer
 
         session = app.state.email_sessions.get(session_id)
         if not session:
             raise HTTPException(404, "Voice conversation expired. Start a new conversation.")
+        from backend.app.email_correction import deterministic_operation, speech_email
+        email_related = session.email_mode or speech_email(body.summary) is not None or deterministic_operation(body.summary) is not None
+        if email_related:
+            session.email_mode = True
+            return await process_email(session, body)
         try:
             answer = await app.state.agent.provider.generate_structured(
                 "general_chat",
-                {"message": body.summary, "conversation": session.conversation[-8:]},
+                {"message": body.summary, "conversation": session.conversation_context[-8:]},
                 GeneralAnswer,
             )
         except LLMError as exc:
             raise HTTPException(502, llm_error_detail(exc)) from exc
-        session.conversation.extend([
+        session.conversation_context.extend([
             {"role": "user", "content": body.summary},
             {"role": "assistant", "content": answer.answer},
         ])
-        session.conversation = session.conversation[-16:]
-        return {"session_id": session.session_id, "response": answer.answer, "mode": "helpdesk"}
+        session.conversation_context = session.conversation_context[-16:]
+        return {"session_id": session.session_id, "response": answer.answer, "mode": "helpdesk", "version": session.version}
 
     @app.post("/email-correction/{session_id}")
-    async def correct_email(session_id: str, body: CaseCreateRequest):
-        from backend.app.email_correction import EmailOperation, apply, deterministic_operation, speech_email
-
+    async def correct_email(session_id: str, body: EmailTurnRequest):
         session = app.state.email_sessions.get(session_id)
         if not session:
             raise HTTPException(404, "Email correction session expired. Start a new conversation.")
-        message = body.summary.strip()
-        parsed = speech_email(message) if not session.email else None
-        lookup = "not_needed"
-        if parsed:
-            username, hint = parsed
-            domain, lookup = await email_domain(hint)
-            if not domain:
-                response = "I could not match that company domain. Which approved company do you mean?"
-            else:
-                session.history.append((session.username, session.domain))
-                session.username, session.domain, session.confirmed = username, domain, False
-                response = f"I have {session.email}. Is that correct?"
-        else:
-            operation = deterministic_operation(message)
-            if operation is None:
-                try:
-                    operation = await app.state.agent.provider.generate_structured(
-                        "email_correction",
-                        {"request": message, "current_email": session.email, "recent_corrections": session.recent_corrections[-6:]},
-                        EmailOperation,
-                    )
-                except LLMError as exc:
-                    raise HTTPException(502, llm_error_detail(exc)) from exc
-            domain = None
-            if operation.operation == "change_domain":
-                domain, lookup = await email_domain(operation.replacement or "")
-            response = apply(session, operation, domain)
-        return {
-            "session_id": session.session_id,
-            "response": response,
-            "email": session.email,
-            "confirmed": session.confirmed,
-            "provider": selected_provider(s),
-            "domain_lookup": lookup,
-        }
+        session.email_mode = True
+        return await process_email(session, body)
 
     @app.get("/knowledge/search")
     async def search_local_knowledge(question: str):

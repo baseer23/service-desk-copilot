@@ -27,6 +27,9 @@ READ_TOOLS = {
     "search_remembered_facts",
     "get_case_history",
     "list_available_context",
+    "list_approved_domains",
+    "resolve_domain",
+    "reload_approved_domains",
 }
 KNOWLEDGE_TOOLS = {
     "search_knowledge",

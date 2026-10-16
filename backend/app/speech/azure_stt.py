@@ -60,6 +60,8 @@ class AzureSpeechRecognizer:
             endpoint=self.settings.azure_speech_endpoint,
         )
         config.speech_recognition_language = self.settings.azure_speech_language
+        if hasattr(sdk, "OutputFormat"):
+            config.output_format = sdk.OutputFormat.Detailed
         # Segmentation ends an utterance, never continuous recognition itself.
         config.set_property(sdk.PropertyId.Speech_SegmentationSilenceTimeoutMs, "600")
         config.set_property(sdk.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs, "0")
@@ -69,6 +71,16 @@ class AzureSpeechRecognizer:
         recognizer = sdk.SpeechRecognizer(
             speech_config=config, audio_config=sdk.audio.AudioConfig(stream=stream)
         )
+        if hasattr(sdk, "PhraseListGrammar"):
+            from backend.app.email_domains import registry
+
+            phrases = sdk.PhraseListGrammar.from_recognizer(recognizer)
+            for domain in registry.list():
+                company, tld = domain.rsplit(".", 1)
+                phrases.addPhrase(domain)
+                phrases.addPhrase(" ".join(company) + " dot " + " ".join(tld))
+            if hasattr(phrases, "setWeight"):
+                phrases.setWeight(1.2)
         self.generation += 1
         generation = self.generation
 

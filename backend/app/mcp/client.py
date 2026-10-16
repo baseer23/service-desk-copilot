@@ -199,6 +199,7 @@ class DeskMateMCPClient:
             "search_remembered_facts", "get_user_context", "get_company_context",
             "get_site_context", "get_device_context", "get_active_alerts",
             "get_recent_changes", "list_available_context", "search_previous_tickets",
+            "list_approved_domains", "resolve_domain", "reload_approved_domains",
         }
 
     async def _own_session(self):

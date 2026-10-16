@@ -89,3 +89,7 @@ Executed verification is recorded with the applicable revision. The browser suit
 ## Voice helpdesk provider check — 2026-10-15
 
 The repaired Voice path used the same conversation session for one minimal real Groq turn followed by one minimal real Azure OpenAI turn. Both providers returned relevant, context-consistent printer troubleshooting replies through the frontend proxy. The deterministic browser regression verifies greeting, stop-boundary transcript flush, exactly-once submission, rendered response and a subsequent recording turn; it does not claim physical microphone or new live Azure Speech recognition.
+
+## Email correction interpreter check — 2026-10-16
+
+Straightforward address capture, grouped spelling, substring changes, positional edits, undo and domain resolution bypass model inference. The exact reported six-turn sequence preserves the approved domain and finishes with the intended username. Azure OpenAI produced a valid clarification operation against a synthetic session. Groq returned invalid structured output for its one synthetic complex instruction; DeskMate rejected it without mutation or fallback and did not automatically retry it. This remains a live Groq structured-output limitation, not a deterministic correction failure.

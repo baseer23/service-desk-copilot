@@ -1,0 +1,3 @@
+# Demonstration entries. Confirm against the company domain list before production use.
+ngenuity.ca
+mdwlaw.ca

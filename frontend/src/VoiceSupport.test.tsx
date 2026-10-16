@@ -112,7 +112,7 @@ test('standalone spoken Stop is excluded; a sentence containing stop is preserve
   expect(fetch).toHaveBeenCalledWith(
     '/voice-conversation/voice1',
     expect.objectContaining({
-      body: JSON.stringify({ summary: 'The service will stop responding.' }),
+      body: expect.stringContaining('"summary":"The service will stop responding."'),
     }),
   )
   expect(
@@ -228,7 +228,7 @@ test('a final transcript flushed by Azure during stop is submitted exactly once'
   const calls = vi.mocked(fetch).mock.calls.filter(([path]) => path === '/voice-conversation/voice1')
   expect(calls).toHaveLength(1)
   expect(calls[0]?.[1]).toEqual(expect.objectContaining({
-    body: JSON.stringify({ summary: 'My printer is offline.' }),
+    body: expect.stringContaining('"summary":"My printer is offline."'),
   }))
 })
 

@@ -27,7 +27,10 @@ class StubProvider:
         if stage == "email_correction":
             return schema.model_validate(
                 {
+                    "intent": "clarify",
                     "operation": "clarify",
+                    "needs_clarification": True,
+                    "domain_change_requested": False,
                     "clarification": "Please say exactly which characters to change.",
                 }
             )

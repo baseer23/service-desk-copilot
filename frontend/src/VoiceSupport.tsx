@@ -90,6 +90,11 @@ export default function VoiceSupport({
   const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
   const [voiceSession, setVoiceSession] = useState<string | null>(null)
+  const [emailState, setEmailState] = useState<{
+    email?: string | null; domain?: string | null; domain_locked?: boolean
+    username_confirmed?: boolean; email_confirmed?: boolean; domain_lookup?: string
+    operation?: string; previous_email?: string | null; raw_transcript?: string
+  } | null>(null)
   const [usage, setUsage] = useState({
     listening_seconds: 0,
     connected_seconds: 0,
@@ -109,6 +114,7 @@ export default function VoiceSupport({
   const lastMeter = useRef(0)
   const processing = useRef(false)
   const pendingTranscript = useRef('')
+  const sessionVersion = useRef(0)
 
   const refresh = useCallback(async () => {
     setChecking(true)
@@ -126,6 +132,8 @@ export default function VoiceSupport({
       const result = await request<{ session_id: string; response: string }>('/voice-conversation/start', { method: 'POST' })
       if (!mounted.current) return
       setVoiceSession(result.session_id)
+      sessionVersion.current = 0
+      setEmailState(null)
       setTurns([{ id: `greeting-${result.session_id}`, role: 'assistant', text: result.response, created_at: new Date().toISOString() }])
     } catch (cause) {
       if (mounted.current) setError((cause as Error).message)
@@ -223,9 +231,16 @@ export default function VoiceSupport({
       if (!voiceSession) throw new Error('Voice conversation is still starting. Please try again.')
       const result = await request<{
         response: string
+        mode?: string; version?: number; email?: string | null; domain?: string | null
+        domain_locked?: boolean; username_confirmed?: boolean; email_confirmed?: boolean
+        domain_lookup?: string; operation?: string; previous_email?: string | null
       }>(`/voice-conversation/${voiceSession}`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ summary: spoken }),
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+          summary: spoken, request_id: crypto.randomUUID(), expected_version: sessionVersion.current,
+        }),
       })
+      sessionVersion.current = result.version ?? sessionVersion.current
+      if (result.mode === 'email') setEmailState({ ...result, raw_transcript: spoken })
       setTurns((old) => [
         ...old,
         { id: `user-${Date.now()}`, role: 'user' as const, text: spoken, created_at: new Date().toISOString() },
@@ -548,6 +563,19 @@ export default function VoiceSupport({
       <div className="readiness-summary" aria-label="Voice conversation status">
         <p>AI provider: <strong>{localStorage.getItem('deskmate.reasoning-provider') === 'azure_openai' ? 'Azure OpenAI' : 'Groq'}</strong></p>
       </div>
+      {emailState && (
+        <div className="readiness-summary" aria-label="Interpreted email status">
+          <p>Interpreted email: <strong>{emailState.email || 'Incomplete'}</strong></p>
+          <p>Domain: {emailState.domain || 'Unresolved'} ({emailState.domain_lookup || 'not checked'})</p>
+          <p>Domain locked: {emailState.domain_locked ? 'Yes' : 'No'} · Full spelling confirmed: {emailState.email_confirmed ? 'Yes' : 'No'}</p>
+          {import.meta.env.DEV && (
+            <details><summary>Email correction debug</summary>
+              <p>Raw transcript: {emailState.raw_transcript}</p><p>Operation: {emailState.operation}</p>
+              <p>Previous email: {emailState.previous_email || 'None'}</p>
+            </details>
+          )}
+        </div>
+      )}
       <div className="voice-controls">
         <div className="voice-button-row">
           <button
