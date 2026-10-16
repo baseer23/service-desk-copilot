@@ -1,0 +1,12 @@
+# Canonical domains. Synthetic test entries are injected only in demo/test mode.
+ngenuity.ca
+mdwlaw.ca
+codybrian.ca
+gmail.com
+outlook.com
+hotmail.com
+live.com
+yahoo.com
+icloud.com
+aol.com
+proton.me

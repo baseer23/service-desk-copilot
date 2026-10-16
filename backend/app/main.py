@@ -81,8 +81,11 @@ def case_response(state):
     if not data.get("origin"):
         summary = state.get("ticket", {}).get("summary", "").casefold()
         data["origin"] = (
-            "test" if summary.startswith(("fictional test:", "acceptance test:"))
-            else "demo" if summary.startswith(("fictional ", "demo:")) else "unknown"
+            "test"
+            if summary.startswith(("fictional test:", "acceptance test:"))
+            else "demo"
+            if summary.startswith(("fictional ", "demo:"))
+            else "unknown"
         )
     if (state.get("status") == "needs_input" and not state.get("workflow")) or state.get(
         "status"
@@ -140,10 +143,10 @@ def create_app(settings: Settings | None = None):
                     app.state.agent = ServiceDeskAgent(s, mcp, provider, saver)
                     await app.state.agent.initialize()
                     from backend.app.voice.history import VoiceHistory
-                    from backend.app.email_correction import EmailSessions
+                    from backend.app.conversation.sessions import ConversationSessions
 
                     app.state.voice = VoiceHistory(s)
-                    app.state.email_sessions = EmailSessions()
+                    app.state.conversation_sessions = ConversationSessions()
                     app.state.provider_initialized = provider is not None
                     try:
                         local = await app.state.agent.harness.invoke("get_local_storage_status", {})
@@ -246,7 +249,9 @@ def create_app(settings: Settings | None = None):
             selection = request.headers.get("X-DeskMate-Provider", s.generation_provider)
             if s.test_mode and s.generation_provider == "stub":
                 selection = "stub"
-            if selection not in {"groq", "azure_openai", "stub"} or (selection == "stub" and not s.test_mode):
+            if selection not in {"groq", "azure_openai", "stub"} or (
+                selection == "stub" and not s.test_mode
+            ):
                 raise HTTPException(422, "Choose Groq or Azure OpenAI")
             with principal_scope(actor), provider_scope(selection):
                 return await call_next(request)
@@ -319,10 +324,13 @@ def create_app(settings: Settings | None = None):
     async def require_reasoning() -> None:
         report = await app.state.voice.store(readiness)
         if not report.text_ready:
-            raise HTTPException(503, {
-                "code": "REASONING_NOT_READY",
-                "message": "The selected AI service is unavailable. Check its configuration or choose another provider. Your saved work is preserved.",
-            })
+            raise HTTPException(
+                503,
+                {
+                    "code": "REASONING_NOT_READY",
+                    "message": "The selected AI service is unavailable. Check its configuration or choose another provider. Your saved work is preserved.",
+                },
+            )
 
     @app.post("/ingest/paste", response_model=IngestPasteResponse)
     async def ingest_paste(body: IngestPasteRequest):
@@ -441,149 +449,83 @@ def create_app(settings: Settings | None = None):
             },
         )
 
-    async def email_domain(name: str, current: str | None = None) -> dict[str, Any]:
-        value = await app.state.agent.harness.invoke(
-            "resolve_domain", {"spoken_domain": name, "current_domain": current}
-        )
-        if value.get("status") != "ok":
-            raise MCPToolError("Approved-domain registry is unavailable")
-        return value["result"]
-
     @app.post("/email-correction/start")
     async def start_email_correction():
         try:
-            # Establish the actual MCP registry connection before advertising it
-            # as ready in the Voice UI. The entries themselves stay server-side.
-            await app.state.agent.harness.invoke("list_approved_domains", {})
+            await app.state.agent.harness.invoke("list_registry", {"registry_type": "domains"})
         except (MCPToolError, MCPConnectionError) as exc:
-            raise HTTPException(503, "Company-domain lookup is unavailable. Retry shortly.") from exc
-        session = app.state.email_sessions.create()
+            raise HTTPException(
+                503, "Email lookup is temporarily unavailable. Retry shortly."
+            ) from exc
+        session = app.state.conversation_sessions.create()
+        session.active_entity = "contact.email"
         return {
             "session_id": session.session_id,
             "response": "Hello, welcome to Digital nGenuity support. Could I have your email address, please?",
             "email": None,
             "confirmed": False,
             "provider": selected_provider(s),
-            "domain_lookup": "ready",
+            "version": 0,
         }
 
     @app.post("/voice-conversation/start")
     async def start_voice_conversation():
-        session = app.state.email_sessions.create()
+        session = app.state.conversation_sessions.create()
         return {
             "session_id": session.session_id,
             "response": "Hello, welcome to Digital nGenuity support. How can I help you today?",
             "mode": "helpdesk",
         }
 
-    async def process_email(session, body: EmailTurnRequest):
-        from backend.app.email_correction import EmailInterpretation, apply, deterministic_operation, speech_email
-
-        request_id = body.request_id or uuid.uuid4().hex
-        with session.lock:
-            if request_id in session.processed_requests:
-                return session.processed_requests[request_id]
-            if body.expected_version is not None and body.expected_version != session.version:
-                raise HTTPException(409, "This correction was based on an older email state. Please retry.")
-            starting_version = session.version
-        message = body.summary.strip()
-        parsed = speech_email(message)
-        operation = None if parsed else deterministic_operation(message)
-        resolution = None
-        if parsed:
-            resolution = await email_domain(parsed[1], session.domain or None)
-        elif operation and operation.operation == "change_domain":
-            resolution = await email_domain(operation.replacement or "", session.domain or None)
-        elif operation is None:
-            try:
-                interpreted = await app.state.agent.provider.generate_structured(
-                    "email_correction",
-                    {"request": message, "current_username": session.username,
-                     "locked_domain": session.domain if session.domain_locked else None,
-                     "pending_clarification": session.pending_clarification,
-                     "previous_correction": session.correction_history[-1].username if session.correction_history else None},
-                    EmailInterpretation,
-                )
-                operation = interpreted.validated_operation()
-            except LLMError as exc:
-                detail = (
-                    llm_error_detail(exc)
-                    if selected_provider(s) == "azure_openai"
-                    else "Groq returned an invalid structured correction. Your email state was preserved; retry or switch providers."
-                )
-                raise HTTPException(502, detail) from exc
-        with session.lock:
-            if session.version != starting_version:
-                raise HTTPException(409, "A newer correction was already applied. Please retry this turn.")
-            previous = session.email
-            lookup = "not_needed"
-            if parsed:
-                username, _hint = parsed
-                if resolution["clarification_required"]:
-                    response = "I could not resolve that approved domain. Which company domain do you mean?"
-                else:
-                    session.correction_history.append(session.snapshot())
-                    session.username = username
-                    if not session.domain_locked:
-                        session.domain = resolution["canonical_domain"]
-                        session.domain_locked = not resolution["requires_confirmation"]
-                    else:
-                        lookup = "locked"
-                    session.email_mode = True
-                    session.email_confirmed = False
-                    if lookup != "locked": lookup = resolution["match_type"]
-                    response = f"I have {session.email}. Is that spelling correct?"
-            else:
-                domain = resolution["canonical_domain"] if resolution and not resolution["clarification_required"] else None
-                if resolution: lookup = resolution["match_type"]
-                response = apply(session, operation, domain, fuzzy_domain=bool(resolution and resolution["requires_confirmation"]))
-            session.version += 1
-            session.conversation_context.append({"role": "user", "content": message})
-            session.conversation_context = session.conversation_context[-12:]
-            result = {"session_id": session.session_id, "response": response, "mode": "email",
-                      "email": session.email, "domain": session.domain or None,
-                      "domain_locked": session.domain_locked, "username_confirmed": session.username_confirmed,
-                      "email_confirmed": session.email_confirmed, "confirmed": session.email_confirmed,
-                      "domain_lookup": lookup, "operation": operation.operation if operation else "capture_email",
-                      "previous_email": previous, "version": session.version, "provider": selected_provider(s)}
-            session.processed_requests[request_id] = result
-            if len(session.processed_requests) > 64: session.processed_requests.pop(next(iter(session.processed_requests)))
-            return result
-
     @app.post("/voice-conversation/{session_id}")
     async def voice_conversation(session_id: str, body: EmailTurnRequest):
         from backend.app.agent.models import GeneralAnswer
+        from backend.app.conversation.engine import ConversationEngine
+        from backend.app.conversation.interpreter import deterministic_turn
 
-        session = app.state.email_sessions.get(session_id)
+        session = app.state.conversation_sessions.get(session_id)
         if not session:
             raise HTTPException(404, "Voice conversation expired. Start a new conversation.")
-        from backend.app.email_correction import deterministic_operation, speech_email
-        email_related = session.email_mode or speech_email(body.summary) is not None or deterministic_operation(body.summary) is not None
-        if email_related:
-            session.email_mode = True
-            return await process_email(session, body)
+        if "ticket" in body.summary.casefold() and not session.active_entity:
+            session.active_helpdesk_task = "ticket"
+        turn = deterministic_turn(body.summary, session.email, session.active_entity)
+        if session.active_entity or (turn and turn.operations):
+            return await ConversationEngine(
+                app.state.agent.harness, app.state.agent.provider, selected_provider(s)
+            ).process(session, body.summary, body.request_id, body.expected_version)
         try:
             answer = await app.state.agent.provider.generate_structured(
                 "general_chat",
-                {"message": body.summary, "conversation": session.conversation_context[-8:]},
+                {"message": body.summary, "conversation": session.conversation_history[-8:]},
                 GeneralAnswer,
             )
         except LLMError as exc:
             raise HTTPException(502, llm_error_detail(exc)) from exc
-        session.conversation_context.extend([
-            {"role": "user", "content": body.summary},
-            {"role": "assistant", "content": answer.answer},
-        ])
-        session.conversation_context = session.conversation_context[-16:]
-        return {"session_id": session.session_id, "response": answer.answer, "mode": "helpdesk", "version": session.version}
+        session.conversation_history.extend(
+            [
+                {"role": "user", "content": body.summary},
+                {"role": "assistant", "content": answer.answer},
+            ]
+        )
+        session.conversation_history = session.conversation_history[-16:]
+        return {
+            "session_id": session.session_id,
+            "response": answer.answer,
+            "mode": "helpdesk",
+            "version": session.version,
+        }
 
     @app.post("/email-correction/{session_id}")
     async def correct_email(session_id: str, body: EmailTurnRequest):
-        session = app.state.email_sessions.get(session_id)
+        from backend.app.conversation.engine import ConversationEngine
+
+        session = app.state.conversation_sessions.get(session_id)
         if not session:
             raise HTTPException(404, "Email correction session expired. Start a new conversation.")
-        session.email_mode = True
-        return await process_email(session, body)
+        session.active_entity = "contact.email"
+        return await ConversationEngine(
+            app.state.agent.harness, app.state.agent.provider, selected_provider(s)
+        ).process(session, body.summary, body.request_id, body.expected_version)
 
     @app.get("/knowledge/search")
     async def search_local_knowledge(question: str):
@@ -673,11 +615,14 @@ def create_app(settings: Settings | None = None):
     @app.post("/requests/{request_id}/message", response_model=AskResponse)
     async def conversation_message(request: Request, request_id: str, body: CaseCreateRequest):
         if "text/event-stream" in request.headers.get("accept", ""):
-            return stream_operation(request, lambda: request_result(request_id, message=body.summary))
+            return stream_operation(
+                request, lambda: request_result(request_id, message=body.summary)
+            )
         return await request_result(request_id, message=body.summary)
 
     def stream_operation(request: Request, operation):
         from backend.app.agent.streaming import investigation_stream
+
         return investigation_stream(request, s, operation)
 
     @app.post("/ask/stream")
@@ -709,7 +654,8 @@ def create_app(settings: Settings | None = None):
                     actor = verify_actor(s, request.cookies.get(COOKIE_NAME))
                 await app.state.voice.store(
                     app.state.voice.repository.get,
-                    state["case_id"].removeprefix("voice-"), actor,
+                    state["case_id"].removeprefix("voice-"),
+                    actor,
                 )
                 return True
             except VoiceError:
@@ -730,10 +676,19 @@ def create_app(settings: Settings | None = None):
         return [
             case_response(state)
             for state in items
-            if await visible(state) and (s.test_mode or not (
-                state.get("origin") in {"demo", "test"}
-                or is_test_knowledge({"title": state.get("ticket", {}).get("summary", ""), "source_system": state.get("source_system", "")})
-            ))
+            if await visible(state)
+            and (
+                s.test_mode
+                or not (
+                    state.get("origin") in {"demo", "test"}
+                    or is_test_knowledge(
+                        {
+                            "title": state.get("ticket", {}).get("summary", ""),
+                            "source_system": state.get("source_system", ""),
+                        }
+                    )
+                )
+            )
         ]
 
     @app.post("/cases", response_model=CaseResponse, status_code=201)

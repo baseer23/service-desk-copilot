@@ -255,7 +255,9 @@ test('unconfigured Speech is unavailable while typed helpdesk chat remains usabl
   await page.getByLabel('Message DeskMate').fill('Sarah cannot complete Microsoft 365 MFA.')
   await page.getByRole('button', { name: 'Send message', exact: true }).click()
   await expect(page.getByTestId('voice-message')).toHaveCount(3)
-  await expect(page.getByText('Sarah cannot complete Microsoft 365 MFA.')).toBeVisible()
+  await expect(
+    page.getByTestId('voice-transcript').getByText('Sarah cannot complete Microsoft 365 MFA.'),
+  ).toBeVisible()
 })
 
 test('isolated microphone permission rejection opens no Speech connection and preserves typed input', async ({ page }) => {

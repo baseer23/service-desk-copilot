@@ -72,10 +72,10 @@ class AzureSpeechRecognizer:
             speech_config=config, audio_config=sdk.audio.AudioConfig(stream=stream)
         )
         if hasattr(sdk, "PhraseListGrammar"):
-            from backend.app.email_domains import registry
+            from backend.app.resolution.registry import registry_store
 
             phrases = sdk.PhraseListGrammar.from_recognizer(recognizer)
-            for domain in registry.list():
+            for domain in registry_store(self.settings.test_mode).list("domains"):
                 company, tld = domain.rsplit(".", 1)
                 phrases.addPhrase(domain)
                 phrases.addPhrase(" ".join(company) + " dot " + " ".join(tld))

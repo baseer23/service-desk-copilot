@@ -370,7 +370,10 @@ async def test_real_langchain_groq_sdk_json_mode_and_header_hook(settings, monke
     try:
         result = await provider.generate_structured("general_chat", {}, GeneralAnswer)
         assert result.answer == "Check the verified evidence."
-        assert requests[0]["response_format"] == {"type": "json_object"}
+        response_format = requests[0]["response_format"]
+        assert response_format["type"] == "json_schema"
+        assert response_format["json_schema"]["name"] == "GeneralAnswer"
+        assert response_format["json_schema"]["strict"] is True
         assert requests[0]["model"] == "openai/gpt-oss-20b"
         assert requests[0]["include_reasoning"] is False
         assert requests[0]["store"] is False

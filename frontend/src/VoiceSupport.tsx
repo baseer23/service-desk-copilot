@@ -566,8 +566,7 @@ export default function VoiceSupport({
       {emailState && (
         <div className="readiness-summary" aria-label="Interpreted email status">
           <p>Interpreted email: <strong>{emailState.email || 'Incomplete'}</strong></p>
-          <p>Domain: {emailState.domain || 'Unresolved'} ({emailState.domain_lookup || 'not checked'})</p>
-          <p>Domain locked: {emailState.domain_locked ? 'Yes' : 'No'} · Full spelling confirmed: {emailState.email_confirmed ? 'Yes' : 'No'}</p>
+          <p>Email spelling: {emailState.email_confirmed ? 'Confirmed' : 'Awaiting confirmation'}</p>
           {import.meta.env.DEV && (
             <details><summary>Email correction debug</summary>
               <p>Raw transcript: {emailState.raw_transcript}</p><p>Operation: {emailState.operation}</p>

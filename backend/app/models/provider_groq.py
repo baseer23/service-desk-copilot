@@ -132,8 +132,12 @@ class GroqProvider:
             raise LLMError("Model usage accounting is unavailable; check local storage") from None
 
     async def generate_structured(self, stage: str, context: dict, schema: type[T]) -> T:
-        # JSON mode works with free-form MCP argument maps, unlike strict schemas.
-        config = self.settings.model_copy(update={"azure_structured_outputs": False})
+        # GPT-OSS supports provider-enforced strict JSON Schema on Groq. Other
+        # configured models retain JSON Object mode unless explicitly supported.
+        strict_models = {"openai/gpt-oss-20b", "openai/gpt-oss-120b", "qwen/qwen3.8-27b"}
+        config = self.settings.model_copy(
+            update={"azure_structured_outputs": self.settings.groq_model_name in strict_models}
+        )
         output_bound = min(TOKEN_LIMITS.get(stage, 1200), self.settings.groq_max_output_tokens)
         window = model_context_window(self.settings)
 
@@ -143,15 +147,21 @@ class GroqProvider:
             context_budget = max(256, int((window - output_bound - 1536) * fraction))
             packed, report = bounded_context(source, context_budget)
             messages, response_format = structured_request(config, stage, packed, schema)
-            estimated = estimate_request_tokens(
-                {"messages": messages, "response_format": response_format}
-            ) + output_bound + 128
+            estimated = (
+                estimate_request_tokens({"messages": messages, "response_format": response_format})
+                + output_bound
+                + 128
+            )
             if estimated > window:
                 packed, report = bounded_context(packed, max(128, context_budget // 2))
                 messages, response_format = structured_request(config, stage, packed, schema)
-                estimated = estimate_request_tokens(
-                    {"messages": messages, "response_format": response_format}
-                ) + output_bound + 128
+                estimated = (
+                    estimate_request_tokens(
+                        {"messages": messages, "response_format": response_format}
+                    )
+                    + output_bound
+                    + 128
+                )
             if estimated > window:
                 raise LLMError(
                     "Groq request cannot fit the configured model context window",
@@ -203,7 +213,8 @@ class GroqProvider:
                         await self.limiter.observe(
                             headers,
                             retry=True,
-                            fallback_delay=(2**rate_attempt) + random.SystemRandom().uniform(0, 0.5),
+                            fallback_delay=(2**rate_attempt)
+                            + random.SystemRandom().uniform(0, 0.5),
                         )
                         await asyncio.to_thread(
                             self._record_usage,

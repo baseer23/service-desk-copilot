@@ -77,3 +77,7 @@ The document extraction/indexing changes do not alter Speech transport, transcri
 ### 2026-10-15 Azure OpenAI diagnostics revision
 
 The reasoning-provider error and investigation-timeline changes do not alter Speech SDK transport, continuous recognition, transcript ownership or microphone behavior. No live Speech request or physical microphone check was run; prior Speech acceptance status remains unchanged.
+
+### 2026-10-16 conversation-runtime verification
+
+The generic conversation refactor did not change the Speech SDK lifecycle. Browser tests continue to verify continuous partial/final handling, Stop exclusion, final-drain ordering, exactly-once submission, reconnect behavior and microphone cleanup. No fresh Azure Speech request or physical microphone test was performed for this revision, so audio recognition accuracy remains unverified here.

@@ -59,13 +59,22 @@ class CancellableClientSession(ClientSession):
             self._cancelled_requests.append(request_id)
             from mcp import types
             import anyio
+
             with anyio.CancelScope(shield=True):
                 with suppress(Exception):
-                    await asyncio.wait_for(self.send_notification(types.ClientNotification(
-                        types.CancelledNotification(params=types.CancelledNotificationParams(
-                            requestId=request_id, reason="Investigation cancelled by caller",
-                        ))
-                    )), 1)
+                    await asyncio.wait_for(
+                        self.send_notification(
+                            types.ClientNotification(
+                                types.CancelledNotification(
+                                    params=types.CancelledNotificationParams(
+                                        requestId=request_id,
+                                        reason="Investigation cancelled by caller",
+                                    )
+                                )
+                            )
+                        ),
+                        1,
+                    )
             raise
 
 
@@ -182,24 +191,45 @@ class DeskMateMCPClient:
     @asynccontextmanager
     async def transport(self):
         params = StdioServerParameters(
-            command=self.server_command, args=["-m", "backend.app.mcp.server"],
-            cwd=self.cwd, env=self.subprocess_env(),
+            command=self.server_command,
+            args=["-m", "backend.app.mcp.server"],
+            cwd=self.cwd,
+            env=self.subprocess_env(),
         )
         async with stdio_client(params, errlog=self.stderr or sys.stderr) as streams:
             yield streams
 
     def request_meta(self):
         from backend.app.core.principal import current_principal, sign_principal
-        return {"deskmate_authority": sign_principal(self.settings, current_principal(self.settings))} if self.settings.voice_session_signing_key else None
+
+        return (
+            {"deskmate_authority": sign_principal(self.settings, current_principal(self.settings))}
+            if self.settings.voice_session_signing_key
+            else None
+        )
 
     def safe_retry_tools(self):
         return {
-            "__list_tools__", "get_local_storage_status", "get_case", "list_cases",
-            "get_case_history", "get_document", "list_documents", "search_memory",
-            "search_remembered_facts", "get_user_context", "get_company_context",
-            "get_site_context", "get_device_context", "get_active_alerts",
-            "get_recent_changes", "list_available_context", "search_previous_tickets",
-            "list_approved_domains", "resolve_domain", "reload_approved_domains",
+            "__list_tools__",
+            "get_local_storage_status",
+            "get_case",
+            "list_cases",
+            "get_case_history",
+            "get_document",
+            "list_documents",
+            "search_memory",
+            "search_remembered_facts",
+            "get_user_context",
+            "get_company_context",
+            "get_site_context",
+            "get_device_context",
+            "get_active_alerts",
+            "get_recent_changes",
+            "list_available_context",
+            "search_previous_tickets",
+            "list_registry",
+            "resolve_entity",
+            "reload_registry",
         }
 
     async def _own_session(self):
@@ -261,13 +291,17 @@ class DeskMateMCPClient:
                                 continue  # Never dispatch an abandoned queued write/read.
                             task = asyncio.create_task(dispatch(*item))
                             future = item[2]
+
                             def cancel_dispatch(completed, dispatch_task=task):
                                 if completed.cancelled():
                                     dispatch_task.cancel()
+
                             future.add_done_callback(cancel_dispatch)
+
                             def finished(completed, response=future, callback=cancel_dispatch):
                                 pending.discard(completed)
                                 response.remove_done_callback(callback)
+
                             pending.add(task)
                             task.add_done_callback(finished)
                     finally:

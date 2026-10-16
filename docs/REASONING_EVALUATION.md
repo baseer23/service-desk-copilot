@@ -93,3 +93,11 @@ The repaired Voice path used the same conversation session for one minimal real 
 ## Email correction interpreter check — 2026-10-16
 
 Straightforward address capture, grouped spelling, substring changes, positional edits, undo and domain resolution bypass model inference. The exact reported six-turn sequence preserves the approved domain and finishes with the intended username. Azure OpenAI produced a valid clarification operation against a synthetic session. Groq returned invalid structured output for its one synthetic complex instruction; DeskMate rejected it without mutation or fallback and did not automatically retry it. This remains a live Groq structured-output limitation, not a deterministic correction failure.
+
+## Generic conversation runtime verification — 2026-10-16
+
+The exact five live-regression transcripts now pass consecutively: capture yields `abdulbasir@ngenuity.ca`, the local-only correction preserves the domain, a repeated full address remains clean, the spelled replacement yields `abdulbaseer@ngenuity.ca`, and confirmation resumes the remembered ticket request. Tests also cover insertion, deletion, replacement, undo, unknown-domain confirmation, ticket-reference correction, 1,000 independent sessions, general VPN routing and real MCP stdio discovery/execution.
+
+The final full backend suite completed with **321 passed and two optional Aura skips**. All **52 frontend unit tests**, all **19 Playwright scenarios**, the production build and dependency check passed. The first concurrent browser/full-backend run exposed resource contention plus an ambiguous text locator; both scenarios passed in isolation, and the locator was scoped to the Voice transcript before the clean final browser rerun.
+
+A bounded live Groq `openai/gpt-oss-120b` request used strict JSON Schema and applied a synthetic `qauser` → `qaanalyst` substring correction while preserving `ngenuity.ca`; no fallback occurred. The current runtime reports Azure OpenAI unconfigured because `AZURE_FOUNDRY_ENDPOINT` is absent, so no Azure model request was attempted. No physical microphone or fresh Azure Speech request was made.

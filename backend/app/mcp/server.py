@@ -2,7 +2,6 @@
 
 import asyncio
 import base64
-import re
 from datetime import datetime, timezone
 from functools import lru_cache, wraps
 from typing import Any, Literal
@@ -15,6 +14,7 @@ from mcp.server.fastmcp import Context, FastMCP
 
 server = FastMCP("deskmate")
 fixtures = FixtureRepository()
+
 
 def capability(source_system, reliability=0.9):
     def decorate(fn):
@@ -161,28 +161,35 @@ def documents():
     return DocumentRepository(get_settings().case_db_path)
 
 
-@capability("email_domain_registry")
-def list_approved_domains():
-    """List canonical domains from the validated local approved-domain file."""
-    from backend.app.email_domains import registry
+@capability("local_registry")
+def list_registry(registry_type: str):
+    """List canonical values from a validated local registry."""
+    from backend.app.resolution.registry import registry_store
 
-    return {"domains": registry.list(), "demo": True}
-
-
-@capability("email_domain_registry")
-def resolve_domain(spoken_domain: str, current_domain: str | None = None):
-    """Resolve speech to one approved canonical domain using strict/fuzzy rules."""
-    from backend.app.email_domains import registry
-
-    return registry.resolve(spoken_domain, current_domain).dict()
+    return {
+        "registry_type": registry_type,
+        "values": registry_store(get_settings().test_mode).list(registry_type),
+    }
 
 
-@capability("email_domain_registry")
-def reload_approved_domains():
-    """Safely reload and validate the maintained approved-domain file."""
-    from backend.app.email_domains import registry
+@capability("local_registry")
+def resolve_entity(entity_type: str, candidate: str, current_value: str | None = None):
+    """Resolve a candidate through its typed registry without model inference."""
+    from backend.app.resolution.registry import registry_store
 
-    return {"domains": registry.reload(), "reloaded": True}
+    return registry_store(get_settings().test_mode).resolve(entity_type, candidate, current_value)
+
+
+@capability("local_registry")
+def reload_registry(registry_type: str):
+    """Safely reload a validated local registry."""
+    from backend.app.resolution.registry import registry_store
+
+    return {
+        "registry_type": registry_type,
+        "values": registry_store(get_settings().test_mode).reload(registry_type),
+        "reloaded": True,
+    }
 
 
 @capability("chroma")
@@ -340,9 +347,13 @@ def ingest_document(
         uploaded = documents().upload(data, title, media_type)
         processed = documents().process(uploaded["id"])
         return {
-            "pages": processed["pages"], "chunks": processed["chunks"], "entities": 0,
-            "vector_count": processed["chunks"], "ms": int((perf_counter() - started) * 1000),
-            "duplicate": uploaded["duplicate"], "content_hash": uploaded["id"],
+            "pages": processed["pages"],
+            "chunks": processed["chunks"],
+            "entities": 0,
+            "vector_count": processed["chunks"],
+            "ms": int((perf_counter() - started) * 1000),
+            "duplicate": uploaded["duplicate"],
+            "content_hash": uploaded["id"],
         }
     return environment()[3].ingest_pdf(title, data).model_dump()
 
@@ -558,8 +569,6 @@ def get_local_storage_status() -> dict[str, bool]:
         "sqlite": sqlite_ready,
         "aura_connected": bool(environment()[2]) if environment.cache_info().currsize else False,
     }
-
-
 
 
 if __name__ == "__main__":

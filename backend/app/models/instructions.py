@@ -3,11 +3,10 @@
 import json
 
 INSTRUCTIONS = {
-    "email_correction": """Interpret one spoken correction into EmailInterpretation only.
-Return an operation, its old_value/new_value, and whether clarification is needed. Current username,
-locked domain and prior correction are immutable input data. Never regenerate a full email, invent or
-change a domain without an explicit request, or claim identity verification. Use clarify whenever the
-target text or position is not unambiguous.""",
+    "conversation_interpret": """Interpret only explicit entity corrections in the latest transcript.
+Return InterpretedTurn with generic validated operations. Entity values are state, not suggestions.
+Never regenerate a full email, infer missing characters, change an unmentioned field, or claim identity
+verification. Use KEEP or clarification when the requested target is ambiguous.""",
     "classify_intent": """Classify the incoming request. Facts/questions about resumes,
 graduation, skills, PDFs, document summaries or current published
 guidance use knowledge. Operational failures, MFA problems, printers,

@@ -12,9 +12,27 @@ class StubProvider:
         text = context.get("request") or context.get("ticket", {}).get("summary", "")
         lower = text.lower()
         if stage == "classify_intent":
-            unrelated = any(term in lower for term in ("immigration", "sports score", "restaurant recommendation", "political news", "election news"))
+            unrelated = any(
+                term in lower
+                for term in (
+                    "immigration",
+                    "sports score",
+                    "restaurant recommendation",
+                    "political news",
+                    "election news",
+                )
+            )
             knowledge = any(
-                t in lower for t in ("graduate", "resume", "skills", "summarize", "guidance", "document", "policy")
+                t in lower
+                for t in (
+                    "graduate",
+                    "resume",
+                    "skills",
+                    "summarize",
+                    "guidance",
+                    "document",
+                    "policy",
+                )
             )
             return schema.model_validate(
                 {
@@ -24,24 +42,29 @@ class StubProvider:
                     "justification": "Explicit test intent fixture",
                 }
             )
-        if stage == "email_correction":
+        if stage == "conversation_interpret":
             return schema.model_validate(
                 {
-                    "intent": "clarify",
-                    "operation": "clarify",
+                    "intent": "general",
+                    "operations": [],
                     "needs_clarification": True,
-                    "domain_change_requested": False,
-                    "clarification": "Please say exactly which characters to change.",
+                    "clarification": "Which exact characters should I change?",
                 }
             )
         if stage == "general_chat":
-            return schema.model_validate({"answer": "I can help troubleshoot that. What error do you see?"})
+            return schema.model_validate(
+                {"answer": "I can help troubleshoot that. What error do you see?"}
+            )
         if stage == "analyze_ticket":
             match = re.search(r"([A-Z][a-z]+ [A-Z][a-z]+) from ([\w-]+)", text)
             user = (
                 match[1]
                 if match
-                else "Sarah" if "sarah" in lower else "Jake" if "jake" in lower else None
+                else "Sarah"
+                if "sarah" in lower
+                else "Jake"
+                if "jake" in lower
+                else None
             )
             company = match[2] if match else "B99" if "b99" in lower else None
             device = "PRN-ACCT-02" if "prn-acct-02" in lower else None
@@ -53,12 +76,18 @@ class StubProvider:
                     "product": (
                         "VPN"
                         if "vpn" in lower
-                        else "Microsoft 365" if "mfa" in lower else "Printer" if device else None
+                        else "Microsoft 365"
+                        if "mfa" in lower
+                        else "Printer"
+                        if device
+                        else None
                     ),
                     "issue_type": (
                         "authentication"
                         if "vpn" in lower or "mfa" in lower
-                        else "printing" if device else "unknown"
+                        else "printing"
+                        if device
+                        else "unknown"
                     ),
                     "symptoms": text,
                     "affected_scope": "multiple users" if "five" in lower else "individual",

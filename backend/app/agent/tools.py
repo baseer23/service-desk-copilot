@@ -27,9 +27,9 @@ READ_TOOLS = {
     "search_remembered_facts",
     "get_case_history",
     "list_available_context",
-    "list_approved_domains",
-    "resolve_domain",
-    "reload_approved_domains",
+    "list_registry",
+    "resolve_entity",
+    "reload_registry",
 }
 KNOWLEDGE_TOOLS = {
     "search_knowledge",
@@ -47,7 +47,11 @@ def allowed_tools(workflow: str) -> set[str]:
 
 def annotation(spec):
     if "enum" in spec:
-        return Any if any(isinstance(value, dict | list) for value in spec["enum"]) else Literal[tuple(spec["enum"]) ]
+        return (
+            Any
+            if any(isinstance(value, dict | list) for value in spec["enum"])
+            else Literal[tuple(spec["enum"])]
+        )
     if "anyOf" in spec:
         types = [annotation(s) for s in spec["anyOf"]]
         result = types[0]
@@ -95,11 +99,14 @@ class AgentToolHarness:
                     async def call(**arguments):
                         self.invocation_count += 1
                         return await self.mcp_client.call_tool(tool_name, arguments)
+
                     return call
 
                 tool = StructuredTool.from_function(
-                    name=name, description=item.get("description") or name,
-                    coroutine=bind(name), args_schema=args,
+                    name=name,
+                    description=item.get("description") or name,
+                    coroutine=bind(name),
+                    args_schema=args,
                 )
             except (KeyError, TypeError, ValueError):
                 continue  # An invalid integration must not hide healthy tools.
@@ -114,10 +121,12 @@ class AgentToolHarness:
 
     def allowed_names(self, workflow):
         permitted = set(allowed_tools(workflow)) | {
-            name for name, item in self.descriptors.items()
+            name
+            for name, item in self.descriptors.items()
             if item.get("_deskmate_read_permitted") is True
             and workflow in item.get("_deskmate_workflows", [])
         }
+
         def available(item):
             metadata = item.get("meta") or item.get("_meta") or {}
             if not isinstance(metadata, dict):
@@ -147,8 +156,11 @@ class AgentToolHarness:
         for name, item in self.descriptors.items():
             if name not in allowed:
                 continue
-            results.append({
-                "name": name, "description": item.get("description", name),
-                "input_schema": planning_schema(item["inputSchema"]),
-            })
+            results.append(
+                {
+                    "name": name,
+                    "description": item.get("description", name),
+                    "input_schema": planning_schema(item["inputSchema"]),
+                }
+            )
         return results
