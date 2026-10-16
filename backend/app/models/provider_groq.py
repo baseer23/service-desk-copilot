@@ -243,6 +243,37 @@ class GroqProvider:
                     error_code = detail.get("code") if isinstance(detail, dict) else None
                     if (
                         status == 400
+                        and error_code == "json_validate_failed"
+                        and validation_attempt == 0
+                    ):
+                        validation_attempt += 1
+                        packed = {
+                            **packed,
+                            "response_correction": (
+                                "The prior response failed the required JSON schema. Return one complete "
+                                "object matching every field and the conversation interpretation rules."
+                            ),
+                        }
+                        packed, report, messages, response_format, estimated_tokens = prepare(
+                            packed, 0.75
+                        )
+                        await asyncio.to_thread(
+                            self._record_usage,
+                            stage,
+                            None,
+                            time.monotonic() - started,
+                            "structured_recovery",
+                        )
+                        await model_event(
+                            kind="structured_recovery",
+                            status="running",
+                            provider="groq",
+                            stage=stage,
+                            summary="Retrying one provider-rejected structured response",
+                        )
+                        continue
+                    if (
+                        status == 400
                         and error_code in {"context_length_exceeded", "context_window_exceeded"}
                         and overflow_attempt == 0
                     ):

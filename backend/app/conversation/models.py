@@ -21,6 +21,7 @@ class EntityOperation(BaseModel):
     old_value: str | None = Field(default=None, max_length=253)
     new_value: str | None = Field(default=None, max_length=253)
     position: int | None = Field(default=None, ge=0, le=253)
+    complete_value: bool = False
     needs_clarification: bool = False
     clarification: str | None = Field(default=None, max_length=300)
 
@@ -48,6 +49,7 @@ class InterpretedTurn(BaseModel):
     operations: list[EntityOperation] = Field(default_factory=list, max_length=3)
     needs_clarification: bool = False
     clarification: str | None = Field(default=None, max_length=300)
+    helpdesk_task: Literal["none", "ticket"] = "none"
 
     @model_validator(mode="after")
     def validate_turn(self):
@@ -55,6 +57,17 @@ class InterpretedTurn(BaseModel):
             raise ValueError("clarification text is required")
         if self.intent != "general" and not self.operations and not self.needs_clarification:
             raise ValueError("an entity intent requires an operation or clarification")
+        kinds = {operation.operation for operation in self.operations}
+        if self.intent == "confirm_entity" and kinds != {"CONFIRM"}:
+            raise ValueError("confirm_entity requires only CONFIRM operations")
+        if "CONFIRM" in kinds and self.intent != "confirm_entity":
+            raise ValueError("CONFIRM requires confirm_entity intent")
+        if self.intent == "undo" and kinds != {"UNDO"}:
+            raise ValueError("undo intent requires only UNDO operations")
+        if "UNDO" in kinds and self.intent != "undo":
+            raise ValueError("UNDO requires undo intent")
+        if self.intent == "general" and self.operations:
+            raise ValueError("general intent cannot mutate entities")
         return self
 
 

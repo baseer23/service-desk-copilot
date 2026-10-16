@@ -9,7 +9,12 @@ class StubProvider:
         return "stub"
 
     async def generate_structured(self, stage: str, context: dict[str, Any], schema: Any) -> Any:
-        text = context.get("request") or context.get("ticket", {}).get("summary", "")
+        text = (
+            context.get("request")
+            or context.get("transcript")
+            or context.get("message")
+            or context.get("ticket", {}).get("summary", "")
+        )
         lower = text.lower()
         if stage == "classify_intent":
             unrelated = any(
@@ -43,13 +48,123 @@ class StubProvider:
                 }
             )
         if stage == "conversation_interpret":
-            return schema.model_validate(
-                {
+            fixtures = {
+                "i'm calling about a ticket.": {
                     "intent": "general",
                     "operations": [],
-                    "needs_clarification": True,
-                    "clarification": "Which exact characters should I change?",
-                }
+                    "helpdesk_task": "ticket",
+                },
+                "my e-mail is abdulbasir at ngenuity.ca.": {
+                    "intent": "set_entity",
+                    "operations": [
+                        {
+                            "entity": "contact.email.local_part",
+                            "operation": "SET",
+                            "new_value": "abdulbasir",
+                        },
+                        {
+                            "entity": "contact.email.domain",
+                            "operation": "SET",
+                            "new_value": "ngenuity.ca",
+                        },
+                    ],
+                },
+                "no, it is just abdul basir before the at symbol.": {
+                    "intent": "set_entity",
+                    "operations": [
+                        {
+                            "entity": "contact.email.local_part",
+                            "operation": "SET",
+                            "new_value": "abdulbasir",
+                        }
+                    ],
+                },
+                "no. my full email address is abdul basir at ngenuity.ca.": {
+                    "intent": "set_entity",
+                    "operations": [
+                        {
+                            "entity": "contact.email.local_part",
+                            "operation": "SET",
+                            "new_value": "abdulbasir",
+                        },
+                        {
+                            "entity": "contact.email.domain",
+                            "operation": "SET",
+                            "new_value": "ngenuity.ca",
+                        },
+                    ],
+                },
+                "basir is actually b a s e e r.": {
+                    "intent": "correct_entity",
+                    "operations": [
+                        {
+                            "entity": "contact.email.local_part",
+                            "operation": "REPLACE",
+                            "old_value": "basir",
+                            "new_value": "baseer",
+                        }
+                    ],
+                },
+                "yes, that is correct.": {
+                    "intent": "confirm_entity",
+                    "operations": [{"entity": "contact.email.local_part", "operation": "CONFIRM"}],
+                },
+                "my email is qa user at customunknown.dev.": {
+                    "intent": "set_entity",
+                    "operations": [
+                        {
+                            "entity": "contact.email.local_part",
+                            "operation": "SET",
+                            "new_value": "qauser",
+                        },
+                        {
+                            "entity": "contact.email.domain",
+                            "operation": "SET",
+                            "new_value": "customunknown.dev",
+                        },
+                    ],
+                },
+                "my email is qa user at ngenuity.ca.": {
+                    "intent": "set_entity",
+                    "operations": [
+                        {
+                            "entity": "contact.email.local_part",
+                            "operation": "SET",
+                            "new_value": "qauser",
+                        },
+                        {
+                            "entity": "contact.email.domain",
+                            "operation": "SET",
+                            "new_value": "ngenuity.ca",
+                        },
+                    ],
+                },
+                "undo": {
+                    "intent": "undo",
+                    "operations": [{"entity": "contact.email.local_part", "operation": "UNDO"}],
+                },
+                "my ticket number is abc-123.": {
+                    "intent": "set_entity",
+                    "operations": [
+                        {"entity": "ticket.reference", "operation": "SET", "new_value": "ABC-123"}
+                    ],
+                    "helpdesk_task": "ticket",
+                },
+                "my ticket number is abc-124.": {
+                    "intent": "set_entity",
+                    "operations": [
+                        {
+                            "entity": "ticket.reference",
+                            "operation": "SET",
+                            "new_value": "ABC-124",
+                            "complete_value": True,
+                        }
+                    ],
+                    "helpdesk_task": "ticket",
+                },
+            }
+            return schema.model_validate(
+                fixtures.get(lower, {"intent": "general", "operations": []})
             )
         if stage == "general_chat":
             return schema.model_validate(

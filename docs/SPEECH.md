@@ -81,3 +81,7 @@ The reasoning-provider error and investigation-timeline changes do not alter Spe
 ### 2026-10-16 conversation-runtime verification
 
 The generic conversation refactor did not change the Speech SDK lifecycle. Browser tests continue to verify continuous partial/final handling, Stop exclusion, final-drain ordering, exactly-once submission, reconnect behavior and microphone cleanup. No fresh Azure Speech request or physical microphone test was performed for this revision, so audio recognition accuracy remains unverified here.
+
+### 2026-10-16 model-first interpretation revision
+
+Recognized text now always enters the selected model's structured conversation interpreter before validated Python state changes. Speech transport, transcript finalization, duplicate suppression and SDK closure are unchanged. The browser suite passed, but no new physical microphone or Azure Speech request was performed.

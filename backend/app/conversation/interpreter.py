@@ -1,107 +1,65 @@
-"""Entity-span parsing: transcript -> intent -> spans -> normalized operations."""
+"""Contextual validation for model-interpreted conversation turns."""
 
 from __future__ import annotations
+
 import re
-from backend.app.conversation.models import EntityOperation, InterpretedTurn
+
+from backend.app.conversation.models import ConversationSession, InterpretedTurn
 
 
-def normalize_local(span):
-    return re.sub(r"[^a-z0-9._+-]", "", span.casefold())
+def contextual_issue(turn: InterpretedTurn, session: ConversationSession) -> str | None:
+    """Reject unsafe or contradictory operations before any state is mutated."""
+    projected = dict(session.entities)
+    changed_entities: set[str] = set()
 
+    for operation in turn.operations:
+        entity = operation.entity
+        current = projected.get(entity, "")
+        if entity in changed_entities and operation.operation not in {"KEEP", "CONFIRM"}:
+            return "I found conflicting changes. What should the final value be?"
+        if operation.operation not in {"KEEP", "CONFIRM", "UNDO"}:
+            changed_entities.add(entity)
 
-def spelled(span):
-    repeats = {"double": 2, "triple": 3, "two": 2, "three": 3}
-    out = []
-    repeat = 1
-    for token in re.findall(r"[a-z0-9]+", span.casefold().replace("-", " ")):
-        if token in repeats:
-            repeat = repeats[token]
-        elif token not in {"letter", "letters", "and", "then"}:
-            out.append(token * repeat)
-            repeat = 1
-    return "".join(out)
-
-
-PREFIX = re.compile(
-    r"^(?:no[,.]?\s*)?(?:my\s+)?(?:full\s+)?(?:e-?mail(?:\s+address)?(?:\s+is)?|address(?:\s+is)?|it\s+is)\s+",
-    re.I,
-)
-
-
-def deterministic_turn(transcript, current_email=None, active_entity=None):
-    text = transcript.strip()
-    lower = text.casefold().strip(" .")
-    if re.fullmatch(
-        r"(?:yes|yes[,]? that is correct|yes[,]? that's correct|that is correct|correct|that's right)",
-        lower,
-    ):
-        confirmation_entity = (
-            "contact.email.local_part" if active_entity == "contact.email" else active_entity
-        ) or "contact.email.local_part"
-        return InterpretedTurn(
-            intent="confirm_entity",
-            operations=[EntityOperation(entity=confirmation_entity, operation="CONFIRM")],
-        )
-    if re.search(r"\b(?:undo|go back to the previous version)\b", lower):
-        return InterpretedTurn(
-            intent="undo",
-            operations=[EntityOperation(entity="contact.email.local_part", operation="UNDO")],
-        )
-    ticket = re.search(r"\bticket\s+(?:number|reference)\s+is\s+([a-z0-9-]+)", text, re.I)
-    if ticket:
-        return InterpretedTurn(
-            intent="set_entity",
-            operations=[
-                EntityOperation(
-                    entity="ticket.reference", operation="SET", new_value=ticket.group(1).upper()
-                )
-            ],
-        )
-    # Explicit local part with no domain must never trigger domain resolution.
-    local_only = re.search(
-        r"(?:no[,.]?\s*)?(?:it is )?(?:just )?(.+?)\s+before\s+the\s+at\s+symbol", text, re.I
-    )
-    if local_only:
-        return InterpretedTurn(
-            intent="set_entity",
-            operations=[
-                EntityOperation(
-                    entity="contact.email.local_part",
-                    operation="SET",
-                    new_value=spelled(local_only.group(1)),
-                )
-            ],
-        )
-    # Complete email: isolate only the entity span on each side of the address separator.
-    separator = re.search(r"\s+(?:at|@)\s+", text, re.I)
-    if separator:
-        left = PREFIX.sub("", text[: separator.start()].strip())
-        right = text[separator.end() :].strip(" .,!?")
-        local = spelled(left)
-        domain = right
-        if local and domain:
-            return InterpretedTurn(
-                intent="set_entity",
-                operations=[
-                    EntityOperation(
-                        entity="contact.email.local_part", operation="SET", new_value=local
-                    ),
-                    EntityOperation(
-                        entity="contact.email.domain", operation="SET", new_value=domain
-                    ),
-                ],
+        if operation.operation == "CONFIRM":
+            if entity.startswith("contact.email."):
+                if not session.email:
+                    return "Please provide the email address first."
+            elif not current:
+                return "Please provide that information first."
+            continue
+        if operation.operation in {"UNDO", "KEEP"}:
+            continue
+        if operation.operation == "SET":
+            if current and operation.new_value != current and not operation.complete_value:
+                return "Should I replace the complete value, or only change part of it?"
+            candidate = operation.new_value or ""
+        elif operation.operation == "REPLACE":
+            if not current or not operation.old_value or current.count(operation.old_value) != 1:
+                return "Which exact existing characters should I replace?"
+            candidate = current.replace(operation.old_value, operation.new_value or "", 1)
+        elif operation.operation == "INSERT":
+            if operation.position is None or operation.position > len(current):
+                return "Where should I insert those characters?"
+            candidate = (
+                current[: operation.position]
+                + (operation.new_value or "")
+                + current[operation.position :]
             )
-    replace = re.search(r"\b([a-z0-9]+)\s+(?:is actually|should be|is)\s+(.+?)[.]?$", text, re.I)
-    if replace and current_email:
-        return InterpretedTurn(
-            intent="correct_entity",
-            operations=[
-                EntityOperation(
-                    entity="contact.email.local_part",
-                    operation="REPLACE",
-                    old_value=normalize_local(replace.group(1)),
-                    new_value=spelled(replace.group(2)),
-                )
-            ],
-        )
+        elif operation.operation == "DELETE":
+            if not current or not operation.old_value or current.count(operation.old_value) != 1:
+                return "Which exact existing characters should I remove?"
+            candidate = current.replace(operation.old_value, "", 1)
+        elif operation.operation == "CLEAR":
+            candidate = ""
+        else:
+            return "Please clarify that change."
+
+        if (
+            entity == "contact.email.local_part"
+            and candidate
+            and not re.fullmatch(r"[a-z0-9._+-]{1,120}", candidate)
+        ):
+            return "Please clarify the username spelling."
+        projected[entity] = candidate
+
     return None

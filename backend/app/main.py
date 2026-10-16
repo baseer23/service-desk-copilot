@@ -479,41 +479,14 @@ def create_app(settings: Settings | None = None):
 
     @app.post("/voice-conversation/{session_id}")
     async def voice_conversation(session_id: str, body: EmailTurnRequest):
-        from backend.app.agent.models import GeneralAnswer
         from backend.app.conversation.engine import ConversationEngine
-        from backend.app.conversation.interpreter import deterministic_turn
 
         session = app.state.conversation_sessions.get(session_id)
         if not session:
             raise HTTPException(404, "Voice conversation expired. Start a new conversation.")
-        if "ticket" in body.summary.casefold() and not session.active_entity:
-            session.active_helpdesk_task = "ticket"
-        turn = deterministic_turn(body.summary, session.email, session.active_entity)
-        if session.active_entity or (turn and turn.operations):
-            return await ConversationEngine(
-                app.state.agent.harness, app.state.agent.provider, selected_provider(s)
-            ).process(session, body.summary, body.request_id, body.expected_version)
-        try:
-            answer = await app.state.agent.provider.generate_structured(
-                "general_chat",
-                {"message": body.summary, "conversation": session.conversation_history[-8:]},
-                GeneralAnswer,
-            )
-        except LLMError as exc:
-            raise HTTPException(502, llm_error_detail(exc)) from exc
-        session.conversation_history.extend(
-            [
-                {"role": "user", "content": body.summary},
-                {"role": "assistant", "content": answer.answer},
-            ]
-        )
-        session.conversation_history = session.conversation_history[-16:]
-        return {
-            "session_id": session.session_id,
-            "response": answer.answer,
-            "mode": "helpdesk",
-            "version": session.version,
-        }
+        return await ConversationEngine(
+            app.state.agent.harness, app.state.agent.provider, selected_provider(s)
+        ).process(session, body.summary, body.request_id, body.expected_version)
 
     @app.post("/email-correction/{session_id}")
     async def correct_email(session_id: str, body: EmailTurnRequest):

@@ -3,10 +3,31 @@
 import json
 
 INSTRUCTIONS = {
-    "conversation_interpret": """Interpret only explicit entity corrections in the latest transcript.
-Return InterpretedTurn with generic validated operations. Entity values are state, not suggestions.
-Never regenerate a full email, infer missing characters, change an unmentioned field, or claim identity
-verification. Use KEEP or clarification when the requested target is ambiguous.""",
+    "conversation_interpret": """Interpret the latest conversational turn using the supplied entities,
+confirmed fields, conversation history, active entity, active helpdesk task and pending clarification.
+Return only an InterpretedTurn. Identify the caller's intent and the exact affected entity; the caller's
+words are evidence, not text to copy wholesale into an identifier.
+
+Normalize explicitly spoken identifier values: remove conversational framing, join spoken letters and
+spaces in an email local part, lowercase email components, and preserve meaningful punctuation. A full
+email produces SET operations for contact.email.local_part and contact.email.domain. The domain operation
+contains only the spoken candidate; another component resolves it. A partial correction to an existing
+value must use REPLACE, INSERT or DELETE, never SET: for example, 'Change Sir to S EE R' replaces old_value
+'sir' with new_value 'seer'. A clearly stated complete replacement may use SET with intent set_entity and
+complete_value=true. Never mark a substring, fragment or uncertain scope as a complete value.
+
+Resolve pronouns and short replies from context. 'The domain is correct' uses KEEP for the domain. 'Yes'
+confirms the pending or active value. 'Undo that' uses UNDO. Do not change an unmentioned field. 'My name is
+Abdul Basir Khan' sets person.name unless the active context explicitly asks for an email username. 'No, it
+has to be Abdul Basir Khan at Ingenuity CA' extracts only local part 'abdulbasirkhan' and domain candidate
+'Ingenuity CA'. A ticket request sets helpdesk_task='ticket'; preserve it through identifier collection so
+confirmation can resume it. Use helpdesk_task='none' when no new ticket task is introduced. A request to
+work on a ticket has intent general with no entity operation. General troubleshooting also has intent
+general and no operations.
+
+Never infer missing characters, regenerate an existing identifier, claim identity verification, expose
+implementation details or emit conflicting operations. Use needs_clarification with one precise question
+when the target, scope or exact characters are ambiguous.""",
     "classify_intent": """Classify the incoming request. Facts/questions about resumes,
 graduation, skills, PDFs, document summaries or current published
 guidance use knowledge. Operational failures, MFA problems, printers,

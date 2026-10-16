@@ -73,6 +73,19 @@ def rate_limited(retry_after="2"):
     return error
 
 
+def structured_rejected():
+    error = RuntimeError("private failed generation must not be surfaced")
+    error.status_code = 400
+    error.response = SimpleNamespace(headers={})
+    error.body = {
+        "error": {
+            "code": "json_validate_failed",
+            "failed_generation": "private generated content",
+        }
+    }
+    return error
+
+
 @pytest.mark.parametrize(
     "value,expected",
     [
@@ -313,6 +326,19 @@ async def test_invalid_structured_response_cannot_dispatch_tools(settings):
     with pytest.raises(LLMError, match="invalid structured GeneralAnswer"):
         await provider.generate_structured("reason", {}, GeneralAnswer)
     assert len(provider.chat.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_provider_rejected_structured_output_retries_once_without_leaking_content(settings):
+    provider = GroqProvider(
+        configured(settings),
+        chat=Chat([structured_rejected(), {"answer": "Validated on the bounded retry."}]),
+    )
+    result = await provider.generate_structured("general_chat", {}, GeneralAnswer)
+    assert result.answer == "Validated on the bounded retry."
+    assert len(provider.chat.calls) == 2
+    path = provider.settings.case_db_path.with_name("llm-provider-usage.sqlite3")
+    assert b"private generated content" not in path.read_bytes()
 
 
 def test_factory_keeps_test_stub_exclusive_to_test_mode(settings):

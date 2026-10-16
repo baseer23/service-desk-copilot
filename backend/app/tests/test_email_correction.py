@@ -1,6 +1,9 @@
 from concurrent.futures import ThreadPoolExecutor
-from backend.app.conversation.interpreter import deterministic_turn
-from backend.app.conversation.models import ConversationSession, EntityOperation
+
+import pytest
+from pydantic import ValidationError
+from backend.app.conversation.interpreter import contextual_issue
+from backend.app.conversation.models import ConversationSession, EntityOperation, InterpretedTurn
 from backend.app.conversation.operations import apply_operation
 from backend.app.conversation.sessions import ConversationSessions
 from backend.app.resolution.registry import RegistryStore
@@ -23,28 +26,61 @@ def test_five_confirmed_live_regressions_and_ticket_resume(make_client):
     client = make_client()
     sid = start(client)
     assert turn(client, sid, "I'm calling about a ticket.", 0, "ticket-task")["mode"] == "helpdesk"
-    a = turn(client, sid, "My e-mail is Abdulbasir at ngenuity.ca.", 0, "failure-a")
+    a = turn(client, sid, "My e-mail is Abdulbasir at ngenuity.ca.", 1, "failure-a")
     assert a["email"] == "abdulbasir@ngenuity.ca"
-    b = turn(client, sid, "No, it is just Abdul Basir before the at symbol.", 1, "failure-b")
+    b = turn(client, sid, "No, it is just Abdul Basir before the at symbol.", 2, "failure-b")
     assert b["email"] == "abdulbasir@ngenuity.ca" and "right" in b["response"].lower()
     c = turn(
-        client, sid, "No. My full email address is Abdul Basir at ngenuity.ca.", 2, "failure-c"
+        client, sid, "No. My full email address is Abdul Basir at ngenuity.ca.", 3, "failure-c"
     )
     assert c["email"] == "abdulbasir@ngenuity.ca"
-    d = turn(client, sid, "Basir is actually B A S E E R.", 3, "failure-d")
+    d = turn(client, sid, "Basir is actually B A S E E R.", 4, "failure-d")
     assert d["email"] == "abdulbaseer@ngenuity.ca"
-    e = turn(client, sid, "Yes, that is correct.", 4, "failure-e")
+    e = turn(client, sid, "Yes, that is correct.", 5, "failure-e")
     assert e["email"] == "abdulbaseer@ngenuity.ca" and e["email_confirmed"]
     assert e["response"] == "Thanks. Do you have your ticket number?"
 
 
-def test_parser_uses_entity_spans_not_conversation_prefixes():
-    for text in [
-        "My e-mail is Abdulbasir at ngenuity.ca.",
-        "No. My full email address is Abdul Basir at ngenuity.ca.",
-    ]:
-        parsed = deterministic_turn(text)
-        assert parsed.operations[0].new_value == "abdulbasir"
+def test_contextual_validation_rejects_substring_overwrite_without_mutation():
+    session = ConversationSession(session_id="context-test")
+    session.entities["contact.email.local_part"] = "abdulbasir"
+    turn = InterpretedTurn(
+        intent="correct_entity",
+        operations=[
+            EntityOperation(entity="contact.email.local_part", operation="SET", new_value="baseer")
+        ],
+    )
+    assert "complete value" in contextual_issue(turn, session)
+    assert session.entities["contact.email.local_part"] == "abdulbasir"
+
+
+def test_confirmation_intent_cannot_be_a_keep_no_op():
+    with pytest.raises(ValidationError, match="CONFIRM"):
+        InterpretedTurn(
+            intent="confirm_entity",
+            operations=[EntityOperation(entity="contact.email.local_part", operation="KEEP")],
+        )
+
+
+def test_every_turn_uses_model_interpretation_with_full_context(make_client, monkeypatch):
+    client = make_client()
+    provider = client.app.state.agent.provider
+    original = provider.generate_structured
+    contexts = []
+
+    async def record(stage, context, schema):
+        if stage == "conversation_interpret":
+            contexts.append(context)
+        return await original(stage, context, schema)
+
+    monkeypatch.setattr(provider, "generate_structured", record)
+    sid = start(client)
+    turn(client, sid, "I'm calling about a ticket.", 0, "context-1")
+    turn(client, sid, "My e-mail is Abdulbasir at ngenuity.ca.", 1, "context-2")
+    assert len(contexts) == 2
+    assert contexts[1]["active_helpdesk_task"] == "ticket"
+    assert contexts[1]["conversation_history"]
+    assert contexts[1]["entities"] == {}
 
 
 def test_unknown_domain_requires_confirmation_but_remains_usable(make_client):
@@ -134,6 +170,7 @@ def test_general_vpn_does_not_force_email(make_client):
     sid = start(client)
     result = turn(client, sid, "My VPN is not connecting.", 0, "vpn-general")
     assert result["mode"] == "helpdesk" and result.get("email") is None
+    assert result["version"] == 1
 
 
 def test_ticket_reference_can_be_corrected_as_generic_entity(make_client):
