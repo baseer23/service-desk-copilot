@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from backend.app.mcp.schema import checked_schema
 from backend.app.mcp.client import DeskMateMCPClient, MCPConnectionError, MCPToolError
+from backend.app.mcp.neo4j_external import build_neo4j_stdio_env
 
 
 class ServerSpec(BaseModel):
@@ -65,12 +66,15 @@ class ExternalMCPClient(DeskMateMCPClient):
     @asynccontextmanager
     async def transport(self):
         if self.spec.transport == "stdio":
-            environment = get_default_environment()
-            for child_key, source_key in self.spec.environment.items():
-                value = os.environ.get(source_key)
-                if value is None:
-                    raise MCPConnectionError("An integration credential is missing")
-                environment[child_key] = value
+            if self.spec.name == "neo4j":
+                environment = build_neo4j_stdio_env(self.settings, os.environ)
+            else:
+                environment = get_default_environment()
+                for child_key, source_key in self.spec.environment.items():
+                    value = os.environ.get(source_key)
+                    if value is None:
+                        raise MCPConnectionError("An integration credential is missing")
+                    environment[child_key] = value
             params = StdioServerParameters(command=self.spec.command, args=self.spec.args,
                                            env=environment)
             # SDK/process diagnostics may contain third-party request bodies.

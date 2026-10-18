@@ -309,6 +309,7 @@ def create_app(settings: Settings | None = None):
             generation_provider=selected_provider(s),
             test_mode=s.test_mode,
             mcp_connected=report.local_mcp == "READY",
+            mcp_integrations=dict(app.state.mcp.integration_status),
             chroma=environment["chroma"],
             aura_configured=bool(s.neo4j_uri),
             aura_connected=environment["aura_connected"],

@@ -4,8 +4,10 @@ import sys
 from types import SimpleNamespace
 import pytest
 from backend.app.agent.tools import AgentToolHarness
-from backend.app.mcp.client import MCPToolError
+from backend.app.mcp.client import MCPConnectionError, MCPToolError
 from backend.app.mcp.multi import MultiMCPClient, ServerSpec
+from backend.app.mcp.neo4j_external import build_neo4j_stdio_env
+from pydantic import SecretStr
 
 class Builtin:
     _task = None
@@ -68,3 +70,31 @@ async def test_full_discovered_schema_rejects_nested_invalid_arguments():
 @pytest.mark.parametrize('values',[{'name':'deskmate','command':'python'},{'name':'remote','transport':'streamable_http','url':'http://example.com'},{'name':'remote','transport':'streamable_http','url':'https://example.com/?token=secret'}])
 def test_invalid_integration_configuration(values):
     with pytest.raises(ValueError): ServerSpec.model_validate(values)
+
+
+def test_neo4j_environment_is_canonical_isolated_and_read_only(settings):
+    configured = settings.model_copy(update={
+        "neo4j_uri": "neo4j+s://example.databases.neo4j.io",
+        "neo4j_user": "reader",
+        "neo4j_password": SecretStr("private-test-value"),
+        "neo4j_database": "support",
+    })
+    parent = {"PATH": "/bin", "UNRELATED_SECRET": "must-not-pass"}
+    child = build_neo4j_stdio_env(configured, parent)
+    assert child == {
+        "PATH": "/bin",
+        "NEO4J_MCP_URI": "neo4j+s://example.databases.neo4j.io",
+        "NEO4J_MCP_USERNAME": "reader",
+        "NEO4J_MCP_PASSWORD": "private-test-value",
+        "NEO4J_MCP_DATABASE": "support",
+        "NEO4J_MCP_READ_ONLY": "true",
+        "NEO4J_MCP_TELEMETRY": "false",
+    }
+    assert parent == {"PATH": "/bin", "UNRELATED_SECRET": "must-not-pass"}
+
+
+def test_neo4j_environment_missing_credentials_has_sanitized_error(settings):
+    with pytest.raises(MCPConnectionError) as caught:
+        build_neo4j_stdio_env(settings, {})
+    assert "missing" in str(caught.value).lower()
+    assert "password" not in str(caught.value).lower()

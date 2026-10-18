@@ -80,6 +80,7 @@ class Settings(BaseSettings):
     neo4j_uri: str = ""
     neo4j_user: str = "neo4j"
     neo4j_password: SecretStr = Field(default=SecretStr(""), repr=False)
+    neo4j_database: str = "neo4j"
     chroma_dir: Path = PROJECT_ROOT / "store/chroma"
     case_db_path: Path = PROJECT_ROOT / "store/case_memory.db"
     top_k: int = Field(default=6, ge=1, le=30)

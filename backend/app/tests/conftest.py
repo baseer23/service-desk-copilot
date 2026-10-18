@@ -19,6 +19,7 @@ for key, value in {
     "EMBED_PROVIDER": "stub",
     "SPEECH_ENABLED": "false",
     "NEO4J_URI": "",
+    "MCP_SERVERS": "[]",
 }.items():
     os.environ[key] = value
 

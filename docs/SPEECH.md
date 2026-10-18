@@ -85,3 +85,7 @@ The generic conversation refactor did not change the Speech SDK lifecycle. Brows
 ### 2026-10-16 model-first interpretation revision
 
 Recognized text now always enters the selected model's structured conversation interpreter before validated Python state changes. Speech transport, transcript finalization, duplicate suppression and SDK closure are unchanged. The browser suite passed, but no new physical microphone or Azure Speech request was performed.
+
+### 2026-10-18 Neo4j MCP revision
+
+The optional read-only Neo4j MCP integration does not change Speech transport, recognition, accounting, transcript ownership or provider routing. Its unit tests perform no Azure inference or Speech request. No new physical microphone or Azure Speech verification was performed for this revision.

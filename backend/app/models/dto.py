@@ -135,6 +135,7 @@ class HealthResponse(BaseModel):
     generation_provider: str
     test_mode: bool
     mcp_connected: bool
+    mcp_integrations: dict[str, str] = Field(default_factory=dict)
     chroma: bool
     aura_configured: bool
     aura_connected: bool
