@@ -29,6 +29,8 @@ export interface ReadinessReport {
   url_ingestion_enabled?: boolean
   structured_ingestion_available?: boolean
   structured_ingestion_blocker?: string | null
+  azure_document_intelligence_available?: boolean
+  neo4j_read_available?: boolean
   voice_validation_scope?: 'not_checked' | 'configuration' | 'transport'
 }
 export function reasoningBlocker(report: ReadinessReport | null): string | null {

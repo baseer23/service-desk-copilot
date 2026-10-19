@@ -17,6 +17,22 @@ interface Match {
   }
 }
 
+function Switch({ label, checked, disabled, onChange }: {
+  label: string
+  checked: boolean
+  disabled: boolean
+  onChange: (checked: boolean) => void
+}) {
+  return (
+    <label className={`knowledge-switch ${disabled ? 'unavailable' : ''}`}>
+      <span>{label}<small>{disabled ? 'Unavailable' : checked ? 'ON' : 'OFF'}</small></span>
+      <input type="checkbox" role="switch" aria-label={label} checked={checked}
+        disabled={disabled} onChange={(event) => onChange(event.target.checked)} />
+      <i aria-hidden="true" />
+    </label>
+  )
+}
+
 export default function KnowledgePanel({
   readiness,
 }: {
@@ -34,7 +50,9 @@ export default function KnowledgePanel({
   const [matches, setMatches] = useState<Match[]>([])
   const [searched, setSearched] = useState(false)
   const [dragging, setDragging] = useState(false)
-  const [structuredIngestion, setStructuredIngestion] = useState(false)
+  const [azureDi, setAzureDi] = useState(true)
+  const [neo4jRead, setNeo4jRead] = useState(true)
+  const [hybrid, setHybrid] = useState(false)
   const picker = useRef<HTMLInputElement>(null)
   const indexingBlocked = readiness?.semantic_ingestion_ready === false
   const urlBlocked = readiness?.url_ingestion_enabled === false
@@ -61,7 +79,8 @@ export default function KnowledgePanel({
         const body = new FormData()
         body.append('file', file)
         if (title) body.append('title', title)
-        body.append('ingestion_mode', structuredIngestion ? 'structured_graph' : 'standard')
+        body.append('document_processing', azureDi ? 'azure_di' : 'local')
+        body.append('ingestion_mode', hybrid ? 'structured_graph' : 'standard')
         options = { method: 'POST', body }
         path =
           readiness?.managed_documents && kind !== 'extract' ? '/documents/upload' :
@@ -142,22 +161,24 @@ export default function KnowledgePanel({
   return (
     <section className="card knowledge-card">
       <h2>Documents and knowledge</h2>
-      <div className="structured-ingestion-toggle">
-        <label htmlFor="structured-ingestion">
-          <input
-            id="structured-ingestion"
-            type="checkbox"
-            role="switch"
-            checked={structuredIngestion}
-            disabled={busy || readiness?.structured_ingestion_available !== true}
-            onChange={(event) => setStructuredIngestion(event.target.checked)}
-          />
-          Structured Ingestion + Neo4j — {structuredIngestion ? 'ON' : 'OFF'}
-        </label>
-        <p className="muted">
-          {readiness?.structured_ingestion_available === true
-            ? 'Applies only to the next selected upload: Extracting → Structuring → Embedding → Linking → Ready.'
-            : 'Unavailable: configure an authorized Neo4j ingestion connection. Standard local ingestion remains available.'}
+      <div className="knowledge-switches" aria-label="Knowledge processing options">
+        <Switch label="Azure Document Intelligence" checked={azureDi}
+          disabled={busy || readiness?.azure_document_intelligence_available === false}
+          onChange={setAzureDi} />
+        <Switch label="Neo4j Read" checked={neo4jRead}
+          disabled={busy || readiness?.neo4j_read_available === false}
+          onChange={setNeo4jRead} />
+        <Switch label="Azure DI + Neo4j Hybrid" checked={hybrid}
+          disabled={busy || !azureDi || !neo4jRead || readiness?.structured_ingestion_available !== true}
+          onChange={setHybrid} />
+        <p className="muted knowledge-switch-note">
+          {readiness?.azure_document_intelligence_available === false
+            ? 'Azure Document Intelligence is unavailable; local document processing remains available. '
+            : 'Azure processing runs only when you upload a document. '}
+          {readiness?.neo4j_read_available === false
+            ? 'Neo4j read is unavailable. '
+            : 'Neo4j access is read-only. '}
+          Hybrid is off for this demo; ChromaDB remains the primary knowledge store.
         </p>
       </div>
       <div className={`document-drop ${dragging ? 'dragging' : ''}`} onDragOver={event => { event.preventDefault(); setDragging(true) }} onDragLeave={() => setDragging(false)} onDrop={event => { event.preventDefault(); setDragging(false); chooseFile(event.dataTransfer.files[0]) }}>

@@ -449,13 +449,14 @@ def save_document(
     title: str | None = None,
     media_type: str = "application/pdf",
     ingestion_mode: Literal["standard", "structured_graph"] = "standard",
+    document_processing: Literal["local", "azure_di"] = "local",
 ):
     """Operator-controlled extraction and local staging; never creates fake semantic vectors."""
     if get_settings().uses_record_store:
         data = base64.b64decode(data_base64, validate=True)
         if len(data) > 5_000_000:
             raise ValueError("Document exceeds 5 MB")
-        return documents().upload(data, title, media_type, ingestion_mode)
+        return documents().upload(data, title, media_type, ingestion_mode, document_processing)
     result = _extract_upload(data_base64, media_type)
     return {
         **documents().save(

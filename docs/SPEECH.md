@@ -89,3 +89,7 @@ Recognized text now always enters the selected model's structured conversation i
 ### 2026-10-18 Neo4j MCP revision
 
 The optional read-only Neo4j MCP integration does not change Speech transport, recognition, accounting, transcript ownership or provider routing. Its unit tests perform no Azure inference or Speech request. No new physical microphone or Azure Speech verification was performed for this revision.
+
+### 2026-10-19 demo-day repair
+
+The knowledge and research repairs do not change Speech transport, continuous recognition, transcript ownership or provider selection. The full browser unit suite passed; no physical microphone or new Azure Speech recognition request was performed.

@@ -140,6 +140,9 @@ class GroqProvider:
         )
         output_bound = min(TOKEN_LIMITS.get(stage, 1200), self.settings.groq_max_output_tokens)
         window = model_context_window(self.settings)
+        account_token_capacity = self.limiter.token_capacity()
+        if account_token_capacity:
+            window = min(window, account_token_capacity)
 
         def prepare(source: dict, fraction: float = 1.0):
             # Reserve output, protocol overhead, instructions and schema. The

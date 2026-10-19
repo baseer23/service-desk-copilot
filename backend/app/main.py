@@ -45,6 +45,11 @@ from backend.app.store.vector_chroma import StorageError
 
 def llm_error_detail(error: LLMError) -> dict[str, Any]:
     """Return an actionable, secret-free provider diagnostic for the UI."""
+    if error.category == "application_validation":
+        return {
+            "code": "APPLICATION_VALIDATION_FAILED",
+            "message": "DeskMate rejected an invalid investigation step. Collected evidence was preserved.",
+        }
     messages = {
         "authentication": "Azure OpenAI authentication failed. Sign in to Entra again and retry.",
         "authorization": (
@@ -292,6 +297,15 @@ def create_app(settings: Settings | None = None):
             "semantic_ingestion_ready": report.semantic_ingestion_ready,
             "url_ingestion_enabled": report.url_ingestion_enabled,
             "managed_documents": s.uses_record_store,
+            "azure_document_intelligence_available": bool(
+                s.uses_record_store and s.azure_document_endpoint
+            ),
+            "neo4j_read_available": bool(
+                app.state.mcp.integration_status.get("neo4j") == "connected"
+                and {"neo4j__get-schema", "neo4j__read-cypher"}.issubset(
+                    app.state.mcp.discovered
+                )
+            ),
             "structured_ingestion_available": bool(
                 s.uses_record_store
                 and s.neo4j_ingestion_enabled
@@ -381,6 +395,7 @@ def create_app(settings: Settings | None = None):
     async def document_upload(
         file: UploadFile, title: str | None, tool: str,
         ingestion_mode: str = "standard",
+        document_processing: str = "local",
     ):
         from pathlib import Path
 
@@ -404,6 +419,7 @@ def create_app(settings: Settings | None = None):
         if tool == "save_document":
             arguments["title"] = title or file.filename
             arguments["ingestion_mode"] = ingestion_mode
+            arguments["document_processing"] = document_processing
         return (await app.state.agent.harness.invoke(tool, arguments))["result"]
 
     @app.post("/documents/extract")
@@ -414,10 +430,15 @@ def create_app(settings: Settings | None = None):
     async def save_upload(
         file: UploadFile = File(...), title: str | None = Form(None),
         ingestion_mode: str = Form("standard"),
+        document_processing: str = Form("local"),
     ):
         if ingestion_mode not in {"standard", "structured_graph"}:
             raise HTTPException(400, "ingestion_mode must be standard or structured_graph")
-        return await document_upload(file, title, "save_document", ingestion_mode)
+        if document_processing not in {"local", "azure_di"}:
+            raise HTTPException(400, "document_processing must be local or azure_di")
+        return await document_upload(
+            file, title, "save_document", ingestion_mode, document_processing
+        )
 
     @app.post("/documents/paste")
     async def save_pasted_document(body: IngestPasteRequest):

@@ -220,8 +220,10 @@ def test_empty_local_knowledge_research_keeps_public_evidence_ephemeral(make_cli
     ).json()["case_id"]
     result = c.post(f"/cases/{cid}/investigate")
     assert result.status_code == 200
+    state = result.json()
+    assert state["status"] == "insufficient_information" and state["confidence"] == 0
     body = result.json()
-    assert any(e["tool"] == "fetch_web_page" for e in body["evidence"])
+    assert not any(e["tool"] == "fetch_web_page" for e in body["evidence"])
     context = c.portal.call(harness.invoke, "list_available_context", {})
     assert context["result"]["knowledge_chunks"] == 0
     assert not any(e["tool"] == "ingest_text" for e in c.get(f"/cases/{cid}/events").json())
@@ -345,7 +347,7 @@ def test_fetched_irrelevant_page_is_not_ingested(make_client, selected_irrelevan
     cid = c.post("/cases", json={"summary": "A newly released utility crashes."}).json()["case_id"]
     result = c.post(f"/cases/{cid}/investigate")
     assert result.status_code == 200
-    assert len(selections) == 2 and "text" in selections[1]["results"][0]
+    assert len(selections) == 1
     assert "fetch_web_page" in calls and "ingest_text" not in calls
     assert calls.index("fetch_web_page") < len(calls) - 1
     context = c.portal.call(original_invoke, "list_available_context", {})
@@ -373,3 +375,56 @@ def test_failed_public_research_records_error_evidence(make_client):
     assert any(
         e["tool"] == "search_web" and e["source_type"] == "tool_error" for e in state["evidence"]
     )
+
+
+def test_empty_search_skips_source_evaluation(make_client):
+    c = make_client()
+    agent = c.app.state.agent
+    original_invoke = agent.harness.invoke
+    original_generate = agent.provider.generate_structured
+    evaluated = []
+
+    async def web(name, arguments):
+        if name == "search_web":
+            return []
+        return await original_invoke(name, arguments)
+
+    async def generate(stage, context, schema):
+        if stage == "evaluate_sources":
+            evaluated.append(context)
+        return await original_generate(stage, context, schema)
+
+    agent.harness.invoke, agent.provider.generate_structured = web, generate
+    case_id = c.post("/cases", json={"summary": "A newly released utility crashes."}).json()[
+        "case_id"
+    ]
+    assert c.post(f"/cases/{case_id}/investigate").status_code == 200
+    assert evaluated == []
+
+
+def test_unknown_selected_url_is_ignored_without_crashing(make_client):
+    c = make_client()
+    agent = c.app.state.agent
+    original_invoke = agent.harness.invoke
+    original_generate = agent.provider.generate_structured
+
+    async def web(name, arguments):
+        if name == "search_web":
+            return [{"url": "https://example.com/guide", "title": "Utility guide"}]
+        return await original_invoke(name, arguments)
+
+    async def generate(stage, context, schema):
+        if stage == "evaluate_sources":
+            return schema(
+                selected_urls=["https://invalid.example/not-a-result"],
+                directly_relevant=True,
+                evidence_gap="No valid selected source.",
+                justification="The model returned an unknown URL.",
+            )
+        return await original_generate(stage, context, schema)
+
+    agent.harness.invoke, agent.provider.generate_structured = web, generate
+    case_id = c.post("/cases", json={"summary": "A newly released utility crashes."}).json()[
+        "case_id"
+    ]
+    assert c.post(f"/cases/{case_id}/investigate").status_code == 200

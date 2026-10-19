@@ -624,7 +624,8 @@ class ServiceDeskAgent:
             except ValueError as exc:
                 if attempt:
                     raise LLMError(
-                        "Model plan failed tool permission or argument validation"
+                        "Model plan failed tool permission or argument validation",
+                        category="application_validation",
                     ) from exc
                 context["plan_validation_feedback"] = (
                     exc.errors(include_input=False, include_url=False)
@@ -687,7 +688,10 @@ class ServiceDeskAgent:
         try:
             self.harness.validate_plan(plan, state["workflow"])
         except ValueError as exc:
-            raise LLMError("Model plan failed tool permission or argument validation") from exc
+            raise LLMError(
+                "Model plan failed tool permission or argument validation",
+                category="application_validation",
+            ) from exc
         results = [None] * len(plan.tool_calls)
         web_round = any(c.name in {"search_web", "search_news"} for c in plan.tool_calls)
 
@@ -1228,6 +1232,11 @@ class ServiceDeskAgent:
                 await failed(search_tool, MCPToolError("Public search returned malformed results"))
                 continue
             rows = rank_sources(rows, self.settings)
+            if not rows:
+                await self.note(
+                    state, search_tool, "Public search returned no usable sources", "tool_error"
+                )
+                continue
             selection = await self.provider.generate_structured(
                 "evaluate_sources",
                 {
@@ -1242,12 +1251,20 @@ class ServiceDeskAgent:
                 ResearchSelection,
             )
             available = {r["url"]: r for r in rows}
-            if set(selection.selected_urls) - set(available):
-                raise LLMError("Research selection contains a URL absent from search results")
+            selected_urls = [url for url in selection.selected_urls if url in available]
+            if len(selected_urls) != len(selection.selected_urls):
+                await self.note(
+                    state,
+                    "evaluate_sources",
+                    "Ignored a source URL that was not present in the search results",
+                    "application_validation",
+                )
             await self.note(
                 state, "evaluate_sources", selection.justification, self.provider.name()
             )
-            for url in selection.selected_urls:
+            if not selection.directly_relevant:
+                selected_urls = []
+            for url in selected_urls:
                 hit = available[url]
                 capability_name = "fetch_web_page"
                 try:
@@ -1259,41 +1276,28 @@ class ServiceDeskAgent:
                     for key in ("published_at", "publisher"):
                         if hit.get(key) is not None:
                             page[key] = hit[key]
-                    outputs.append({"name": "fetch_web_page", "output": fetched})
                     text = page.get("text", "")
                     if len(text.strip()) < 120:
                         continue
-                    useful = await self.provider.generate_structured(
-                        "evaluate_sources",
-                        {
-                            "request": state["ticket"]["summary"],
-                            "query": query,
-                            "results": [
-                                {
-                                    "url": page["url"],
-                                    "title": page.get("title"),
-                                    "text": relevant_excerpt(text, query, 6000),
-                                }
-                            ],
-                            "preferred_domains": self.settings.research_preferred_domains,
-                            "source_policy": self.settings.research_source_policy,
-                            "missing_evidence": decision.get("missing_information", []),
-                            "purpose": "Assess actual fetched content for usefulness before ingestion.",
-                        },
-                        ResearchSelection,
-                    )
-                    if set(useful.selected_urls) - {page["url"]}:
-                        raise LLMError("Fetched-source evaluation selected an unknown URL")
-                    await self.note(
-                        state, "evaluate_sources", useful.justification, self.provider.name()
-                    )
-                    if not useful.selected_urls or not useful.directly_relevant:
+                    excerpt = relevant_excerpt(text, query, 6000)
+                    generic_terms = {
+                        "about", "changes", "current", "find", "latest", "news",
+                        "provide", "released", "system", "update", "updates", "what",
+                    }
+                    query_terms = {
+                        term.casefold().strip(".,:;!?()[]{}\"'")
+                        for term in query.split()
+                        if len(term.strip(".,:;!?()[]{}\"'")) >= 4
+                        and term.casefold().strip(".,:;!?()[]{}\"'") not in generic_terms
+                    }
+                    if query_terms and not any(term in excerpt.casefold() for term in query_terms):
                         continue
+                    outputs.append({"name": "fetch_web_page", "output": fetched})
                     await emit(
                         "source_verified",
                         "completed",
                         f"Relevant source collected: {str(page.get('title') or urlsplit(page['url']).hostname)[:220]}",
-                        rationale=useful.justification[:500],
+                        rationale=selection.justification[:500],
                         sources=[{"title": str(page.get("title") or page["url"])[:200], "url": page["url"]}],
                     )
                 except (MCPToolError, ValueError) as exc:
@@ -1302,7 +1306,10 @@ class ServiceDeskAgent:
 
     def _validate_evidence_refs(self, state, ids):
         if set(ids) - {e["id"] for e in state.get("evidence", [])}:
-            raise LLMError("Structured reasoning cited unknown evidence identifiers")
+            raise LLMError(
+                "Structured reasoning cited unknown evidence identifiers",
+                category="application_validation",
+            )
 
     async def verify(self, state):
         # Judge the current candidate independently; prior critic text and

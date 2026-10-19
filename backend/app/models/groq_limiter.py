@@ -70,6 +70,16 @@ class GroqRateLimiter:
             "tpd": (settings.groq_tokens_per_day, 86400, True),
         }
 
+    def token_capacity(self) -> int | None:
+        """Return only token limits learned from Groq or explicitly configured."""
+        limits = [budget.limit for kind, budget in self.budgets.items() if kind == "tpm"]
+        limits.extend(
+            limit
+            for limit, _seconds, token_limit in self.configured.values()
+            if token_limit and limit
+        )
+        return min(limits) if limits else None
+
     async def observe(self, headers, *, retry: bool = False, fallback_delay: float = 1) -> None:
         headers = {key.lower(): value for key, value in headers.items()}
         now = self.clock()

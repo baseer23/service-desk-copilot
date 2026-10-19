@@ -10,9 +10,9 @@ class LocalDocumentExtractor:
     def __init__(self, settings, records):
         self.settings, self.records = settings, records
 
-    def extract(self, data, media_type, enhanced=False):
+    def extract(self, data, media_type, enhanced=False, force_azure=False):
         # Native extraction avoids uploading ordinary PDFs to any cloud service.
-        if media_type == "application/pdf":
+        if media_type == "application/pdf" and not force_azure:
             from backend.app.services.local_pdf import extract_pdf_pages
 
             pages = extract_pdf_pages(data)

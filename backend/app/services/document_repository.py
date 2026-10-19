@@ -34,9 +34,12 @@ class DocumentRepository:
         title: str | None,
         media_type: str,
         ingestion_mode: str = "standard",
+        document_processing: str = "local",
     ):
         if ingestion_mode not in {"standard", "structured_graph"}:
             raise ValueError("ingestion_mode must be standard or structured_graph")
+        if document_processing not in {"local", "azure_di"}:
+            raise ValueError("document_processing must be local or azure_di")
         if not data or len(data) > 5_000_000 or len(title or "") > 300:
             raise ValueError(
                 "Choose a nonempty document up to 5 MB and a title up to 300 characters"
@@ -54,6 +57,7 @@ class DocumentRepository:
                 "storage": "local",
                 "indexed": previous["payload"]["status"] == "ready",
                 "ingestion_mode": previous["payload"].get("ingestion_mode", "standard"),
+                "document_processing": previous["payload"].get("document_processing", "local"),
             }
         self.blobs.put(identifier, "original", data, media_type)
         payload = {
@@ -66,6 +70,7 @@ class DocumentRepository:
             "chunks": 0,
             "pages": 0,
             "ingestion_mode": ingestion_mode,
+            "document_processing": document_processing,
         }
         family = hashlib.sha256((title or identifier).strip().casefold().encode()).hexdigest()
         with self.records.locked("document_family", family) as history:
@@ -133,11 +138,14 @@ class DocumentRepository:
                 else:
                     state.update(phase="extract_inflight", status="extracting")
                     row = self.records.write("document", identifier, state, previous=row)
-                    result = (
-                        self.extractor.extract(original, state["media_type"], True)
-                        if state.get("ingestion_mode") == "structured_graph"
-                        else self.extractor.extract(original, state["media_type"])
-                    )
+                    if state.get("document_processing") == "azure_di":
+                        result = self.extractor.extract(
+                            original, state["media_type"], True, True
+                        )
+                    elif state.get("ingestion_mode") == "structured_graph":
+                        result = self.extractor.extract(original, state["media_type"], True)
+                    else:
+                        result = self.extractor.extract(original, state["media_type"])
                 for figure in result.get("figures", []):
                     encoded = figure.pop("image_base64", None)
                     if encoded:
