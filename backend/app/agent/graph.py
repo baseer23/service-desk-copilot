@@ -189,7 +189,14 @@ class ServiceDeskAgent:
             and not permits(arguments["url"], self.settings)
         ):
             raise MCPToolError("Public source excluded by configured policy")
-        summary = "Searching local knowledge" if name == "search_knowledge" else "Querying knowledge relationships" if name == "search_graph" else "Searching current news" if name == "search_news" else "Searching the public web" if name == "search_web" else "Reading a public source" if name == "fetch_web_page" else "Reading connected tool evidence"
+        summaries = {
+            "search_knowledge": "Searching Neo4j references, then local knowledge",
+            "search_graph": "Querying knowledge relationships",
+            "search_news": "Searching current news",
+            "search_web": "Searching the public web",
+            "fetch_web_page": "Reading a public source",
+        }
+        summary = summaries.get(name, "Reading connected tool evidence")
         details = {"tool": name}
         if name in {"search_web", "search_news", "search_knowledge"}:
             details["query"] = str(arguments.get("query") or arguments.get("question") or "")[:500]
@@ -833,9 +840,10 @@ class ServiceDeskAgent:
         if len(candidate_ids) != len(set(candidate_ids)):
             await emit(
                 "evidence_grading", "failed",
-                f"Document relevance could not be verified; {len(candidates)} candidates excluded",
+                "Model grading unavailable; retaining "
+                f"{len(candidates)} retrieved documents for evidence assessment",
             )
-            return []
+            return candidates
         bounded = [
             {
                 "id": candidate_ids[index],

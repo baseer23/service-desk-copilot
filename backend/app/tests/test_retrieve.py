@@ -112,3 +112,44 @@ def test_structured_hybrid_reads_graph_references_before_local_content():
     ).hybrid_search("Widget Alpha details", 2)
     assert calls[:3] == ["graph", "local", "semantic"]
     assert result[0]["id"] == "chunk-1"
+
+
+def test_graph_lookup_failure_falls_back_to_local_hybrid():
+    class Graph(GraphStub):
+        def fetch_structured_references(self, concepts, limit, **constraints):
+            raise RuntimeError("fictional graph outage")
+
+    class Vector(VectorStub):
+        def hybrid(self, question, embedding, limit):
+            return self.results[:limit]
+
+    result = Retriever(
+        SimpleNamespace(top_k=2),
+        Vector(sample_vector_results),
+        Graph(),
+        StubEmbeddingProvider(dim=4),
+    ).hybrid_search("Widget Alpha details", 2)
+    assert [row["id"] for row in result] == ["chunk-1", "chunk-2"]
+    assert all(row["graph_enrichment"] == "unavailable" for row in result)
+
+
+def test_graph_hydration_receives_query_embedding_for_local_ranking():
+    class Graph(GraphStub):
+        def fetch_structured_references(self, concepts, limit, **constraints):
+            return [
+                {"object_id": "C17", "object_type": "Chunk", "document_id": "doc-1"}
+            ]
+
+    class Vector(VectorStub):
+        def resolve_object_ids(self, object_ids, query_embedding):
+            assert object_ids == ["C17"]
+            assert len(query_embedding) == 4
+            return [{**sample_vector_results[0], "score_type": "cosine_similarity"}]
+
+    result = Retriever(
+        SimpleNamespace(top_k=1),
+        Vector(sample_vector_results),
+        Graph(),
+        StubEmbeddingProvider(dim=4),
+    ).hybrid_search("Widget Alpha details", 1)
+    assert result[0]["score_type"] == "cosine_similarity"

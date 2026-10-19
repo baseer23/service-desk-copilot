@@ -157,6 +157,38 @@ class VectorChromaStore:
                 "Chroma identifier lookup failed; stored data was preserved"
             ) from exc
 
+    def resolve_object_ids(self, object_ids, query_embedding=None):
+        """Resolve structured objects with a bounded Chroma metadata query."""
+        wanted = list(dict.fromkeys(object_ids))
+        if not wanted:
+            return []
+        include = ["documents", "metadatas"] + (["embeddings"] if query_embedding else [])
+        try:
+            found = self._collection.get(
+                where={"object_id": {"$in": wanted}}, include=include
+            )
+            rows = []
+            for index, identifier in enumerate(found["ids"]):
+                row = {
+                    "id": identifier,
+                    "text": found["documents"][index],
+                    "metadata": found["metadatas"][index],
+                    "score": 0.0,
+                    "storage": "chroma",
+                }
+                if query_embedding:
+                    row["score"] = sum(
+                        a * b
+                        for a, b in zip(
+                            query_embedding, found["embeddings"][index], strict=True
+                        )
+                    )
+                    row["score_type"] = "cosine_similarity"
+                rows.append(row)
+            return sorted(rows, key=lambda row: (-row["score"], row["id"]))
+        except Exception as exc:
+            raise StorageError("Chroma object lookup failed; stored data was preserved") from exc
+
     def count(self):
         try:
             return self._collection.count()

@@ -156,6 +156,54 @@ class DocumentRepository:
         self.records.write("document", identifier, state, previous=row, fields={"status": "queued"})
         return state
 
+    def prepare_graph_enrichment(self, identifier: str):
+        """Rebuild local structured objects from saved extraction, never Azure DI."""
+        row = self.records.read("document", identifier)
+        if not row:
+            raise ValueError("Document not found")
+        state = dict(row["payload"])
+        artifact = state.get("extraction_artifact", "extraction.json")
+        try:
+            extraction = json.loads(self.blobs.get(identifier, artifact))
+        except Exception:
+            raise ManagedStoreError(
+                "Saved extraction is unavailable; graph enrichment cannot proceed safely"
+            ) from None
+        if (
+            state.get("phase") in {"extract_inflight", "embedding_inflight"}
+            and not state.get("chunks")
+        ):
+            raise ManagedStoreError("This document has an ambiguous in-flight operation")
+        phase = "structure"
+        structured_texts = [
+            item["text"]
+            for item in split_structured(identifier, extraction, self.settings.chunk_tokens)
+        ]
+        reusable = getattr(
+            self.search_store, "reusable_vectors", lambda _identifier, _texts: None
+        )(identifier, structured_texts)
+        if reusable:
+            # Embeddings are a pure function of text. Reuse the verified saved
+            # vectors when graph enrichment only adds stable object metadata.
+            encoded = json.dumps(reusable).encode()
+            state["vector_artifact"] = (
+                "vectors-" + hashlib.sha256(encoded).hexdigest()[:16] + ".json"
+            )
+            self.blobs.put(
+                identifier, state["vector_artifact"], encoded, "application/json"
+            )
+            phase = "index"
+        state.update(
+            ingestion_mode="structured_graph",
+            status="structuring",
+            phase=phase,
+            graph_link_status="pending",
+        )
+        self.records.write(
+            "document", identifier, state, previous=row, fields={"status": "structuring"}
+        )
+        return state
+
     def search(self, question: str, top_k: int):
         return self.search_store.search_keywords(question, top_k)
 
@@ -176,9 +224,14 @@ class DocumentRepository:
             row = self.records.write("document", identifier, state, previous=row)
         try:
             if state["phase"] == "extract":
-                original_path = self.blobs.location(identifier, "original")
+                location = getattr(self.blobs, "location", None)
+                original_path = location(identifier, "original") if location else None
                 if state["media_type"] in {"text/plain", "text/markdown"}:
-                    original = original_path.read_text(encoding="utf-8-sig")
+                    original = (
+                        original_path.read_text(encoding="utf-8-sig")
+                        if original_path
+                        else self.blobs.get(identifier, "original").decode("utf-8-sig")
+                    )
                     result = {
                         "pages": [
                             {
@@ -222,15 +275,22 @@ class DocumentRepository:
                             "document", identifier, state, previous=row,
                             fields={"status": "extracting"},
                         )
-                    if state.get("document_processing") == "azure_di":
+                    if original_path and state.get("document_processing") == "azure_di":
                         result = self.extractor.extract_path(
                             original_path, state["media_type"], True, force_azure=True,
                             load_batch=load_batch, save_batch=save_batch,
                         )
-                    elif state.get("ingestion_mode") == "structured_graph":
+                    elif original_path and state.get("ingestion_mode") == "structured_graph":
                         result = self.extractor.extract_path(original_path, state["media_type"], True)
-                    else:
+                    elif original_path:
                         result = self.extractor.extract_path(original_path, state["media_type"])
+                    else:
+                        original = self.blobs.get(identifier, "original")
+                        result = self.extractor.extract(
+                            original,
+                            state["media_type"],
+                            state.get("ingestion_mode") == "structured_graph",
+                        )
                 for figure in result.get("figures", []):
                     encoded = figure.pop("image_base64", None)
                     if encoded:
@@ -253,6 +313,15 @@ class DocumentRepository:
                     "extraction-" + hashlib.sha256(encoded_result).hexdigest()[:16] + ".json"
                 )
                 self.blobs.put(identifier, extraction_artifact, encoded_result, "application/json")
+                # Preserve the first-generation compatibility pointer as an
+                # immutable artifact. Reprocessing writes only content-addressed
+                # generations and never overwrites this original extraction.
+                try:
+                    self.blobs.get(identifier, "extraction.json")
+                except (ManagedStoreError, KeyError):
+                    self.blobs.put(
+                        identifier, "extraction.json", encoded_result, "application/json"
+                    )
                 state["extraction_artifact"] = extraction_artifact
                 state.update(phase="structure", status="structuring", pages=len(result["pages"]))
                 row = self.records.write(
@@ -412,7 +481,7 @@ class DocumentRepository:
                 tables=len(result["tables"]),
             )
             self.records.write(
-                "document", identifier, state, previous=row, fields={"status": "ready"}
+                "document", identifier, state, previous=row, fields={"status": state["status"]}
             )
             self.records.write("indexed_hash", identifier, {"chunks": len(chunks)})
             return state

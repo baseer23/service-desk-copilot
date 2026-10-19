@@ -60,25 +60,49 @@ class GraphRepository:
             "CREATE CONSTRAINT IF NOT EXISTS FOR (s:Section) REQUIRE s.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (t:Table) REQUIRE t.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (f:Figure) REQUIRE f.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (p:Page) REQUIRE p.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (t:Topic) REQUIRE t.id IS UNIQUE",
         ]
         with self._driver.session() as session:
             for statement in statements:
                 session.run(statement)
 
     def upsert_document(
-        self, doc_id: str, title: Optional[str] = None, source: str = "paste"
+        self, doc_id: str, title: Optional[str] = None, source: str = "paste",
+        *, version: int = 1, content_hash: str | None = None,
     ) -> None:
         """Insert or update a document node and basic metadata."""
 
         def _tx(tx: Transaction) -> None:
             tx.run(
                 "MERGE (d:Document {id: $doc_id}) "
-                "SET d.title = $title, d.source = $source, d.updated_at = timestamp(), d.original_id=$original_id, d.tenant_id=$tenant_id",
+                "SET d.title = $title, d.source = $source, d.version=$version, "
+                "d.content_hash=$content_hash, d.link_status='linked', "
+                "d.updated_at = timestamp(), d.original_id=$original_id, d.tenant_id=$tenant_id",
                 doc_id=self.scope(doc_id),
                 title=title,
                 source=source,
                 original_id=doc_id,
                 tenant_id=self.tenant(),
+                version=version,
+                content_hash=content_hash or doc_id,
+            )
+
+        self._execute_write(_tx)
+
+    def upsert_page(self, doc_id: str, page: int, version: int = 1) -> None:
+        """Create a tenant-scoped page anchor without storing private content."""
+        page_id = f"{doc_id}:page:{page}"
+
+        def _tx(tx: Transaction) -> None:
+            tx.run(
+                "MATCH (d:Document {id:$doc_id}) MERGE (p:Page {id:$page_id}) "
+                "SET p.original_id=$original_id, p.document_id=$original_doc_id, "
+                "p.page=$page, p.version=$version, p.tenant_id=$tenant "
+                "MERGE (d)-[:HAS_PAGE]->(p)",
+                doc_id=self.scope(doc_id), page_id=self.scope(page_id),
+                original_id=page_id, original_doc_id=doc_id, page=page,
+                version=version, tenant=self.tenant(),
             )
 
         self._execute_write(_tx)
@@ -114,7 +138,9 @@ class GraphRepository:
                 f"MERGE (n:{label} {{id: $id}}) "
                 "SET n.original_id=$original_id, n.document_id=$document_id, "
                 "n.page=$page, n.ordinal=$ordinal, n.description=$description, "
-                "n.document_hash=$document_hash, n.tenant_id=$tenant_id",
+                "n.document_hash=$document_hash, n.content_hash=$content_hash, "
+                "n.version=$version, n.source_provenance=$source_provenance, "
+                "n.link_status=$link_status, n.tenant_id=$tenant_id",
                 id=self.scope(item["object_id"]),
                 original_id=item["object_id"],
                 document_id=doc_id,
@@ -123,11 +149,15 @@ class GraphRepository:
                 description=description,
                 document_hash=doc_id,
                 tenant_id=self.tenant(),
+                content_hash=item.get("content_hash"),
+                version=item.get("version", 1),
+                source_provenance=item.get("source_provenance"),
+                link_status=item.get("link_status", "linked"),
             )
             tx.run(
-                f"MATCH (d:Document {{id:$doc_id}}), (n:{label} {{id:$id}}) "
-                "MERGE (d)-[:HAS_OBJECT]->(n)",
-                doc_id=self.scope(doc_id),
+                f"MATCH (p:Page {{id:$page_id}}), (n:{label} {{id:$id}}) "
+                f"MERGE (p)-[:HAS_{label.upper()}]->(n)",
+                page_id=self.scope(f"{doc_id}:page:{item.get('page')}"),
                 id=self.scope(item["object_id"]),
             )
 
@@ -169,10 +199,11 @@ class GraphRepository:
 
         def _tx(tx: Transaction):
             result = tx.run(
-                "MATCH (d:Document)-[:HAS_OBJECT]->(seed) "
+                "MATCH (d:Document)-[:HAS_PAGE]->(:Page)-[]->(seed) "
                 "WHERE d.tenant_id=$tenant AND seed.tenant_id=$tenant "
                 "AND (size($document_ids)=0 OR d.original_id IN $document_ids) "
-                "AND any(term IN $terms WHERE toLower(coalesce(seed.description,'')) CONTAINS term) "
+                "AND any(term IN $terms WHERE toLower(coalesce(seed.description,'')) CONTAINS term "
+                "OR toLower(coalesce(d.title,'')) CONTAINS term) "
                 "MATCH path=(seed)-[*0..2]-(n) "
                 "WHERE n.tenant_id=$tenant AND any(label IN labels(n) WHERE label IN $object_types) "
                 "AND all(r IN relationships(path) WHERE type(r) IN $relationships) "
@@ -430,6 +461,9 @@ class UnavailableGraphRepository:
     def upsert_chunk(self, *args, **kwargs):
         pass
 
+    def upsert_page(self, *args, **kwargs):
+        pass
+
     def link_doc_chunk(self, *args, **kwargs):
         pass
 
@@ -448,7 +482,7 @@ class UnavailableGraphRepository:
     def fetch_chunks_for_entities(self, names, limit):
         return []
 
-    def fetch_structured_references(self, concepts, limit=20):
+    def fetch_structured_references(self, concepts, limit=20, **kwargs):
         return []
 
     def upsert_reference_object(self, *args, **kwargs):
@@ -478,11 +512,14 @@ class InMemoryGraphRepository:
         """In-memory store has no constraints to create."""
 
     def upsert_document(
-        self, doc_id: str, title: Optional[str] = None, source: str = "paste"
+        self, doc_id: str, title: Optional[str] = None, source: str = "paste", **metadata
     ) -> None:
         """Store document metadata in-memory."""
 
         self.documents[doc_id] = {"title": title, "source": source}
+
+    def upsert_page(self, doc_id: str, page: int, version: int = 1) -> None:
+        """Pages are implicit in the lightweight test repository."""
 
     def upsert_chunk(
         self, doc_id: str, chunk_id: str, ord: int, text: str, token_count: int
@@ -517,7 +554,16 @@ class InMemoryGraphRepository:
         return [
             dict(item)
             for item in self.references.values()
-            if any(term in item["description"].casefold() for term in terms)
+            if (
+                any(term in item["description"].casefold() for term in terms)
+                or any(
+                    term
+                    in str(
+                        self.documents.get(item["document_id"], {}).get("title") or ""
+                    ).casefold()
+                    for term in terms
+                )
+            )
             and (not document_ids or item["document_id"] in document_ids)
             and (not object_types or item["object_type"] in object_types)
         ][: min(max(limit, 1), 20)]

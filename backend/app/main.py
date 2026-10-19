@@ -486,6 +486,14 @@ def create_app(settings: Settings | None = None):
             )
         )["result"]
 
+    @app.post("/documents/{document_id}/enrich-graph")
+    async def enrich_local_document_graph(document_id: str):
+        return (
+            await app.state.agent.harness.invoke(
+                "enrich_document_graph", {"document_id": document_id}
+            )
+        )["result"]
+
     @app.get("/documents/{document_id}/status")
     async def document_status(document_id: str):
         return (await app.state.agent.harness.invoke("get_document", {"document_id": document_id}))[

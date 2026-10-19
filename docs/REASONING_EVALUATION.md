@@ -135,3 +135,9 @@ The live Groq Express Entry request completes with HTTP 200 after one bounded pu
 ## Streaming document upload revision — 2026-10-19
 
 This revision changes only document transport, extraction batching and local artifact persistence. Agentic RAG and reasoning-provider behavior are unchanged. Per explicit instruction, no reasoning evaluation or automated test was run.
+
+## Graph-first evidence routing evaluation — 2026-10-19
+
+Knowledge planning now explicitly selects `search_knowledge` in HYBRID mode for uploaded/internal document questions. That single boundary performs tenant-scoped Neo4j reference discovery first, bounded local object hydration and semantic ranking, then direct Chroma fallback when graph evidence is unavailable, empty or stale. Activity reports the real combined lookup rather than claiming graph success. Public research remains a later route for a genuine external gap and is not a replacement for missing private-document evidence.
+
+Focused stored-evidence checks exercised the production Chroma collection without Azure extraction: the newspaper query resolved stable page objects and the cross-object offer-letter query resolved Chunk and Table objects with page provenance. Aura has verified read connectivity, but writer configuration is absent; the same graph-first component was therefore checked with reference-only in-memory discovery over the real persisted object IDs, and both documents remain honestly marked `graph_pending`. The live missing-knowledge/web check could not execute because external web access was denied by the environment safety review. No answer, graph write or web success was fabricated.

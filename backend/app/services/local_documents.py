@@ -1,5 +1,7 @@
 """Local originals, text extraction, Chroma retrieval and transactional jobs."""
 
+import hashlib
+
 from backend.app.services.document_repository import DocumentRepository
 from backend.app.services.capabilities import knowledge_stores
 from backend.app.store.local_knowledge import LocalDocuments
@@ -80,12 +82,27 @@ class LocalDocumentRepository(DocumentRepository):
         )
 
     def process(self, identifier):
+        existing = self.get(identifier)
+        if (
+            existing.get("ingestion_mode") == "structured_graph"
+            and existing.get("phase") == "link"
+            and existing.get("status") in {"linking", "graph_pending"}
+        ):
+            return self._link_structured(identifier, existing)
         state = super().process(identifier)
         if state.get("ingestion_mode") == "structured_graph":
             return self._link_structured(identifier, state)
         # Standard ingestion is local-only. Aura writes require the explicit
         # structured_graph mode and its separately authorized writer.
         return state
+
+    def enrich_graph(self, identifier):
+        """Index saved extraction as structured objects, then idempotently link it."""
+        state = self.get(identifier)
+        if state.get("ingestion_mode") == "structured_graph" and state.get("phase") == "link":
+            return self._link_structured(identifier, state)
+        self.prepare_graph_enrichment(identifier)
+        return self.process(identifier)
 
     def _link_structured(self, identifier, state):
         """Publish reference-only structure with explicitly separate writer credentials."""
@@ -135,14 +152,31 @@ class LocalDocumentRepository(DocumentRepository):
             graph.upsert_document(
                 identifier, str(state.get("title") or "Untitled")[:160],
                 "structured_local_document",
+                version=state.get("version", 1),
+                content_hash=state.get("content_hash", identifier),
             )
             objects = split_structured(identifier, extraction, self.settings.chunk_tokens)
+            pages = sorted({item.get("page") for item in objects if item.get("page") is not None})
+            for page in pages:
+                graph.upsert_page(identifier, page, state.get("version", 1))
             for item in objects:
+                description = (
+                    f"{item['object_type']} reference for "
+                    f"{str(state.get('title') or 'Untitled')[:100]}"
+                    f" on page {item.get('page')}"
+                )
                 graph.upsert_reference_object(
                     identifier,
                     {
                         **item,
-                        "description": item["text"][:160],
+                        # Never send private source excerpts or table values to Aura.
+                        "description": description,
+                        "version": state.get("version", 1),
+                        "content_hash": hashlib.sha256(item["text"].encode()).hexdigest(),
+                        "source_provenance": "azure_document_intelligence"
+                        if state.get("document_processing") == "azure_di"
+                        else "saved_local_extraction",
+                        "link_status": "linked",
                     },
                 )
             sections = {
@@ -151,23 +185,11 @@ class LocalDocumentRepository(DocumentRepository):
                 if item["object_type"] == "Section"
             }
             chunks = [item for item in objects if item["object_type"] == "Chunk"]
-            tables = [item for item in objects if item["object_type"] == "Table"]
-            figures = [item for item in objects if item["object_type"] == "Figure"]
             for chunk in chunks:
                 if chunk.get("section_id") in sections:
                     graph.link_reference_objects(
                         sections[chunk["section_id"]], chunk["object_id"], "HAS_CHUNK"
                     )
-                for table in tables:
-                    if table.get("page") == chunk.get("page"):
-                        graph.link_reference_objects(
-                            chunk["object_id"], table["object_id"], "REFERENCES_TABLE"
-                        )
-                for figure in figures:
-                    if figure.get("page") == chunk.get("page"):
-                        graph.link_reference_objects(
-                            chunk["object_id"], figure["object_id"], "REFERENCES_FIGURE"
-                        )
             return self._set_graph_status(identifier, state, "ready")
         except Exception:
             return self._set_graph_status(identifier, state, "graph_pending")
@@ -177,6 +199,12 @@ class LocalDocumentRepository(DocumentRepository):
 
     def _set_graph_status(self, identifier, state, status):
         row = self.records.read("document", identifier)
-        updated = {**state, "status": status, "phase": "complete" if status == "ready" else "link"}
+        updated = {
+            **state,
+            "status": status,
+            "phase": "complete" if status == "ready" else "link",
+            "local_index_ready": bool(state.get("chunks")),
+            "graph_link_status": "linked" if status == "ready" else "pending",
+        }
         self.records.write("document", identifier, updated, previous=row, fields={"status": status})
         return updated

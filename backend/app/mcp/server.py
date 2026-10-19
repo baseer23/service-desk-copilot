@@ -537,6 +537,16 @@ def reprocess_document(
     )
 
 
+@capability("local_document")
+def enrich_document_graph(document_id: str):
+    """Explicitly graph-enrich a saved extraction without repeating Azure processing."""
+    repository = documents()
+    enrich = getattr(repository, "enrich_graph", None)
+    if enrich is None:
+        raise ValueError("Graph enrichment is unavailable for this document store")
+    return enrich(document_id)
+
+
 @capability("document_store")
 def get_document(document_id: str):
     """Read an authorized document's processing status."""

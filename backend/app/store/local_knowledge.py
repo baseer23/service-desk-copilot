@@ -131,13 +131,25 @@ class LocalKnowledgeStore:
         self.vector.upsert(ready)
         if ready:
             with self.records.transaction() as db:
-                for chunk in chunks:
+                for chunk in ready:
                     if chunk.get("embedding") is not None:
                         db.execute(
                             "DELETE FROM local_records WHERE tenant=? "
                             "AND kind='knowledge_pending' AND record_key=?",
-                            (self.records.tenant(), chunk["id"]),
+                            (self.records.tenant(), chunk["metadata"]["chunk_id"]),
                         )
+                        object_id = chunk.get("metadata", {}).get("object_id")
+                        if object_id:
+                            self.records.write(
+                                "knowledge_object_ref",
+                                object_id,
+                                {
+                                    "object_id": object_id,
+                                    "chunk_id": chunk["metadata"]["chunk_id"],
+                                    "physical_id": chunk["id"],
+                                    "doc_id": chunk["metadata"].get("doc_id"),
+                                },
+                            )
 
     def row(self, identifier, text, metadata, score=0, **extra):
         meta = json.loads(metadata["metadata_json"])
@@ -146,6 +158,16 @@ class LocalKnowledgeStore:
         if meta.get("family"):
             family = self.records.read("document_family", meta["family"])
             if family and family["payload"].get("published") not in {None, meta.get("doc_id")}:
+                return None
+        if meta.get("doc_id"):
+            document = self.records.read("document", meta["doc_id"])
+            if (
+                document
+                and document["payload"].get("ingestion_mode") == "structured_graph"
+                and meta.get("ingestion_mode") != "structured_graph"
+            ):
+                # Preserve historical vectors physically while preventing the
+                # superseded unstructured representation from duplicating results.
                 return None
         return {
             "id": metadata.get("chunk_id", identifier),
@@ -245,24 +267,110 @@ class LocalKnowledgeStore:
             rows.setdefault(row["id"], row)
         return list(rows.values())[:top_k]
 
-    def resolve_object_ids(self, object_ids):
-        """Hydrate tenant-owned graph references from local Chroma content."""
-        wanted = set(object_ids)
+    def resolve_object_ids(self, object_ids, query_embedding=None):
+        """Hydrate graph references by indexed IDs without scanning the collection."""
+        wanted = list(dict.fromkeys(object_ids))
         if not wanted:
             return []
+        physical_ids, mapped_objects = [], set()
+        for object_id in wanted:
+            mapping = self.records.read("knowledge_object_ref", object_id)
+            if mapping:
+                physical_ids.append(mapping["payload"]["physical_id"])
+                mapped_objects.add(object_id)
+        include = ["documents", "metadatas"] + (["embeddings"] if query_embedding else [])
+        batches = []
+        if physical_ids:
+            batches.append(self.vector._collection.get(ids=physical_ids, include=include))
+        missing = [object_id for object_id in wanted if object_id not in mapped_objects]
+        if missing:
+            # One bounded metadata lookup supports graph references created before
+            # the SQLite mapping was introduced; successful hydration backfills it.
+            batches.append(
+                self.vector._collection.get(
+                    where={
+                        "$and": [
+                            {"tenant_id": self.records.tenant()},
+                            {"object_id": {"$in": missing}},
+                        ]
+                    },
+                    include=include,
+                )
+            )
+        rows = []
+        for found in batches:
+            for index, identifier in enumerate(found["ids"]):
+                metadata = found["metadatas"][index]
+                meta = json.loads(metadata["metadata_json"])
+                if (
+                    metadata.get("tenant_id") != self.records.tenant()
+                    or meta.get("object_id") not in wanted
+                    or meta.get("ingestion_mode") != "structured_graph"
+                ):
+                    continue
+                row = self.row(identifier, found["documents"][index], metadata)
+                if row:
+                    if query_embedding:
+                        embedding = found["embeddings"][index]
+                        row["score"] = sum(
+                            a * b for a, b in zip(query_embedding, embedding, strict=True)
+                        )
+                        row["score_type"] = "cosine_similarity"
+                    rows.append(row)
+                    if not self.records.read("knowledge_object_ref", meta["object_id"]):
+                        self.records.write(
+                            "knowledge_object_ref",
+                            meta["object_id"],
+                            {
+                                "object_id": meta["object_id"],
+                                "chunk_id": metadata.get("chunk_id", identifier),
+                                "physical_id": identifier,
+                                "doc_id": meta.get("doc_id"),
+                            },
+                        )
+        if query_embedding:
+            rows.sort(key=lambda row: (-row["score"], row["id"]))
+        return rows
+
+    def document_texts(self, doc_id):
+        """Return one tenant-owned document's indexed text in stable chunk order."""
         found = self.vector._collection.get(
-            where={"tenant_id": self.records.tenant()}, include=["documents", "metadatas"]
+            where={
+                "$and": [
+                    {"tenant_id": self.records.tenant()},
+                    {"doc_id": doc_id},
+                ]
+            },
+            include=["documents", "metadatas"],
         )
         rows = []
-        for index, identifier in enumerate(found["ids"]):
+        for index, text in enumerate(found["documents"]):
             metadata = found["metadatas"][index]
             meta = json.loads(metadata["metadata_json"])
-            if meta.get("object_id") not in wanted or meta.get("ingestion_mode") != "structured_graph":
-                continue
-            row = self.row(identifier, found["documents"][index], metadata)
-            if row:
-                rows.append(row)
-        return rows
+            rows.append((int(meta.get("ord", index)), text))
+        return [text for _, text in sorted(rows)]
+
+    def reusable_vectors(self, doc_id, texts):
+        """Reuse vectors only for byte-identical text already owned by the tenant."""
+        found = self.vector._collection.get(
+            where={
+                "$and": [
+                    {"tenant_id": self.records.tenant()},
+                    {"doc_id": doc_id},
+                ]
+            },
+            include=["documents", "embeddings"],
+        )
+        by_text = {}
+        for index, text in enumerate(found["documents"]):
+            by_text.setdefault(text, []).append(found["embeddings"][index])
+        ordered = []
+        for text in texts:
+            matches = by_text.get(text)
+            if not matches:
+                return None
+            ordered.append(matches.pop(0))
+        return ordered
 
     def contains_hash(self, digest):
         return bool(self.records.read("indexed_hash", digest)) or bool(
