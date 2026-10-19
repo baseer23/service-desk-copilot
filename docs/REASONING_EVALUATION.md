@@ -131,3 +131,7 @@ Synthetic structured-document tests preserve a heading, paragraph, spanned table
 ## Demo-day research repair — 2026-10-19
 
 The live Groq Express Entry request completes with HTTP 200 after one bounded public-research pass and capacity-aware context compaction. Empty search results do not invoke source evaluation, selected URLs absent from search results are ignored as application validation, irrelevant fetched content is excluded from evidence, and fetch failures remain non-fatal. The live short VPN request also completed with HTTP 200 and asked exactly one question: which device and operating system is being used. Azure OpenAI was not selected or exercised.
+
+## Streaming document upload revision — 2026-10-19
+
+This revision changes only document transport, extraction batching and local artifact persistence. Agentic RAG and reasoning-provider behavior are unchanged. Per explicit instruction, no reasoning evaluation or automated test was run.

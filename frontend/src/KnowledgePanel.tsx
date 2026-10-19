@@ -59,7 +59,6 @@ export default function KnowledgePanel({
 
   function chooseFile(selected: File | undefined) {
     if (!selected) return
-    if (selected.size > 5 * 1024 * 1024) { setError('Choose a document smaller than 5 MB.'); return }
     setFile(selected)
     setMode('pdf')
     setPreview('')
@@ -229,7 +228,7 @@ export default function KnowledgePanel({
               onChange={(event) => chooseFile(event.target.files?.[0])}
             />
             <p className="muted">
-              {readiness?.managed_documents ? 'PDF, Word, images or UTF-8 text; up to 5 MB. PDFs: up to 100 pages.' : 'PDF, UTF-8 .txt or .md; up to 5 MB. PDFs: up to 20 pages.'}
+              {readiness?.managed_documents ? 'PDF, Word, images or UTF-8 text. Large PDFs are processed in resumable batches.' : 'PDF, UTF-8 .txt or .md.'}
               {readiness?.local_ocr_available === false &&
                 ' Text preview may be unavailable for scanned documents. Upload them for processing.'}
             </p>
@@ -293,7 +292,7 @@ export default function KnowledgePanel({
       </form>
       {error && <p role="alert">{error}</p>}
       <p role="status" className="muted">
-        {message}
+        {busy && mode === 'pdf' ? 'Uploading and processing…' : message}
       </p>
       {preview && (
         <details open>

@@ -8,9 +8,7 @@ import tempfile
 from io import BytesIO
 from pathlib import Path
 
-MAX_BYTES = 5_000_000
 MAX_TEXT = 1_000_000
-MAX_PAGES = 20
 
 
 class DocumentError(ValueError):
@@ -24,8 +22,6 @@ def ocr_available() -> bool:
 
 
 def extract_document(data: bytes, media_type: str) -> dict:
-    if len(data) > MAX_BYTES:
-        raise DocumentError("Document exceeds 5 MB", 413)
     if media_type in {"text/plain", "text/markdown"}:
         try:
             text = data.decode("utf-8-sig")
@@ -58,6 +54,26 @@ def extract_document(data: bytes, media_type: str) -> dict:
     return result
 
 
+def extract_document_path(path: Path, media_type: str) -> dict:
+    if media_type in {"text/plain", "text/markdown"}:
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            raise DocumentError("Text documents must use UTF-8") from None
+        if not text.strip():
+            raise DocumentError("Document contains no text")
+        return {"text": text, "pages": 1, "method": "text", "ocr_available": ocr_available()}
+    if media_type != "application/pdf":
+        raise DocumentError("Preview is available for PDF or UTF-8 text documents", 400)
+    from backend.app.services.local_pdf import extract_pdf_pages_path
+
+    pages = extract_pdf_pages_path(path)
+    return {
+        "text": "\n\n".join(page["text"] for page in pages),
+        "pages": len(pages), "method": "pdf_text", "ocr_available": ocr_available(),
+    }
+
+
 def _pdf_worker(data: bytes) -> dict:
     from pdfminer.high_level import extract_text
     from pdfminer.pdfpage import PDFPage
@@ -65,11 +81,9 @@ def _pdf_worker(data: bytes) -> dict:
     pages = 0
     for _ in PDFPage.get_pages(BytesIO(data), check_extractable=True):
         pages += 1
-        if pages > MAX_PAGES:
-            raise DocumentError("PDF exceeds the 20-page extraction limit")
     if not pages:
         raise DocumentError("PDF contains no pages")
-    text = extract_text(BytesIO(data), maxpages=MAX_PAGES)
+    text = extract_text(BytesIO(data))
     method = "pdf_text"
     if not text.strip():
         renderer, recognizer = shutil.which("pdftoppm"), shutil.which("tesseract")

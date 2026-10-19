@@ -372,25 +372,17 @@ def create_app(settings: Settings | None = None):
 
     @app.post("/ingest/pdf", response_model=IngestPdfResponse)
     async def ingest_pdf(file: UploadFile = File(...), title: str | None = Form(None)):
-        data = await file.read(5_000_001)
-        if len(data) > 5_000_000:
-            raise HTTPException(413, "PDF exceeds 5 MB")
-        if not data.startswith(b"%PDF-"):
-            raise HTTPException(400, "A valid PDF is required")
-        try:
-            return (
-                await app.state.agent.harness.invoke(
-                    "ingest_document",
-                    {
-                        "title": title or file.filename,
-                        "data_base64": base64.b64encode(data).decode(),
-                        "media_type": "application/pdf",
-                    },
-                )
-            )["result"]
-        except MCPToolError as exc:
-            # Distinguish parsing, policy and embedding failures.
-            raise HTTPException(exc.status_code, str(exc)) from exc
+        uploaded = await document_upload(file, title, "save_staged_document")
+        processed = (
+            await app.state.agent.harness.invoke(
+                "index_document", {"document_id": uploaded["id"]}
+            )
+        )["result"]
+        return {
+            "pages": processed["pages"], "chunks": processed["chunks"],
+            "entities": 0, "vector_count": processed["chunks"],
+            "ms": 0, "duplicate": uploaded["duplicate"], "content_hash": uploaded["id"],
+        }
 
     async def document_upload(
         file: UploadFile, title: str | None, tool: str,
@@ -399,9 +391,6 @@ def create_app(settings: Settings | None = None):
     ):
         from pathlib import Path
 
-        data = await file.read(5_000_001)
-        if len(data) > 5_000_000:
-            raise HTTPException(413, "Document exceeds 5 MB")
         suffix = Path(file.filename or "").suffix.lower()
         media_type = {
             ".pdf": "application/pdf",
@@ -414,17 +403,29 @@ def create_app(settings: Settings | None = None):
             ".tiff": "image/tiff",
         }.get(suffix)
         if media_type is None:
-            raise HTTPException(400, "Choose a PDF, .txt or .md document")
-        arguments = {"data_base64": base64.b64encode(data).decode(), "media_type": media_type}
-        if tool == "save_document":
-            arguments["title"] = title or file.filename
-            arguments["ingestion_mode"] = ingestion_mode
-            arguments["document_processing"] = document_processing
-        return (await app.state.agent.harness.invoke(tool, arguments))["result"]
+            raise HTTPException(400, "Choose a PDF, Word, image, .txt or .md document")
+        staging = (s.local_documents_dir / ".uploads").resolve()
+        staging.mkdir(mode=0o700, parents=True, exist_ok=True)
+        token = secrets.token_hex(32)
+        staged = staging / token
+        try:
+            with staged.open("xb") as target:
+                while chunk := await file.read(1024 * 1024):
+                    target.write(chunk)
+                target.flush()
+            arguments = {"upload_token": token, "media_type": media_type}
+            if tool in {"save_document", "save_staged_document"}:
+                tool = "save_staged_document"
+                arguments["title"] = title or file.filename
+                arguments["ingestion_mode"] = ingestion_mode
+                arguments["document_processing"] = document_processing
+            return (await app.state.agent.harness.invoke(tool, arguments))["result"]
+        finally:
+            staged.unlink(missing_ok=True)
 
     @app.post("/documents/extract")
     async def extract_upload(file: UploadFile = File(...)):
-        return await document_upload(file, None, "extract_document")
+        return await document_upload(file, None, "extract_staged_document")
 
     @app.post("/documents/upload")
     async def save_upload(

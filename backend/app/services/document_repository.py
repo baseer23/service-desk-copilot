@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from pathlib import Path
 
 from backend.app.adapters.embeddings import get_embedding_provider
 from backend.app.core.config import Settings
@@ -40,10 +41,8 @@ class DocumentRepository:
             raise ValueError("ingestion_mode must be standard or structured_graph")
         if document_processing not in {"local", "azure_di"}:
             raise ValueError("document_processing must be local or azure_di")
-        if not data or len(data) > 5_000_000 or len(title or "") > 300:
-            raise ValueError(
-                "Choose a nonempty document up to 5 MB and a title up to 300 characters"
-            )
+        if not data or len(title or "") > 300:
+            raise ValueError("Choose a nonempty document and a title up to 300 characters")
         if media_type in {"text/plain", "text/markdown"} and not data.decode("utf-8-sig").strip():
             raise ValueError("The document contains no readable text")
         identifier = hashlib.sha256(data).hexdigest()
@@ -82,6 +81,44 @@ class DocumentRepository:
             versions.append(identifier)
         return {**payload, "duplicate": False, "storage": "local", "indexed": False}
 
+    def upload_path(
+        self, source, title, media_type, ingestion_mode="standard", document_processing="local"
+    ):
+        path = Path(source)
+        digest, size = hashlib.sha256(), 0
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+                size += len(chunk)
+        if not size:
+            raise ValueError("Choose a nonempty document")
+        identifier = digest.hexdigest()
+        previous = self.records.read("document", identifier)
+        if previous:
+            payload = previous["payload"]
+            return {**payload, "duplicate": True, "storage": "local", "indexed": payload["status"] == "ready"}
+        if ingestion_mode not in {"standard", "structured_graph"}:
+            raise ValueError("ingestion_mode must be standard or structured_graph")
+        if document_processing not in {"local", "azure_di"}:
+            raise ValueError("document_processing must be local or azure_di")
+        if len(title or "") > 300:
+            raise ValueError("Choose a title up to 300 characters")
+        self.blobs.put_file(identifier, "original", path, media_type)
+        payload = {
+            "id": identifier, "title": title or "Untitled",
+            "source_type": "pdf" if media_type == "application/pdf" else "document",
+            "media_type": media_type, "status": "queued", "phase": "extract",
+            "chunks": 0, "pages": 0, "ingestion_mode": ingestion_mode,
+            "document_processing": document_processing,
+        }
+        family = hashlib.sha256((title or identifier).strip().casefold().encode()).hexdigest()
+        with self.records.locked("document_family", family) as history:
+            versions = history.setdefault("versions", [])
+            payload.update(family=family, version=len(versions) + 1, content_hash=identifier)
+            self.records.write("document", identifier, payload, create_only=True, fields={"status": "queued"})
+            versions.append(identifier)
+        return {**payload, "duplicate": False, "storage": "local", "indexed": False}
+
     def save(self, text: str, title: str | None, source_type: str, pages: int = 1):
         return self.upload(text.encode(), title, "text/plain")
 
@@ -114,14 +151,15 @@ class DocumentRepository:
             row = self.records.write("document", identifier, state, previous=row)
         try:
             if state["phase"] == "extract":
-                original = self.blobs.get(identifier, "original")
+                original_path = self.blobs.location(identifier, "original")
                 if state["media_type"] in {"text/plain", "text/markdown"}:
+                    original = original_path.read_text(encoding="utf-8-sig")
                     result = {
                         "pages": [
                             {
                                 "page": 1,
-                                "text": original.decode("utf-8-sig"),
-                                "markdown": original.decode("utf-8-sig"),
+                                "text": original,
+                                "markdown": original,
                                 "spans": [],
                             }
                         ],
@@ -138,14 +176,36 @@ class DocumentRepository:
                 else:
                     state.update(phase="extract_inflight", status="extracting")
                     row = self.records.write("document", identifier, state, previous=row)
+                    def load_batch(index):
+                        path = self.blobs.location(identifier, f"extraction-batch-{index}.json")
+                        return json.loads(path.read_bytes()) if path.exists() else None
+
+                    def save_batch(index, batch):
+                        nonlocal row
+                        self.blobs.put(
+                            identifier, f"extraction-batch-{index}.json",
+                            json.dumps(batch).encode(), "application/json",
+                        )
+                        state.update(
+                            completed_batches=index + 1,
+                            pages=sum(
+                                len(load_batch(item).get("pages", []))
+                                for item in range(index + 1)
+                            ),
+                        )
+                        row = self.records.write(
+                            "document", identifier, state, previous=row,
+                            fields={"status": "extracting"},
+                        )
                     if state.get("document_processing") == "azure_di":
-                        result = self.extractor.extract(
-                            original, state["media_type"], True, True
+                        result = self.extractor.extract_path(
+                            original_path, state["media_type"], True,
+                            load_batch=load_batch, save_batch=save_batch,
                         )
                     elif state.get("ingestion_mode") == "structured_graph":
-                        result = self.extractor.extract(original, state["media_type"], True)
+                        result = self.extractor.extract_path(original_path, state["media_type"], True)
                     else:
-                        result = self.extractor.extract(original, state["media_type"])
+                        result = self.extractor.extract_path(original_path, state["media_type"])
                 for figure in result.get("figures", []):
                     encoded = figure.pop("image_base64", None)
                     if encoded:

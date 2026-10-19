@@ -11,8 +11,6 @@ from defusedxml.ElementTree import fromstring
 def word_segments(data: bytes) -> list[tuple[bytes, int]]:
     namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
     with ZipFile(BytesIO(data)) as archive:
-        if sum(item.file_size for item in archive.infolist()) > 20_000_000:
-            raise ValueError("The Word document expands beyond the safe processing limit")
         xml = archive.read("word/document.xml")
         if b"<!DOCTYPE" in xml or b"<!ENTITY" in xml:
             raise ValueError("Unsupported Word document structure")
@@ -26,8 +24,6 @@ def word_segments(data: bytes) -> list[tuple[bytes, int]]:
             if block is section:
                 continue
             size = sum(len(node.text or "") for node in block.iter("{" + namespace + "}t"))
-            if size > 5000:
-                raise ValueError("A Word paragraph or table is too large; upload its PDF version")
             if group and length + size > 5000:
                 groups.append(group)
                 group, length = [], 0
@@ -35,8 +31,8 @@ def word_segments(data: bytes) -> list[tuple[bytes, int]]:
             length += size
         if group:
             groups.append(group)
-        if not groups or len(groups) > 50:
-            raise ValueError("Choose a Word document with at most 100 processing pages")
+        if not groups:
+            raise ValueError("The Word document has no readable content")
         segments = []
         for index, blocks in enumerate(groups):
             document = copy.deepcopy(root)

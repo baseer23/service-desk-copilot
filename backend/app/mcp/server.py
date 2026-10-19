@@ -401,12 +401,12 @@ def ingest_text(
 def ingest_document(
     data_base64: str, title: str | None = None, media_type: str = "application/pdf"
 ):
-    """Extract and ingest an uploaded PDF, limited to 5 MB. Input bytes are base64, never a filesystem path."""
-    if media_type != "application/pdf" or len(data_base64) > 6_666_672:
-        raise ValueError("A PDF of at most 5 MB is required")
+    """Compatibility path for PDF ingestion; HTTP uploads use staged streaming."""
+    if media_type != "application/pdf":
+        raise ValueError("A PDF is required")
     data = base64.b64decode(data_base64, validate=True)
-    if len(data) > 5_000_000 or not data.startswith(b"%PDF-"):
-        raise ValueError("A valid PDF of at most 5 MB is required")
+    if not data.startswith(b"%PDF-"):
+        raise ValueError("A valid PDF is required")
     if get_settings().uses_record_store:
         from time import perf_counter
 
@@ -428,8 +428,6 @@ def ingest_document(
 def _extract_upload(data_base64: str, media_type: str):
     from backend.app.services.document_extract import DocumentError, extract_document
 
-    if len(data_base64) > 6_666_672:
-        raise DocumentError("Document exceeds 5 MB", 413)
     try:
         data = base64.b64decode(data_base64, validate=True)
     except ValueError:
@@ -454,8 +452,6 @@ def save_document(
     """Operator-controlled extraction and local staging; never creates fake semantic vectors."""
     if get_settings().uses_record_store:
         data = base64.b64decode(data_base64, validate=True)
-        if len(data) > 5_000_000:
-            raise ValueError("Document exceeds 5 MB")
         return documents().upload(data, title, media_type, ingestion_mode, document_processing)
     result = _extract_upload(data_base64, media_type)
     return {
@@ -468,6 +464,41 @@ def save_document(
         "pages": result["pages"],
         "method": result["method"],
     }
+
+
+def _staged_path(upload_token: str):
+    import re
+
+    if not re.fullmatch(r"[a-f0-9]{64}", upload_token):
+        raise ValueError("Invalid upload token")
+    root = (get_settings().local_documents_dir / ".uploads").resolve()
+    path = (root / upload_token).resolve()
+    if path.parent != root or not path.is_file() or path.is_symlink():
+        raise ValueError("Staged upload is unavailable")
+    return path
+
+
+@capability("local_document")
+def save_staged_document(
+    upload_token: str,
+    title: str | None = None,
+    media_type: str = "application/pdf",
+    ingestion_mode: Literal["standard", "structured_graph"] = "standard",
+    document_processing: Literal["local", "azure_di"] = "local",
+):
+    """Persist a server-staged upload without transporting its bytes through MCP."""
+    return documents().upload_path(
+        _staged_path(upload_token), title, media_type, ingestion_mode, document_processing
+    )
+
+
+@capability("local_document")
+def extract_staged_document(upload_token: str, media_type: str = "application/pdf"):
+    """Preview a server-staged document without base64 transport."""
+    path = _staged_path(upload_token)
+    from backend.app.services.document_extract import extract_document_path
+
+    return extract_document_path(path, media_type)
 
 
 @capability("local_document")

@@ -21,6 +21,7 @@ class LocalDocuments:
         valid_artifact = artifact in {"original", "extraction.json", "vectors.json"} or bool(
             re.fullmatch(r"vectors-[a-f0-9]{16}\.json", artifact)
             or re.fullmatch(r"figure-[a-f0-9]{16}\.bin", artifact)
+            or re.fullmatch(r"extraction-batch-\d{1,6}\.json", artifact)
         )
         if not re.fullmatch(r"[a-f0-9]{64}", document_id) or not valid_artifact:
             raise ValueError("Unsupported document artifact")
@@ -61,11 +62,35 @@ class LocalDocuments:
             Path(temporary).unlink(missing_ok=True)
         return self.path(document_id, artifact)
 
+    def put_file(self, document_id, artifact, source, media_type):
+        path = self.location(document_id, artifact)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(dir=path.parent)
+        try:
+            with open(source, "rb") as reader, os.fdopen(descriptor, "wb") as target:
+                while chunk := reader.read(1024 * 1024):
+                    target.write(chunk)
+                target.flush()
+                os.fsync(target.fileno())
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                def digest(value):
+                    result = hashlib.sha256()
+                    with Path(value).open("rb") as stream:
+                        while chunk := stream.read(1024 * 1024):
+                            result.update(chunk)
+                    return result.digest()
+
+                if digest(path) != digest(temporary):
+                    raise ManagedStoreError("Document artifact integrity mismatch") from None
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+        return self.path(document_id, artifact)
+
     def get(self, document_id, artifact):
         path = self.location(document_id, artifact)
         try:
-            if path.stat().st_size > 25_000_000:
-                raise ManagedStoreError("Document artifact exceeds the safe download limit")
             return path.read_bytes()
         except OSError:
             raise ManagedStoreError("Document could not be read securely") from None

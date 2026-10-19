@@ -1,8 +1,8 @@
 """Optional Azure Document Intelligence processing; originals remain local."""
 
-import time
 import base64
 from io import BytesIO
+from pathlib import Path
 from typing import Any
 
 from backend.app.core.config import Settings
@@ -47,8 +47,8 @@ class AzureDocumentExtractor:
             from pypdf import PdfReader, PdfWriter
 
             reader = PdfReader(BytesIO(data))
-            if reader.is_encrypted or len(reader.pages) > 100:
-                raise ValueError("Choose an unencrypted document of at most 100 pages")
+            if reader.is_encrypted:
+                raise ValueError("Encrypted PDFs are not supported")
             segments = []
             for start in range(
                 0, len(reader.pages), 2 if self.settings.azure_document_free_tier else 100
@@ -62,10 +62,10 @@ class AzureDocumentExtractor:
                 writer.write(output)
                 segments.append((output.getvalue(), start))
         pages, tables, paragraphs, figures = [], [], [], []
-        deadline = time.monotonic() + 90
         for segment, offset in segments:
-            if len(segment) > 4_000_000 or time.monotonic() >= deadline:
-                raise ValueError("Document processing limit reached; use smaller document sections")
+            request_limit = 4_000_000 if self.settings.azure_document_free_tier else 500_000_000
+            if len(segment) > request_limit:
+                raise ValueError("A single document page exceeds the Azure request-size limit")
             try:
                 arguments = {
                     "body": BytesIO(segment),
@@ -80,7 +80,7 @@ class AzureDocumentExtractor:
                     except (ImportError, AttributeError):
                         pass
                 poller = self.client.begin_analyze_document("prebuilt-layout", **arguments)
-                result = poller.result(timeout=min(30, max(1, deadline - time.monotonic())))
+                result = poller.result(timeout=600)
                 for page in result.pages or []:
                     text = "\n".join(line.content for line in page.lines or [])
                     if not text and result.content:
@@ -201,6 +201,62 @@ class AzureDocumentExtractor:
             },
         }
 
+    def extract_path(
+        self, path, media_type: str, enhanced: bool = False,
+        load_batch=lambda _index: None, save_batch=lambda _index, _result: None,
+    ):
+        path = Path(path)
+        if media_type != "application/pdf":
+            return self.extract(path.read_bytes(), media_type, enhanced)
+        from pypdf import PdfReader, PdfWriter
+
+        reader = PdfReader(str(path))
+        if reader.is_encrypted:
+            raise ValueError("Encrypted PDFs are not supported")
+        if not reader.pages:
+            raise ValueError("The PDF contains no pages")
+        page_limit = 2 if self.settings.azure_document_free_tier else 100
+        byte_limit = 4_000_000 if self.settings.azure_document_free_tier else 500_000_000
+        ranges = [(start, min(start + page_limit, len(reader.pages)))
+                  for start in range(0, len(reader.pages), page_limit)]
+        results = []
+        batch_index = 0
+        while ranges:
+            start, end = ranges.pop(0)
+            writer = PdfWriter()
+            for page in reader.pages[start:end]:
+                writer.add_page(page)
+            output = BytesIO()
+            writer.write(output)
+            segment = output.getvalue()
+            if len(segment) > byte_limit and end - start > 1:
+                middle = start + (end - start) // 2
+                ranges[0:0] = [(start, middle), (middle, end)]
+                continue
+            if len(segment) > byte_limit:
+                raise ValueError("A single PDF page exceeds the Azure request-size limit")
+            batch = load_batch(batch_index)
+            if batch is None:
+                batch = self.extract(segment, media_type, enhanced)
+                batch = _offset_batch(batch, start, batch_index)
+                save_batch(batch_index, batch)
+            results.append(batch)
+            batch_index += 1
+        pages = [item for result in results for item in result.get("pages", [])]
+        paragraphs = [item for result in results for item in result.get("paragraphs", [])]
+        tables = [item for result in results for item in result.get("tables", [])]
+        figures = [item for result in results for item in result.get("figures", [])]
+        return {
+            "pages": pages, "paragraphs": paragraphs, "sections": _sections(paragraphs),
+            "tables": tables, "figures": figures, "method": "document_intelligence",
+            "metadata": {
+                "format": media_type, "page_count": len(pages), "table_count": len(tables),
+                "classification": "table_document" if tables else "text_document",
+                "classification_method": "layout_rules", "structured": enhanced,
+                "image_understanding": "not_performed", "completed_batches": len(results),
+            },
+        }
+
 
 def _sections(paragraphs):
     """Build a deterministic heading hierarchy without inventing semantics."""
@@ -221,6 +277,18 @@ def _sections(paragraphs):
         sections.append(section)
         stack.append(section["id"])
     return sections
+
+
+def _offset_batch(batch, offset, batch_index):
+    for collection in ("pages", "paragraphs", "tables", "figures"):
+        for ordinal, item in enumerate(batch.get(collection, [])):
+            item["page"] = item.get("page", 1) + offset
+            if collection in {"paragraphs", "tables", "figures"}:
+                item["id"] = f"batch-{batch_index}-{collection}-{ordinal}"
+            for region in item.get("bounding_regions", []):
+                region["page"] = region.get("page", 1) + offset
+    batch["sections"] = []
+    return batch
 
 
 def _regions(regions, offset=0):

@@ -93,3 +93,7 @@ The optional read-only Neo4j MCP integration does not change Speech transport, r
 ### 2026-10-19 demo-day repair
 
 The knowledge and research repairs do not change Speech transport, continuous recognition, transcript ownership or provider selection. The full browser unit suite passed; no physical microphone or new Azure Speech recognition request was performed.
+
+### 2026-10-19 streaming document uploads
+
+The upload changes do not alter Speech transport or recognition. Per explicit instruction, no automated or live Speech check was run.

@@ -41,6 +41,30 @@ class LocalDocumentExtractor:
             if extractor.credential:
                 extractor.credential.close()
 
+    def extract_path(self, path, media_type, enhanced=False, force_azure=False, **callbacks):
+        if media_type == "application/pdf" and not force_azure:
+            from backend.app.services.local_pdf import extract_pdf_pages_path
+
+            pages = extract_pdf_pages_path(path)
+            if pages and all(page["text"].strip() for page in pages):
+                return {
+                    "pages": [{**page, "markdown": page["text"], "spans": []} for page in pages],
+                    "paragraphs": [], "sections": [], "tables": [], "figures": [],
+                    "method": "pdf_text",
+                    "metadata": {"structured": enhanced, "image_understanding": "unsupported_local_extraction"},
+                }
+        if not self.settings.azure_document_endpoint:
+            raise ValueError("Document processing is not configured for scanned or image documents")
+        from backend.app.services.document_processing import AzureDocumentExtractor
+
+        extractor = AzureDocumentExtractor(self.settings, self.records)
+        try:
+            return extractor.extract_path(path, media_type, enhanced=enhanced, **callbacks)
+        finally:
+            extractor.client.close()
+            if extractor.credential:
+                extractor.credential.close()
+
 
 class LocalDocumentRepository(DocumentRepository):
     def __init__(self, settings, records=None, *, extractor=None, embeddings=None):
