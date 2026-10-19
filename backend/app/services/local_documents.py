@@ -10,20 +10,32 @@ class LocalDocumentExtractor:
     def __init__(self, settings, records):
         self.settings, self.records = settings, records
 
-    def extract(self, data, media_type):
+    def extract(self, data, media_type, enhanced=False):
         # Native extraction avoids uploading ordinary PDFs to any cloud service.
         if media_type == "application/pdf":
             from backend.app.services.local_pdf import extract_pdf_pages
+
             pages = extract_pdf_pages(data)
             if pages and all(page["text"].strip() for page in pages):
-                return {"pages": pages, "tables": [], "method": "pdf_text"}
+                return {
+                    "pages": [{**page, "markdown": page["text"], "spans": []} for page in pages],
+                    "paragraphs": [],
+                    "sections": [],
+                    "tables": [],
+                    "figures": [],
+                    "method": "pdf_text",
+                    "metadata": {
+                        "structured": enhanced,
+                        "image_understanding": "unsupported_local_extraction",
+                    },
+                }
         if not self.settings.azure_document_endpoint:
             raise ValueError("Document processing is not configured for scanned or image documents")
         from backend.app.services.document_processing import AzureDocumentExtractor
 
         extractor = AzureDocumentExtractor(self.settings, self.records)
         try:
-            return extractor.extract(data, media_type)
+            return extractor.extract(data, media_type, enhanced=enhanced)
         finally:
             extractor.client.close()
             if extractor.credential:
@@ -35,46 +47,110 @@ class LocalDocumentRepository(DocumentRepository):
         records = records or LocalRecords(settings)
         vector, _, _ = knowledge_stores(settings, connect_graph=False, records=records)
         super().__init__(
-            settings, records=records,
-            blobs=LocalDocuments(settings, records), search=vector,
+            settings,
+            records=records,
+            blobs=LocalDocuments(settings, records),
+            search=vector,
             extractor=extractor or LocalDocumentExtractor(settings, records),
             embeddings=embeddings,
         )
 
     def process(self, identifier):
         state = super().process(identifier)
-        if not self.settings.neo4j_uri:
-            return state
-        from backend.app.services.knowledge_policy import is_test_knowledge
-        if not self.settings.test_mode and is_test_knowledge(state):
-            return state
-        # Local indexing is already committed. Optional Aura enrichment cannot
-        # invalidate a successful upload when the online graph is unavailable.
-        vector, graph, driver = knowledge_stores(self.settings, records=self.records)
+        if state.get("ingestion_mode") == "structured_graph":
+            return self._link_structured(identifier, state)
+        # Standard ingestion is local-only. Aura writes require the explicit
+        # structured_graph mode and its separately authorized writer.
+        return state
+
+    def _link_structured(self, identifier, state):
+        """Publish reference-only structure with explicitly separate writer credentials."""
+        import json
+        from backend.app.services.chunking import split_structured
+
+        configured = (
+            self.settings.neo4j_ingestion_enabled
+            and self.settings.neo4j_uri
+            and self.settings.neo4j_ingestion_user
+            and self.settings.neo4j_ingestion_password.get_secret_value()
+        )
+        if not configured and not self.settings.test_mode:
+            return self._set_graph_status(identifier, state, "graph_pending")
+        driver = None
         try:
-            if driver is None:
-                return state
-            from backend.app.services.entities import extract_entities
-            import json
-            graph.upsert_document(identifier, state.get("title"), "local_document")
-            offset = 0
-            while True:
-                rows = vector.vector._collection.get(
-                    where={"$and": [{"tenant_id": self.records.tenant()}, {"doc_id": identifier}]},
-                    include=["documents", "metadatas"], limit=200, offset=offset,
+            if self.settings.test_mode:
+                from backend.app.store.graph_repo import InMemoryGraphRepository
+
+                graph = InMemoryGraphRepository()
+            else:
+                from neo4j import GraphDatabase
+                from backend.app.core.principal import current_principal
+                from backend.app.store.graph_repo import GraphRepository
+
+                driver = GraphDatabase.driver(
+                    self.settings.neo4j_uri,
+                    auth=(
+                        self.settings.neo4j_ingestion_user,
+                        self.settings.neo4j_ingestion_password.get_secret_value(),
+                    ),
+                    connection_timeout=5,
+                    max_transaction_retry_time=0,
+                    connection_acquisition_timeout=5,
                 )
-                for index, physical_id in enumerate(rows["ids"]):
-                    stored = rows["metadatas"][index]
-                    metadata = json.loads(stored["metadata_json"])
-                    chunk_id, text = stored.get("chunk_id", physical_id), rows["documents"][index]
-                    graph.upsert_chunk(identifier, chunk_id, int(metadata.get("ord", index + offset)), text, max(1, len(text) // 4))
-                    graph.link_doc_chunk(identifier, chunk_id)
-                    for entity in extract_entities([{"text": text}]):
-                        graph.link_chunk_entity(chunk_id, graph.upsert_entity(entity))
-                if len(rows["ids"]) < 200:
-                    break
-                offset += 200
-            return state
+                driver.verify_connectivity()
+                graph = GraphRepository(
+                    driver,
+                    tenant_provider=lambda: current_principal(self.settings).tenant_id,
+                    optional=False,
+                    allow_fixtures=self.settings.test_mode,
+                )
+                graph.ensure_constraints()
+            extraction = json.loads(self.blobs.get(identifier, "extraction.json"))
+            graph.upsert_document(
+                identifier, str(state.get("title") or "Untitled")[:160],
+                "structured_local_document",
+            )
+            objects = split_structured(identifier, extraction, self.settings.chunk_tokens)
+            for item in objects:
+                graph.upsert_reference_object(
+                    identifier,
+                    {
+                        **item,
+                        "description": item["text"][:160],
+                    },
+                )
+            sections = {
+                item.get("source_id"): item["object_id"]
+                for item in objects
+                if item["object_type"] == "Section"
+            }
+            chunks = [item for item in objects if item["object_type"] == "Chunk"]
+            tables = [item for item in objects if item["object_type"] == "Table"]
+            figures = [item for item in objects if item["object_type"] == "Figure"]
+            for chunk in chunks:
+                if chunk.get("section_id") in sections:
+                    graph.link_reference_objects(
+                        sections[chunk["section_id"]], chunk["object_id"], "HAS_CHUNK"
+                    )
+                for table in tables:
+                    if table.get("page") == chunk.get("page"):
+                        graph.link_reference_objects(
+                            chunk["object_id"], table["object_id"], "REFERENCES_TABLE"
+                        )
+                for figure in figures:
+                    if figure.get("page") == chunk.get("page"):
+                        graph.link_reference_objects(
+                            chunk["object_id"], figure["object_id"], "REFERENCES_FIGURE"
+                        )
+            return self._set_graph_status(identifier, state, "ready")
+        except Exception:
+            return self._set_graph_status(identifier, state, "graph_pending")
         finally:
             if driver:
                 driver.close()
+
+    def _set_graph_status(self, identifier, state, status):
+        row = self.records.read("document", identifier)
+        updated = {**state, "status": status, "phase": "complete" if status == "ready" else "link"}
+        self.records.write("document", identifier, updated, previous=row, fields={"status": status})
+        return updated

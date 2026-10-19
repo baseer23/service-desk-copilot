@@ -20,6 +20,7 @@ class LocalDocuments:
     def path(self, document_id, artifact):
         valid_artifact = artifact in {"original", "extraction.json", "vectors.json"} or bool(
             re.fullmatch(r"vectors-[a-f0-9]{16}\.json", artifact)
+            or re.fullmatch(r"figure-[a-f0-9]{16}\.bin", artifact)
         )
         if not re.fullmatch(r"[a-f0-9]{64}", document_id) or not valid_artifact:
             raise ValueError("Unsupported document artifact")
@@ -209,6 +210,25 @@ class LocalKnowledgeStore:
         for row in self.search(query_embedding, top_k):
             rows.setdefault(row["id"], row)
         return list(rows.values())[:top_k]
+
+    def resolve_object_ids(self, object_ids):
+        """Hydrate tenant-owned graph references from local Chroma content."""
+        wanted = set(object_ids)
+        if not wanted:
+            return []
+        found = self.vector._collection.get(
+            where={"tenant_id": self.records.tenant()}, include=["documents", "metadatas"]
+        )
+        rows = []
+        for index, identifier in enumerate(found["ids"]):
+            metadata = found["metadatas"][index]
+            meta = json.loads(metadata["metadata_json"])
+            if meta.get("object_id") not in wanted or meta.get("ingestion_mode") != "structured_graph":
+                continue
+            row = self.row(identifier, found["documents"][index], metadata)
+            if row:
+                rows.append(row)
+        return rows
 
     def contains_hash(self, digest):
         return bool(self.records.read("indexed_hash", digest)) or bool(

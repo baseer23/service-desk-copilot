@@ -49,3 +49,28 @@ test('never lists or fetches saved documents while preserving upload and search'
   expect(screen.getByLabelText('Knowledge search')).toBeInTheDocument()
   expect(fetch).not.toHaveBeenCalled()
 })
+
+test('structured ingestion is off by default and applies to the selected upload', async () => {
+  const fetch = vi.fn(async () => Response.json({ chunks: 1, status: 'queued' }))
+  vi.stubGlobal('fetch', fetch)
+  render(
+    <KnowledgePanel
+      readiness={{
+        managed_documents: true,
+        semantic_ingestion_ready: true,
+        structured_ingestion_available: true,
+      } as ReadinessReport}
+    />,
+  )
+  const user = userEvent.setup()
+  const toggle = screen.getByRole('switch', { name: /Structured Ingestion/ })
+  expect(toggle).not.toBeChecked()
+  await user.click(toggle)
+  const file = new File(['structured content'], 'structured.pdf', { type: 'application/pdf' })
+  await user.upload(screen.getByLabelText('PDF document'), file)
+  await user.click(screen.getByRole('button', { name: 'Add to knowledge' }))
+  const calls = fetch.mock.calls as unknown as [string, RequestInit][]
+  const body = calls[0][1].body as FormData
+  expect(body.get('ingestion_mode')).toBe('structured_graph')
+  expect(await screen.findByText('Extracting → Ready')).toBeInTheDocument()
+})

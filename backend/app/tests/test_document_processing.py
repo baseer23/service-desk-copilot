@@ -1,6 +1,5 @@
 import json
 from io import BytesIO
-from types import SimpleNamespace
 
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.core.credentials import AccessToken

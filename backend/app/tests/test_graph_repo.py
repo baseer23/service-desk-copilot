@@ -32,6 +32,35 @@ def test_upsert_chunk_links_document(mock_driver):
     assert mock_driver.execute_write.call_count == 2
 
 
+def test_structured_graph_writes_reference_metadata_without_raw_content():
+    captured = []
+
+    class Driver:
+        def execute_write(self, callback):
+            return callback(
+                SimpleNamespace(run=lambda query, **params: captured.append((query, params)))
+            )
+
+    from types import SimpleNamespace
+
+    repo = GraphRepository(Driver(), tenant_provider=lambda: "tenant-a")
+    repo.upsert_reference_object(
+        "a" * 64,
+        {
+            "object_id": "C17",
+            "object_type": "Chunk",
+            "page": 5,
+            "position": 2,
+            "description": "VPN guidance " * 40,
+        },
+    )
+    serialized = repr(captured)
+    assert "full private paragraph" not in serialized
+    assert all("text" not in params and "embedding" not in params for _, params in captured)
+    assert captured[0][1]["tenant_id"] == "tenant-a"
+    assert len(captured[0][1]["description"]) == 160
+
+
 def test_upsert_entity_and_link(mock_driver):
     repo = GraphRepository(mock_driver)
     entity_id = repo.upsert_entity("Widget")
@@ -230,5 +259,10 @@ def test_relationship_discovery_is_bounded_parameterized_and_provenanced():
     assert rows[0]["predicate"] == "USES" and rows[0]["source_system"] == "local_fixture"
     query, arguments = statements[-1]
     assert "[*1..2]" in query and "LIMIT $limit" in query
-    assert arguments == {"terms": ["jake peralta"], "limit": 5, "tenant": None, "allow_fixtures": True}
+    assert arguments == {
+        "terms": ["jake peralta"],
+        "limit": 5,
+        "tenant": None,
+        "allow_fixtures": True,
+    }
     assert any("WORKS_AT" in q for q, _ in statements)

@@ -27,6 +27,8 @@ export interface ReadinessReport {
   semantic_ingestion_ready?: boolean
   semantic_ingestion_blocker?: string | null
   url_ingestion_enabled?: boolean
+  structured_ingestion_available?: boolean
+  structured_ingestion_blocker?: string | null
   voice_validation_scope?: 'not_checked' | 'configuration' | 'transport'
 }
 export function reasoningBlocker(report: ReadinessReport | null): string | null {

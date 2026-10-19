@@ -37,6 +37,8 @@ def test_full_case_interrupt_resume_events_and_cross_case_memory(make_client):
         assert any(e["tool"] == name and "B99 2nd floor" in str(e["content"]) for e in evidence)
     events = c.get(f"/cases/{cid}/events").json()
     assert sum(e["tool"] == "analyze_ticket" for e in events) == 1
+    # Passing verification finalizes immediately; trusted context persistence
+    # happens inside finalization without another reasoning cycle.
     assert sum(e["tool"] == "remember_fact" for e in events) == 3
     assert agent.harness.invocation_count > 10
     other = create(c)

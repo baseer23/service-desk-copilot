@@ -69,7 +69,46 @@ def test_hybrid_filters_vector_results():
 
 def test_local_hybrid_still_queries_real_graph_relationships():
     class Hybrid(VectorStub):
-        def hybrid(self, question, embedding, limit): return self.results[:limit]
-    graph=GraphStub(degrees={'widget alpha':1},chunks=sample_vector_results[1:])
-    retriever=Retriever(SimpleNamespace(top_k=2),Hybrid(sample_vector_results[:1]),graph,StubEmbeddingProvider(dim=4))
-    assert [x['id'] for x in retriever.hybrid_search('Widget Alpha details',2)]==['chunk-1','chunk-2']
+        def hybrid(self, question, embedding, limit):
+            return self.results[:limit]
+
+    graph = GraphStub(degrees={"widget alpha": 1}, chunks=sample_vector_results[1:])
+    retriever = Retriever(
+        SimpleNamespace(top_k=2),
+        Hybrid(sample_vector_results[:1]),
+        graph,
+        StubEmbeddingProvider(dim=4),
+    )
+    assert [x["id"] for x in retriever.hybrid_search("Widget Alpha details", 2)] == [
+        "chunk-1",
+        "chunk-2",
+    ]
+
+
+def test_structured_hybrid_reads_graph_references_before_local_content():
+    calls = []
+
+    class Graph(GraphStub):
+        def fetch_structured_references(self, concepts, limit, **constraints):
+            calls.append("graph")
+            assert constraints["object_types"] == ["Chunk", "Table", "Figure", "Section"]
+            return [{"object_id": "C17", "object_type": "Chunk", "document_id": "doc-1", "page": 5}]
+
+    class Vector(VectorStub):
+        def resolve_object_ids(self, object_ids):
+            calls.append("local")
+            assert object_ids == ["C17"]
+            return [sample_vector_results[0]]
+
+        def search(self, embedding, top_k):
+            calls.append("semantic")
+            return super().search(embedding, top_k)
+
+    result = Retriever(
+        SimpleNamespace(top_k=2),
+        Vector(sample_vector_results),
+        Graph(),
+        StubEmbeddingProvider(dim=4),
+    ).hybrid_search("Widget Alpha details", 2)
+    assert calls[:3] == ["graph", "local", "semantic"]
+    assert result[0]["id"] == "chunk-1"

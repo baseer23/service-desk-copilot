@@ -295,7 +295,7 @@ def test_document_grader_batches_candidates_and_rejects_irrelevant_chunks(make_c
     assert agent._source_relevance("search_knowledge", {"score": 0.25}) == 0.8
 
 
-def test_verifier_blocks_unsupported_claim_and_researches_again(make_client):
+def test_verifier_blocks_unsupported_claim_without_repeating_same_research(make_client):
     c = make_client()
     c.post("/ingest/paste", json={"title": "Resume", "text": RESUME})
     provider = c.app.state.agent.provider
@@ -318,9 +318,10 @@ def test_verifier_blocks_unsupported_claim_and_researches_again(make_client):
 
     provider.generate_structured = critic
     cid, result = run(c, "What year did Abdul graduate?")
-    assert result["status"] == "assessment_ready" and count == 2
-    assert result["research_iteration"] == 2
-    assert sum(e["tool"] == "search_knowledge" for e in c.get(f"/cases/{cid}/events").json()) == 2
+    assert result["status"] == "insufficient_information" and count == 1
+    assert result["research_iteration"] == 1
+    assert "Year needs source verification" in result["uncertainty"]
+    assert sum(e["tool"] == "search_knowledge" for e in c.get(f"/cases/{cid}/events").json()) == 1
 
 
 def test_verifier_rejects_unsupported_final_answer(make_client):
@@ -483,9 +484,10 @@ def test_short_user_name_loads_context_before_material_site_question(make_client
     c = make_client()
     cid, result = run(c, "Jake cannot connect to VPN")
     assert result["workflow"] == "service_desk" and result["status"] == "needs_input"
-    assert "floor" in result["pending_question"]
+    assert "exact error message" in result["pending_question"]
     tools = [e["tool"] for e in c.get(f"/cases/{cid}/events").json()]
-    assert tools.index("get_user_context") < tools.index("get_active_alerts")
+    assert tools.count("get_user_context") == 1
+    assert "get_active_alerts" not in tools
 
 
 def test_shared_outage_clarifies_company_then_checks_shared_service(make_client):

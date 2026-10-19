@@ -181,7 +181,7 @@ def test_pending_question_with_rejected_claims_is_revised_not_abandoned(make_cli
     }
     assert agent.verification_route(state) == "reason"
     state["decision"]["question_for_human"] = None
-    assert agent.verification_route(state) == "reason"
+    assert agent.verification_route(state) == "finalize"
     state["research_iteration"] = agent.settings.max_investigation_cycles
     assert agent.verification_route(state) == "finalize"
 

@@ -960,9 +960,16 @@ class ServiceDeskAgent:
                 or any(word in summary for word in ("vpn", "wifi", "wireless", "wirless"))
             )
         )
+        diagnostic_evidence = [
+            item for item in self.usable_evidence(state)
+            if item["tool"] not in {
+                "get_user_context", "get_company_context", "search_memory",
+                "search_remembered_facts",
+            }
+        ]
         if (
             state["workflow"] == "service_desk"
-            and not self.usable_evidence(state)
+            and not diagnostic_evidence
             and terse_diagnostic_request
         ):
             # An underspecified incident cannot be diagnosed by broad web
@@ -1071,11 +1078,9 @@ class ServiceDeskAgent:
         if state["research_iteration"] >= self.settings.max_investigation_cycles:
             return "finalize"
         d = state["decision"]
-        if d.get("requested_tools"):
-            return "plan"
         if (
             d.get("needs_web_research")
-            and state.get("research_rounds", 0) < self.settings.max_research_rounds
+            and state.get("research_rounds", 0) == 0
         ):
             return "research"
         return "verify"
@@ -1377,25 +1382,23 @@ class ServiceDeskAgent:
     def verification_route(self, state):
         v = state["verification"]
         decision = state["decision"]
-        if state["research_iteration"] >= self.settings.max_investigation_cycles:
-            return "finalize"
-        if v["contradictions"] and v["should_continue_research"]:
-            return "reason"
-        if v["unsupported_claims"]:
-            return (
-                "reason"
-                if decision.get("question_for_human") or not v["should_continue_research"]
-                else "plan"
-            )
         if decision.get("question_for_human"):
-            if not v["unsupported_claims"] and not v["contradictions"]:
+            if decision.get("human_field") in {
+                "vpn_error_message", "wireless_error_message", "affected_service_and_symptom"
+            }:
                 return "ask_human"
-            # A rejected candidate needs revision even if the critic says no
-            # further research is necessary. The cycle limit bounds correction.
+            if not state.get("decision_issues") and not v["contradictions"]:
+                if not v["unsupported_claims"]:
+                    return "ask_human"
+            if state.get("research_iteration", 0) < 2:
+                return "reason"
+        if state.get("decision_issues") and state.get("research_iteration", 0) < 2:
+            # One bounded schema/policy correction is allowed without another
+            # source lookup. This cannot become an evidence-reconsideration loop.
             return "reason"
-        if v["should_continue_research"]:
-            return "plan"
-        return "remember" if not v["unsupported_claims"] else "finalize"
+        # Verification is terminal for this evidence pass. Only new human
+        # information starts a new source-selection pass.
+        return "finalize"
 
     async def remember(self, state):
         # Only explicit trusted record fields are eligible for reusable facts.
@@ -1420,6 +1423,19 @@ class ServiceDeskAgent:
         return {}
 
     async def finalize(self, state):
+        # Finalization is immediate after verification, but trusted context can
+        # still be persisted here without another reasoning/research cycle.
+        if state.get("persist_case") is not False:
+            for evidence in state.get("evidence", []):
+                row = evidence["content"]
+                if evidence["tool"] == "get_user_context" and row.get("name") and row.get("company"):
+                    fact = MemoryFact(
+                        subject=row["name"], predicate="works_at", value=row["company"],
+                        source="trusted_tool", source_system=evidence["source_system"],
+                        observed_at=evidence["timestamp"], confidence=evidence["reliability"],
+                        case_id=state["case_id"], metadata={"evidence_id": evidence["id"]},
+                    )
+                    await self._call(state, "remember_fact", {"fact": fact.model_dump()})
         d = InvestigationDecision.model_validate(state["decision"])
         v = state.get("verification", {})
         public_request = state.get("intent", {}).get("knowledge_source") == "public_web"
@@ -1428,9 +1444,8 @@ class ServiceDeskAgent:
         supported = (
             bool(v)
             and not v.get("unsupported_claims")
-            and d.enough_information
+            and (d.enough_information or bool(d.answer))
             and bool(self.usable_evidence(state))
-            and not limited
         )
         uncertainty = list(
             dict.fromkeys(
@@ -1475,9 +1490,13 @@ class ServiceDeskAgent:
             contradictions=state.get("contradictions", []),
             evidence=state.get("evidence", []),
             actions_already_taken=[e["content"] for e in events if e.get("tool") != "error"],
-            recommended_next_action=d.recommended_next_action
-            if not v.get("unsupported_claims")
-            else "Collect missing evidence before accepting the candidate assessment.",
+            recommended_next_action=(
+                d.recommended_next_action
+                if d.recommended_next_action and self.usable_evidence(state)
+                else "Collect missing evidence before accepting the candidate assessment."
+                if v.get("unsupported_claims")
+                else d.recommended_next_action
+            ),
             troubleshooting_steps=d.troubleshooting_steps
             if not v.get("unsupported_claims")
             else [],

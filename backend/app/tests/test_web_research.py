@@ -267,8 +267,49 @@ def test_loop_limit_finalizes_without_recursion_failure(make_client):
     result = c.post(f"/cases/{cid}/investigate")
     assert result.status_code == 200
     body = result.json()
-    assert body["status"] == "insufficient_information" and body["research_iteration"] == 3
-    assert body["confidence"] == 0 and any("cycle limit" in u for u in body["uncertainty"])
+    assert body["status"] == "needs_input" and body["research_iteration"] == 1
+    assert body["confidence"] == 0
+    assert body["pending_question"] == (
+        "Which application or service is affected, and what exact error or symptom do you see?"
+    )
+
+
+def test_verified_news_answer_survives_research_cycle_limit(make_client):
+    client = make_client({"MAX_INVESTIGATION_CYCLES": "1"})
+    agent = client.app.state.agent
+    evidence = agent._evidence(
+        {"case_id": "news-limit", "persist_case": False},
+        "fetch_web_page",
+        {
+            "url": "https://news.example/alberta",
+            "title": "Verified Alberta update",
+            "text": "A fetched and independently verified Alberta report. " * 4,
+            "published_at": "2026-10-18T12:00:00Z",
+            "source_system": "public_web",
+        },
+    )
+    answer = "Verified Alberta update — 2026-10-18 — https://news.example/alberta"
+    result = client.portal.call(
+        agent.finalize,
+        {
+            "case_id": "news-limit", "persist_case": False,
+            "ticket": {"summary": "Alberta news"},
+            "intent": {"knowledge_source": "public_web", "public_topic": "news"},
+            "research_iteration": 1, "evidence": evidence, "chat_messages": [],
+            "decision": InvestigationDecision(
+                outcome="answer", evidence_summary="Fetched article supports the headline.",
+                answer=answer, enough_information=True, confidence=0.8,
+            ).model_dump(),
+            "verification": {
+                "supported_claims": [answer], "unsupported_claims": [],
+                "contradictions": [], "missing_evidence": [],
+                "evidence_ids": [evidence[0]["id"]], "confidence": 0.8,
+                "should_continue_research": False, "justification": "Fetched evidence supports it.",
+            },
+        },
+    )
+    assert result["status"] == "assessment_ready"
+    assert result["final_answer"] == answer
 
 
 @pytest.mark.parametrize("selected_irrelevant", [False, True])

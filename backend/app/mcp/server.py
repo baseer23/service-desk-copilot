@@ -199,6 +199,7 @@ def search_knowledge(
     question: str,
     mode: Literal["VECTOR", "GRAPH", "HYBRID", "KEYWORD"] = "HYBRID",
     top_k: int = 6,
+    graph_plan: dict | None = None,
 ):
     """Semantic document/KB retrieval. Use for factual questions, resumes, PDFs and troubleshooting documentation."""
     if mode.upper() not in {"VECTOR", "GRAPH", "HYBRID", "KEYWORD"}:
@@ -216,9 +217,12 @@ def search_knowledge(
         )
     else:
         r = environment()[4]
-        rows = {"VECTOR": r.vector_search, "GRAPH": r.graph_search, "HYBRID": r.hybrid_search}[
-            mode.upper()
-        ](question, top_k)
+        if mode.upper() == "HYBRID":
+            rows = r.hybrid_search(question, top_k, graph_plan=graph_plan)
+        else:
+            rows = {"VECTOR": r.vector_search, "GRAPH": r.graph_search}[
+                mode.upper()
+            ](question, top_k)
     for row in rows:
         if row.get("metadata", {}).get("source_type") == "local_fixture":
             row["source_system"] = "local_fixture"
@@ -440,13 +444,18 @@ def extract_document(data_base64: str, media_type: str = "application/pdf"):
 
 
 @capability("local_document")
-def save_document(data_base64: str, title: str | None = None, media_type: str = "application/pdf"):
+def save_document(
+    data_base64: str,
+    title: str | None = None,
+    media_type: str = "application/pdf",
+    ingestion_mode: Literal["standard", "structured_graph"] = "standard",
+):
     """Operator-controlled extraction and local staging; never creates fake semantic vectors."""
     if get_settings().uses_record_store:
         data = base64.b64decode(data_base64, validate=True)
         if len(data) > 5_000_000:
             raise ValueError("Document exceeds 5 MB")
-        return documents().upload(data, title, media_type)
+        return documents().upload(data, title, media_type, ingestion_mode)
     result = _extract_upload(data_base64, media_type)
     return {
         **documents().save(

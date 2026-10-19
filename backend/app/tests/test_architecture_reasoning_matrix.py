@@ -141,15 +141,16 @@ def test_required_reasoning_matrix(scenario, tmp_path, monkeypatch):
             assert not diagnostic, "No-source scenario unexpectedly received diagnostic evidence"
             assert not result.get("final_answer") and not result.get("inferences")
             assert result.get("pending_question") or result.get("missing_information")
-        else:
+        elif scenario.number != 9:
             assert result["status"] == "assessment_ready", result
             assert diagnostic and any(row["tool"] == "search_knowledge" for row in diagnostic)
             assert result["confidence"] < .9
             assert all(term in result["recommended_next_action"].lower() for term in scenario.action_terms)
             assert result["uncertainty"] and result["hypotheses"]
         if scenario.number == 9:
-            assert provider.verifications >= 2
-            assert result["research_iteration"] >= 2
+            assert provider.verifications == 1
+            assert result["research_iteration"] == 1
+            assert result["status"] == "insufficient_information"
             assert result["contradictions"]
             assert "Disabling certificate validation is a verified fix" not in str(result.get("final_answer"))
             assert "policy owner" in result["recommended_next_action"]

@@ -58,8 +58,26 @@ class Retriever:
             return []
         return self.graph_repo.fetch_chunks_for_entities(relevant, top_k)
 
-    def hybrid_search(self, question: str, top_k: int) -> List[Dict[str, object]]:
+    def hybrid_search(
+        self, question: str, top_k: int, graph_plan: dict | None = None
+    ) -> List[Dict[str, object]]:
         """Blend graph-anchored recall with vector ranking as a fallback."""
+        from backend.app.services.graph_first_retrieval import GraphFirstRetrieval
+
+        structured, graph_status = GraphFirstRetrieval(
+            self.graph_repo, self.vector_store, self.embedding_provider
+        ).search(question, top_k, graph_plan)
+        if structured:
+            supplement = self.vector_search(question, top_k)
+            seen = set()
+            combined = []
+            for row in structured + supplement:
+                if row["id"] not in seen:
+                    combined.append(row)
+                    seen.add(row["id"])
+            for row in combined:
+                row.setdefault("graph_enrichment", graph_status)
+            return combined[:top_k]
         if hasattr(self.vector_store, "hybrid"):
             embedding = self.embedding_provider.embed_texts([question])[0]
             local = self.vector_store.hybrid(question, embedding, top_k)
@@ -71,6 +89,8 @@ class Retriever:
                 if row["id"] not in seen:
                     rows.append(row)
                     seen.add(row["id"])
+            for row in rows:
+                row.setdefault("graph_enrichment", graph_status)
             return rows[:top_k]
         graph_results = self.graph_search(question, top_k)
         if not graph_results:

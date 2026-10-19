@@ -117,6 +117,7 @@ class MissingInformation(StructuredModel):
 
 
 class InvestigationDecision(StructuredModel):
+    outcome: Literal["answer", "ask_one_question", "cannot_verify"] = "cannot_verify"
     hypotheses: list[Hypothesis] = Field(default_factory=list)
     inferences: list[str] = Field(default_factory=list)
     evidence_summary: str
@@ -153,8 +154,14 @@ class InvestigationDecision(StructuredModel):
     def question_valid(self):
         if not self.question_for_human:
             self.question_for_human = self.human_field = None
+            if self.outcome == "ask_one_question":
+                raise ValueError("ask_one_question requires a question_for_human")
         elif not self.human_field:
             raise ValueError("Human questions require a human_field")
+        else:
+            self.outcome = "ask_one_question"
+        if self.enough_information and self.answer:
+            self.outcome = "answer"
         return self
 
 
@@ -163,6 +170,20 @@ class ResearchSelection(StructuredModel):
     selected_urls: list[str] = Field(default_factory=list, max_length=2)
     evidence_gap: str
     justification: str
+
+
+class GraphLookupPlan(StructuredModel):
+    entities: list[str] = Field(default_factory=list, max_length=10)
+    concepts: list[str] = Field(default_factory=list, max_length=10)
+    relationship_types: list[Literal[
+        "HAS_OBJECT", "HAS_SECTION", "HAS_CHUNK", "HAS_TABLE", "HAS_FIGURE",
+        "REFERENCES_TABLE", "REFERENCES_FIGURE", "MENTIONS", "RELATED_TO",
+    ]] = Field(default_factory=list, max_length=10)
+    document_ids: list[str] = Field(default_factory=list, max_length=10)
+    object_types: list[Literal["Chunk", "Table", "Figure", "Section"]] = Field(
+        default_factory=lambda: ["Chunk", "Table", "Figure", "Section"]
+    )
+    limit: int = Field(default=20, ge=1, le=20)
 
 
 class VerificationResult(StructuredModel):

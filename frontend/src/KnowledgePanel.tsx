@@ -34,6 +34,7 @@ export default function KnowledgePanel({
   const [matches, setMatches] = useState<Match[]>([])
   const [searched, setSearched] = useState(false)
   const [dragging, setDragging] = useState(false)
+  const [structuredIngestion, setStructuredIngestion] = useState(false)
   const picker = useRef<HTMLInputElement>(null)
   const indexingBlocked = readiness?.semantic_ingestion_ready === false
   const urlBlocked = readiness?.url_ingestion_enabled === false
@@ -60,6 +61,7 @@ export default function KnowledgePanel({
         const body = new FormData()
         body.append('file', file)
         if (title) body.append('title', title)
+        body.append('ingestion_mode', structuredIngestion ? 'structured_graph' : 'standard')
         options = { method: 'POST', body }
         path =
           readiness?.managed_documents && kind !== 'extract' ? '/documents/upload' :
@@ -91,7 +93,15 @@ export default function KnowledgePanel({
         setPreview(result.text ?? '')
         setMessage(`Text preview is ready (${result.pages} page(s)).`)
       } else if (result.status && result.status !== 'ready') {
-        setMessage('Your document is uploaded. It will appear in knowledge when processing is complete.')
+        const stage: Record<string, string> = {
+          queued: 'Extracting', extracting: 'Extracting', structuring: 'Structuring',
+          embedding: 'Embedding', linking: 'Linking', graph_pending: 'Graph linking unavailable',
+        }
+        setMessage(
+          result.status === 'graph_pending'
+            ? 'Local indexing is ready, but Neo4j linking is pending. Configure the authorized ingestion connection and retry linking.'
+            : `${stage[result.status] ?? 'Processing'} → Ready`,
+        )
       } else if (kind === 'save') {
         setMessage(
           result.duplicate
@@ -132,6 +142,24 @@ export default function KnowledgePanel({
   return (
     <section className="card knowledge-card">
       <h2>Documents and knowledge</h2>
+      <div className="structured-ingestion-toggle">
+        <label htmlFor="structured-ingestion">
+          <input
+            id="structured-ingestion"
+            type="checkbox"
+            role="switch"
+            checked={structuredIngestion}
+            disabled={busy || readiness?.structured_ingestion_available !== true}
+            onChange={(event) => setStructuredIngestion(event.target.checked)}
+          />
+          Structured Ingestion + Neo4j — {structuredIngestion ? 'ON' : 'OFF'}
+        </label>
+        <p className="muted">
+          {readiness?.structured_ingestion_available === true
+            ? 'Applies only to the next selected upload: Extracting → Structuring → Embedding → Linking → Ready.'
+            : 'Unavailable: configure an authorized Neo4j ingestion connection. Standard local ingestion remains available.'}
+        </p>
+      </div>
       <div className={`document-drop ${dragging ? 'dragging' : ''}`} onDragOver={event => { event.preventDefault(); setDragging(true) }} onDragLeave={() => setDragging(false)} onDrop={event => { event.preventDefault(); setDragging(false); chooseFile(event.dataTransfer.files[0]) }}>
         <svg aria-hidden="true" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M12 16V3m-5 5 5-5 5 5M4 15v5h16v-5" /></svg>
         <h3>{file ? file.name : 'Give your answers a source'}</h3><p>Drag a document here, or choose a file.</p>

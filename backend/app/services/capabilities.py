@@ -55,7 +55,8 @@ def knowledge_stores(settings, *, connect_graph=True, records=None):
                 if settings.local_persistence_enabled else None,
                 optional=True, allow_fixtures=settings.test_mode,
             )
-            graph.ensure_constraints()
+            # This connection is used for optional reads. Schema mutation is
+            # reserved for the separately authorized structured-ingestion writer.
         except Exception:
             if driver:
                 driver.close()

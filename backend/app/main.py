@@ -292,6 +292,21 @@ def create_app(settings: Settings | None = None):
             "semantic_ingestion_ready": report.semantic_ingestion_ready,
             "url_ingestion_enabled": report.url_ingestion_enabled,
             "managed_documents": s.uses_record_store,
+            "structured_ingestion_available": bool(
+                s.uses_record_store
+                and s.neo4j_ingestion_enabled
+                and s.neo4j_uri
+                and s.neo4j_ingestion_user
+                and s.neo4j_ingestion_password.get_secret_value()
+            ),
+            "structured_ingestion_blocker": (
+                None
+                if s.neo4j_ingestion_enabled
+                and s.neo4j_uri
+                and s.neo4j_ingestion_user
+                and s.neo4j_ingestion_password.get_secret_value()
+                else "Configure an authorized Neo4j ingestion connection to enable linking."
+            ),
         }
 
     @app.get("/health")
@@ -363,7 +378,10 @@ def create_app(settings: Settings | None = None):
             # Distinguish parsing, policy and embedding failures.
             raise HTTPException(exc.status_code, str(exc)) from exc
 
-    async def document_upload(file: UploadFile, title: str | None, tool: str):
+    async def document_upload(
+        file: UploadFile, title: str | None, tool: str,
+        ingestion_mode: str = "standard",
+    ):
         from pathlib import Path
 
         data = await file.read(5_000_001)
@@ -385,6 +403,7 @@ def create_app(settings: Settings | None = None):
         arguments = {"data_base64": base64.b64encode(data).decode(), "media_type": media_type}
         if tool == "save_document":
             arguments["title"] = title or file.filename
+            arguments["ingestion_mode"] = ingestion_mode
         return (await app.state.agent.harness.invoke(tool, arguments))["result"]
 
     @app.post("/documents/extract")
@@ -392,8 +411,13 @@ def create_app(settings: Settings | None = None):
         return await document_upload(file, None, "extract_document")
 
     @app.post("/documents/upload")
-    async def save_upload(file: UploadFile = File(...), title: str | None = Form(None)):
-        return await document_upload(file, title, "save_document")
+    async def save_upload(
+        file: UploadFile = File(...), title: str | None = Form(None),
+        ingestion_mode: str = Form("standard"),
+    ):
+        if ingestion_mode not in {"standard", "structured_graph"}:
+            raise HTTPException(400, "ingestion_mode must be standard or structured_graph")
+        return await document_upload(file, title, "save_document", ingestion_mode)
 
     @app.post("/documents/paste")
     async def save_pasted_document(body: IngestPasteRequest):

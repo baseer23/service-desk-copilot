@@ -3,7 +3,18 @@ from __future__ import annotations
 import re
 import hashlib
 import logging
-from typing import Any, Callable, Dict, Iterable, List, MutableMapping, Optional, Sequence, Set, TypeVar
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    MutableMapping,
+    Optional,
+    Sequence,
+    Set,
+    TypeVar,
+)
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover - import is for type checking only
@@ -20,7 +31,9 @@ ChunkRecord = Dict[str, object]
 class GraphRepository:
     """Persistence adapter for document, chunk, and entity metadata in Neo4j."""
 
-    def __init__(self, driver: Driver, *, tenant_provider=None, optional=False, allow_fixtures=True) -> None:
+    def __init__(
+        self, driver: Driver, *, tenant_provider=None, optional=False, allow_fixtures=True
+    ) -> None:
         """Store the Neo4j driver for subsequent transactional work."""
         self._driver: Driver = driver
         self.tenant_provider = tenant_provider
@@ -44,12 +57,17 @@ class GraphRepository:
             "CREATE CONSTRAINT IF NOT EXISTS FOR (c:Chunk) REQUIRE c.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (e:Entity) REQUIRE e.id IS UNIQUE",
             "CREATE INDEX IF NOT EXISTS FOR (e:Entity) ON (e.name)",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (s:Section) REQUIRE s.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (t:Table) REQUIRE t.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (f:Figure) REQUIRE f.id IS UNIQUE",
         ]
         with self._driver.session() as session:
             for statement in statements:
                 session.run(statement)
 
-    def upsert_document(self, doc_id: str, title: Optional[str] = None, source: str = "paste") -> None:
+    def upsert_document(
+        self, doc_id: str, title: Optional[str] = None, source: str = "paste"
+    ) -> None:
         """Insert or update a document node and basic metadata."""
 
         def _tx(tx: Transaction) -> None:
@@ -57,12 +75,17 @@ class GraphRepository:
                 "MERGE (d:Document {id: $doc_id}) "
                 "SET d.title = $title, d.source = $source, d.updated_at = timestamp(), d.original_id=$original_id, d.tenant_id=$tenant_id",
                 doc_id=self.scope(doc_id),
-                title=title, source=source, original_id=doc_id, tenant_id=self.tenant(),
+                title=title,
+                source=source,
+                original_id=doc_id,
+                tenant_id=self.tenant(),
             )
 
         self._execute_write(_tx)
 
-    def upsert_chunk(self, doc_id: str, chunk_id: str, ord: int, text: str, token_count: int) -> None:
+    def upsert_chunk(
+        self, doc_id: str, chunk_id: str, ord: int, text: str, token_count: int
+    ) -> None:
         """Insert or update a chunk node with ordering and token metadata."""
 
         def _tx(tx: Transaction) -> None:
@@ -72,7 +95,122 @@ class GraphRepository:
                 chunk_id=self.scope(chunk_id),
                 ord=ord,
                 text=text,
-                token_count=token_count, original_id=chunk_id, tenant_id=self.tenant(),
+                token_count=token_count,
+                original_id=chunk_id,
+                tenant_id=self.tenant(),
+            )
+
+        self._execute_write(_tx)
+
+    def upsert_reference_object(self, doc_id: str, item: dict) -> None:
+        """Persist bounded reference metadata only; actual content remains local."""
+        label = item.get("object_type", "Chunk")
+        if label not in {"Chunk", "Table", "Figure", "Section"}:
+            raise ValueError("Unsupported graph object type")
+        description = re.sub(r"\s+", " ", str(item.get("description") or "")).strip()[:160]
+
+        def _tx(tx: Transaction) -> None:
+            tx.run(
+                f"MERGE (n:{label} {{id: $id}}) "
+                "SET n.original_id=$original_id, n.document_id=$document_id, "
+                "n.page=$page, n.ordinal=$ordinal, n.description=$description, "
+                "n.document_hash=$document_hash, n.tenant_id=$tenant_id",
+                id=self.scope(item["object_id"]),
+                original_id=item["object_id"],
+                document_id=doc_id,
+                page=item.get("page"),
+                ordinal=item.get("position"),
+                description=description,
+                document_hash=doc_id,
+                tenant_id=self.tenant(),
+            )
+            tx.run(
+                f"MATCH (d:Document {{id:$doc_id}}), (n:{label} {{id:$id}}) "
+                "MERGE (d)-[:HAS_OBJECT]->(n)",
+                doc_id=self.scope(doc_id),
+                id=self.scope(item["object_id"]),
+            )
+
+        self._execute_write(_tx)
+
+    def fetch_structured_references(
+        self,
+        concepts: Sequence[str],
+        limit: int = 20,
+        document_ids: Sequence[str] | None = None,
+        object_types: Sequence[str] | None = None,
+        relationships: Sequence[str] | None = None,
+    ):
+        """Return tenant-scoped references and descriptions, never document content."""
+        terms = [term.casefold() for term in concepts if term.strip()][:10]
+        if not terms:
+            return []
+        allowed_relationships = {
+            "HAS_SECTION",
+            "HAS_CHUNK",
+            "HAS_TABLE",
+            "HAS_FIGURE",
+            "HAS_OBJECT",
+            "REFERENCES_TABLE",
+            "REFERENCES_FIGURE",
+            "MENTIONS",
+            "RELATED_TO",
+        }
+        selected_relationships = [
+            relation
+            for relation in (relationships or allowed_relationships)
+            if relation in allowed_relationships
+        ]
+        selected_types = [
+            label
+            for label in (object_types or ["Chunk", "Table", "Figure", "Section"])
+            if label in {"Chunk", "Table", "Figure", "Section"}
+        ]
+
+        def _tx(tx: Transaction):
+            result = tx.run(
+                "MATCH (d:Document)-[:HAS_OBJECT]->(seed) "
+                "WHERE d.tenant_id=$tenant AND seed.tenant_id=$tenant "
+                "AND (size($document_ids)=0 OR d.original_id IN $document_ids) "
+                "AND any(term IN $terms WHERE toLower(coalesce(seed.description,'')) CONTAINS term) "
+                "MATCH path=(seed)-[*0..2]-(n) "
+                "WHERE n.tenant_id=$tenant AND any(label IN labels(n) WHERE label IN $object_types) "
+                "AND all(r IN relationships(path) WHERE type(r) IN $relationships) "
+                "RETURN DISTINCT coalesce(n.original_id,n.id) AS object_id, labels(n)[0] AS object_type, "
+                "n.document_id AS document_id, n.page AS page, n.description AS description "
+                "LIMIT $limit",
+                tenant=self.tenant(),
+                terms=terms,
+                document_ids=list(document_ids or []),
+                object_types=selected_types,
+                relationships=selected_relationships,
+                limit=min(max(limit, 1), 20),
+            )
+            return [dict(record) for record in result]
+
+        return self._execute_read(_tx) or []
+
+    def link_reference_objects(self, source_id: str, target_id: str, relationship: str):
+        allowed = {
+            "HAS_SECTION",
+            "HAS_CHUNK",
+            "HAS_TABLE",
+            "HAS_FIGURE",
+            "REFERENCES_TABLE",
+            "REFERENCES_FIGURE",
+            "MENTIONS",
+            "RELATED_TO",
+        }
+        if relationship not in allowed:
+            raise ValueError("Unsupported structured relationship")
+
+        def _tx(tx: Transaction):
+            tx.run(
+                "MATCH (a {id:$source}), (b {id:$target}) "
+                f"WHERE a.tenant_id=$tenant AND b.tenant_id=$tenant MERGE (a)-[:{relationship}]->(b)",
+                source=self.scope(source_id),
+                target=self.scope(target_id),
+                tenant=self.tenant(),
             )
 
         self._execute_write(_tx)
@@ -98,7 +236,10 @@ class GraphRepository:
                 "MERGE (e:Entity {id: $entity_id}) "
                 "SET e.name = $name, e.type = $type, e.updated_at = timestamp(), e.tenant_id=$tenant_id "
                 "RETURN e.id AS id",
-                name=name, type=type, entity_id=self.scope(name.lower()), tenant_id=self.tenant(),
+                name=name,
+                type=type,
+                entity_id=self.scope(name.lower()),
+                tenant_id=self.tenant(),
             )
             result.single()
             return name.lower()
@@ -162,6 +303,7 @@ class GraphRepository:
             records: List[ChunkRecord] = []
             for record in result:
                 from backend.app.services.knowledge_policy import is_test_knowledge
+
                 if not self.allow_fixtures and is_test_knowledge({"title": record.get("title")}):
                     continue
                 records.append(
@@ -195,8 +337,10 @@ class GraphRepository:
                     f"MERGE (a)-[r:{rel}]->(b) "
                     "SET r.source_system=$source_system, r.observed_at=datetime() ",
                     subject=item["subject"],
-                    object=item["object"], subject_id=self.scope(item["subject"].lower()),
-                    object_id=self.scope(item["object"].lower()), tenant=self.tenant(),
+                    object=item["object"],
+                    subject_id=self.scope(item["subject"].lower()),
+                    object_id=self.scope(item["object"].lower()),
+                    tenant=self.tenant(),
                     source_system=item.get("source_system", "knowledge_graph"),
                 )
 
@@ -220,7 +364,10 @@ class GraphRepository:
                 "RETURN DISTINCT startNode(r).name AS subject, type(r) AS predicate, "
                 "endNode(r).name AS object, r.source_system AS source_system, "
                 "toString(r.observed_at) AS observed_at LIMIT $limit",
-                terms=terms, limit=min(max(limit, 1), 50), tenant=self.tenant(), allow_fixtures=self.allow_fixtures,
+                terms=terms,
+                limit=min(max(limit, 1), 50),
+                tenant=self.tenant(),
+                allow_fixtures=self.allow_fixtures,
             )
             return [dict(row) for row in rows]
 
@@ -248,7 +395,9 @@ class GraphRepository:
             if not self.optional:
                 raise
             self.available = False
-            logging.getLogger(__name__).warning("Aura graph write unavailable; local knowledge preserved")
+            logging.getLogger(__name__).warning(
+                "Aura graph write unavailable; local knowledge preserved"
+            )
             return None
 
     def _execute_read(self, func: Callable[[Transaction], T]) -> T:
@@ -261,7 +410,9 @@ class GraphRepository:
             if not self.optional:
                 raise
             self.available = False
-            logging.getLogger(__name__).warning("Aura graph read unavailable; using local vector evidence")
+            logging.getLogger(__name__).warning(
+                "Aura graph read unavailable; using local vector evidence"
+            )
             return None
 
 
@@ -297,6 +448,15 @@ class UnavailableGraphRepository:
     def fetch_chunks_for_entities(self, names, limit):
         return []
 
+    def fetch_structured_references(self, concepts, limit=20):
+        return []
+
+    def upsert_reference_object(self, *args, **kwargs):
+        pass
+
+    def link_reference_objects(self, *args, **kwargs):
+        pass
+
     def search_relationships(self, entities, limit=12):
         return []
 
@@ -312,16 +472,21 @@ class InMemoryGraphRepository:
         self.documents: MutableMapping[str, Dict[str, Optional[str]]] = {}
         self.chunks: MutableMapping[str, Dict[str, Any]] = {}
         self.entity_links: MutableMapping[str, Dict[str, Any]] = {}
+        self.references: MutableMapping[str, Dict[str, Any]] = {}
 
     def ensure_constraints(self) -> None:  # pragma: no cover - no-op for in-memory variant
         """In-memory store has no constraints to create."""
 
-    def upsert_document(self, doc_id: str, title: Optional[str] = None, source: str = "paste") -> None:
+    def upsert_document(
+        self, doc_id: str, title: Optional[str] = None, source: str = "paste"
+    ) -> None:
         """Store document metadata in-memory."""
 
         self.documents[doc_id] = {"title": title, "source": source}
 
-    def upsert_chunk(self, doc_id: str, chunk_id: str, ord: int, text: str, token_count: int) -> None:
+    def upsert_chunk(
+        self, doc_id: str, chunk_id: str, ord: int, text: str, token_count: int
+    ) -> None:
         """Persist chunk metadata in-memory for testing."""
 
         self.chunks[chunk_id] = {
@@ -330,6 +495,36 @@ class InMemoryGraphRepository:
             "ord": ord,
             "tokens": token_count,
         }
+
+    def upsert_reference_object(self, doc_id: str, item: dict) -> None:
+        self.references[item["object_id"]] = {
+            "object_id": item["object_id"],
+            "object_type": item["object_type"],
+            "document_id": doc_id,
+            "page": item.get("page"),
+            "description": str(item.get("description") or "")[:160],
+        }
+
+    def fetch_structured_references(
+        self,
+        concepts: Sequence[str],
+        limit: int = 20,
+        document_ids=None,
+        object_types=None,
+        relationships=None,
+    ):
+        terms = [term.casefold() for term in concepts]
+        return [
+            dict(item)
+            for item in self.references.values()
+            if any(term in item["description"].casefold() for term in terms)
+            and (not document_ids or item["document_id"] in document_ids)
+            and (not object_types or item["object_type"] in object_types)
+        ][: min(max(limit, 1), 20)]
+
+    def link_reference_objects(self, source_id: str, target_id: str, relationship: str):
+        if source_id not in self.references or target_id not in self.references:
+            raise ValueError("Unknown reference object")
 
     def link_doc_chunk(self, doc_id: str, chunk_id: str) -> None:  # pragma: no cover - no-op
         """Document/chunk relationships are implicit in the in-memory structure."""
@@ -345,7 +540,9 @@ class InMemoryGraphRepository:
     def link_chunk_entity(self, chunk_id: str, entity_id: str, rel: str = "ABOUT") -> None:
         """Record a chunk→entity relationship in-memory."""
 
-        info = self.entity_links.setdefault(entity_id, {"name": entity_id, "type": "TERM", "chunks": set()})
+        info = self.entity_links.setdefault(
+            entity_id, {"name": entity_id, "type": "TERM", "chunks": set()}
+        )
         chunks: Set[str] = info.setdefault("chunks", set())  # type: ignore[assignment]
         chunks.add(chunk_id)
 
@@ -365,7 +562,9 @@ class InMemoryGraphRepository:
         collected: List[ChunkRecord] = []
         for name in names:
             entity_id = name.lower()
-            for chunk_id in self.entity_links.get(entity_id, {"chunks": set()}).get("chunks", set()):
+            for chunk_id in self.entity_links.get(entity_id, {"chunks": set()}).get(
+                "chunks", set()
+            ):
                 chunk = self.chunks.get(chunk_id)
                 if not chunk:
                     continue
@@ -374,7 +573,9 @@ class InMemoryGraphRepository:
                     "title": self.documents.get(chunk["doc_id"], {}).get("title"),
                     "ord": chunk.get("ord"),
                 }
-                collected.append({"id": chunk_id, "text": chunk["text"], "metadata": metadata, "score": 0.0})
+                collected.append(
+                    {"id": chunk_id, "text": chunk["text"], "metadata": metadata, "score": 0.0}
+                )
         return collected[:limit]
 
     def ping(self) -> bool:

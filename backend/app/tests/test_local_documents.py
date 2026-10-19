@@ -122,6 +122,34 @@ def test_local_save_semantic_index_real_chroma_dedup_and_retrieval(make_client):
     assert found[0]["storage"] == "chroma" and found[0]["metadata"]["title"] == "Indexed only"
 
 
+def test_structured_upload_mode_is_explicit_persisted_and_nonretroactive(make_client):
+    client = make_client(
+        {
+            "NEO4J_URI": "neo4j+s://fictional.example",
+            "NEO4J_INGESTION_ENABLED": "true",
+            "NEO4J_INGESTION_USER": "isolated-writer",
+            "NEO4J_INGESTION_PASSWORD": "isolated-secret",
+            "LOCAL_PERSISTENCE_ENABLED": "true",
+        }
+    )
+    assert client.get("/readiness").json()["structured_ingestion_available"] is True
+    files = {"file": ("structured.pdf", MINIMAL_PDF, "application/pdf")}
+    uploaded = client.post(
+        "/documents/upload",
+        files=files,
+        data={"title": "Structured PDF", "ingestion_mode": "structured_graph"},
+    ).json()
+    assert uploaded["ingestion_mode"] == "structured_graph"
+    indexed = client.post(f"/documents/{uploaded['id']}/index").json()
+    assert indexed["status"] == "ready" and indexed["ingestion_mode"] == "structured_graph"
+    duplicate = client.post(
+        "/documents/upload",
+        files=files,
+        data={"ingestion_mode": "standard"},
+    ).json()
+    assert duplicate["duplicate"] and duplicate["ingestion_mode"] == "structured_graph"
+
+
 def test_simultaneous_local_cases_remain_separate(make_client):
     client = make_client()
     summaries = [

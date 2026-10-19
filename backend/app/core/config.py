@@ -81,6 +81,9 @@ class Settings(BaseSettings):
     neo4j_user: str = "neo4j"
     neo4j_password: SecretStr = Field(default=SecretStr(""), repr=False)
     neo4j_database: str = "neo4j"
+    neo4j_ingestion_enabled: bool = False
+    neo4j_ingestion_user: str = ""
+    neo4j_ingestion_password: SecretStr = Field(default=SecretStr(""), repr=False)
     chroma_dir: Path = PROJECT_ROOT / "store/chroma"
     case_db_path: Path = PROJECT_ROOT / "store/case_memory.db"
     top_k: int = Field(default=6, ge=1, le=30)
@@ -144,6 +147,7 @@ class Settings(BaseSettings):
         "voice_session_signing_key",
         "azure_openai_api_key",
         "groq_api_key",
+        "neo4j_ingestion_password",
         mode="before",
     )
     @classmethod

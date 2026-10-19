@@ -1,4 +1,5 @@
 import sqlite3
+import json
 from io import BytesIO
 from types import SimpleNamespace
 from zipfile import ZipFile
@@ -64,8 +65,6 @@ def test_migration_resumes_idempotently_rejects_conflicts_and_retains_changed_re
             "retained_changed_records": 1,
         }
         assert records.read("case", "two")["payload"]["evidence"] == "later work"
-
-
 
 
 def test_ambiguous_document_dispatch_is_never_automatically_repeated(settings, monkeypatch):
@@ -148,14 +147,20 @@ def test_record_voice_case_event_and_intake_are_atomic_and_owner_scoped(settings
 
 def test_local_embedding_failure_can_be_retried_without_reextracting_or_losing_original(settings):
     records, files, calls = LocalRecords(settings), Blobs(), []
+
     def embed(texts):
         calls.append(list(texts))
         if len(calls) == 1:
             raise RuntimeError("Local model temporarily unavailable")
         return [[1.0] + [0.0] * 383 for text in texts]
+
     repository = DocumentRepository(
-        settings, records, files, SimpleNamespace(upsert=lambda chunks: None),
-        SimpleNamespace(), SimpleNamespace(embed_texts=embed),
+        settings,
+        records,
+        files,
+        SimpleNamespace(upsert=lambda chunks: None),
+        SimpleNamespace(),
+        SimpleNamespace(embed_texts=embed),
     )
     document = repository.upload(b"Preserved local instructions", "Local procedure", "text/plain")
     with pytest.raises(RuntimeError, match="Local model"):
@@ -175,23 +180,29 @@ def test_layout_tables_and_extraction_provenance_are_indexed_by_page(settings):
 
     extraction = {
         "pages": [{"page": 3, "text": "Support matrix"}],
-        "tables": [{
-            "page": 3,
-            "cells": [
-                {"row": 0, "column": 0, "text": "Product"},
-                {"row": 0, "column": 1, "text": "Supported"},
-                {"row": 1, "column": 0, "text": "DeskMate"},
-                {"row": 1, "column": 1, "text": "Yes"},
-            ],
-        }],
+        "tables": [
+            {
+                "page": 3,
+                "cells": [
+                    {"row": 0, "column": 0, "text": "Product"},
+                    {"row": 0, "column": 1, "text": "Supported"},
+                    {"row": 1, "column": 0, "text": "DeskMate"},
+                    {"row": 1, "column": 1, "text": "Yes"},
+                ],
+            }
+        ],
         "method": "document_intelligence",
         "metadata": {"classification": "table_document", "table_count": 1},
     }
     repository = DocumentRepository(
-        settings, records, files, Search(),
+        settings,
+        records,
+        files,
+        Search(),
         SimpleNamespace(extract=lambda *_: extraction),
         SimpleNamespace(
-            provider="sentence_transformers", model_name="all-MiniLM-L6-v2",
+            provider="sentence_transformers",
+            model_name="all-MiniLM-L6-v2",
             embed_texts=lambda texts: [[1.0] + [0.0] * 383 for _ in texts],
         ),
     )
@@ -204,3 +215,99 @@ def test_layout_tables_and_extraction_provenance_are_indexed_by_page(settings):
     assert indexed[0]["metadata"]["extraction_method"] == "document_intelligence"
     assert indexed[0]["metadata"]["document_classification"] == "table_document"
     assert indexed[0]["metadata"]["table_count"] == 1
+
+
+def test_structured_mode_preserves_objects_and_stable_local_ids(settings):
+    records, files, indexed = LocalRecords(settings), Blobs(), []
+
+    class Search:
+        def upsert(self, chunks):
+            indexed[:] = chunks
+
+    extraction = {
+        "pages": [{"page": 5, "text": "VPN recovery", "markdown": "# VPN recovery", "spans": []}],
+        "paragraphs": [
+            {
+                "id": "p1",
+                "page": 5,
+                "text": "VPN recovery",
+                "role": "sectionHeading",
+                "position": 0,
+            },
+            {
+                "id": "p2",
+                "page": 5,
+                "text": "Check the gateway and certificate.",
+                "role": None,
+                "position": 1,
+            },
+        ],
+        "sections": [
+            {"id": "s1", "page": 5, "title": "VPN recovery", "level": 2, "parent_id": None}
+        ],
+        "tables": [
+            {
+                "id": "t1",
+                "page": 5,
+                "row_count": 2,
+                "column_count": 2,
+                "cells": [
+                    {"row": 0, "column": 0, "row_span": 1, "column_span": 1, "text": "Code"},
+                    {"row": 0, "column": 1, "row_span": 1, "column_span": 1, "text": "Action"},
+                    {"row": 1, "column": 0, "row_span": 1, "column_span": 1, "text": "VPN42"},
+                    {
+                        "row": 1,
+                        "column": 1,
+                        "row_span": 1,
+                        "column_span": 1,
+                        "text": "Renew certificate",
+                    },
+                ],
+            }
+        ],
+        "figures": [
+            {
+                "id": "f1",
+                "page": 5,
+                "caption": "Gateway flow",
+                "related_text": ["Client to gateway"],
+                "image_status": "available",
+                "image_base64": "aW1hZ2U=",
+            }
+        ],
+        "method": "document_intelligence",
+        "metadata": {"structured": True, "classification": "table_document"},
+    }
+    repository = DocumentRepository(
+        settings,
+        records,
+        files,
+        Search(),
+        SimpleNamespace(extract=lambda *_: extraction),
+        SimpleNamespace(
+            provider="sentence_transformers",
+            model_name="all-MiniLM-L6-v2",
+            embed_texts=lambda texts: [[1.0] + [0.0] * 383 for _ in texts],
+        ),
+    )
+    document = repository.upload(
+        b"fictional-structured-pdf", "Structured guide", "application/pdf", "structured_graph"
+    )
+    result = repository.process(document["id"])
+    assert result["status"] == "linking" and result["ingestion_mode"] == "structured_graph"
+    assert {row["metadata"]["object_type"] for row in indexed} == {
+        "Chunk",
+        "Section",
+        "Table",
+        "Figure",
+    }
+    assert all(row["metadata"]["page"] == 5 for row in indexed)
+    assert any(
+        "Code | Action" in row["text"] and "VPN42 | Renew certificate" in row["text"]
+        for row in indexed
+    )
+    assert any(row["metadata"]["figure_id"] == "f1" for row in indexed)
+    stored = json.loads(files.get(document["id"], "extraction.json"))
+    assert stored["tables"][0]["cells"][0]["row_span"] == 1
+    assert "image_base64" not in stored["figures"][0]
+    assert files.get(document["id"], stored["figures"][0]["image_artifact"]) == b"image"
