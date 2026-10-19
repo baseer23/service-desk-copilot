@@ -28,9 +28,13 @@ general and no operations.
 Never infer missing characters, regenerate an existing identifier, claim identity verification, expose
 implementation details or emit conflicting operations. Use needs_clarification with one precise question
 when the target, scope or exact characters are ambiguous.""",
-    "classify_intent": """Classify the incoming request. Facts/questions about resumes,
-graduation, skills, PDFs, document summaries or current published
-guidance use knowledge. Operational failures, MFA problems, printers,
+    "classify_intent": """Classify the incoming request using conversation history. Stable facts
+and ordinary conversation use workflow=knowledge, knowledge_source=general and public_topic=none.
+News, recent events, latest developments and explicit internet searches use workflow=knowledge and
+knowledge_source=public_web; current-news requests use public_topic=news and other internet searches
+use public_topic=web. Resolve follow-ups from history: 'Can you search it?' after a question about
+Alberta retains Alberta in the goal and uses public_web. Questions about resumes, graduation,
+skills, uploaded PDFs or document summaries use knowledge_source=documents. Operational failures, MFA problems, printers,
 VPN and outages use service_desk. A person's resume is a document, not
 an investigation. Return RequestIntent with the user's goal and concise
 justification.""",
@@ -175,8 +179,9 @@ def stage_instructions(stage: str, context: dict) -> str:
                 " or internal documents, use workflow=knowledge and knowledge_source=general."
                 " Questions about current eligibility, laws, government programs, vendor support,"
                 " or other changing published guidance require authoritative research: use"
-                " workflow=knowledge and knowledge_source=documents so the investigation subgraph"
-                " can retrieve, evaluate and cite sources."
+                " workflow=knowledge and knowledge_source=public_web so MCP web tools can retrieve,"
+                " evaluate and cite sources. Use public_topic=news for current events and news,"
+                " otherwise public_topic=web."
                 " For uploaded/internal document questions use knowledge_source=documents."
                 " Comparing conflicting KB entries, internal procedures or reported system evidence"
                 " requires retrieval and verification through a knowledge or service-desk subgraph,"
@@ -247,6 +252,14 @@ def stage_instructions(stage: str, context: dict) -> str:
                 " hide an implicit cause only in the recommendation or justification. Record the"
                 " corresponding inference separately. A system record's uncertainty (such as"
                 " unconfirmed physical clearance) must be retained."
+            )
+        if context.get("intent", {}).get("knowledge_source") == "public_web":
+            instructions += (
+                " For verified news research, summarize approximately three short headlines with"
+                " actual publication dates and source URLs from fetched evidence. Search snippets"
+                " are discovery only and cannot independently verify an article. If articles could"
+                " not be fetched, state that limitation. Do not claim internet access is unavailable"
+                " when authorized web tool evidence is present."
             )
         if context.get("decision_issues"):
             instructions += (

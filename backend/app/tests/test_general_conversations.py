@@ -97,6 +97,76 @@ def test_support_scope_cannot_enter_general_generation(make_client):
     assert "in_scope=false" in stage_instructions("classify_intent", {"knowledge_scope": "support"})
 
 
+def test_public_news_intent_routes_to_research_and_keeps_followup_context(make_client):
+    client = make_client({"KNOWLEDGE_SCOPE": "broad", "ENABLE_PUBLIC_WEB_TOOLS": "true"})
+    agent = client.app.state.agent
+    assert agent.intent_route(
+        {
+            "intent": {
+                "workflow": "knowledge",
+                "knowledge_source": "public_web",
+                "public_topic": "news",
+                "in_scope": True,
+            }
+        }
+    ) == "public_research"
+    assert "public_web" in stage_instructions(
+        "classify_intent", {"knowledge_scope": "broad"}
+    )
+    assert "conversation" in stage_instructions(
+        "classify_intent", {"knowledge_scope": "broad"}
+    )
+
+
+def test_public_news_request_uses_news_and_fetches_sources_without_local_retrieval(make_client):
+    client = make_client({"KNOWLEDGE_SCOPE": "broad", "ENABLE_PUBLIC_WEB_TOOLS": "true"})
+    agent = client.app.state.agent
+    original = agent.harness.invoke
+    calls = []
+
+    async def public_tools(name, arguments):
+        calls.append(name)
+        if name == "search_news":
+            return [
+                {
+                    "title": f"Alberta headline {number}",
+                    "url": f"https://news{number}.example/alberta",
+                    "snippet": "A current Alberta report.",
+                    "published_at": f"2026-10-{18 - number:02d}T12:00:00Z",
+                    "publisher": (
+                        f"Publisher {number} with detailed regional coverage, local context, "
+                        "and independently reported developments"
+                    ),
+                    "source_system": "public_web",
+                }
+                for number in range(1, 4)
+            ]
+        if name == "fetch_web_page":
+            number = arguments["url"].split("news", 1)[1].split(".", 1)[0]
+            return {
+                "url": arguments["url"],
+                "title": f"Alberta headline {number}",
+                "text": "Verified reporting about a current Alberta development. " * 4,
+                "source_system": "public_web",
+            }
+        return await original(name, arguments)
+
+    agent.harness.invoke = public_tools
+    response = client.post("/ask", json={"summary": "What's going on in Alberta right now?"})
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert calls.count("search_news") == 1
+    assert calls.count("fetch_web_page") == 2
+    assert "search_knowledge" not in calls and "search_graph" not in calls
+    assert result["final_answer"].count("Alberta headline") == 2
+    assert "2026-10-" in result["final_answer"]
+    assert len(result["final_answer"]) > 280
+    assert {
+        "https://news1.example/alberta",
+        "https://news2.example/alberta",
+    }.issubset(result["final_response"]["sources"])
+
+
 def test_pending_question_with_rejected_claims_is_revised_not_abandoned(make_client):
     client = make_client()
     agent = client.app.state.agent

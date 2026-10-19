@@ -10,7 +10,8 @@ class StructuredModel(BaseModel):
 class RequestIntent(StructuredModel):
     in_scope: bool = True
     workflow: Literal["knowledge", "service_desk"]
-    knowledge_source: Literal["documents", "general"] = "documents"
+    knowledge_source: Literal["documents", "general", "public_web"] = "documents"
+    public_topic: Literal["none", "news", "web"] = "none"
     goal: str
     justification: str
 

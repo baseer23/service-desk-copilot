@@ -31,7 +31,9 @@ def capability(source_system, reliability=0.9):
                 system = source_system
                 if (
                     (settings.deployment_mode == "production" or not settings.test_mode)
-                    and fn.__name__ in {"search_web", "fetch_web_page", "ingest_url"}
+                    and fn.__name__ in {
+                        "search_web", "search_news", "fetch_web_page", "ingest_url"
+                    }
                     and not settings.enable_public_web_tools
                 ):
                     raise ValueError("Public research requires explicit workspace authorization")
@@ -304,6 +306,67 @@ def search_web(query: str, max_results: int = 3):
         for r in DDGS(timeout=10).text(query, max_results=max_results)
         if r.get("href")
     ]
+
+
+@capability("public_web", 0.6)
+def search_news(
+    query: str,
+    max_results: int = 5,
+    timelimit: Literal["d", "w", "m"] = "w",
+):
+    """Search current Canadian-English news for explicitly authorized research."""
+    if not 1 <= max_results <= 10:
+        raise ValueError("max_results must be between 1 and 10")
+    if timelimit not in {"d", "w", "m"}:
+        raise ValueError("timelimit must be d, w or m")
+    from ddgs import DDGS
+    from urllib.parse import urlsplit
+
+    rows, seen = [], set()
+    for item in DDGS(timeout=10).news(
+        query, region="ca-en", timelimit=timelimit, max_results=max_results
+    ):
+        url = str(item.get("url") or "").strip()
+        title = str(item.get("title") or "").strip()
+        parsed = urlsplit(url)
+        if (
+            not title or parsed.scheme not in {"http", "https"} or not parsed.hostname
+            or parsed.username or parsed.password or url in seen
+        ):
+            continue
+        published = item.get("date")
+        if published:
+            try:
+                datetime.fromisoformat(str(published).replace("Z", "+00:00"))
+            except ValueError:
+                published = None
+        seen.add(url)
+        rows.append({
+            "title": title,
+            "url": url,
+            "snippet": str(item.get("body") or "").strip(),
+            "published_at": str(published) if published else None,
+            "publisher": str(item.get("source") or "").strip() or None,
+            "source_system": "public_web",
+        })
+    return rows
+
+
+@capability("system_time", 1.0)
+def get_current_time(timezone: str = "America/Halifax"):
+    """Return the current date and timezone-aware time for an IANA timezone."""
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    try:
+        current = datetime.now(ZoneInfo(timezone))
+    except ZoneInfoNotFoundError:
+        raise ValueError("Unknown IANA timezone name") from None
+    return {
+        "timezone": timezone,
+        "timestamp": current.isoformat(),
+        "date": current.date().isoformat(),
+        "weekday": current.strftime("%A"),
+    }
 
 
 @capability("public_web", 0.7)

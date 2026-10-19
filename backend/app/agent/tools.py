@@ -22,7 +22,9 @@ READ_TOOLS = {
     "get_active_alerts",
     "get_recent_changes",
     "search_web",
+    "search_news",
     "fetch_web_page",
+    "get_current_time",
     "search_memory",
     "search_remembered_facts",
     "get_case_history",
@@ -35,7 +37,9 @@ KNOWLEDGE_TOOLS = {
     "search_knowledge",
     "search_graph",
     "search_web",
+    "search_news",
     "fetch_web_page",
+    "get_current_time",
     "list_available_context",
 }
 

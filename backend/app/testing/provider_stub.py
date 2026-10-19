@@ -17,6 +17,9 @@ class StubProvider:
         )
         lower = text.lower()
         if stage == "classify_intent":
+            current_news = any(
+                term in lower for term in ("what's going on", "news", "latest", "recent events")
+            )
             unrelated = any(
                 term in lower
                 for term in (
@@ -41,8 +44,10 @@ class StubProvider:
             )
             return schema.model_validate(
                 {
-                    "workflow": "knowledge" if knowledge or unrelated else "service_desk",
+                    "workflow": "knowledge" if knowledge or unrelated or current_news else "service_desk",
                     "in_scope": not unrelated,
+                    "knowledge_source": "public_web" if current_news else "documents",
+                    "public_topic": "news" if current_news else "none",
                     "goal": text,
                     "justification": "Explicit test intent fixture",
                 }
@@ -304,7 +309,8 @@ class StubProvider:
                 e["id"]
                 for e in evidence
                 if e["source_type"] != "tool_error"
-                and e["tool"] not in {"search_web", "list_available_context", "user_request"}
+                and e["tool"]
+                not in {"search_web", "search_news", "list_available_context", "user_request"}
             ]
             if decision.get("question_for_human") and not ids:
                 ids = [e["id"] for e in evidence if e["tool"] == "user_request"]
@@ -339,6 +345,11 @@ class StubProvider:
             for e in evidence
             if e["tool"] == "search_knowledge" and e["source_type"] != "tool_error"
         ]
+        public_pages = [
+            e
+            for e in evidence
+            if e["tool"] == "fetch_web_page" and e["source_type"] != "tool_error"
+        ]
         if context["workflow"] == "knowledge":
             source = "\n".join(e["content"].get("text", "") for e in documents)
             if source:
@@ -355,6 +366,26 @@ class StubProvider:
                     enough_information=bool(year) if "graduate" in lower else True,
                     confidence=0.75,
                     recommended_next_action="Review the cited document for context.",
+                )
+            elif public_pages:
+                answer = "\n".join(
+                    " — ".join(
+                        str(value)
+                        for value in (
+                            page["content"].get("title") or "Public update",
+                            page["content"].get("published_at") or "date unavailable",
+                            page["content"].get("publisher") or "publisher unavailable",
+                            page["content"].get("url"),
+                        )
+                        if value
+                    )
+                    for page in public_pages
+                )
+                base.update(
+                    answer=answer,
+                    enough_information=True,
+                    confidence=0.75,
+                    recommended_next_action="Open the cited sources for the full reporting.",
                 )
             elif not context.get("research_rounds"):
                 base.update(

@@ -115,3 +115,9 @@ Knowledge and service-desk planners can receive the discovered `neo4j__get-schem
 ## Plan-selected retrieval and evidence grading — 2026-10-18
 
 Retrieval now follows the structured planner's validated source selection without unconditional document prefetch. A direct live-database plan invokes its authorized schema capability and invokes `search_knowledge` zero times. Document candidates are graded in one bounded structured-model batch only after the planner selects document search; rejected chunks are excluded from evidence, reasoning context and final sources, with rejection diagnostics retained outside the source list. Missing evidence is routed to another authorized tool, one precise human question or an explicit limitation rather than filled with unrelated documents.
+
+## Public-news routing evaluation — 2026-10-19
+
+The exact prompt `What's going on in Alberta right now?` now classifies as `knowledge/public_web/news` in the deterministic evaluation and enters the bounded public-research node directly. The regression records `search_news` plus selected `fetch_web_page` calls, asserts zero `search_knowledge` and `search_graph` calls, and verifies that dates, publishers, URLs, source links and a multi-line answer longer than 280 characters survive reasoning and finalization. Unit checks cover the `ca-en` region, time window, result bounds, duplicate/unsafe URL filtering, malformed dates and IANA timezone responses.
+
+The live Groq-backed `/ask` acceptance attempt successfully executed DDGS news requests against public providers, then exceeded the 180-second client bound before DeskMate returned a final response. It was not retried. Consequently this revision does not claim a live three-headline final answer, citation quality or bounded end-to-end latency; those remain live acceptance blockers even though deterministic graph behavior, actual public-search reachability and the complete offline/browser suites pass.

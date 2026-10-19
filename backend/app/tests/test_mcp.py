@@ -6,6 +6,14 @@ from backend.app.agent.models import MemoryFact
 from datetime import datetime, timezone
 
 
+def test_public_research_tools_are_available_to_knowledge_agent():
+    from backend.app.agent.tools import KNOWLEDGE_TOOLS, READ_TOOLS
+
+    for tool in ("search_news", "get_current_time"):
+        assert tool in KNOWLEDGE_TOOLS
+        assert tool in READ_TOOLS
+
+
 def test_hosted_mcp_subprocess_keeps_installed_library_path(settings, monkeypatch, tmp_path):
     import subprocess
     import sys

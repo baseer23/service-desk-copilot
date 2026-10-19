@@ -143,6 +143,59 @@ async def test_search_and_fetch_server_units(monkeypatch):
     assert (await server.fetch_web_page("https://example.com")).result["text"] == "Body"
 
 
+@pytest.mark.asyncio
+async def test_news_search_deduplicates_and_preserves_valid_metadata(monkeypatch):
+    import ddgs
+
+    captured = {}
+
+    class FakeDDGS:
+        def __init__(self, **kwargs):
+            captured["init"] = kwargs
+
+        def news(self, query, **kwargs):
+            captured["query"], captured["kwargs"] = query, kwargs
+            return [
+                {
+                    "title": "Alberta update",
+                    "url": "https://news.example/alberta",
+                    "body": "A current provincial update.",
+                    "date": "2026-10-18T12:00:00Z",
+                    "source": "Example News",
+                },
+                {"title": "Duplicate", "url": "https://news.example/alberta"},
+                {
+                    "title": "Bad date",
+                    "url": "https://news.example/second",
+                    "date": "yesterday-ish",
+                },
+                {"title": "Unsafe", "url": "file:///etc/passwd"},
+            ]
+
+    monkeypatch.setattr(ddgs, "DDGS", FakeDDGS)
+    result = (await server.search_news("Alberta news", max_results=4, timelimit="d")).result
+    assert captured == {
+        "init": {"timeout": 10},
+        "query": "Alberta news",
+        "kwargs": {"region": "ca-en", "timelimit": "d", "max_results": 4},
+    }
+    assert [row["title"] for row in result] == ["Alberta update", "Bad date"]
+    assert result[0]["publisher"] == "Example News"
+    assert result[0]["published_at"] == "2026-10-18T12:00:00Z"
+    assert result[1]["published_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_news_search_bounds_and_current_time_schema():
+    assert (await server.search_news("Alberta", max_results=0)).status == "error"
+    assert (await server.search_news("Alberta", timelimit="year")).status == "error"
+    current = (await server.get_current_time(timezone="America/Halifax")).result
+    assert current["timezone"] == "America/Halifax"
+    assert current["timestamp"].startswith(current["date"])
+    assert current["weekday"]
+    assert (await server.get_current_time(timezone="Not/A_Zone")).status == "error"
+
+
 def test_empty_local_knowledge_research_keeps_public_evidence_ephemeral(make_client):
     c = make_client()
     harness = c.app.state.agent.harness

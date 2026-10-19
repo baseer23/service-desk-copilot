@@ -44,7 +44,9 @@ LABELS = {
     "search_knowledge": "Knowledge searched",
     "search_graph": "Relationships searched",
     "search_web": "Public sources searched",
+    "search_news": "Current news searched",
     "fetch_web_page": "Public page fetched",
+    "get_current_time": "Current time checked",
 }
 
 
@@ -85,7 +87,9 @@ class ServiceDeskAgent:
             builder.add_node(name, instrument(name, getattr(self, name)))
         builder.add_node("reject_scope", instrument("reject_scope", self.reject_scope))
         builder.add_node("general_chat", instrument("general_chat", self.general_chat))
+        builder.add_node("public_research", instrument("public_research", self.research))
         builder.add_edge("general_chat", END)
+        builder.add_edge("public_research", "observe")
         builder.add_edge("reject_scope", END)
         builder.add_node("knowledge_subgraph", self.knowledge_subgraph)
         builder.add_node("case_subgraph", self.case_subgraph)
@@ -185,9 +189,9 @@ class ServiceDeskAgent:
             and not permits(arguments["url"], self.settings)
         ):
             raise MCPToolError("Public source excluded by configured policy")
-        summary = "Searching local knowledge" if name == "search_knowledge" else "Querying knowledge relationships" if name == "search_graph" else "Searching the public web" if name == "search_web" else "Reading a public source" if name == "fetch_web_page" else "Reading connected tool evidence"
+        summary = "Searching local knowledge" if name == "search_knowledge" else "Querying knowledge relationships" if name == "search_graph" else "Searching current news" if name == "search_news" else "Searching the public web" if name == "search_web" else "Reading a public source" if name == "fetch_web_page" else "Reading connected tool evidence"
         details = {"tool": name}
-        if name in {"search_web", "search_knowledge"}:
+        if name in {"search_web", "search_news", "search_knowledge"}:
             details["query"] = str(arguments.get("query") or arguments.get("question") or "")[:500]
         elif name == "fetch_web_page":
             details["source_host"] = urlsplit(str(arguments.get("url", ""))).hostname or "public source"
@@ -485,11 +489,10 @@ class ServiceDeskAgent:
         )
         return {
             "intent": intent.model_dump(), "workflow": intent.workflow,
-            "chat_messages": (
-                state.get("chat_messages", [])
-                if intent.workflow == "knowledge" and intent.knowledge_source == "general"
-                else []
-            ),
+            "chat_messages": state.get("chat_messages", [])
+            if intent.workflow == "knowledge"
+            and intent.knowledge_source in {"general", "public_web"}
+            else [],
         }
 
     def intent_route(self, state):
@@ -497,8 +500,12 @@ class ServiceDeskAgent:
         if self.settings.knowledge_scope == "broad":
             if intent["workflow"] == "knowledge" and intent.get("knowledge_source") == "general":
                 return "general_chat"
+            if intent["workflow"] == "knowledge" and intent.get("knowledge_source") == "public_web":
+                return "public_research"
             return "understand_request"
-        return "understand_request" if intent.get("in_scope", True) else "reject_scope"
+        if not intent.get("in_scope", True):
+            return "reject_scope"
+        return "public_research" if intent.get("knowledge_source") == "public_web" else "understand_request"
 
     async def general_chat(self, state):
         answer = await self.provider.generate_structured(
@@ -682,13 +689,13 @@ class ServiceDeskAgent:
         except ValueError as exc:
             raise LLMError("Model plan failed tool permission or argument validation") from exc
         results = [None] * len(plan.tool_calls)
-        web_round = any(c.name == "search_web" for c in plan.tool_calls)
+        web_round = any(c.name in {"search_web", "search_news"} for c in plan.tool_calls)
 
         async def execute(index):
             call = plan.tool_calls[index]
             try:
                 if (
-                    call.name in {"search_web", "fetch_web_page"}
+                    call.name in {"search_web", "search_news", "fetch_web_page"}
                     and state.get("research_rounds", 0) >= self.settings.max_research_rounds
                 ):
                     raise MCPToolError("Public research round limit reached")
@@ -730,11 +737,19 @@ class ServiceDeskAgent:
                 "items": rows,
                 "timestamp": now(),
                 "source_system": "public_web"
-                if name in {"search_web", "fetch_web_page"}
+                if name in {"search_web", "search_news", "fetch_web_page"}
                 else "capability",
                 "reliability": 0.6,
             }
         rows = result["items"]
+        result.setdefault("timestamp", now())
+        result.setdefault(
+            "source_system",
+            "public_web"
+            if name in {"search_web", "search_news", "fetch_web_page"}
+            else "capability",
+        )
+        result.setdefault("reliability", 0.6)
         if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
             rows = [{"error": "Capability returned a malformed result"}]
             result = {
@@ -1046,7 +1061,9 @@ class ServiceDeskAgent:
             e
             for e in state.get("evidence", [])
             if e["source_type"] != "tool_error"
-            and e["tool"] not in {"list_available_context", "search_web", "user_request"}
+            and e["tool"] not in {
+                "list_available_context", "search_web", "search_news", "user_request"
+            }
             and not e["content"].get("available") is False
         ]
 
@@ -1146,13 +1163,21 @@ class ServiceDeskAgent:
         }
 
     async def research(self, state):
-        decision = state["decision"]
-        queries = decision.get("research_queries", [])
+        decision = state.get("decision") or {}
+        public_request = state.get("intent", {}).get("knowledge_source") == "public_web"
+        queries = decision.get("research_queries") or (
+            [state["intent"]["goal"]] if public_request else []
+        )
         if not queries:
             raise ValueError(
                 "Public research requires a model-formulated query tied to an evidence gap"
             )
         outputs = []
+        search_tool = (
+            "search_news"
+            if public_request and state["intent"].get("public_topic") == "news"
+            else "search_web"
+        )
 
         async def failed(name, error):
             outputs.append(
@@ -1181,18 +1206,21 @@ class ServiceDeskAgent:
                 event_id=f"research:{state.get('research_rounds', 0)}:{sha256(query.encode()).hexdigest()[:12]}",
             )
             try:
-                search = await self._call(state, "search_web", {"query": query, "max_results": 3})
+                arguments = {"query": query, "max_results": 5}
+                if search_tool == "search_news":
+                    arguments["timelimit"] = "w"
+                search = await self._call(state, search_tool, arguments)
             except MCPToolError as exc:
-                await failed("search_web", exc)
+                await failed(search_tool, exc)
                 continue
-            outputs.append({"name": "search_web", "output": search})
+            outputs.append({"name": search_tool, "output": search})
             rows = (
                 search.get("items", [])
                 if isinstance(search, dict) and "items" in search
                 else search
             )
             if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
-                await failed("search_web", MCPToolError("Public search returned malformed results"))
+                await failed(search_tool, MCPToolError("Public search returned malformed results"))
                 continue
             rows = rank_sources(rows, self.settings)
             selection = await self.provider.generate_structured(
@@ -1223,6 +1251,9 @@ class ServiceDeskAgent:
                     if not permits(page.get("url", ""), self.settings):
                         continue
                     page["source_quality"] = quality(page.get("url", ""), self.settings)
+                    for key in ("published_at", "publisher"):
+                        if hit.get(key) is not None:
+                            page[key] = hit[key]
                     outputs.append({"name": "fetch_web_page", "output": fetched})
                     text = page.get("text", "")
                     if len(text.strip()) < 120:
@@ -1391,6 +1422,8 @@ class ServiceDeskAgent:
     async def finalize(self, state):
         d = InvestigationDecision.model_validate(state["decision"])
         v = state.get("verification", {})
+        public_request = state.get("intent", {}).get("knowledge_source") == "public_web"
+        news_request = public_request and state.get("intent", {}).get("public_topic") == "news"
         limited = state["research_iteration"] >= self.settings.max_investigation_cycles
         supported = (
             bool(v)
@@ -1422,9 +1455,20 @@ class ServiceDeskAgent:
                 "items"
             ]
         )
+        public_limitation = None
+        if public_request and not supported:
+            errors = [
+                e["content"].get("error") for e in state.get("evidence", [])
+                if e["source_type"] == "tool_error" and e["content"].get("error")
+            ]
+            public_limitation = (
+                "Public research could not be completed: " + "; ".join(dict.fromkeys(errors))
+                if errors else "No verifiable public sources were retrieved for this request."
+            )
+        answer_value = (d.answer or d.recommended_next_action) if supported else public_limitation
         response = FinalResponse(
             issue_summary=state["ticket"]["summary"],
-            answer=d.answer if supported else None,
+            answer=answer_value,
             likely_causes=d.hypotheses,
             confirmed_facts=state.get("confirmed_facts", []),
             inferences=d.inferences,
@@ -1464,11 +1508,19 @@ class ServiceDeskAgent:
             else "Final assessment retains unresolved evidence gaps",
             confidence=confidence,
             source_count=len(response.sources),
-            conclusion=concise_answer_line(d.answer or d.recommended_next_action)
+            conclusion=concise_answer_line(answer_value)
             if supported else None,
         )
-        final_answer = concise_answer_line(d.answer or d.recommended_next_action) if supported else None
-        response.answer = concise_answer_line(response.answer)
+        final_answer = answer_value if news_request else concise_answer_line(answer_value)
+        response.answer = answer_value if news_request else concise_answer_line(answer_value)
+        chat_messages = state.get("chat_messages", [])
+        if public_request and state.get("persist_case") is False and response.answer:
+            pair = [
+                {"role": "user", "content": state["ticket"]["summary"]},
+                {"role": "assistant", "content": response.answer},
+            ]
+            if chat_messages[-2:] != pair:
+                chat_messages = [*chat_messages, *pair][-16:]
         return {
             "status": "assessment_ready" if supported else "insufficient_information",
             "confidence": confidence,
@@ -1480,4 +1532,5 @@ class ServiceDeskAgent:
             "likely_issue": d.likely_issue if not v.get("unsupported_claims") else None,
             "recommended_next_action": response.recommended_next_action,
             "actions_already_taken": response.actions_already_taken,
+            "chat_messages": chat_messages,
         }
