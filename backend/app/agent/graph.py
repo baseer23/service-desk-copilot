@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 from backend.app.agent.activity import emit, instrument
 from backend.app.agent.models import (
+    EvidenceGradeResult,
     EvidenceItem,
     FinalResponse,
     GeneralAnswer,
@@ -112,7 +113,6 @@ class ServiceDeskAgent:
 
     def _subgraph(self, workflow):
         graph = StateGraph(InvestigationState)
-        graph.add_node("prefetch_local_evidence", instrument("prefetch_local_evidence", self.prefetch_local_evidence))
         graph.add_node("execute_tools", instrument("execute_tools", self.execute_tools))
         if workflow == "knowledge":
             graph.add_node("understand_question", instrument("understand_question", self.understand_question))
@@ -121,8 +121,7 @@ class ServiceDeskAgent:
             graph.add_edge(START, "understand_question")
             graph.add_edge("understand_question", "retrieval_context")
             graph.add_edge("retrieval_context", "formulate_retrieval_plan")
-            graph.add_edge("retrieval_context", "prefetch_local_evidence")
-            graph.add_edge(["formulate_retrieval_plan", "prefetch_local_evidence"], "execute_tools")
+            graph.add_edge("formulate_retrieval_plan", "execute_tools")
         else:
             for name in (
                 "analyze_ticket",
@@ -138,8 +137,7 @@ class ServiceDeskAgent:
             graph.add_edge("analyze_ticket", "identify_entities")
             graph.add_edge("identify_entities", "load_memory")
             graph.add_edge("load_memory", "formulate_investigation_plan")
-            graph.add_edge("load_memory", "prefetch_local_evidence")
-            graph.add_edge(["formulate_investigation_plan", "prefetch_local_evidence"], "execute_tools")
+            graph.add_edge("formulate_investigation_plan", "execute_tools")
         graph.add_node("observe", instrument("observe", self.observe))
         graph.add_edge("execute_tools", "observe")
         graph.add_edge("observe", END)
@@ -602,24 +600,6 @@ class ServiceDeskAgent:
         evidence = self._evidence(state, "search_memory", result)
         return {"remembered_facts": facts, "evidence": state.get("evidence", []) + evidence}
 
-    async def prefetch_local_evidence(self, state):
-        """Independent read-only work runs alongside model planning/queue waiting."""
-        calls = [("search_knowledge", {"question": state["ticket"]["summary"],
-                                       "mode": "KEYWORD", "top_k": 3})]
-        entities = state.get("analysis", {}).get("entities", [])[:8]
-        if entities:
-            calls.append(("search_graph", {"entities": entities}))
-        async def read(name, arguments):
-            if name not in getattr(self.harness, "tools", {}):
-                return None
-            try:
-                result = await self._call(state, name, arguments)
-                return {"name": name, "arguments": arguments, "output": result}
-            except (MCPToolError, ValueError):
-                return None
-        results = await asyncio.gather(*(read(name, args) for name, args in calls))
-        return {"prefetch_results": [row for row in results if row]}
-
     async def plan(self, state):
         if state.get("plan") and not state.get("plan_executed"):
             return {}
@@ -662,6 +642,32 @@ class ServiceDeskAgent:
                 for call in plan.tool_calls
             ],
         )
+        selected = [
+            f"{LABELS.get(call.name, call.name.replace('__', ' ').replace('_', ' '))} because {call.reason.rstrip('.')}"
+            for call in plan.tool_calls
+        ]
+        skipped = [
+            f"{item.source}: {item.reason}" for item in plan.skipped_sources
+        ]
+        explanation = (
+            ("Checking " + "; ".join(selected) + ". " if selected else "No tool lookup is needed. ")
+            + ("Skipping " + "; ".join(skipped) + ". " if skipped else "")
+            + "Evidence needed: " + ("; ".join(plan.unknowns) or plan.stop_condition)
+        )
+        await emit(
+            "source_decision",
+            "completed",
+            explanation[:1000],
+            objective=plan.goal[:500],
+            actions=[
+                {"tool": call.name, "reason": call.reason[:300]} for call in plan.tool_calls
+            ],
+            skipped_sources=[
+                {"source": item.source, "reason": item.reason[:300]}
+                for item in plan.skipped_sources
+            ],
+            research_questions=plan.unknowns[:6],
+        )
         return {
             "plan": plan.model_dump(),
             "research_questions": plan.unknowns,
@@ -675,18 +681,12 @@ class ServiceDeskAgent:
             self.harness.validate_plan(plan, state["workflow"])
         except ValueError as exc:
             raise LLMError("Model plan failed tool permission or argument validation") from exc
-        prefetched = state.get("prefetch_results", [])
         results = [None] * len(plan.tool_calls)
         web_round = any(c.name == "search_web" for c in plan.tool_calls)
 
         async def execute(index):
             call = plan.tool_calls[index]
             try:
-                cached = next((row for row in prefetched if row["name"] == call.name
-                               and row.get("arguments") == call.arguments), None)
-                if cached is not None:
-                    results[index] = {"name": call.name, "output": cached["output"]}
-                    return
                 if (
                     call.name in {"search_web", "fetch_web_page"}
                     and state.get("research_rounds", 0) >= self.settings.max_research_rounds
@@ -718,9 +718,7 @@ class ServiceDeskAgent:
             if i not in grouped:
                 await execute(i)
         return {
-            "tool_results": [{"name": row["name"], "output": row["output"]}
-                             for row in prefetched] + results,
-            "prefetch_results": [],
+            "tool_results": results,
             "plan_executed": True,
             "research_rounds": state.get("research_rounds", 0) + int(web_round),
         }
@@ -779,7 +777,7 @@ class ServiceDeskAgent:
                     content=row,
                     entities=state.get("analysis", {}).get("entities", []),
                     reliability=0 if kind == "tool_error" else result["reliability"],
-                    relevance=1 / (1 + max(float(row.get("score") or 0), 0)),
+                    relevance=self._source_relevance(name, row),
                     case_id=state["case_id"] if state.get("persist_case") is not False else None,
                     url=row.get("url") or meta.get("url") or None,
                     doc_id=meta.get("doc_id"),
@@ -793,14 +791,96 @@ class ServiceDeskAgent:
             )
         return items
 
+    @staticmethod
+    def _source_relevance(name, row):
+        """Retain source semantics: keyword scores rise, vector distances fall."""
+        if name != "search_knowledge":
+            return 1.0
+        score = max(float(row.get("score") or 0), 0)
+        match_type = row.get("match_type")
+        if match_type in {"keyword", "exact_identifier"}:
+            return 1.0 if match_type == "exact_identifier" else min(1.0, score / 3.0)
+        return 1.0 / (1.0 + score)
+
+    async def _grade_document_evidence(self, state, candidates):
+        if not candidates:
+            return []
+        candidate_ids = [
+            str(item["content"].get("id")
+                or item["content"].get("metadata", {}).get("chunk_id")
+                or item["id"])
+            for item in candidates
+        ]
+        if len(candidate_ids) != len(set(candidate_ids)):
+            await emit(
+                "evidence_grading", "failed",
+                f"Document relevance could not be verified; {len(candidates)} candidates excluded",
+            )
+            return []
+        bounded = [
+            {
+                "id": candidate_ids[index],
+                "chunk_id": candidate_ids[index],
+                "title": item["content"].get("title")
+                or item["content"].get("metadata", {}).get("title"),
+                "excerpt": relevant_excerpt(
+                    str(item["content"].get("text", "")), state["ticket"]["summary"], 900
+                ),
+            }
+            for index, item in enumerate(candidates)
+        ]
+        try:
+            grade = await self.provider.generate_structured(
+                "grade_evidence",
+                {"question": state["ticket"]["summary"], "candidates": bounded},
+                EvidenceGradeResult,
+            )
+            actual = set(candidate_ids)
+            accepted = set(grade.accepted_ids)
+            rejected = {item.id for item in grade.rejected}
+            if (
+                len(grade.accepted_ids) != len(accepted)
+                or len(grade.rejected) != len(rejected)
+                or not accepted <= actual
+                or not rejected <= actual
+                or accepted & rejected
+                or accepted | rejected != actual
+            ):
+                raise ValueError("Evidence grader returned invalid candidate identifiers")
+            await emit(
+                "evidence_grading",
+                "completed",
+                f"Document relevance checked: {len(accepted)} accepted; {len(rejected)} rejected",
+                findings=[f"Rejected {item.id}: {item.reason}" for item in grade.rejected[:6]],
+            )
+            return [
+                item for candidate_id, item in zip(candidate_ids, candidates)
+                if candidate_id in accepted
+            ]
+        except Exception:
+            await emit(
+                "evidence_grading",
+                "failed",
+                f"Document relevance could not be verified; {len(candidates)} candidates excluded",
+            )
+            return []
+
     async def observe(self, state):
         evidence = list(state.get("evidence", []))
         seen = {e["id"] for e in evidence}
+        converted = []
         for item in state.get("tool_results", []):
-            for row in self._evidence(state, item["name"], item["output"]):
-                if row["id"] not in seen:
-                    evidence.append(row)
-                    seen.add(row["id"])
+            rows = self._evidence(state, item["name"], item["output"])
+            if item["name"] == "search_knowledge":
+                errors = [row for row in rows if row["source_type"] == "tool_error"]
+                rows = errors + await self._grade_document_evidence(
+                    state, [row for row in rows if row["source_type"] == "document"]
+                )
+            converted.extend(rows)
+        for row in converted:
+            if row["id"] not in seen:
+                evidence.append(row)
+                seen.add(row["id"])
         contradictions = list(state.get("contradictions", []))
         by_predicate = {}
         trusted_facts = []

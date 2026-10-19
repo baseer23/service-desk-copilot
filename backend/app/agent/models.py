@@ -41,12 +41,18 @@ class ToolRequest(StructuredModel):
     reason: str = ""
 
 
+class SkippedSource(StructuredModel):
+    source: str
+    reason: str
+
+
 class InvestigationPlan(StructuredModel):
     goal: str
     known_facts: list[str] = Field(default_factory=list)
     unknowns: list[str] = Field(default_factory=list)
     tool_calls: list[ToolRequest] = Field(default_factory=list, max_length=6)
     parallel_groups: list[list[int]] = Field(default_factory=list)
+    skipped_sources: list[SkippedSource] = Field(default_factory=list)
     stop_condition: str
 
     @model_validator(mode="after")
@@ -57,6 +63,16 @@ class InvestigationPlan(StructuredModel):
         ):
             raise ValueError("Parallel groups must contain unique valid tool indexes")
         return self
+
+
+class RejectedEvidence(StructuredModel):
+    id: str
+    reason: str
+
+
+class EvidenceGradeResult(StructuredModel):
+    accepted_ids: list[str] = Field(default_factory=list)
+    rejected: list[RejectedEvidence] = Field(default_factory=list)
 
 
 class EvidenceItem(StructuredModel):

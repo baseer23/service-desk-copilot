@@ -111,3 +111,7 @@ Final checks: **324 backend tests passed with two optional Aura skips; 52 fronte
 ## Neo4j MCP evidence boundary — 2026-10-18
 
 Knowledge and service-desk planners can receive the discovered `neo4j__get-schema` and `neo4j__read-cypher` schemas through the existing LangChain harness. Built-in `search_graph` and `search_knowledge` remain available. Allowlist, JSON Schema, read-only annotation and production tenant checks run before invocation, and returned evidence retains tool, status, UTC timestamp and `mcp:neo4j` provenance. Live reasoning against Aura remains unverified because the configured private credential was rejected; no graph result was invented or substituted.
+
+## Plan-selected retrieval and evidence grading — 2026-10-18
+
+Retrieval now follows the structured planner's validated source selection without unconditional document prefetch. A direct live-database plan invokes its authorized schema capability and invokes `search_knowledge` zero times. Document candidates are graded in one bounded structured-model batch only after the planner selects document search; rejected chunks are excluded from evidence, reasoning context and final sources, with rejection diagnostics retained outside the source list. Missing evidence is routed to another authorized tool, one precise human question or an explicit limitation rather than filled with unrelated documents.

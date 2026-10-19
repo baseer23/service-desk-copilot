@@ -128,6 +128,8 @@ test('creates a case, shows real event data, resumes human input and renders ass
   await user.type(screen.getByLabelText('Your answer'), '2nd floor')
   await user.click(screen.getByRole('button', { name: 'Continue Investigation' }))
   expect(await screen.findByText('Refresh the client profile')).toBeInTheDocument()
+  expect(screen.queryByText('Still gathering information')).not.toBeInTheDocument()
+  expect(screen.queryByText('Await the next investigation step.')).not.toBeInTheDocument()
   expect(screen.getByText(/70%/)).toBeInTheDocument()
   expect(screen.getByText('Resolution unverified')).toBeInTheDocument()
   expect(screen.queryByLabelText('Your answer')).not.toBeInTheDocument()

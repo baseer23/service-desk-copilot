@@ -105,6 +105,12 @@ DeskMate now launches the official `neo4j-mcp` 1.6.0 binary as an optional FastA
 
 Focused adapter/security tests passed. The complete backend suite passed (**328 passed, two optional tests skipped**), all **52 frontend tests** passed, the production frontend build passed, and `pip check` found no broken dependencies. DeskMate started through `make dev`; its frontend returned HTTP 200 and `/health` reported the built-in MCP ready while accurately marking Neo4j MCP unavailable and Aura disconnected. A live attempt reached the configured Aura service but authentication was rejected with the sanitized code `Neo.ClientError.Security.Unauthorized`; therefore live MCP discovery, schema retrieval and the two read queries are not claimed successful. No write query, migration, backfill, ingestion, Azure inference or document upload was performed.
 
+## Intelligent source routing — 2026-10-18
+
+The knowledge and service-desk subgraphs no longer run unconditional local document/graph prefetches. Only the validated `InvestigationPlan.tool_calls` execute, while legacy checkpoint `prefetch_results` remain readable but inert. Plans now record selected and skipped sources as observable activity. Explicitly selected document results receive one provider-selected batch relevance grade; unknown, duplicated or incomplete grader IDs fail closed and rejected chunks never reach reasoning or citations. Keyword match strength and vector distance retain distinct relevance semantics.
+
+Executed checks: **331 backend tests passed with two optional tests skipped; all 53 frontend tests passed; the production frontend build and changed-code undefined-name/syntax lint passed.** Tests verify zero document calls for a direct connected-database schema plan, batch rejection of an irrelevant immigration passage, legacy checkpoint compatibility, parallel execution, MCP permissions and removal of completed-state placeholder copy. No live model, Azure inference, public-web request or cloud mutation was performed.
+
 ## Observable-investigation verification — 2026-10-14
 
 The existing graph now retains the plan's model-generated `unknowns` as visible research questions and streams a bounded public activity view containing the objective, research questions, MCP query, concise result labels, evidence gaps and next intended action. Full tool payloads and model reasoning remain outside the activity stream. The persisted plan and research questions render again with restored case state; LangGraph interrupts continue to resume the same `thread_id`.

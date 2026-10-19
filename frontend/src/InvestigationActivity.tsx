@@ -9,6 +9,7 @@ function ActivityRow({ event }: { event: ActivityEvent }): JSX.Element {
     {event.rationale && <p className="activity-detail">{event.rationale}</p>}
     {event.research_questions?.length ? <div className="activity-detail"><strong>Research questions</strong><ul>{event.research_questions.map(question => <li key={question}>{question}</li>)}</ul></div> : null}
     {event.actions?.length ? <ul className="activity-detail">{event.actions.map((action, index) => <li key={`${action.tool}-${index}`}><strong>{action.tool.replace(/_/g, ' ')}</strong>{action.reason ? ` — ${action.reason}` : ''}</li>)}</ul> : null}
+    {event.skipped_sources?.length ? <div className="activity-detail"><strong>Not needed</strong><ul>{event.skipped_sources.map((item, index) => <li key={`${item.source}-${index}`}><strong>{item.source}</strong> — {item.reason}</li>)}</ul></div> : null}
     {event.research_queries?.length ? <ul className="activity-detail">{event.research_queries.map(query => <li key={query}>{query}</li>)}</ul> : null}
     {event.findings?.length ? <div className="activity-detail"><strong>Observed</strong><ul>{event.findings.map(finding => <li key={finding}>{finding}</li>)}</ul></div> : null}
     {event.missing_information?.length ? <div className="activity-detail"><strong>Still needed</strong><ul>{event.missing_information.map(item => <li key={item}>{item}</li>)}</ul></div> : null}
@@ -27,7 +28,7 @@ function ActivityRow({ event }: { event: ActivityEvent }): JSX.Element {
 
 export default function InvestigationActivity({ events, busy, onCancel }: { events: ActivityEvent[]; busy: boolean; onCancel: () => void }): JSX.Element | null {
   if (!events.length && !busy) return null
-  const diagnostics = events.filter(event => event.kind.startsWith('llm_') || event.kind === 'context_compaction' || event.kind === 'provider_fallback')
+  const diagnostics = events.filter(event => event.kind.startsWith('llm_') || event.kind === 'context_compaction' || event.kind === 'provider_fallback' || event.stage === 'evidence_grading')
   const investigation = events.filter(event => !diagnostics.includes(event))
   return <details className="card investigation-activity" open={busy}>
     <summary>Investigation Activity</summary>

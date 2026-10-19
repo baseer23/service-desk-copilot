@@ -135,6 +135,10 @@ def test_plan_streams_objective_and_agent_generated_research_questions(make_clie
                 'arguments': {'question': 'Nova Scotia graduate stream eligibility'},
                 'reason': 'Check existing authoritative workspace material first',
             }],
+        skipped_sources=[{
+            'source': 'live infrastructure',
+            'reason': 'The request asks only about uploaded policy material',
+        }],
             stop_condition='Official requirements and applicant-specific gaps are identified',
         )
 
@@ -156,6 +160,12 @@ def test_plan_streams_objective_and_agent_generated_research_questions(make_clie
     event = next(row for row in events if row['stage'] == 'research_plan')
     assert event['objective'] == 'Assess the documented eligibility requirements'
     assert event['research_questions'] == update['research_questions']
+    decision = next(row for row in events if row['stage'] == 'source_decision')
+    assert decision['actions'][0]['tool'] == 'search_knowledge'
+    assert decision['skipped_sources'] == [{
+        'source': 'live infrastructure',
+        'reason': 'The request asks only about uploaded policy material',
+    }]
 
 
 def test_tool_completion_streams_concise_observations(make_client):

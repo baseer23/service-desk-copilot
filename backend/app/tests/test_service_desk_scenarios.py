@@ -183,6 +183,12 @@ class ScenarioProvider:
                 evidence_gap="Public error definition",
                 justification="Select a supplied authoritative URL only when its fetched content addresses the reported error",
             )
+        if stage == "grade_evidence":
+            from backend.app.agent.models import EvidenceGradeResult
+
+            return EvidenceGradeResult(
+                accepted_ids=[item["id"] for item in context["candidates"]]
+            )
         raise AssertionError(stage)
 
 

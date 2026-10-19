@@ -390,12 +390,16 @@ export default function App(): JSX.Element {
                 <dl>
                   {active.workflow !== 'knowledge' && (
                     <>
-                      <dt>Likely issue</dt>
-                      <dd>{active.likely_issue || 'Still gathering information'}</dd>
-                      <dt>Next best action</dt>
-                      <dd className="next-action">
-                        {active.recommended_next_action || 'Await the next investigation step.'}
-                      </dd>
+                      {(active.likely_issue || active.status !== 'assessment_ready') && <>
+                        <dt>Likely issue</dt>
+                        <dd>{active.likely_issue || 'Still gathering information'}</dd>
+                      </>}
+                      {(active.recommended_next_action || active.status !== 'assessment_ready') && <>
+                        <dt>Next best action</dt>
+                        <dd className="next-action">
+                          {active.recommended_next_action || 'Await the next investigation step.'}
+                        </dd>
+                      </>}
                     </>
                   )}
                   <dt>Confidence</dt>

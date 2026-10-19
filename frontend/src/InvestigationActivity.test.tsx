@@ -58,3 +58,19 @@ test('keeps provider mechanics in expandable diagnostics', () => {
   fireEvent.click(screen.getByText('Diagnostics'))
   expect(screen.getByText('Azure OpenAI request completed')).toBeVisible()
 })
+
+test('shows the validated source selection and skipped sources', () => {
+  render(<InvestigationActivity events={[{
+    sequence: 7,
+    kind: 'workflow',
+    stage: 'source_decision',
+    status: 'completed',
+    summary: 'Checking the connected infrastructure database.',
+    objective: 'Describe currently recorded infrastructure information',
+    actions: [{ tool: 'neo4j__get-schema', reason: 'Inspect the live database structure' }],
+    skipped_sources: [{ source: 'uploaded documents', reason: 'Documents cannot establish current database contents' }],
+  }]} busy={false} onCancel={vi.fn()} />)
+  expect(screen.getByText('Checking the connected infrastructure database.')).toBeInTheDocument()
+  expect(screen.getByText(/Inspect the live database structure/)).toBeInTheDocument()
+  expect(screen.getByText(/Documents cannot establish current database contents/)).toBeInTheDocument()
+})

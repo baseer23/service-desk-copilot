@@ -294,6 +294,10 @@ class StubProvider:
                     "justification": "Explicit test source selection",
                 }
             )
+        if stage == "grade_evidence":
+            return schema.model_validate(
+                {"accepted_ids": [item["id"] for item in context["candidates"]], "rejected": []}
+            )
         if stage == "verify":
             decision = context["decision"]
             ids = [

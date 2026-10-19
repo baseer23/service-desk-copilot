@@ -18,7 +18,6 @@ LABELS = {
     "plan": "Planning the investigation",
     "formulate_retrieval_plan": "Planning knowledge retrieval",
     "formulate_investigation_plan": "Planning the investigation",
-    "prefetch_local_evidence": "Searching local knowledge and relationships",
     "execute_tools": "Executing investigation tools",
     "observe": "Evaluating collected evidence",
     "reason": "Comparing evidence and identifying gaps",

@@ -4,7 +4,12 @@ import pytest
 
 from backend.app.agent.graph import concise_answer_line
 from langchain_core.tools import StructuredTool
-from backend.app.agent.models import InvestigationPlan, VerificationResult, MemoryFact
+from backend.app.agent.models import (
+    EvidenceGradeResult,
+    InvestigationPlan,
+    VerificationResult,
+    MemoryFact,
+)
 from backend.app.mcp.client import DeskMateMCPClient
 
 RESUME = "Abdul Khan — Resume. Education: Graduated in 2022 from Dalhousie University. Skills: Python, React, SQL."
@@ -206,6 +211,90 @@ def test_plan_permissions_argument_validation_and_parallel_groups(make_client):
         InvestigationPlan(goal="bad", tool_calls=[], parallel_groups=[[3]], stop_condition="bad")
 
 
+def test_execute_tools_ignores_legacy_prefetch_and_runs_only_validated_plan(make_client):
+    client = make_client()
+    agent = client.app.state.agent
+    original = agent.harness.invoke
+    calls = []
+
+    async def record(name, arguments):
+        calls.append(name)
+        return await original(name, arguments)
+
+    agent.harness.invoke = record
+    state = {
+        "case_id": "route-only",
+        "persist_case": False,
+        "workflow": "knowledge",
+        "plan": InvestigationPlan(
+            goal="Inspect connected relationships",
+            tool_calls=[{
+                "name": "search_graph",
+                "arguments": {"entities": ["Infrastructure"]},
+                "reason": "Use the selected connected graph source",
+            }],
+            parallel_groups=[[0]],
+            skipped_sources=[{
+                "source": "uploaded documents",
+                "reason": "Documents cannot establish live graph contents",
+            }],
+            stop_condition="The connected graph responds",
+        ).model_dump(),
+        "prefetch_results": [{
+            "name": "search_knowledge",
+            "arguments": {"question": "unrelated"},
+            "output": {"items": [{"text": "irrelevant"}]},
+        }],
+    }
+    update = client.portal.call(agent.execute_tools, state)
+    assert [item["name"] for item in update["tool_results"]] == ["search_graph"]
+    assert calls == ["search_graph"]
+
+
+def test_document_grader_batches_candidates_and_rejects_irrelevant_chunks(make_client):
+    client = make_client()
+    agent = client.app.state.agent
+    captured = []
+
+    async def grade(stage, context, schema):
+        assert stage == "grade_evidence"
+        captured.append(context)
+        relevant, irrelevant = context["candidates"]
+        return EvidenceGradeResult(
+            accepted_ids=[relevant["id"]],
+            rejected=[{"id": irrelevant["id"], "reason": "Immigration text does not answer VPN guidance"}],
+        )
+
+    agent.provider.generate_structured = grade
+    state = {
+        "case_id": "grade-documents",
+        "persist_case": False,
+        "workflow": "knowledge",
+        "ticket": {"summary": "What does our uploaded VPN manual say?"},
+        "analysis": {"entities": ["VPN"]},
+        "evidence": [],
+        "tool_results": [{
+            "name": "search_knowledge",
+            "output": {
+                "source_system": "local_knowledge",
+                "timestamp": "2026-10-18T00:00:00Z",
+                "reliability": 0.9,
+                "items": [
+                    {"id": "vpn", "text": "VPN manual: refresh the approved profile.",
+                     "score": 2, "match_type": "keyword", "metadata": {"title": "VPN manual"}},
+                    {"id": "immigration", "text": "Immigration and employment eligibility.",
+                     "score": 1, "match_type": "keyword", "metadata": {"title": "Immigration PDF"}},
+                ],
+            },
+        }],
+    }
+    update = client.portal.call(agent.observe, state)
+    assert len(captured) == 1 and len(captured[0]["candidates"]) == 2
+    assert [row["content"]["id"] for row in update["evidence"]] == ["vpn"]
+    assert update["evidence"][0]["relevance"] == pytest.approx(2 / 3)
+    assert agent._source_relevance("search_knowledge", {"score": 0.25}) == 0.8
+
+
 def test_verifier_blocks_unsupported_claim_and_researches_again(make_client):
     c = make_client()
     c.post("/ingest/paste", json={"title": "Resume", "text": RESUME})
@@ -231,7 +320,7 @@ def test_verifier_blocks_unsupported_claim_and_researches_again(make_client):
     cid, result = run(c, "What year did Abdul graduate?")
     assert result["status"] == "assessment_ready" and count == 2
     assert result["research_iteration"] == 2
-    assert sum(e["tool"] == "search_knowledge" for e in c.get(f"/cases/{cid}/events").json()) == 3  # one parallel keyword prefetch and two planned retrievals
+    assert sum(e["tool"] == "search_knowledge" for e in c.get(f"/cases/{cid}/events").json()) == 2
 
 
 def test_verifier_rejects_unsupported_final_answer(make_client):

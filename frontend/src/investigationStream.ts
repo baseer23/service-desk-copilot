@@ -21,6 +21,7 @@ export interface ActivityEvent {
   question?: string
   conclusion?: string
   actions?: Array<{ tool: string; reason: string }>
+  skipped_sources?: Array<{ source: string; reason: string }>
   sources?: Array<{
     title: string
     url?: string | null
