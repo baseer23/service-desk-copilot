@@ -54,6 +54,7 @@ def knowledge_stores(settings, *, connect_graph=True, records=None):
                 tenant_provider=(lambda: current_principal(settings).tenant_id)
                 if settings.local_persistence_enabled else None,
                 optional=True, allow_fixtures=settings.test_mode,
+                database=settings.neo4j_database,
             )
             # This connection is used for optional reads. Schema mutation is
             # reserved for the separately authorized structured-ingestion writer.

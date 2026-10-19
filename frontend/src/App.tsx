@@ -78,6 +78,48 @@ type AskResponse = {
   result: Omit<Case, 'case_id' | 'thread_id'>
   events: Event[]
 }
+
+function AnswerText({ value }: { value: string }): JSX.Element {
+  const inline = (text: string) => text.split(/(\*\*[^*]+\*\*)/g).map((part, index) =>
+    part.startsWith('**') && part.endsWith('**')
+      ? <strong key={index}>{part.slice(2, -2)}</strong>
+      : part
+  )
+  const lines = value.split('\n')
+  const blocks: JSX.Element[] = []
+  for (let index = 0; index < lines.length;) {
+    const line = lines[index].trim()
+    if (!line) { index += 1; continue }
+    if (/^\d+\.\s+/.test(line)) {
+      const items: string[] = []
+      while (index < lines.length && /^\d+\.\s+/.test(lines[index].trim())) {
+        items.push(lines[index].trim().replace(/^\d+\.\s+/, ''))
+        index += 1
+      }
+      blocks.push(<ol key={`ol-${index}`}>{items.map((item, itemIndex) =>
+        <li key={itemIndex}>{inline(item)}</li>)}</ol>)
+      continue
+    }
+    if (/^[-*]\s+/.test(line)) {
+      const items: string[] = []
+      while (index < lines.length && /^[-*]\s+/.test(lines[index].trim())) {
+        items.push(lines[index].trim().replace(/^[-*]\s+/, ''))
+        index += 1
+      }
+      blocks.push(<ul key={`ul-${index}`}>{items.map((item, itemIndex) =>
+        <li key={itemIndex}>{inline(item)}</li>)}</ul>)
+      continue
+    }
+    if (/^#{1,3}\s+/.test(line)) {
+      blocks.push(<h3 key={`h-${index}`}>{inline(line.replace(/^#{1,3}\s+/, ''))}</h3>)
+    } else {
+      blocks.push(<p key={`p-${index}`}>{inline(line)}</p>)
+    }
+    index += 1
+  }
+  return <div className="answer-content">{blocks}</div>
+}
+
 export default function App(): JSX.Element {
   // This custom data hook accepts no effect callback.
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -314,7 +356,7 @@ export default function App(): JSX.Element {
               {!active.chat_messages?.length && (active.final_response?.answer || active.final_answer) && (
                 <section className="card knowledge-answer">
                   <h2>Final Answer</h2>
-                  <p><strong>{active.final_response?.answer || active.final_answer}</strong></p>
+                  <AnswerText value={(active.final_response?.answer || active.final_answer)!} />
                 </section>
               )}
               {active.workflow === 'knowledge' && !active.chat_messages?.length && !active.final_response?.answer && !active.final_answer && (
@@ -323,7 +365,7 @@ export default function App(): JSX.Element {
               {!!active.chat_messages?.length && <section className="card conversation-card" aria-label="Conversation">
                 <h2 className="sr-only">Conversation</h2>
                 <div className="chat-history" role="log" aria-live="polite">
-                  {active.chat_messages.map((message, index) => <div key={index} className={`chat-message ${message.role}`}><strong>{message.role === 'user' ? 'You' : 'DeskMate'}</strong><p>{message.role === 'assistant' ? <strong>{message.content}</strong> : message.content}</p></div>)}
+                  {active.chat_messages.map((message, index) => <div key={index} className={`chat-message ${message.role}`}><strong>{message.role === 'user' ? 'You' : 'DeskMate'}</strong>{message.role === 'assistant' ? <AnswerText value={message.content} /> : <p>{message.content}</p>}</div>)}
                 </div>
                 <form onSubmit={continueChat} className="chat-reply">
                   <label htmlFor="chat-reply">Reply to this conversation</label>

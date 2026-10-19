@@ -138,6 +138,9 @@ def create_app(settings: Settings | None = None):
                 # errors explicitly. No fake provider is constructed as a fallback.
                 provider = None
             await mcp.start()
+            from backend.app.services.local_documents import graph_writer_readiness
+
+            app.state.graph_writer = await asyncio.to_thread(graph_writer_readiness, s)
             from backend.app.core.principal import Principal, principal_scope
 
             system_tenant = (
@@ -307,20 +310,9 @@ def create_app(settings: Settings | None = None):
                 )
             ),
             "structured_ingestion_available": bool(
-                s.uses_record_store
-                and s.neo4j_ingestion_enabled
-                and s.neo4j_uri
-                and s.neo4j_ingestion_user
-                and s.neo4j_ingestion_password.get_secret_value()
+                s.uses_record_store and app.state.graph_writer["available"]
             ),
-            "structured_ingestion_blocker": (
-                None
-                if s.neo4j_ingestion_enabled
-                and s.neo4j_uri
-                and s.neo4j_ingestion_user
-                and s.neo4j_ingestion_password.get_secret_value()
-                else "Configure an authorized Neo4j ingestion connection to enable linking."
-            ),
+            "structured_ingestion_blocker": app.state.graph_writer["blocker"],
         }
 
     @app.get("/health")

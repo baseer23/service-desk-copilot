@@ -20,7 +20,7 @@ T = TypeVar("T", bound=BaseModel)
 TOKEN_LIMITS = {
     "readiness": 80,
     "classify_intent": 220,
-    "general_chat": 1000,
+    "general_chat": 1500,
     "analyze_ticket": 600,
     "plan": 1400,
     "reason": 1500,

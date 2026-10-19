@@ -665,6 +665,13 @@ h1, h2, h3 { font-family: inherit; }
 .chat-message.user { margin-left: auto; background: #244a3b; color: #fff; border-color: #244a3b; border-radius: 18px 18px 4px 18px; }
 .chat-message p { margin: 8px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .chat-message strong { font-size: 11px; font-weight: 600; }
+.answer-content { margin-top: 8px; overflow-wrap: anywhere; }
+.answer-content p { margin: 0 0 12px; white-space: pre-wrap; line-height: 1.65; }
+.answer-content p:last-child { margin-bottom: 0; }
+.answer-content ol, .answer-content ul { margin: 10px 0 14px; padding-left: 24px; }
+.answer-content li { margin: 7px 0; line-height: 1.6; }
+.answer-content h3 { margin: 18px 0 8px; font-size: 15px; }
+.answer-content strong { font-size: inherit; font-weight: 650; }
 .chat-reply { padding: 16px; background: #fff; border-radius: 16px; border: 1px solid #dce5df; margin-top: 22px; }
 .chat-reply .primary { width: auto; float: right; margin-top: 8px; }
 .chat-reply::after { content: ''; display: block; clear: both; }

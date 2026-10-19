@@ -8,6 +8,57 @@ from backend.app.store.local_knowledge import LocalDocuments
 from backend.app.store.local_records import LocalRecords
 
 
+def graph_writer_readiness(settings):
+    """Verify the separately authorized ingestion writer and required schema."""
+    configured = (
+        settings.neo4j_ingestion_enabled
+        and settings.neo4j_uri
+        and settings.neo4j_ingestion_user
+        and settings.neo4j_ingestion_password.get_secret_value()
+    )
+    if not configured:
+        return {
+            "available": False,
+            "blocker": "Configure an authorized Neo4j ingestion connection to enable linking.",
+        }
+    from neo4j import GraphDatabase
+    from backend.app.store.graph_repo import GraphRepository
+
+    driver = None
+    try:
+        driver = GraphDatabase.driver(
+            settings.neo4j_uri,
+            auth=(
+                settings.neo4j_ingestion_user,
+                settings.neo4j_ingestion_password.get_secret_value(),
+            ),
+            connection_timeout=5,
+            max_transaction_retry_time=0,
+            connection_acquisition_timeout=5,
+        )
+        driver.verify_connectivity()
+        graph = GraphRepository(driver, optional=False, database=settings.neo4j_database)
+        graph.ensure_constraints()
+        with driver.session(database=settings.neo4j_database) as session:
+            transaction = session.begin_transaction()
+            try:
+                transaction.run(
+                    "MERGE (n:DeskMateWriterProbe {id:$id}) SET n.checked_at=timestamp()",
+                    id="permission-check",
+                ).consume()
+            finally:
+                transaction.rollback()
+        return {"available": True, "blocker": None}
+    except Exception:
+        return {
+            "available": False,
+            "blocker": "Neo4j ingestion credentials could not create reference metadata.",
+        }
+    finally:
+        if driver:
+            driver.close()
+
+
 class LocalDocumentExtractor:
     def __init__(self, settings, records):
         self.settings, self.records = settings, records
@@ -144,6 +195,7 @@ class LocalDocumentRepository(DocumentRepository):
                     tenant_provider=lambda: current_principal(self.settings).tenant_id,
                     optional=False,
                     allow_fixtures=self.settings.test_mode,
+                    database=self.settings.neo4j_database,
                 )
                 graph.ensure_constraints()
             extraction = json.loads(

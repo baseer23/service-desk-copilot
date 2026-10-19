@@ -523,7 +523,6 @@ class ServiceDeskAgent:
             },
             GeneralAnswer,
         )
-        answer.answer = concise_answer_line(answer.answer) or answer.answer
         messages = [*state.get("chat_messages", []),
             {"role": "user", "content": state["ticket"]["summary"]},
             {"role": "assistant", "content": answer.answer},
@@ -1454,7 +1453,6 @@ class ServiceDeskAgent:
         d = InvestigationDecision.model_validate(state["decision"])
         v = state.get("verification", {})
         public_request = state.get("intent", {}).get("knowledge_source") == "public_web"
-        news_request = public_request and state.get("intent", {}).get("public_topic") == "news"
         limited = state["research_iteration"] >= self.settings.max_investigation_cycles
         supported = (
             bool(v)
@@ -1545,8 +1543,10 @@ class ServiceDeskAgent:
             conclusion=concise_answer_line(answer_value)
             if supported else None,
         )
-        final_answer = answer_value if news_request else concise_answer_line(answer_value)
-        response.answer = answer_value if news_request else concise_answer_line(answer_value)
+        # Persist and return the complete verified answer. Only the separate
+        # activity conclusion is compacted for timeline display.
+        final_answer = answer_value
+        response.answer = answer_value
         chat_messages = state.get("chat_messages", [])
         if public_request and state.get("persist_case") is False and response.answer:
             pair = [

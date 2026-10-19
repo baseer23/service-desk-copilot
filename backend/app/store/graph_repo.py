@@ -32,13 +32,15 @@ class GraphRepository:
     """Persistence adapter for document, chunk, and entity metadata in Neo4j."""
 
     def __init__(
-        self, driver: Driver, *, tenant_provider=None, optional=False, allow_fixtures=True
+        self, driver: Driver, *, tenant_provider=None, optional=False, allow_fixtures=True,
+        database: str | None = None,
     ) -> None:
         """Store the Neo4j driver for subsequent transactional work."""
         self._driver: Driver = driver
         self.tenant_provider = tenant_provider
         self.optional = optional
         self.allow_fixtures = allow_fixtures
+        self.database = database
         self.available = True
 
     def scope(self, identifier):
@@ -63,7 +65,7 @@ class GraphRepository:
             "CREATE CONSTRAINT IF NOT EXISTS FOR (p:Page) REQUIRE p.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (t:Topic) REQUIRE t.id IS UNIQUE",
         ]
-        with self._driver.session() as session:
+        with self._driver.session(database=self.database) as session:
             for statement in statements:
                 session.run(statement)
 
@@ -420,7 +422,7 @@ class GraphRepository:
         try:
             if hasattr(self._driver, "execute_write"):
                 return self._driver.execute_write(func)
-            with self._driver.session() as session:
+            with self._driver.session(database=self.database) as session:
                 return session.execute_write(func)
         except Exception:
             if not self.optional:
@@ -435,7 +437,7 @@ class GraphRepository:
         try:
             if hasattr(self._driver, "execute_read"):
                 return self._driver.execute_read(func)
-            with self._driver.session() as session:
+            with self._driver.session(database=self.database) as session:
                 return session.execute_read(func)
         except Exception:
             if not self.optional:

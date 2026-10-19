@@ -177,7 +177,11 @@ export default function KnowledgePanel({
           {readiness?.neo4j_read_available === false
             ? 'Neo4j read is unavailable. '
             : 'Neo4j access is read-only. '}
-          Hybrid is off for this demo; ChromaDB remains the primary knowledge store.
+          {readiness?.structured_ingestion_available !== true
+            ? 'Hybrid ingestion is unavailable until the backend writer is verified.'
+            : hybrid
+              ? 'Hybrid is ON: uploads use Azure extraction, local ChromaDB, and Neo4j references.'
+              : 'Hybrid is OFF: uploads remain local and do not write graph references.'}
         </p>
       </div>
       <div className={`document-drop ${dragging ? 'dragging' : ''}`} onDragOver={event => { event.preventDefault(); setDragging(true) }} onDragLeave={() => setDragging(false)} onDrop={event => { event.preventDefault(); setDragging(false); chooseFile(event.dataTransfer.files[0]) }}>
