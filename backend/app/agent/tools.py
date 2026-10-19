@@ -36,6 +36,8 @@ READ_TOOLS = {
 KNOWLEDGE_TOOLS = {
     "search_knowledge",
     "search_graph",
+    "search_memory",
+    "search_remembered_facts",
     "search_web",
     "search_news",
     "fetch_web_page",

@@ -201,7 +201,7 @@ def search_knowledge(
     top_k: int = 6,
     graph_plan: dict | None = None,
 ):
-    """Semantic document/KB retrieval. Use for factual questions, resumes, PDFs and troubleshooting documentation."""
+    """Retrieve internal knowledge. VECTOR discovers semantically relevant local content even without a known title; HYBRID combines bounded graph references with local content fallback; GRAPH searches linked references; KEYWORD searches indexed text."""
     if mode.upper() not in {"VECTOR", "GRAPH", "HYBRID", "KEYWORD"}:
         raise ValueError("mode must be VECTOR, GRAPH, HYBRID or KEYWORD")
     if not 1 <= top_k <= 30:
@@ -663,17 +663,53 @@ def save_case(case_id: str, state: dict[str, Any]):
 
 
 @capability("environment", 1)
-def list_available_context():
-    """Discover available datasets/services, fixture provenance, graph availability, and knowledge document counts."""
+def list_available_context(question: str | None = None):
+    """Discover bounded tenant-owned knowledge metadata and available services."""
     vector, _, driver, _, _ = environment()
+    catalog = []
+    rows = []
+    if get_settings().uses_record_store:
+        import re
+
+        terms = {
+            value.casefold()
+            for value in re.findall(r"[\w-]+", question or "")
+            if len(value) > 2
+        }
+        rows = documents().list_documents()
+        rows.sort(
+            key=lambda row: (
+                -sum(term in str(row.get("title") or "").casefold() for term in terms),
+                str(row.get("title") or "").casefold(),
+            )
+        )
+        catalog = [
+            {
+                "id": row.get("id"),
+                "title": row.get("title"),
+                "source_type": row.get("source_type"),
+                "status": row.get("status"),
+                "pages": row.get("pages"),
+                "tables": row.get("tables", 0),
+                "ingestion_mode": row.get("ingestion_mode"),
+                "graph_link_status": row.get("graph_link_status"),
+                "version": row.get("version", 1),
+                "created_at": row.get("created_at"),
+                "updated_at": row.get("updated_at"),
+            }
+            for row in rows[:20]
+        ]
     return {
         "knowledge_chunks": vector.count(),
+        "local_documents_available": bool(catalog),
+        "document_catalog": catalog,
+        "document_catalog_bounded": len(catalog) < len(rows) if get_settings().uses_record_store else False,
         "chroma": vector.ping(),
         "aura_connected": driver is not None,
         **(fixtures.inventory() if get_settings().enable_local_fixtures else {}),
         "fixture_source_system": "local_fixture",
         "memory": "sqlite_memory",
-        "web": "public_web",
+        "web": "public_web" if get_settings().enable_public_web_tools else "unavailable",
     }
 
 

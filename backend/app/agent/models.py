@@ -49,11 +49,16 @@ class SkippedSource(StructuredModel):
 
 class InvestigationPlan(StructuredModel):
     goal: str
+    additional_evidence_useful: bool = True
+    source_strategy: str = ""
     known_facts: list[str] = Field(default_factory=list)
     unknowns: list[str] = Field(default_factory=list)
     tool_calls: list[ToolRequest] = Field(default_factory=list, max_length=6)
     parallel_groups: list[list[int]] = Field(default_factory=list)
     skipped_sources: list[SkippedSource] = Field(default_factory=list)
+    clarification_needed: bool = False
+    clarification_question: str | None = None
+    clarification_reason: str | None = None
     stop_condition: str
 
     @model_validator(mode="after")

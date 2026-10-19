@@ -1,6 +1,7 @@
 """Supervisor and two compiled subgraphs. Every capability invocation uses LangChain→MCP."""
 
 import asyncio
+import json
 from datetime import datetime, timezone
 from hashlib import sha256
 from urllib.parse import urlsplit
@@ -14,7 +15,6 @@ from backend.app.agent.models import (
     EvidenceGradeResult,
     EvidenceItem,
     FinalResponse,
-    GeneralAnswer,
     InvestigationDecision,
     InvestigationPlan,
     MemoryFact,
@@ -86,10 +86,6 @@ class ServiceDeskAgent:
         ):
             builder.add_node(name, instrument(name, getattr(self, name)))
         builder.add_node("reject_scope", instrument("reject_scope", self.reject_scope))
-        builder.add_node("general_chat", instrument("general_chat", self.general_chat))
-        builder.add_node("public_research", instrument("public_research", self.research))
-        builder.add_edge("general_chat", END)
-        builder.add_edge("public_research", "observe")
         builder.add_edge("reject_scope", END)
         builder.add_node("knowledge_subgraph", self.knowledge_subgraph)
         builder.add_node("case_subgraph", self.case_subgraph)
@@ -189,8 +185,15 @@ class ServiceDeskAgent:
             and not permits(arguments["url"], self.settings)
         ):
             raise MCPToolError("Public source excluded by configured policy")
+        knowledge_mode = str(arguments.get("mode") or "HYBRID").upper()
+        knowledge_summary = {
+            "HYBRID": "Searching linked graph references and local semantic knowledge",
+            "GRAPH": "Searching linked knowledge references",
+            "VECTOR": "Searching local semantic knowledge",
+            "KEYWORD": "Searching local indexed text",
+        }.get(knowledge_mode, "Searching internal knowledge")
         summaries = {
-            "search_knowledge": "Searching Neo4j references, then local knowledge",
+            "search_knowledge": knowledge_summary,
             "search_graph": "Querying knowledge relationships",
             "search_news": "Searching current news",
             "search_web": "Searching the public web",
@@ -344,6 +347,7 @@ class ServiceDeskAgent:
                 "verification": {},
                 "research_rounds": 0,
                 "research_iteration": 0,
+                "executed_tool_calls": [],
                 "final_answer": None,
                 "final_response": {},
                 "pending_question": None,
@@ -375,6 +379,7 @@ class ServiceDeskAgent:
                 "contradictions": [],
                 "research_iteration": 0,
                 "research_rounds": 0,
+                "executed_tool_calls": [],
                 "chat_messages": [],
                 "request_owner": owner,
             }
@@ -467,8 +472,10 @@ class ServiceDeskAgent:
                 "decision_issues",
                 "research_rounds",
                 "available_context",
+                "executed_tool_calls",
             )
         }
+        result["conversation"] = state.get("chat_messages", [])[-8:]
         result["evidence"] = evidence
         if include_tools:
             result["available_tools"] = self.harness.schemas(state.get("workflow", "service_desk"))
@@ -496,52 +503,14 @@ class ServiceDeskAgent:
         )
         return {
             "intent": intent.model_dump(), "workflow": intent.workflow,
-            "chat_messages": state.get("chat_messages", [])
-            if intent.workflow == "knowledge"
-            and intent.knowledge_source in {"general", "public_web"}
-            else [],
+            "chat_messages": state.get("chat_messages", []),
         }
 
     def intent_route(self, state):
         intent = state["intent"]
-        if self.settings.knowledge_scope == "broad":
-            if intent["workflow"] == "knowledge" and intent.get("knowledge_source") == "general":
-                return "general_chat"
-            if intent["workflow"] == "knowledge" and intent.get("knowledge_source") == "public_web":
-                return "public_research"
-            return "understand_request"
         if not intent.get("in_scope", True):
             return "reject_scope"
-        return "public_research" if intent.get("knowledge_source") == "public_web" else "understand_request"
-
-    async def general_chat(self, state):
-        answer = await self.provider.generate_structured(
-            "general_chat",
-            {
-                "message": state["ticket"]["summary"],
-                "conversation": state.get("chat_messages", [])[-8:],
-            },
-            GeneralAnswer,
-        )
-        messages = [*state.get("chat_messages", []),
-            {"role": "user", "content": state["ticket"]["summary"]},
-            {"role": "assistant", "content": answer.answer},
-        ]
-        return {
-            "persist_case": False,
-            "workflow": "knowledge",
-            "status": "assessment_ready",
-            "final_answer": answer.answer,
-            "final_response": FinalResponse(
-                issue_summary=state["ticket"]["summary"], answer=answer.answer,
-                confidence=0, uncertainty=answer.uncertainty,
-            ).model_dump(),
-            "chat_messages": messages[-16:],
-            "evidence": [],
-            "confidence": 0,
-            "uncertainty": answer.uncertainty,
-            "pending_question": None,
-        }
+        return "understand_request"
 
     async def reject_scope(self, state):
         return {
@@ -580,12 +549,14 @@ class ServiceDeskAgent:
         await self.note(
             state,
             "understand_question",
-            "Knowledge workflow selected; evidence is required for an answer",
+            "Knowledge objective interpreted; source needs remain a planning decision",
         )
         return {"analysis": {"symptoms": state["ticket"]["summary"], "entities": []}}
 
     async def retrieval_context(self, state):
-        result = await self._call(state, "list_available_context", {})
+        result = await self.harness.invoke(
+            "list_available_context", {"question": state["ticket"]["summary"]}
+        )
         return {"available_context": result["result"]}
 
     async def analyze_ticket(self, state):
@@ -650,6 +621,8 @@ class ServiceDeskAgent:
             f"Research plan: {plan.goal[:240]}",
             objective=plan.goal[:500],
             rationale=plan.stop_condition[:500],
+            source_strategy=plan.source_strategy[:500],
+            sufficient_evidence=plan.stop_condition[:500],
             research_questions=plan.unknowns[:6],
             actions=[
                 {"tool": call.name, "reason": call.reason[:300]}
@@ -681,6 +654,8 @@ class ServiceDeskAgent:
                 for item in plan.skipped_sources
             ],
             research_questions=plan.unknowns[:6],
+            source_strategy=plan.source_strategy[:500],
+            additional_evidence_useful=plan.additional_evidence_useful,
         )
         return {
             "plan": plan.model_dump(),
@@ -699,6 +674,7 @@ class ServiceDeskAgent:
                 category="application_validation",
             ) from exc
         results = [None] * len(plan.tool_calls)
+        completed_signatures = []
         web_round = any(c.name in {"search_web", "search_news"} for c in plan.tool_calls)
 
         async def execute(index):
@@ -709,10 +685,15 @@ class ServiceDeskAgent:
                     and state.get("research_rounds", 0) >= self.settings.max_research_rounds
                 ):
                     raise MCPToolError("Public research round limit reached")
+                output = await self._call(state, call.name, call.arguments)
                 results[index] = {
                     "name": call.name,
-                    "output": await self._call(state, call.name, call.arguments),
+                    "output": output,
                 }
+                if not isinstance(output, dict) or output.get("status") not in {
+                    "error", "unavailable"
+                }:
+                    completed_signatures.append(self._tool_signature(call.name, call.arguments))
             except MCPToolError as exc:
                 await self.note(state, call.name, f"Capability failed: {call.name}", "tool_error")
                 results[index] = {
@@ -737,8 +718,20 @@ class ServiceDeskAgent:
         return {
             "tool_results": results,
             "plan_executed": True,
+            "executed_tool_calls": list(
+                dict.fromkeys(state.get("executed_tool_calls", []) + completed_signatures)
+            ),
             "research_rounds": state.get("research_rounds", 0) + int(web_round),
         }
+
+    @staticmethod
+    def _tool_signature(name, arguments):
+        return json.dumps(
+            {"name": name, "arguments": arguments},
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
 
     def _evidence(self, state, name, result):
         if not isinstance(result, dict) or "items" not in result:
@@ -887,9 +880,10 @@ class ServiceDeskAgent:
             await emit(
                 "evidence_grading",
                 "failed",
-                f"Document relevance could not be verified; {len(candidates)} candidates excluded",
+                "Model grading unavailable; retaining "
+                f"{len(candidates)} retrieved documents for evidence assessment",
             )
-            return []
+            return candidates
 
     async def observe(self, state):
         evidence = list(state.get("evidence", []))
@@ -1034,9 +1028,26 @@ class ServiceDeskAgent:
                 )
         if decision.question_for_human and not decision.question_reason:
             issues.append("Human question lacks a material decision justification.")
-        if not self.usable_evidence(state):
+        if not self.usable_evidence(state) and not self._direct_model_answer(state):
             decision.enough_information = False
             decision.confidence = 0
+        executed = set(state.get("executed_tool_calls", []))
+        requested_tools = [
+            call
+            for call in decision.requested_tools
+            if self._tool_signature(call.name, call.arguments) not in executed
+        ]
+        next_plan = None
+        if requested_tools:
+            next_plan = InvestigationPlan(
+                goal=decision.recommended_next_action or "Resolve the remaining evidence gaps",
+                additional_evidence_useful=True,
+                source_strategy=decision.decision_justification,
+                known_facts=decision.inferences,
+                unknowns=[item.description for item in decision.missing_information],
+                tool_calls=requested_tools,
+                stop_condition="Stop when the requested observations resolve the stated evidence gaps.",
+            )
         await self.note(
             state,
             "reason",
@@ -1057,7 +1068,7 @@ class ServiceDeskAgent:
                 or ("Verify the candidate answer" if decision.enough_information else "Revise the investigation plan")
             ),
         )
-        return {
+        result = {
             "decision": decision.model_dump(),
             "decision_issues": issues,
             "research_iteration": iteration,
@@ -1072,6 +1083,9 @@ class ServiceDeskAgent:
             "pending_field": decision.human_field,
             "status": "needs_input" if decision.question_for_human else "investigating",
         }
+        if next_plan is not None:
+            result.update(plan=next_plan.model_dump(), plan_executed=False)
+        return result
 
     @staticmethod
     def usable_evidence(state):
@@ -1085,9 +1099,20 @@ class ServiceDeskAgent:
             and not e["content"].get("available") is False
         ]
 
+    @staticmethod
+    def _direct_model_answer(state):
+        plan = state.get("plan") or {}
+        return (
+            state.get("workflow") == "knowledge"
+            and not plan.get("tool_calls")
+            and plan.get("additional_evidence_useful") is False
+        )
+
     def route(self, state):
         if state["research_iteration"] >= self.settings.max_investigation_cycles:
             return "finalize"
+        if not state.get("plan_executed", True) and state.get("plan", {}).get("tool_calls"):
+            return "execute_tools"
         d = state["decision"]
         if (
             d.get("needs_web_research")
@@ -1333,8 +1358,10 @@ class ServiceDeskAgent:
                 "remembered_facts",
                 "human_answers",
                 "contradictions",
+                "conversation",
             )
         }
+        context["direct_model_answer"] = self._direct_model_answer(state)
         clarifying = bool(state["decision"].get("question_for_human"))
         if clarifying:
             # Verify the question and its premises before interrupting. A
@@ -1357,7 +1384,11 @@ class ServiceDeskAgent:
                 dict.fromkeys(verification.unsupported_claims + state["decision_issues"])
             )
             verification.should_continue_research = True
-        if not self.usable_evidence(state) and not state["decision"].get("question_for_human"):
+        if (
+            not self.usable_evidence(state)
+            and not self._direct_model_answer(state)
+            and not state["decision"].get("question_for_human")
+        ):
             verification.confidence = 0
             verification.unsupported_claims.append("No supporting evidence is available.")
         await self.note(state, "verify", verification.justification, self.provider.name())
@@ -1453,12 +1484,13 @@ class ServiceDeskAgent:
         d = InvestigationDecision.model_validate(state["decision"])
         v = state.get("verification", {})
         public_request = state.get("intent", {}).get("knowledge_source") == "public_web"
+        direct_model_answer = self._direct_model_answer(state)
         limited = state["research_iteration"] >= self.settings.max_investigation_cycles
         supported = (
             bool(v)
             and not v.get("unsupported_claims")
             and (d.enough_information or bool(d.answer))
-            and bool(self.usable_evidence(state))
+            and (bool(self.usable_evidence(state)) or direct_model_answer)
         )
         uncertainty = list(
             dict.fromkeys(
@@ -1505,7 +1537,8 @@ class ServiceDeskAgent:
             actions_already_taken=[e["content"] for e in events if e.get("tool") != "error"],
             recommended_next_action=(
                 d.recommended_next_action
-                if d.recommended_next_action and self.usable_evidence(state)
+                if d.recommended_next_action
+                and (self.usable_evidence(state) or direct_model_answer)
                 else "Collect missing evidence before accepting the candidate assessment."
                 if v.get("unsupported_claims")
                 else d.recommended_next_action
@@ -1548,7 +1581,7 @@ class ServiceDeskAgent:
         final_answer = answer_value
         response.answer = answer_value
         chat_messages = state.get("chat_messages", [])
-        if public_request and state.get("persist_case") is False and response.answer:
+        if state.get("persist_case") is False and response.answer:
             pair = [
                 {"role": "user", "content": state["ticket"]["summary"]},
                 {"role": "assistant", "content": response.answer},
