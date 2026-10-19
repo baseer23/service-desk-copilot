@@ -22,6 +22,7 @@ class LocalDocuments:
             re.fullmatch(r"vectors-[a-f0-9]{16}\.json", artifact)
             or re.fullmatch(r"figure-[a-f0-9]{16}\.bin", artifact)
             or re.fullmatch(r"extraction-batch-\d{1,6}\.json", artifact)
+            or re.fullmatch(r"extraction-[a-f0-9]{16}\.json", artifact)
         )
         if not re.fullmatch(r"[a-f0-9]{64}", document_id) or not valid_artifact:
             raise ValueError("Unsupported document artifact")
@@ -175,7 +176,9 @@ class LocalKnowledgeStore:
         return [row for row in rows if row][:top_k]
 
     def search_keywords(self, question, top_k=6):
-        from backend.app.repositories.documents import query_terms
+        from backend.app.repositories.documents import (
+            explicit_publication_source, is_publication, lexical_score, query_terms,
+        )
 
         terms = query_terms(question)
         if not terms:
@@ -195,7 +198,8 @@ class LocalKnowledgeStore:
                 )
                 for i, identifier in enumerate(found["ids"]):
                     text = found["documents"][i]
-                    score = sum(term in text.casefold() for term in terms)
+                    meta = json.loads(found["metadatas"][i]["metadata_json"])
+                    score = lexical_score(question, text, meta)
                     row = self.row(
                         identifier, text, found["metadatas"][i], score, match_type="keyword"
                     )
@@ -206,7 +210,7 @@ class LocalKnowledgeStore:
                 offset += 200
         for entry in self.records.query("knowledge_pending", limit=10000):
             chunk = entry["payload"]
-            score = sum(term in chunk["text"].casefold() for term in terms)
+            score = lexical_score(question, chunk["text"], chunk.get("metadata"))
             if score and chunk["id"] not in rows:
                 row = self.row(
                     chunk["id"],
@@ -217,7 +221,12 @@ class LocalKnowledgeStore:
                 )
                 if row:
                     rows[chunk["id"]] = row
-        return sorted(rows.values(), key=lambda row: (-row["score"], row["id"]))[:top_k]
+        ranked = sorted(rows.values(), key=lambda row: (-row["score"], row["id"]))
+        if explicit_publication_source(question):
+            publication_rows = [row for row in ranked if is_publication(row.get("metadata"))]
+            if publication_rows:
+                ranked = publication_rows
+        return ranked[:top_k]
 
     def search_identifiers(self, identifiers, top_k=6):
         rows = self.search_keywords(" ".join(identifiers), max(top_k * 5, 30))

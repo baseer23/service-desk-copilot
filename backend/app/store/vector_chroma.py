@@ -165,7 +165,9 @@ class VectorChromaStore:
 
     def search_keywords(self, question, top_k=6):
         """Read existing document text without generating a query embedding."""
-        from backend.app.repositories.documents import query_terms
+        from backend.app.repositories.documents import (
+            explicit_publication_source, is_publication, lexical_score, query_terms,
+        )
         import re
 
         terms = query_terms(question)
@@ -184,7 +186,7 @@ class VectorChromaStore:
             rows = []
             for index, identifier in enumerate(found["ids"]):
                 text = found["documents"][index]
-                score = sum(term in text.casefold() for term in terms)
+                score = lexical_score(question, text, found["metadatas"][index])
                 if score:
                     rows.append(
                         {
@@ -196,7 +198,12 @@ class VectorChromaStore:
                             "storage": "chroma",
                         }
                     )
-            return sorted(rows, key=lambda row: (-row["score"], row["id"]))[:top_k]
+            ranked = sorted(rows, key=lambda row: (-row["score"], row["id"]))
+            if explicit_publication_source(question):
+                publication_rows = [row for row in ranked if is_publication(row.get("metadata"))]
+                if publication_rows:
+                    ranked = publication_rows
+            return ranked[:top_k]
         except Exception as exc:
             raise StorageError("Chroma keyword lookup failed; stored data preserved") from exc
 

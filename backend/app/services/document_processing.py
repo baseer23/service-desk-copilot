@@ -1,6 +1,7 @@
 """Optional Azure Document Intelligence processing; originals remain local."""
 
 import base64
+import hashlib
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -220,6 +221,7 @@ class AzureDocumentExtractor:
         ranges = [(start, min(start + page_limit, len(reader.pages)))
                   for start in range(0, len(reader.pages), page_limit)]
         results = []
+        raster_results = {}
         batch_index = 0
         while ranges:
             start, end = ranges.pop(0)
@@ -233,13 +235,30 @@ class AzureDocumentExtractor:
                 middle = start + (end - start) // 2
                 ranges[0:0] = [(start, middle), (middle, end)]
                 continue
+            request_media_type = media_type
+            source_image_hash = None
             if len(segment) > byte_limit:
-                raise ValueError("A single PDF page exceeds the Azure request-size limit")
+                segment = _compressed_page_image(reader.pages[start], byte_limit)
+                request_media_type = "image/jpeg"
+                source_image_hash = hashlib.sha256(segment).hexdigest()
             batch = load_batch(batch_index)
             if batch is None:
-                batch = self.extract(segment, media_type, enhanced)
-                batch = _offset_batch(batch, start, batch_index)
+                if source_image_hash and source_image_hash in raster_results:
+                    batch = {
+                        "pages": [], "paragraphs": [], "sections": [], "tables": [],
+                        "figures": [], "method": "document_intelligence",
+                        "metadata": {"duplicate_raster_of": raster_results[source_image_hash],
+                                     "source_image_hash": source_image_hash},
+                    }
+                else:
+                    batch = self.extract(segment, request_media_type, enhanced)
+                    batch = _offset_batch(batch, start, batch_index)
+                    if source_image_hash:
+                        batch.setdefault("metadata", {})["source_image_hash"] = source_image_hash
+                        raster_results[source_image_hash] = batch_index
                 save_batch(batch_index, batch)
+            elif batch.get("metadata", {}).get("source_image_hash"):
+                raster_results[batch["metadata"]["source_image_hash"]] = batch_index
             results.append(batch)
             batch_index += 1
         pages = [item for result in results for item in result.get("pages", [])]
@@ -289,6 +308,23 @@ def _offset_batch(batch, offset, batch_index):
                 region["page"] = region.get("page", 1) + offset
     batch["sections"] = []
     return batch
+
+
+def _compressed_page_image(page, byte_limit):
+    """Use the dominant embedded screenshot when a PDF page cannot fit one request."""
+    images = [item.image for item in page.images]
+    if not images:
+        raise ValueError("A single PDF page exceeds the Azure request-size limit")
+    image = max(images, key=lambda item: item.width * item.height).convert("RGB")
+    while True:
+        for quality in (85, 75, 65, 55, 45, 35):
+            output = BytesIO()
+            image.save(output, format="JPEG", quality=quality, optimize=True)
+            if output.tell() <= byte_limit:
+                return output.getvalue()
+        if image.width <= 1200 or image.height <= 1200:
+            raise ValueError("A single page image exceeds the Azure request-size limit")
+        image.thumbnail((int(image.width * 0.8), int(image.height * 0.8)))
 
 
 def _regions(regions, offset=0):

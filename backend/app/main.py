@@ -473,6 +473,19 @@ def create_app(settings: Settings | None = None):
             await app.state.agent.harness.invoke("index_document", {"document_id": document_id})
         )["result"]
 
+    @app.post("/documents/{document_id}/reprocess")
+    async def reprocess_local_document(document_id: str):
+        return (
+            await app.state.agent.harness.invoke(
+                "reprocess_document",
+                {
+                    "document_id": document_id,
+                    "document_processing": "azure_di",
+                    "operator_reviewed_inflight": True,
+                },
+            )
+        )["result"]
+
     @app.get("/documents/{document_id}/status")
     async def document_status(document_id: str):
         return (await app.state.agent.harness.invoke("get_document", {"document_id": document_id}))[

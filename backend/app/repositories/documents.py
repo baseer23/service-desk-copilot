@@ -13,7 +13,52 @@ from backend.app.store.vector_chroma import StorageError
 
 
 def query_terms(question: str) -> list[str]:
-    return list(dict.fromkeys(re.findall(r"[\w-]+", question.casefold())))[:16]
+    stopwords = {
+        "a", "an", "and", "according", "about", "are", "as", "at", "be", "by",
+        "did", "do", "does", "for", "from", "how", "i", "in", "is", "it", "me",
+        "my", "of", "on", "only", "or", "say", "says", "that", "the", "this", "to",
+        "was", "were", "what", "when", "where", "which", "who", "with",
+    }
+    return list(
+        dict.fromkeys(
+            term for term in re.findall(r"[\w-]+", question.casefold())
+            if len(term) > 1 and term not in stopwords
+        )
+    )[:16]
+
+
+def lexical_score(question: str, text: str, metadata: dict[str, Any] | None = None) -> int:
+    """Rank actual lexical evidence and explicit source-type intent."""
+    terms = query_terms(question)
+    folded = text.casefold()
+    words = set(re.findall(r"[\w-]+", folded))
+    score = sum(2 for term in terms if term in words)
+    # Adjacent content terms are much stronger than isolated generic matches.
+    score += sum(
+        3 for left, right in zip(terms, terms[1:])
+        if re.search(rf"(?<!\w){re.escape(left)}\W+{re.escape(right)}(?!\w)", folded)
+    )
+    title = str((metadata or {}).get("title") or "").casefold()
+    publication_query = {"article", "headline", "newspaper", "paper", "front-page", "frontpage"}
+    publication_title = ("newspaper", "e paper", "e-paper", "epaper")
+    publication_intent = bool(publication_query.intersection(terms)) or {"front", "page"}.issubset(terms)
+    if publication_intent and any(value in title for value in publication_title):
+        score += 8
+    score += sum(2 for term in terms if re.search(rf"(?<!\w){re.escape(term)}(?!\w)", title))
+    return score
+
+
+def explicit_publication_source(question: str) -> bool:
+    folded = " ".join(question.casefold().split())
+    return any(
+        phrase in folded
+        for phrase in ("this newspaper", "my newspaper", "uploaded newspaper", "the paper")
+    )
+
+
+def is_publication(metadata: dict[str, Any] | None) -> bool:
+    title = str((metadata or {}).get("title") or "").casefold()
+    return any(value in title for value in ("newspaper", "e paper", "e-paper", "epaper"))
 
 
 class DocumentRepository:

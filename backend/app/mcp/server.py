@@ -525,6 +525,18 @@ def index_document(document_id: str):
     )
 
 
+@capability("local_document")
+def reprocess_document(
+    document_id: str,
+    document_processing: Literal["local", "azure_di"] = "azure_di",
+    operator_reviewed_inflight: bool = False,
+):
+    """Explicitly queue a preserved document for a new extraction generation."""
+    return documents().reprocess(
+        document_id, document_processing, operator_reviewed_inflight
+    )
+
+
 @capability("document_store")
 def get_document(document_id: str):
     """Read an authorized document's processing status."""

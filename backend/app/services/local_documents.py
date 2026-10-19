@@ -129,7 +129,9 @@ class LocalDocumentRepository(DocumentRepository):
                     allow_fixtures=self.settings.test_mode,
                 )
                 graph.ensure_constraints()
-            extraction = json.loads(self.blobs.get(identifier, "extraction.json"))
+            extraction = json.loads(
+                self.blobs.get(identifier, state.get("extraction_artifact", "extraction.json"))
+            )
             graph.upsert_document(
                 identifier, str(state.get("title") or "Untitled")[:160],
                 "structured_local_document",

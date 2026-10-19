@@ -131,6 +131,31 @@ class DocumentRepository:
             raise ValueError("Document not found")
         return row["payload"]
 
+    def reprocess(
+        self, identifier: str, document_processing: str = "azure_di",
+        operator_reviewed_inflight: bool = False,
+    ):
+        row = self.records.read("document", identifier)
+        if not row:
+            raise ValueError("Document not found")
+        state = dict(row["payload"])
+        if state.get("phase") in {"extract_inflight", "embedding_inflight"} and not (
+            operator_reviewed_inflight and state.get("status") == "error"
+        ):
+            raise ManagedStoreError("This document has an ambiguous in-flight operation")
+        history = list(state.get("extraction_history", []))
+        if state.get("extraction_artifact"):
+            history.append(state["extraction_artifact"])
+        elif self.blobs.location(identifier, "extraction.json").exists():
+            history.append("extraction.json")
+        state.update(
+            status="queued", phase="extract", document_processing=document_processing,
+            extraction_history=history, reprocess_generation=state.get("reprocess_generation", 0) + 1,
+        )
+        state.pop("extraction_artifact", None)
+        self.records.write("document", identifier, state, previous=row, fields={"status": "queued"})
+        return state
+
     def search(self, question: str, top_k: int):
         return self.search_store.search_keywords(question, top_k)
 
@@ -199,7 +224,7 @@ class DocumentRepository:
                         )
                     if state.get("document_processing") == "azure_di":
                         result = self.extractor.extract_path(
-                            original_path, state["media_type"], True,
+                            original_path, state["media_type"], True, force_azure=True,
                             load_batch=load_batch, save_batch=save_batch,
                         )
                     elif state.get("ingestion_mode") == "structured_graph":
@@ -223,14 +248,19 @@ class DocumentRepository:
                             "application/octet-stream",
                         )
                         figure["image_artifact"] = artifact
-                self.blobs.put(
-                    identifier, "extraction.json", json.dumps(result).encode(), "application/json"
+                encoded_result = json.dumps(result).encode()
+                extraction_artifact = (
+                    "extraction-" + hashlib.sha256(encoded_result).hexdigest()[:16] + ".json"
                 )
+                self.blobs.put(identifier, extraction_artifact, encoded_result, "application/json")
+                state["extraction_artifact"] = extraction_artifact
                 state.update(phase="structure", status="structuring", pages=len(result["pages"]))
                 row = self.records.write(
                     "document", identifier, state, previous=row, fields={"status": "structuring"}
                 )
-            result = json.loads(self.blobs.get(identifier, "extraction.json"))
+            result = json.loads(
+                self.blobs.get(identifier, state.get("extraction_artifact", "extraction.json"))
+            )
             extraction_metadata = result.get("metadata", {})
             chunks = []
             ordinal = 0
