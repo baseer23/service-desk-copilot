@@ -824,6 +824,7 @@ class ServiceDeskAgent:
                         "preferred_domains": self.settings.research_preferred_domains,
                         "source_policy": self.settings.research_source_policy,
                         "missing_evidence": [],
+                        "selection_phase": "candidate_discovery",
                     },
                     ResearchSelection,
                 )
@@ -831,9 +832,20 @@ class ServiceDeskAgent:
                 await emit("source_selection", "failed", "Article selection unavailable")
                 continue
             urls = {row["url"]: row for row in candidates if row.get("url")}
-            for url in (selected.selected_urls if selected.directly_relevant else []):
-                if url not in urls:
-                    continue
+            selected_urls = list(dict.fromkeys(
+                url for url in selected.selected_urls if url in urls
+            ))
+            await emit(
+                "source_selection", "completed",
+                f"Selected {len(selected_urls)} news/web article(s) for verification",
+                result_count=len(selected_urls),
+                rationale=selected.justification[:500],
+                sources=[{"title": urls[url].get("title") or url, "url": url}
+                         for url in selected_urls],
+            )
+            # Explicit URLs chosen by the LLM are leads to READ, even if a
+            # conflicting Boolean said they were not yet factually verified.
+            for url in selected_urls:
                 signature = self._tool_signature("fetch_web_page", {"url": url})
                 if signature in set(state.get("executed_tool_calls", [])) | set(completed_signatures):
                     continue
@@ -849,12 +861,19 @@ class ServiceDeskAgent:
                     })
                     continue
                 if not isinstance(fetched, dict) or fetched.get("status") != "ok":
+                    await emit(
+                        "source_fetch", "failed", "Selected article could not be read",
+                        source_host=urlsplit(url).hostname,
+                        rationale=str(fetched.get("error") or "MCP webpage reader unavailable")[:300]
+                        if isinstance(fetched, dict) else "Unexpected webpage response",
+                    )
                     results.append({"name": "fetch_web_page", "output": fetched})
                     continue
                 page = fetched.get("result")
                 if not isinstance(page, dict) or len(str(page.get("text") or "").strip()) < 120:
-                    await emit("source_fetch", "completed",
-                               "Article did not provide sufficient readable text")
+                    await emit("source_fetch", "failed",
+                               "Selected article did not provide enough readable text",
+                               source_host=urlsplit(url).hostname)
                     continue
                 page = {
                     **page, "published_at": urls[url].get("published_at"),
@@ -1546,6 +1565,7 @@ class ServiceDeskAgent:
                     "preferred_domains": self.settings.research_preferred_domains,
                     "source_policy": self.settings.research_source_policy,
                     "missing_evidence": decision.get("missing_information", []),
+                    "selection_phase": "candidate_discovery",
                 },
                 ResearchSelection,
             )
@@ -1561,8 +1581,14 @@ class ServiceDeskAgent:
             await self.note(
                 state, "evaluate_sources", selection.justification, self.provider.name()
             )
-            if not selection.directly_relevant:
-                selected_urls = []
+            await emit(
+                "source_selection", "completed",
+                f"Selected {len(selected_urls)} public article(s) for verification",
+                result_count=len(selected_urls),
+                rationale=selection.justification[:500],
+                sources=[{"title": available[url].get("title") or url, "url": url}
+                         for url in selected_urls],
+            )
             for url in selected_urls:
                 hit = available[url]
                 capability_name = "fetch_web_page"
