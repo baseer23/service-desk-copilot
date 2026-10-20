@@ -957,6 +957,28 @@ class ServiceDeskAgent:
             # to judge. Application validation takes priority during revision.
             context.pop("verification", None)
         decision = await self.provider.generate_structured("reason", context, InvestigationDecision)
+        # Carry forward the planner's grounded clarification decision. A
+        # retrieval-free clarification must not become an unsupported answer or
+        # another generic search merely because the model forgot its own plan.
+        plan = state.get("plan") or {}
+        if (
+            state.get("workflow") == "knowledge"
+            and plan.get("clarification_needed")
+            and not plan.get("tool_calls")
+            and plan.get("clarification_question")
+        ):
+            decision.outcome = "ask_one_question"
+            decision.question_for_human = plan["clarification_question"]
+            decision.human_field = "clarification_context"
+            decision.question_reason = (
+                plan.get("clarification_reason")
+                or "The requested reference cannot be resolved from this conversation."
+            )
+            decision.answer = None
+            decision.enough_information = False
+            decision.needs_web_research = False
+            decision.requested_tools = []
+            decision.confidence = 0
         summary = state["ticket"]["summary"].casefold()
         terse_diagnostic_request = (
             len(summary.split()) <= 8
@@ -1378,6 +1400,12 @@ class ServiceDeskAgent:
         verification = await self.provider.generate_structured(
             "verify", context, VerificationResult
         )
+        # For clarification verification, the user has not supplied the missing
+        # fact. Missing answer evidence is not an unsupported *question*.
+        # Keep the verifier's explicit invalid-question finding, if any.
+        if clarifying and verification.clarification_valid is True:
+            verification.unsupported_claims = []
+            verification.should_continue_research = False
         self._validate_evidence_refs(state, verification.evidence_ids)
         if state.get("decision_issues"):
             verification.unsupported_claims = list(
@@ -1428,6 +1456,12 @@ class ServiceDeskAgent:
         v = state["verification"]
         decision = state["decision"]
         if decision.get("question_for_human"):
+            if (
+                not state.get("decision_issues")
+                and not v.get("contradictions")
+                and v.get("clarification_valid") is True
+            ):
+                return "ask_human"
             if decision.get("human_field") in {
                 "vpn_error_message", "wireless_error_message", "affected_service_and_symptom"
             }:
