@@ -318,6 +318,12 @@ def stage_instructions(stage: str, context: dict) -> str:
                 " rejected question or invent evidence to justify it. The prior critic cannot"
                 " override application validation."
             )
+        if context.get("reason_validation_feedback"):
+            instructions += (
+                " REQUIRED STRUCTURED CORRECTION: "
+                + context["reason_validation_feedback"]
+                + " Do not invent or transform evidence identifiers."
+            )
     if stage == "plan":
         if context.get("plan_validation_feedback"):
             instructions += (

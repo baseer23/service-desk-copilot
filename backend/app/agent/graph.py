@@ -1087,7 +1087,22 @@ class ServiceDeskAgent:
             # An erroneous critic can repeat the invalid premise it was asked
             # to judge. Application validation takes priority during revision.
             context.pop("verification", None)
-        decision = await self.provider.generate_structured("reason", context, InvestigationDecision)
+        for attempt in range(2):
+            decision = await self.provider.generate_structured(
+                "reason", context, InvestigationDecision
+            )
+            try:
+                self._validate_evidence_refs(
+                    state, [identifier for item in decision.hypotheses for identifier in item.evidence_ids]
+                )
+                break
+            except LLMError:
+                if attempt:
+                    raise
+                context["reason_validation_feedback"] = (
+                    "The prior decision cited evidence identifiers that do not exist. Cite only "
+                    "exact IDs supplied in evidence, or leave evidence_ids empty."
+                )
         # Carry forward the planner's grounded clarification decision. A
         # retrieval-free clarification must not become an unsupported answer or
         # another generic search merely because the model forgot its own plan.
@@ -1156,9 +1171,6 @@ class ServiceDeskAgent:
             decision.research_queries = []
             decision.enough_information = False
             decision.confidence = 0
-        self._validate_evidence_refs(
-            state, [i for h in decision.hypotheses for i in h.evidence_ids]
-        )
         issues = []
         if (
             decision.question_for_human

@@ -6,10 +6,10 @@ Mode: real local DeskMate application, Groq `openai/gpt-oss-120b`, LangGraph and
 
 ## Resume checkpoint
 
-- Latest completed investigation: 3 (source-policy recheck pending)
-- Next investigation: fresh re-run of 3 with authoritative-source selection, then 4 — printer troubleshooting
-- Current hypothesis: named technical standards and protocol behavior need primary documentation when model recall is unreliable.
-- Completed fixes during this run: bounded post-verification revision; human-evidence cycle reset; repeated-question rejection; state-aware stale-clarification validation; verifier contract normalization; primary-source guidance for named protocols/standards.
+- Latest completed investigation: 6 (repair pending live recheck)
+- Next investigation: re-run 6, then 7 — repeated Microsoft 365 MFA prompts
+- Current hypothesis: malformed model evidence citations should receive one bounded schema correction, never be accepted or immediately crash the request.
+- Completed fixes during this run: bounded verifier revision; clarification resume/deduplication; state-aware plan validation; verifier normalization; primary-source protocol guidance; bounded evidence-ID correction in reasoning.
 - Live constraints: Groq shared request queue is imposing roughly 31 seconds of capacity wait between some stages. The cybersecurity PDF original is preserved, but extraction is `error / extract_inflight` with zero pages/chunks and no matching Chroma metadata.
 
 ## Baseline
@@ -30,6 +30,9 @@ Mode: real local DeskMate application, Groq `openai/gpt-oss-120b`, LangGraph and
 | 1 | What is a vector database, and when should I use one? | PASS (trace; final payload capture interrupted) | Correct direct-knowledge plan; no retrieval warranted. Groq queue added latency. | None | Confirm direct behavior on a comparison question. |
 | 2 | Explain the difference between RAG and fine-tuning. | PASS | Correct direct-knowledge plan and grounded general answer; no tool call. | None | Explain MCP versus REST. |
 | 3 | What is MCP, and how does it differ from an ordinary REST API? | FAIL; source recheck pending | Recovery and resumability were repaired, but unsupported model recall still misdescribed the protocol and passed verification. | Recovery/resume repairs plus authoritative-primary-source guidance for named technical standards. | Fresh source-selection recheck. |
+| 4 | How would you troubleshoot a network printer that suddenly stopped printing? | PASS with minor caution | Correct direct procedural answer; no source lookup needed. Some disruptive steps were presented too readily. | None | Detailed OS-specific printer setup. |
+| 5 | Give detailed Windows 11 instructions for installing a printer by IP. | PASS | Direct procedural answer was complete and coherent; no unsupported source claim. | None | Compare VPN failure modes. |
+| 6 | Difference between VPN authentication failure and connection timeout? | FAIL; repair pending | Reasoner emitted unknown evidence IDs; integrity validation correctly rejected them but surfaced a 502. | One bounded reason-schema retry with exact-ID feedback. | Re-run, then MFA scenario. |
 
 ## Investigation details
 
@@ -65,6 +68,26 @@ Mode: real local DeskMate application, Groq `openai/gpt-oss-120b`, LangGraph and
 - Third recheck: a same-thread follow-up retained the confirmed expansion, did not repeat the question, and completed in one reasoning pass. Context/resume behavior therefore passed. The answer was still substantively wrong: it described MCP as a framework for persistent conversation state and invented confidence/error semantics. Verification accepted those claims as stable general knowledge.
 - Fourth root cause: the selected model's unaided knowledge of a named technical protocol was unreliable, while planner policy allowed direct recall.
 - Fourth code action: source-selection instructions now classify detailed claims about named protocols, standards and APIs as precise sourceable claims and prefer authorized primary documentation. This is a general evidence rule, not an MCP-specific answer or keyword route.
+- Source-policy recheck: the fresh run reached verifier rejection and the new bounded revision, but the second Groq reasoning call failed at the provider boundary. This is unresolved provider/model-call behavior, not evidence of a correct MCP answer.
+
+### 4 — Network printer troubleshooting
+
+- Conversation: `8251d58ed12d42db88edb5979c5551ed`
+- Observed: knowledge workflow, zero retrieval calls, one reason/verify pass, confidence 0.90. The answer covered device state, connectivity, queue, driver, logs and recent changes.
+- Assessment: PASS with minor caution. Restarting a print server and firmware updates should be framed as controlled/escalated actions, but no action was actually performed.
+
+### 5 — Windows 11 printer installation by IP
+
+- Conversation: `67ed351eced0486da3e0acac056525cc`
+- Observed: direct knowledge plan, complete UI/TCP-IP/driver/test-page flow, confidence 0.98, no tool claims.
+- Assessment: PASS. Exact UI labels can drift across Windows updates, but the response was internally coherent and appropriately detailed.
+
+### 6 — VPN authentication failure versus timeout
+
+- Expected: stable diagnostic comparison without retrieval.
+- Observed: API returned 502 `Structured reasoning cited unknown evidence identifiers` before a final answer.
+- Root cause: `_validate_evidence_refs()` correctly enforced integrity, but `reason()` lacked the bounded structured-output correction used by `plan()`.
+- Code action: retry `reason` once with explicit exact-ID feedback; a second invalid result remains a hard validation failure.
 
 ## Source-grounded reference notes
 
