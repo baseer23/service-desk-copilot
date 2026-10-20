@@ -1684,7 +1684,6 @@ class ServiceDeskAgent:
                     await self._call(state, "remember_fact", {"fact": fact.model_dump()})
         d = InvestigationDecision.model_validate(state["decision"])
         v = state.get("verification", {})
-        public_request = state.get("intent", {}).get("knowledge_source") == "public_web"
         direct_model_answer = self._direct_model_answer(state)
         limited = state["research_iteration"] >= self.settings.max_investigation_cycles
         supported = (
