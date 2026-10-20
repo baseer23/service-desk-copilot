@@ -1437,11 +1437,28 @@ class ServiceDeskAgent:
             if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
                 await failed(search_tool, MCPToolError("Public search returned malformed results"))
                 continue
+            raw_result_count = len(rows)
             rows = rank_sources(rows, self.settings)
             if not rows:
-                await self.note(
-                    state, search_tool, "Public search returned no usable sources", "tool_error"
+                # A source-policy filter is different from an empty search.
+                # Surface the actual blocker instead of claiming no results.
+                policy_rejected = raw_result_count > 0
+                reason = (
+                    f"Web search returned {raw_result_count} candidate(s), but "
+                    f"RESEARCH_SOURCE_POLICY={self.settings.research_source_policy} "
+                    "excluded all URLs. An operator can set prefer_primary "
+                    "to consider third-party sources while prioritizing configured primary domains."
+                    if policy_rejected else
+                    "Public search returned no usable candidates for this query."
                 )
+                await emit(
+                    "source_policy_filter",
+                    "completed",
+                    reason,
+                    result_count=raw_result_count,
+                    policy=self.settings.research_source_policy,
+                )
+                await failed(search_tool, MCPToolError(reason))
                 continue
             selection = await self.provider.generate_structured(
                 "evaluate_sources",
