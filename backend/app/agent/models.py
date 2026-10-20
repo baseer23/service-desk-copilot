@@ -179,7 +179,7 @@ class InvestigationDecision(StructuredModel):
 
 class ResearchSelection(StructuredModel):
     directly_relevant: bool = False
-    selected_urls: list[str] = Field(default_factory=list, max_length=2)
+    selected_urls: list[str] = Field(default_factory=list, max_length=4)
     evidence_gap: str
     justification: str
 

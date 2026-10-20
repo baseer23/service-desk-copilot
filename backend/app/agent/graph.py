@@ -216,6 +216,7 @@ class ServiceDeskAgent:
         except BaseException:
             await emit("tool:" + name, "failed", summary, tool=name)
             raise
+        result = self._normalize_capability_result(name, result)
         result_items = result.get("items", []) if isinstance(result, dict) else result
         result_count = len(result_items) if isinstance(result_items, list) else 0
         findings = []
@@ -275,6 +276,70 @@ class ServiceDeskAgent:
             result.get("source_system", "capability") if isinstance(result, dict) else "capability",
         )
         return result
+
+    @staticmethod
+    def _normalize_capability_result(name, value):
+        """Normalize built-in and discovered MCP response shapes at one boundary."""
+        if isinstance(value, dict) and "items" in value:
+            result = dict(value)
+            result.setdefault("tool", name)
+            result.setdefault("status", "ok")
+            result.setdefault("timestamp", now())
+            result.setdefault("reliability", 0.6)
+            return result
+        if isinstance(value, dict) and "result" in value:
+            result = dict(value)
+            payload = result.get("result")
+            result.setdefault("tool", name)
+            result.setdefault("source_system", "capability")
+            result.setdefault("status", "ok")
+            result.setdefault("timestamp", now())
+            result.setdefault("reliability", 0.6)
+            result["items"] = (
+                payload if isinstance(payload, list)
+                else [payload] if isinstance(payload, dict)
+                else []
+            )
+            return result
+        if isinstance(value, list):
+            if all(isinstance(item, dict) for item in value):
+                return {
+                    "tool": name,
+                    "source_system": "capability",
+                    "timestamp": now(),
+                    "reliability": 0.6,
+                    "status": "ok",
+                    "items": value,
+                    "result": value,
+                }
+        elif isinstance(value, dict):
+            if value.get("status") in {"error", "unavailable"}:
+                return {
+                    **value,
+                    "tool": value.get("tool") or name,
+                    "timestamp": value.get("timestamp") or now(),
+                    "reliability": value.get("reliability", 0),
+                    "items": [],
+                }
+            return {
+                "tool": name,
+                "source_system": value.get("source_system", "capability"),
+                "timestamp": now(),
+                "reliability": 0.6,
+                "status": "ok",
+                "items": [value],
+                "result": value,
+            }
+        return {
+            "tool": name,
+            "source_system": "tool_error",
+            "timestamp": now(),
+            "reliability": 0,
+            "status": "error",
+            "error": "Capability returned an unsupported response shape",
+            "items": [],
+            "result": None,
+        }
 
     async def run_case(self, case_id, answer=None):
         lock = self._case_locks.setdefault(case_id, asyncio.Lock())

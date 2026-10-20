@@ -22,6 +22,17 @@ from .provider_routing import model_event
 T = TypeVar("T", bound=BaseModel)
 
 
+def _schema_feedback(error: Exception) -> str:
+    """Return bounded schema-only feedback without model content or user data."""
+    if not isinstance(error, ValidationError):
+        return "The response was not a valid JSON object for the required schema."
+    issues = []
+    for item in error.errors(include_input=False, include_context=False)[:8]:
+        location = ".".join(str(part) for part in item.get("loc", ())) or "root"
+        issues.append(f"{location}: {item.get('type', 'invalid')}")
+    return "Schema errors: " + "; ".join(issues)
+
+
 class GroqProvider:
     def __init__(
         self, settings: Settings, chat: Any = None, limiter: GroqRateLimiter | None = None
@@ -250,11 +261,19 @@ class GroqProvider:
                         and validation_attempt == 0
                     ):
                         validation_attempt += 1
+                        # The same Groq model may fail to satisfy provider-side
+                        # strict generation for a valid schema. Retry once in
+                        # JSON-object mode and retain local Pydantic validation;
+                        # this is not a provider/model fallback.
+                        config = config.model_copy(update={"azure_structured_outputs": False})
                         packed = {
                             **packed,
                             "response_correction": (
                                 "The prior response failed the required JSON schema. Return one complete "
-                                "object matching every field and the conversation interpretation rules."
+                                "object matching every field and the conversation interpretation rules. "
+                                "Required top-level fields: "
+                                + ", ".join(schema.model_fields)
+                                + "."
                             ),
                         }
                         packed, report, messages, response_format, estimated_tokens = prepare(
@@ -362,14 +381,15 @@ class GroqProvider:
                 )
                 try:
                     value = schema.model_validate_json(response.content)
-                except (ValidationError, ValueError, TypeError):
+                except (ValidationError, ValueError, TypeError) as exc:
                     if validation_attempt == 0:
                         validation_attempt += 1
                         packed = {
                             **packed,
                             "response_correction": (
-                                "The prior response was not valid JSON for the required schema. "
-                                "Return one complete JSON object and no prose."
+                                _schema_feedback(exc)
+                                + " Return one complete JSON object with every required field and "
+                                "no prose. Use only the exact supplied evidence identifiers."
                             ),
                         }
                         packed, report, messages, response_format, estimated_tokens = prepare(

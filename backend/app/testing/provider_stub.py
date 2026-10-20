@@ -238,7 +238,21 @@ class StubProvider:
         )
         company = analysis.get("company") or facts.get("company") or observed_company
         if stage == "plan":
-            if context["workflow"] == "knowledge":
+            intent = context.get("intent") or {}
+            if (
+                context["workflow"] == "knowledge"
+                and intent.get("knowledge_source") == "public_web"
+            ):
+                calls = [
+                    call(
+                        "search_news" if intent.get("public_topic") == "news" else "search_web",
+                        query=text,
+                        **({"max_results": 5, "timelimit": "w"}
+                           if intent.get("public_topic") == "news"
+                           else {"max_results": 5}),
+                    )
+                ]
+            elif context["workflow"] == "knowledge":
                 calls = [call("search_knowledge", question=text)]
             elif analysis.get("device"):
                 calls = [
@@ -293,7 +307,7 @@ class StubProvider:
         if stage == "evaluate_sources":
             return schema.model_validate(
                 {
-                    "selected_urls": [r["url"] for r in context["results"][:2]],
+                    "selected_urls": [r["url"] for r in context["results"][:4]],
                     "directly_relevant": True,
                     "evidence_gap": text,
                     "justification": "Explicit test source selection",

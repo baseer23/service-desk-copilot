@@ -65,9 +65,16 @@ def bounded_context(context: dict[str, Any], max_tokens: int) -> tuple[dict[str,
     if isinstance(packed.get("chat_messages"), list):
         packed["chat_messages"] = packed["chat_messages"][-4:]
     if isinstance(packed.get("evidence"), list):
-        # Keep the newest bounded set. Evidence IDs, URLs, titles and source
-        # metadata remain beside every excerpt.
-        packed["evidence"] = packed["evidence"][-8:]
+        # An authoritative inventory is a set-valued answer: truncating it
+        # makes the model falsely describe the returned list as incomplete.
+        # Preserve a bounded complete inventory alongside the newest ordinary
+        # evidence, then let the token-budget loop compact only if necessary.
+        inventory = [
+            item for item in packed["evidence"]
+            if isinstance(item, dict) and item.get("tool") == "list_documents"
+        ][-30:]
+        recent = [item for item in packed["evidence"] if item not in inventory][-8:]
+        packed["evidence"] = recent + inventory
     if isinstance(packed.get("available_tools"), list):
         packed["available_tools"] = packed["available_tools"][:16]
     for key in ("remembered_facts", "confirmed_facts", "human_answers", "missing_information"):

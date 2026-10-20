@@ -156,14 +156,15 @@ def test_public_news_request_uses_news_and_fetches_sources_without_local_retriev
     assert response.status_code == 200
     result = response.json()["result"]
     assert calls.count("search_news") == 1
-    assert calls.count("fetch_web_page") == 2
+    assert calls.count("fetch_web_page") == 3
     assert "search_knowledge" not in calls and "search_graph" not in calls
-    assert result["final_answer"].count("Alberta headline") == 2
+    assert result["final_answer"].count("Alberta headline") == 3
     assert "2026-10-" in result["final_answer"]
     assert len(result["final_answer"]) > 280
     assert {
         "https://news1.example/alberta",
         "https://news2.example/alberta",
+        "https://news3.example/alberta",
     }.issubset(result["final_response"]["sources"])
 
 

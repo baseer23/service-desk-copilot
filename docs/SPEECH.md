@@ -97,3 +97,7 @@ The knowledge and research repairs do not change Speech transport, continuous re
 ### 2026-10-19 streaming document uploads
 
 The upload changes do not alter Speech transport or recognition. Per explicit instruction, no automated or live Speech check was run.
+
+### 2026-10-20 recovery integration
+
+The MCP normalization, public-research, inventory-context and Groq structured-output recovery changes do not modify Speech transport, continuous recognition, transcript ownership, usage accounting or browser microphone behavior. No Speech test, live Azure Speech request or physical microphone check was run for this revision.

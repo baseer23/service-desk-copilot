@@ -62,6 +62,25 @@ def test_model_specific_budget_and_progressive_context_compaction(settings):
     assert report.compacted and report.original_tokens > report.final_tokens
 
 
+def test_context_preserves_complete_bounded_document_inventory():
+    evidence = [
+        {
+            "id": f"document-{index}",
+            "tool": "list_documents",
+            "source_type": "system_record",
+            "content": {"title": f"Document {index}", "status": "ready"},
+        }
+        for index in range(15)
+    ]
+    packed, _ = bounded_context(
+        {"ticket": {"summary": "What documents have I uploaded?"}, "evidence": evidence},
+        10_000,
+    )
+    assert [item["id"] for item in packed["evidence"]] == [
+        item["id"] for item in evidence
+    ]
+
+
 class RecordingChat:
     def __init__(self, replies):
         self.replies = list(replies)
