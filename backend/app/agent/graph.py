@@ -861,12 +861,19 @@ class ServiceDeskAgent:
                     })
                     continue
                 if not isinstance(fetched, dict) or fetched.get("status") != "ok":
+                    await emit(
+                        "source_fetch", "failed", "Selected article could not be read",
+                        source_host=urlsplit(url).hostname,
+                        rationale=str(fetched.get("error") or "MCP webpage reader unavailable")[:300]
+                        if isinstance(fetched, dict) else "Unexpected webpage response",
+                    )
                     results.append({"name": "fetch_web_page", "output": fetched})
                     continue
                 page = fetched.get("result")
                 if not isinstance(page, dict) or len(str(page.get("text") or "").strip()) < 120:
-                    await emit("source_fetch", "completed",
-                               "Article did not provide sufficient readable text")
+                    await emit("source_fetch", "failed",
+                               "Selected article did not provide enough readable text",
+                               source_host=urlsplit(url).hostname)
                     continue
                 page = {
                     **page, "published_at": urls[url].get("published_at"),
