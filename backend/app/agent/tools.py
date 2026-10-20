@@ -29,6 +29,7 @@ READ_TOOLS = {
     "search_remembered_facts",
     "get_case_history",
     "list_available_context",
+    "list_documents",
     "list_registry",
     "resolve_entity",
     "reload_registry",
@@ -43,6 +44,7 @@ KNOWLEDGE_TOOLS = {
     "fetch_web_page",
     "get_current_time",
     "list_available_context",
+    "list_documents",
 }
 
 
