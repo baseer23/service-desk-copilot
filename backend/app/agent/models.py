@@ -68,6 +68,13 @@ class InvestigationPlan(StructuredModel):
             i < 0 or i >= len(self.tool_calls) for i in indexes
         ):
             raise ValueError("Parallel groups must contain unique valid tool indexes")
+        # The model may search before requesting clarification, but a
+        # clarification-only plan must carry a real question and rationale.
+        if self.clarification_needed and not self.tool_calls:
+            if not (self.clarification_question or "").strip():
+                raise ValueError("Clarification-only plans require a question")
+            if not (self.clarification_reason or "").strip():
+                raise ValueError("Clarification-only plans require a rationale")
         return self
 
 
@@ -192,6 +199,9 @@ class GraphLookupPlan(StructuredModel):
 
 
 class VerificationResult(StructuredModel):
+    # Independent judgement about a proposed *question*, not the truth of an
+    # answer the user has not supplied. None preserves older provider behavior.
+    clarification_valid: bool | None = None
     supported_claims: list[str] = Field(default_factory=list)
     unsupported_claims: list[str] = Field(default_factory=list)
     contradictions: list[str] = Field(default_factory=list)
