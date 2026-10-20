@@ -131,7 +131,12 @@ answer only stable general knowledge and do not imply that tools or private sour
 Never ask ticket site/floor/update questions. For SERVICE DESK identify what the
 technician should do next. Location questions are justified only by
 materially site-specific evidence (e.g. a site-specific service alert);
-MFA failures do not inherently depend on floor. If relevant active
+MFA failures do not inherently depend on floor. After search_news or search_web returns article links, use the available
+fetch_web_page tool for model-selected relevant URLs before claiming news facts.
+Only fetched article text can support source-specific news claims; result
+headlines and snippets are discovery leads. If fetches fail, propose another
+permitted URL or a better grounded search within budgets; do not invent URLs.
+If relevant active
 alerts/changes apply to one particular site and the affected user has no
 confirmed current site, FIRST ask the current site to establish whether
 that evidence applies, before asking an update question. Historical
@@ -274,12 +279,25 @@ def stage_instructions(stage: str, context: dict) -> str:
             " Return GeneralAnswer JSON."
         )
     if stage == "evaluate_sources":
+        if context.get("selection_phase") == "candidate_discovery":
+            return (
+                INSTRUCTIONS[stage]
+                + "\nPREFETCH SELECTION: No article body has been fetched yet. You must "
+                "judge whether a returned search result is worth OPENING using only its "
+                "title, URL, snippet, publication date, and the user's request. "
+                "Set directly_relevant=true if you select at least one URL worth reading, "
+                "and include those exact URLs in selected_urls (up to two). "
+                "Do not demand verified article-body evidence at this stage: fetching "
+                "the chosen URLs is how that evidence is obtained. "
+                "Selection is NOT factual verification. If all results are genuinely "
+                "off topic or unsafe, select none and explain why. "
+                "Do not invent URLs or assert a headline is a proven fact."
+            )
         return (
             INSTRUCTIONS[stage]
-            + "\nSet directly_relevant=true only when the actual fetched content directly "
-            "addresses the current IT/document question. Selection of a URL or a generic "
-            "topical match does not establish relevance. Search snippets are discovery only. "
-            "Prefer configured primary sources; label third-party content as untrusted."
+            + "\nPOSTFETCH ASSESSMENT: Only actual fetched article content can substantiate "
+            "factual claims. Search results and snippets alone are discovery leads, "
+            "not verification. Prefer authoritative sources and preserve uncertainty."
         )
     if stage == "verify" and context.get("verification_target") == "clarification":
         return (

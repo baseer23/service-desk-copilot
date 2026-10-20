@@ -2,7 +2,7 @@ import type { ActivityEvent } from './investigationStream'
 
 function ActivityRow({ event }: { event: ActivityEvent }): JSX.Element {
   // Show decision questions and observed uncertainties, not private chain-of-thought.
-  const isDecision = ['understanding_summary', 'research_plan', 'source_decision', 'evidence_evaluation', 'follow_up'].includes(event.stage)
+  const isDecision = ['understanding_summary', 'research_plan', 'source_decision', 'source_selection', 'evidence_evaluation', 'follow_up'].includes(event.stage)
   return <li>
     <div>{isDecision && <span aria-label="Agent investigation question" title="Investigation decision">? </span>}<span>{event.summary}</span>{' '}<small>{event.status}{event.duration_ms !== undefined ? ` · ${(event.duration_ms / 1000).toFixed(1)}s` : ''}</small></div>
     {event.objective && <p className="activity-detail"><strong>Objective:</strong> {event.objective}</p>}

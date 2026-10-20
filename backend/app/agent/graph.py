@@ -179,6 +179,11 @@ class ServiceDeskAgent:
         )
 
     async def _call(self, state, name, arguments):
+        if name == "fetch_web_page":
+            count = state.get("web_pages_fetched", 0)
+            if count >= self.settings.max_web_page_fetches:
+                raise MCPToolError("Public page fetch limit reached")
+            state["web_pages_fetched"] = count + 1
         if (
             name in {"fetch_web_page", "ingest_text"}
             and arguments.get("url")
@@ -385,6 +390,7 @@ class ServiceDeskAgent:
                 "verification": {},
                 "research_rounds": 0,
                 "research_iteration": 0,
+                "web_pages_fetched": 0,
                 "executed_tool_calls": [],
                 "final_answer": None,
                 "final_response": {},
@@ -424,6 +430,7 @@ class ServiceDeskAgent:
                 "contradictions": [],
                 "research_iteration": 0,
                 "research_rounds": 0,
+                "web_pages_fetched": 0,
                 "executed_tool_calls": [],
                 "chat_messages": [],
                 "conversation_context": {},
@@ -757,7 +764,7 @@ class ServiceDeskAgent:
             call = plan.tool_calls[index]
             try:
                 if (
-                    call.name in {"search_web", "search_news", "fetch_web_page"}
+                    call.name in {"search_web", "search_news"}
                     and state.get("research_rounds", 0) >= self.settings.max_research_rounds
                 ):
                     raise MCPToolError("Public research round limit reached")
@@ -791,8 +798,96 @@ class ServiceDeskAgent:
         for i in range(len(results)):
             if i not in grouped:
                 await execute(i)
+        # Search results are leads, not verified evidence. The model selects
+        # URLs to read before we ask the reasoner to assess the answer.
+        for index, call in enumerate(plan.tool_calls):
+            if call.name not in {"search_news", "search_web"}:
+                continue
+            output = results[index]["output"]
+            if not isinstance(output, dict) or output.get("status") != "ok":
+                continue
+            candidates = output.get("items", [])
+            if not isinstance(candidates, list):
+                continue
+            candidates = rank_sources(candidates, self.settings)
+            if not candidates:
+                await emit("source_selection", "completed", "No permitted web candidates")
+                continue
+            try:
+                selected = await self.provider.generate_structured(
+                    "evaluate_sources",
+                    {
+                        "ticket": state["ticket"],
+                        "request": state["ticket"]["summary"],
+                        "query": call.arguments.get("query", ""),
+                        "results": candidates[:10],
+                        "preferred_domains": self.settings.research_preferred_domains,
+                        "source_policy": self.settings.research_source_policy,
+                        "missing_evidence": [],
+                        "selection_phase": "candidate_discovery",
+                    },
+                    ResearchSelection,
+                )
+            except LLMError:
+                await emit("source_selection", "failed", "Article selection unavailable")
+                continue
+            urls = {row["url"]: row for row in candidates if row.get("url")}
+            selected_urls = list(dict.fromkeys(
+                url for url in selected.selected_urls if url in urls
+            ))
+            await emit(
+                "source_selection", "completed",
+                f"Selected {len(selected_urls)} news/web article(s) for verification",
+                result_count=len(selected_urls),
+                rationale=selected.justification[:500],
+                sources=[{"title": urls[url].get("title") or url, "url": url}
+                         for url in selected_urls],
+            )
+            # Explicit URLs chosen by the LLM are leads to READ, even if a
+            # conflicting Boolean said they were not yet factually verified.
+            for url in selected_urls:
+                signature = self._tool_signature("fetch_web_page", {"url": url})
+                if signature in set(state.get("executed_tool_calls", [])) | set(completed_signatures):
+                    continue
+                try:
+                    fetched = await self._call(state, "fetch_web_page", {"url": url})
+                except MCPToolError as exc:
+                    await emit("source_fetch", "failed", "Public article unavailable",
+                               source_host=urlsplit(url).hostname)
+                    results.append({
+                        "name": "fetch_web_page",
+                        "output": {"status": "error", "error": str(exc), "items": [],
+                                   "source_system": "tool_error", "timestamp": now()},
+                    })
+                    continue
+                if not isinstance(fetched, dict) or fetched.get("status") != "ok":
+                    await emit(
+                        "source_fetch", "failed", "Selected article could not be read",
+                        source_host=urlsplit(url).hostname,
+                        rationale=str(fetched.get("error") or "MCP webpage reader unavailable")[:300]
+                        if isinstance(fetched, dict) else "Unexpected webpage response",
+                    )
+                    results.append({"name": "fetch_web_page", "output": fetched})
+                    continue
+                page = fetched.get("result")
+                if not isinstance(page, dict) or len(str(page.get("text") or "").strip()) < 120:
+                    await emit("source_fetch", "failed",
+                               "Selected article did not provide enough readable text",
+                               source_host=urlsplit(url).hostname)
+                    continue
+                page = {
+                    **page, "published_at": urls[url].get("published_at"),
+                    "publisher": urls[url].get("publisher"),
+                    "source_quality": quality(page.get("url") or url, self.settings),
+                }
+                results.append({"name": "fetch_web_page", "output": {
+                    **fetched, "result": page, "items": [page]}})
+                completed_signatures.append(signature)
+                await emit("source_fetched", "completed", "Read article for evidence review",
+                           sources=[{"title": page.get("title") or url, "url": page.get("url") or url}])
         return {
             "tool_results": results,
+            "web_pages_fetched": state.get("web_pages_fetched", 0),
             "plan_executed": True,
             "executed_tool_calls": list(
                 dict.fromkeys(state.get("executed_tool_calls", []) + completed_signatures)
@@ -839,9 +934,9 @@ class ServiceDeskAgent:
                 "reliability": 0,
                 "timestamp": result.get("timestamp", now()),
             }
-        unavailable = result.get("status") == "unavailable"
-        if result.get("status") == "error":
-            rows = [{"error": result.get("error")}]
+        failed = result.get("status") in {"error", "unavailable"}
+        if failed:
+            rows = [{"error": result.get("error") or "Capability returned no usable response"}]
         items = []
         for row in rows:
             meta = row.get("metadata", {})
@@ -849,7 +944,7 @@ class ServiceDeskAgent:
             stamp = row.get("observed_at") or meta.get("created_at") or result["timestamp"]
             kind = (
                 "tool_error"
-                if system == "tool_error" or unavailable or row.get("available") is False
+                if failed or system == "tool_error" or row.get("available") is False
                 else "confirmed_fact"
                 if name in {"search_memory", "remember_fact"}
                 else "public_documentation"
@@ -1299,7 +1394,7 @@ class ServiceDeskAgent:
         d = state["decision"]
         if (
             d.get("needs_web_research")
-            and state.get("research_rounds", 0) == 0
+            and state.get("research_rounds", 0) < self.settings.max_research_rounds
         ):
             return "research"
         return "verify"
@@ -1482,6 +1577,7 @@ class ServiceDeskAgent:
                     "preferred_domains": self.settings.research_preferred_domains,
                     "source_policy": self.settings.research_source_policy,
                     "missing_evidence": decision.get("missing_information", []),
+                    "selection_phase": "candidate_discovery",
                 },
                 ResearchSelection,
             )
@@ -1497,14 +1593,29 @@ class ServiceDeskAgent:
             await self.note(
                 state, "evaluate_sources", selection.justification, self.provider.name()
             )
-            if not selection.directly_relevant:
-                selected_urls = []
+            await emit(
+                "source_selection", "completed",
+                f"Selected {len(selected_urls)} public article(s) for verification",
+                result_count=len(selected_urls),
+                rationale=selection.justification[:500],
+                sources=[{"title": available[url].get("title") or url, "url": url}
+                         for url in selected_urls],
+            )
             for url in selected_urls:
                 hit = available[url]
                 capability_name = "fetch_web_page"
                 try:
                     fetched = await self._call(state, "fetch_web_page", {"url": hit["url"]})
-                    page = fetched["result"] if "result" in fetched else fetched
+                    if not isinstance(fetched, dict) or fetched.get("status") != "ok":
+                        await failed(capability_name, MCPToolError(
+                            fetched.get("error", "Webpage fetch failed") if isinstance(fetched, dict)
+                            else "Invalid webpage response"
+                        ))
+                        continue
+                    page = fetched.get("result")
+                    if not isinstance(page, dict):
+                        await failed(capability_name, MCPToolError("Invalid fetched article"))
+                        continue
                     if not permits(page.get("url", ""), self.settings):
                         continue
                     page["source_quality"] = quality(page.get("url", ""), self.settings)
@@ -1514,20 +1625,11 @@ class ServiceDeskAgent:
                     text = page.get("text", "")
                     if len(text.strip()) < 120:
                         continue
-                    excerpt = relevant_excerpt(text, query, 6000)
-                    generic_terms = {
-                        "about", "changes", "current", "find", "latest", "news",
-                        "provide", "released", "system", "update", "updates", "what",
-                    }
-                    query_terms = {
-                        term.casefold().strip(".,:;!?()[]{}\"'")
-                        for term in query.split()
-                        if len(term.strip(".,:;!?()[]{}\"'")) >= 4
-                        and term.casefold().strip(".,:;!?()[]{}\"'") not in generic_terms
-                    }
-                    if query_terms and not any(term in excerpt.casefold() for term in query_terms):
-                        continue
-                    outputs.append({"name": "fetch_web_page", "output": fetched})
+                    # Reasoning and verification assess actual article content;
+                    # a lexical substring test can reject valid news in other languages.
+                    verified_page = {**page, "text": relevant_excerpt(text, query, 6000)}
+                    outputs.append({"name": "fetch_web_page", "output": {
+                        **fetched, "items": [verified_page], "result": verified_page}})
                     await emit(
                         "source_verified",
                         "completed",
@@ -1537,7 +1639,8 @@ class ServiceDeskAgent:
                     )
                 except (MCPToolError, ValueError) as exc:
                     await failed(capability_name, exc)
-        return {"tool_results": outputs, "research_rounds": state.get("research_rounds", 0) + 1}
+        return {"tool_results": outputs, "research_rounds": state.get("research_rounds", 0) + 1,
+                "web_pages_fetched": state.get("web_pages_fetched", 0)}
 
     def _validate_evidence_refs(self, state, ids):
         if set(ids) - {e["id"] for e in state.get("evidence", [])}:
@@ -1604,7 +1707,9 @@ class ServiceDeskAgent:
             and not state["decision"].get("question_for_human")
         ):
             verification.confidence = 0
-            verification.unsupported_claims.append("No supporting evidence is available.")
+            if "No supporting evidence is available." not in verification.unsupported_claims:
+                verification.unsupported_claims.append("No supporting evidence is available.")
+            verification.should_continue_research = True
         await self.note(state, "verify", verification.justification, self.provider.name())
         await emit(
             "verification_summary",
