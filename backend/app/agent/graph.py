@@ -657,6 +657,20 @@ class ServiceDeskAgent:
             plan = await self.provider.generate_structured("plan", context, InvestigationPlan)
             try:
                 self.harness.validate_plan(plan, state["workflow"])
+                answered_questions = {
+                    str(item.get("question") or "").strip().casefold()
+                    for item in state.get("human_answers", [])
+                    if item.get("question")
+                }
+                if (
+                    plan.clarification_needed
+                    and plan.clarification_question
+                    and plan.clarification_question.strip().casefold() in answered_questions
+                ):
+                    raise ValueError(
+                        "The proposed clarification was already answered. Build a new plan using "
+                        "the confirmed human answer."
+                    )
                 break
             except ValueError as exc:
                 if attempt:
@@ -667,6 +681,8 @@ class ServiceDeskAgent:
                 context["plan_validation_feedback"] = (
                     exc.errors(include_input=False, include_url=False)
                     if isinstance(exc, ValidationError)
+                    else str(exc)
+                    if str(exc).startswith("The proposed clarification was already answered")
                     else "Choose only permitted capabilities from available_tools."
                 )
         await self.note(
@@ -1076,11 +1092,17 @@ class ServiceDeskAgent:
         # retrieval-free clarification must not become an unsupported answer or
         # another generic search merely because the model forgot its own plan.
         plan = state.get("plan") or {}
+        answered_questions = {
+            str(item.get("question") or "").strip().casefold()
+            for item in state.get("human_answers", [])
+            if item.get("question")
+        }
         if (
             state.get("workflow") == "knowledge"
             and plan.get("clarification_needed")
             and not plan.get("tool_calls")
             and plan.get("clarification_question")
+            and plan["clarification_question"].strip().casefold() not in answered_questions
         ):
             decision.outcome = "ask_one_question"
             decision.question_for_human = plan["clarification_question"]
@@ -1138,6 +1160,18 @@ class ServiceDeskAgent:
             state, [i for h in decision.hypotheses for i in h.evidence_ids]
         )
         issues = []
+        if (
+            decision.question_for_human
+            and decision.question_for_human.strip().casefold() in answered_questions
+        ):
+            issues.append(
+                "The proposed clarification was already answered. Use the confirmed human fact "
+                "and do not ask the same question again."
+            )
+            decision.question_for_human = None
+            decision.human_field = None
+            decision.question_subject = None
+            decision.question_reason = None
         if state["workflow"] == "knowledge" and decision.human_field in {
             "current_site",
             "required_update_installed",
@@ -1338,6 +1372,9 @@ class ServiceDeskAgent:
             "pending_question": None,
             "pending_field": None,
             "plan_executed": True,
+            "research_iteration": 0,
+            "decision_issues": [],
+            "verification": {},
         }
 
     async def research(self, state):
@@ -1521,6 +1558,11 @@ class ServiceDeskAgent:
         if clarifying and verification.clarification_valid is True:
             verification.unsupported_claims = []
             verification.should_continue_research = False
+        elif not clarifying and verification.unsupported_claims:
+            # Unsupported claims and a terminal/no-research flag are
+            # contradictory. Normalize the contract so the bounded recovery
+            # edge can revise the rejected candidate once.
+            verification.should_continue_research = True
         self._validate_evidence_refs(state, verification.evidence_ids)
         if state.get("decision_issues"):
             verification.unsupported_claims = list(
@@ -1586,6 +1628,16 @@ class ServiceDeskAgent:
                     return "ask_human"
             if state.get("research_iteration", 0) < 2:
                 return "reason"
+        if (
+            not decision.get("question_for_human")
+            and v.get("should_continue_research")
+            and state.get("research_iteration", 0) < 2
+        ):
+            # The verifier supplied a new observation about a rejected answer.
+            # Allow exactly one bounded revision so the model can correct the
+            # answer, select a source, or ask a clarification. A second
+            # verification remains terminal for this evidence pass.
+            return "reason"
         if state.get("decision_issues") and state.get("research_iteration", 0) < 2:
             # One bounded schema/policy correction is allowed without another
             # source lookup. This cannot become an evidence-reconsideration loop.

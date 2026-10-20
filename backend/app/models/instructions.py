@@ -56,7 +56,9 @@ not need to name Neo4j, ChromaDB, MCP, tools or workflows. Treat the intent clas
 label as a descriptive hint, never as a source-access decision. Use bounded environment/document
 metadata and conversation context to choose zero, one or several supplied MCP tools. Stable general
 explanations, greetings and ordinary conversation may need no tool. Precise claims about uploaded
-content, changing facts or workspace state normally need evidence. Never search documents merely
+content, changing facts, workspace state, or the defined behavior of a named technical standard,
+protocol or API normally need evidence. For detailed comparisons of named technical protocols,
+prefer available authoritative primary documentation over unsupported model recall. Never search documents merely
 because they exist. When internal content may help, VECTOR can discover semantic matches without a
 known filename; HYBRID is useful when linked structure may help and must fall back to local semantic
 content when graph recall is empty or weak. Graph references are discovery context, not proof;
@@ -282,6 +284,9 @@ def stage_instructions(stage: str, context: dict) -> str:
             " username merely to begin troubleshooting; request identity only when a concrete"
             " evidence lookup needs it. If the exact error is already supplied, choose the"
             " next missing diagnostic fact such as the client or device."
+            " If verification rejected the previous candidate, treat its unsupported_claims and"
+            " missing_evidence as new observations. Revise the candidate, select an authorized"
+            " source, or ask one useful clarification; do not simply repeat the rejected answer."
         )
         instructions += (
             " If question_for_human is nonempty, human_field MUST be a nonempty semantic predicate"
@@ -330,5 +335,7 @@ def stage_instructions(stage: str, context: dict) -> str:
             " Explicitly populate additional_evidence_useful and source_strategy. Use"
             " clarification_needed, clarification_question and clarification_reason only when a"
             " focused clarification is genuinely more useful than an available lookup."
+            " Never request a clarification that human_answers already answers; incorporate that"
+            " confirmed fact into the new plan."
         )
     return instructions
