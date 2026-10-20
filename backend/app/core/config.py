@@ -110,6 +110,7 @@ class Settings(BaseSettings):
         "cisa.gov",
     ]
     max_research_rounds: int = Field(default=2, ge=0, le=3)
+    max_web_page_fetches: int = Field(default=4, ge=0, le=10)
     max_investigation_cycles: int = Field(default=8, ge=1, le=20)
     allow_url_ingest: bool = True
     url_max_depth: int = Field(default=1, ge=0, le=3)
