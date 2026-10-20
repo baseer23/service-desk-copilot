@@ -236,8 +236,22 @@ class ServiceDeskAgent:
                             "extraction_method": metadata.get("extraction_method"),
                         }
                     )
-        await emit("tool:" + name, "completed", summary, **details,
-                   result_count=result_count, findings=findings, sources=sources)
+        completed_summary = (
+            f"Retrieved {result_count} document candidate"
+            + ("s" if result_count != 1 else "")
+            if name == "search_knowledge"
+            else summary
+        )
+        await emit(
+            "tool:" + name,
+            "completed",
+            completed_summary,
+            **details,
+            result_count=result_count,
+            findings=findings,
+            sources=sources,
+            result_role="retrieval_candidates" if name == "search_knowledge" else "observations",
+        )
         if name == "fetch_web_page" and isinstance(result, dict):
             page = result.get("result") or result
             if not permits(page.get("url", arguments.get("url", "")), self.settings):
@@ -338,11 +352,35 @@ class ServiceDeskAgent:
                 raise KeyError(request_id)
             if snapshot.next or snapshot.values.get("persist_case"):
                 raise ValueError("Continue this investigation using its pending question")
+            previous = dict(snapshot.values)
+            references = list(
+                previous.get("conversation_context", {}).get("document_references", [])
+            )
+            known_reference_ids = {
+                (item.get("document_id"), item.get("title"), item.get("page"))
+                for item in references
+            }
+            for item in previous.get("evidence", []):
+                if item.get("source_type") != "document":
+                    continue
+                content = item.get("content", {})
+                metadata = content.get("metadata", {})
+                reference = {
+                    "document_id": item.get("doc_id") or metadata.get("doc_id"),
+                    "title": content.get("title") or metadata.get("title"),
+                    "page": metadata.get("page"),
+                    "source": item.get("source"),
+                }
+                key = (reference["document_id"], reference["title"], reference["page"])
+                if key not in known_reference_ids:
+                    references.append(reference)
+                    known_reference_ids.add(key)
             graph_input = {
                 "ticket": {"summary": message},
                 "status": "investigating",
                 "intent": {},
                 "evidence": [],
+                "retrieval_candidates": [],
                 "decision": {},
                 "verification": {},
                 "research_rounds": 0,
@@ -351,6 +389,12 @@ class ServiceDeskAgent:
                 "final_answer": None,
                 "final_response": {},
                 "pending_question": None,
+                "chat_messages": previous.get("chat_messages", [])[-16:],
+                "conversation_context": {
+                    "previous_request": previous.get("ticket", {}).get("summary"),
+                    "resolved_goal": previous.get("intent", {}).get("goal"),
+                    "document_references": references[-12:],
+                },
             }
             self._request_events[request_id] = []
         elif answer is None:
@@ -373,6 +417,7 @@ class ServiceDeskAgent:
                         reliability=0.7,
                     ).model_dump()
                 ],
+                "retrieval_candidates": [],
                 "confirmed_facts": [],
                 "remembered_facts": [],
                 "human_answers": [],
@@ -381,6 +426,7 @@ class ServiceDeskAgent:
                 "research_rounds": 0,
                 "executed_tool_calls": [],
                 "chat_messages": [],
+                "conversation_context": {},
                 "request_owner": owner,
             }
             self._request_events[request_id] = []
@@ -473,10 +519,23 @@ class ServiceDeskAgent:
                 "research_rounds",
                 "available_context",
                 "executed_tool_calls",
+                "conversation_context",
             )
         }
         result["conversation"] = state.get("chat_messages", [])[-8:]
         result["evidence"] = evidence
+        result["retrieval_assessment"] = [
+            {
+                "document_id": item.get("doc_id")
+                or item.get("content", {}).get("metadata", {}).get("doc_id"),
+                "title": item.get("content", {}).get("title")
+                or item.get("content", {}).get("metadata", {}).get("title"),
+                "page": item.get("content", {}).get("metadata", {}).get("page"),
+                "assessment": item.get("assessment"),
+                "reason": item.get("assessment_reason"),
+            }
+            for item in state.get("retrieval_candidates", [])[-12:]
+        ]
         if include_tools:
             result["available_tools"] = self.harness.schemas(state.get("workflow", "service_desk"))
         return result
@@ -488,6 +547,7 @@ class ServiceDeskAgent:
                 "request": state["ticket"]["summary"],
                 "knowledge_scope": self.settings.knowledge_scope,
                 "conversation": state.get("chat_messages", [])[-8:],
+                "conversation_context": state.get("conversation_context", {}),
             },
             RequestIntent,
         )
@@ -822,7 +882,7 @@ class ServiceDeskAgent:
 
     async def _grade_document_evidence(self, state, candidates):
         if not candidates:
-            return []
+            return {"accepted": [], "rejected": [], "unverified": []}
         candidate_ids = [
             str(item["content"].get("id")
                 or item["content"].get("metadata", {}).get("chunk_id")
@@ -833,9 +893,9 @@ class ServiceDeskAgent:
             await emit(
                 "evidence_grading", "failed",
                 "Model grading unavailable; retaining "
-                f"{len(candidates)} retrieved documents for evidence assessment",
+                f"{len(candidates)} retrieved documents as unverified candidates",
             )
-            return candidates
+            return {"accepted": [], "rejected": [], "unverified": candidates}
         bounded = [
             {
                 "id": candidate_ids[index],
@@ -872,31 +932,72 @@ class ServiceDeskAgent:
                 f"Document relevance checked: {len(accepted)} accepted; {len(rejected)} rejected",
                 findings=[f"Rejected {item.id}: {item.reason}" for item in grade.rejected[:6]],
             )
-            return [
-                item for candidate_id, item in zip(candidate_ids, candidates)
-                if candidate_id in accepted
-            ]
+            return {
+                "accepted": [
+                    item for candidate_id, item in zip(candidate_ids, candidates)
+                    if candidate_id in accepted
+                ],
+                "rejected": [
+                    {
+                        "evidence": item,
+                        "reason": next(
+                            rejected_item.reason
+                            for rejected_item in grade.rejected
+                            if rejected_item.id == candidate_id
+                        ),
+                    }
+                    for candidate_id, item in zip(candidate_ids, candidates)
+                    if candidate_id in rejected
+                ],
+                "unverified": [],
+            }
         except Exception:
             await emit(
                 "evidence_grading",
                 "failed",
                 "Model grading unavailable; retaining "
-                f"{len(candidates)} retrieved documents for evidence assessment",
+                f"{len(candidates)} retrieved documents as unverified candidates",
             )
-            return candidates
+            return {"accepted": [], "rejected": [], "unverified": candidates}
 
     async def observe(self, state):
         evidence = list(state.get("evidence", []))
+        retrieval_candidates = list(state.get("retrieval_candidates", []))
         seen = {e["id"] for e in evidence}
+        candidate_map = {e["id"]: e for e in retrieval_candidates}
         converted = []
         for item in state.get("tool_results", []):
             rows = self._evidence(state, item["name"], item["output"])
             if item["name"] == "search_knowledge":
                 errors = [row for row in rows if row["source_type"] == "tool_error"]
-                rows = errors + await self._grade_document_evidence(
+                assessment = await self._grade_document_evidence(
                     state, [row for row in rows if row["source_type"] == "document"]
                 )
+                for row in assessment["accepted"]:
+                    candidate_map[row["id"]] = {**row, "assessment": "accepted"}
+                for rejected in assessment["rejected"]:
+                    row = rejected["evidence"]
+                    candidate_map[row["id"]] = {
+                        **row,
+                        "assessment": "rejected",
+                        "assessment_reason": rejected["reason"],
+                    }
+                for row in assessment["unverified"]:
+                    candidate_map[row["id"]] = {**row, "assessment": "unverified"}
+                await emit(
+                    "source_assessment",
+                    "completed" if not assessment["unverified"] else "failed",
+                    "Document candidates assessed: "
+                    f"{len(assessment['accepted'])} accepted, "
+                    f"{len(assessment['rejected'])} rejected, "
+                    f"{len(assessment['unverified'])} unverified",
+                    accepted_count=len(assessment["accepted"]),
+                    rejected_count=len(assessment["rejected"]),
+                    unverified_count=len(assessment["unverified"]),
+                )
+                rows = errors + assessment["accepted"]
             converted.extend(rows)
+        retrieval_candidates = list(candidate_map.values())[-24:]
         for row in converted:
             if row["id"] not in seen:
                 evidence.append(row)
@@ -946,8 +1047,22 @@ class ServiceDeskAgent:
             "completed",
             f"Evidence collected: {len(evidence)} items; {len(contradictions)} contradictions",
             sources=public_sources,
+            accepted_document_count=sum(
+                item.get("assessment") == "accepted" for item in retrieval_candidates
+            ),
+            rejected_document_count=sum(
+                item.get("assessment") == "rejected" for item in retrieval_candidates
+            ),
+            unverified_document_count=sum(
+                item.get("assessment") == "unverified" for item in retrieval_candidates
+            ),
         )
-        return {"evidence": evidence, "contradictions": contradictions, "tool_results": []}
+        return {
+            "evidence": evidence,
+            "retrieval_candidates": retrieval_candidates,
+            "contradictions": contradictions,
+            "tool_results": [],
+        }
 
     async def reason(self, state):
         iteration = state.get("research_iteration", 0) + 1

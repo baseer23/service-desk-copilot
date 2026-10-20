@@ -20,6 +20,7 @@ class InvestigationState(TypedDict, total=False):
     decision: dict[str, Any]
     verification: dict[str, Any]
     evidence: list[dict[str, Any]]
+    retrieval_candidates: list[dict[str, Any]]
     tool_results: list[dict[str, Any]]
     prefetch_results: list[dict[str, Any]]
     tools_discovered: bool
@@ -44,4 +45,5 @@ class InvestigationState(TypedDict, total=False):
     final_response: dict[str, Any]
     uncertainty: list[str]
     chat_messages: list[dict[str, str]]
+    conversation_context: dict[str, Any]
     request_owner: str
