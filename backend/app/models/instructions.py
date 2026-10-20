@@ -30,6 +30,10 @@ implementation details or emit conflicting operations. Use needs_clarification w
 when the target, scope or exact characters are ambiguous.""",
     "classify_intent": """Classify the incoming request using conversation history. Stable facts
 and ordinary conversation use workflow=knowledge, knowledge_source=general and public_topic=none.
+Preserve explicit source scope: requests to answer "from knowledge", "from my document",
+"from the uploaded newspaper", or from the workspace are about LOCAL stored knowledge,
+regardless of whether the document itself covers a news event. Do not classify these
+as public_web merely because the subject is newsworthy. Do not invent internal evidence.
 News, recent events, latest developments and explicit internet searches use workflow=knowledge and
 knowledge_source=public_web; current-news requests use public_topic=news and other internet searches
 use public_topic=web. Resolve follow-ups from history: 'Can you search it?' after a question about
@@ -59,7 +63,20 @@ explanations, greetings and ordinary conversation may need no tool. Precise clai
 content, changing facts, workspace state, or the defined behavior of a named technical standard,
 protocol or API normally need evidence. For detailed comparisons of named technical protocols,
 prefer available authoritative primary documentation over unsupported model recall. Never search documents merely
-because they exist. When internal content may help, VECTOR can discover semantic matches without a
+because they exist. Treat an explicit user request to use their saved knowledge,
+uploaded documents or internal workspace as an evidence-scope constraint, not an
+optional preference: select authorized local retrieval or ask a focused clarification
+if that source is unavailable or ambiguous. Do not override this with public web
+search solely because the subject happens to be a news event. A question about
+documents AVAILABLE in the workspace requires an authorized list_documents read
+instead of treating a bounded catalog preview as verified complete inventory.
+Distinguish a document's local content/index readiness from independent Neo4j
+graph-link status: graph_pending alone does not mean its local content is unavailable.
+When a selected source yields no supporting evidence, evaluate other relevant,
+permitted local tools (including hybrid graph plus Chroma, and scoped memory
+when a subject is known), then public sources only if the user authorizes broader
+research. Use existing observations to reformulate retrieval queries; do not repeat
+the same unhelpful query or collect unrelated hits to appear productive. When internal content may help, VECTOR can discover semantic matches without a
 known filename; HYBRID is useful when linked structure may help and must fall back to local semantic
 content when graph recall is empty or weak. Graph references are discovery context, not proof;
 hydrated local content supports factual answers. Select connected live-system tools for current
@@ -328,6 +345,9 @@ def stage_instructions(stage: str, context: dict) -> str:
         instructions += (
             " Use available_context knowledge counts and bounded document_catalog only to assess"
             " whether indexed internal guidance may address a gap; metadata is not answer evidence."
+            " For an authoritative answer about which documents exist and their statuses,"
+            " use list_documents when available, not an incomplete or stale catalog preview."
+            " Prefer the user's explicit internal-source scope over generic public-news classification."
             " Do not search it when another connected source directly"
             " matches the request. Populate unknowns with the concrete research questions that must be"
             " answered; these are shown to the user, so keep them concise and do not include hidden"
