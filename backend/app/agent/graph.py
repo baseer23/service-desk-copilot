@@ -1437,11 +1437,28 @@ class ServiceDeskAgent:
             if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
                 await failed(search_tool, MCPToolError("Public search returned malformed results"))
                 continue
+            raw_result_count = len(rows)
             rows = rank_sources(rows, self.settings)
             if not rows:
-                await self.note(
-                    state, search_tool, "Public search returned no usable sources", "tool_error"
+                # A source-policy filter is different from an empty search.
+                # Surface the actual blocker instead of claiming no results.
+                policy_rejected = raw_result_count > 0
+                reason = (
+                    f"Web search returned {raw_result_count} candidate(s), but "
+                    f"RESEARCH_SOURCE_POLICY={self.settings.research_source_policy} "
+                    "excluded all URLs. An operator can set prefer_primary "
+                    "to consider third-party sources while prioritizing configured primary domains."
+                    if policy_rejected else
+                    "Public search returned no usable candidates for this query."
                 )
+                await emit(
+                    "source_policy_filter",
+                    "completed",
+                    reason,
+                    result_count=raw_result_count,
+                    policy=self.settings.research_source_policy,
+                )
+                await failed(search_tool, MCPToolError(reason))
                 continue
             selection = await self.provider.generate_structured(
                 "evaluate_sources",
@@ -1684,7 +1701,6 @@ class ServiceDeskAgent:
                     await self._call(state, "remember_fact", {"fact": fact.model_dump()})
         d = InvestigationDecision.model_validate(state["decision"])
         v = state.get("verification", {})
-        public_request = state.get("intent", {}).get("knowledge_source") == "public_web"
         direct_model_answer = self._direct_model_answer(state)
         limited = state["research_iteration"] >= self.settings.max_investigation_cycles
         supported = (
@@ -1716,17 +1732,42 @@ class ServiceDeskAgent:
                 "items"
             ]
         )
-        public_limitation = None
-        if public_request and not supported:
+        limitation = None
+        if not supported:
             errors = [
                 e["content"].get("error") for e in state.get("evidence", [])
                 if e["source_type"] == "tool_error" and e["content"].get("error")
             ]
-            public_limitation = (
-                "Public research could not be completed: " + "; ".join(dict.fromkeys(errors))
-                if errors else "No verifiable public sources were retrieved for this request."
-            )
-        answer_value = (d.answer or d.recommended_next_action) if supported else public_limitation
+            observed_tools = {
+                e["tool"] for e in state.get("evidence", [])
+                if e["source_type"] != "tool_error"
+            }
+            if errors:
+                limitation = "Some evidence sources failed: " + "; ".join(
+                    dict.fromkeys(str(error) for error in errors)
+                )
+            elif observed_tools & {"search_web", "search_news"}:
+                limitation = (
+                    "Public search returned candidate results, but no verified source "
+                    "established the requested fact."
+                )
+            elif "search_knowledge" in observed_tools or state.get("retrieval_candidates"):
+                limitation = (
+                    "I searched available local knowledge but could not verify the "
+                    "requested fact from the relevant retrieved passages."
+                )
+            else:
+                limitation = "I could not verify the requested fact from the evidence available."
+            # A missing source or disambiguating detail should remain visible,
+            # rather than reducing all unsuccessful investigations to a generic
+            # "no sources" claim or silently dropping the answer.
+            missing = [
+                item.description for item in d.missing_information
+                if item.affects_decision and item.description.strip()
+            ]
+            if missing:
+                limitation += " I still need: " + missing[0].rstrip(".") + "."
+        answer_value = (d.answer or d.recommended_next_action) if supported else limitation
         response = FinalResponse(
             issue_summary=state["ticket"]["summary"],
             answer=answer_value,
