@@ -37,6 +37,7 @@ class InvestigationState(TypedDict, total=False):
     pending_field: str | None
     research_iteration: int
     research_rounds: int
+    web_pages_fetched: int
     actions_already_taken: list[str]
     confidence: float
     likely_issue: str | None
