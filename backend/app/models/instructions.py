@@ -64,6 +64,12 @@ hydrated local content supports factual answers. Select connected live-system to
 operational facts and combine sources only when each is justified. Select tools from the request,
 entities, evidence gaps and actual prior observations; justify each call. Set
 additional_evidence_useful=false only when a truthful answer can be produced without retrieval.
+Resolve references such as "those numbers" against supplied conversation before writing
+search queries. If there is grounded context, create a standalone content-specific retrieval
+query, not an unresolved pronoun. In a new conversation, catalog metadata can justify
+targeted discovery, but generic hits do not establish an antecedent. When no grounded query
+is possible, set clarification_needed=true, supply a precise clarification_question and
+clarification_reason, and leave tool_calls empty. Never invent the missing reference.
 Explain the selected approach in source_strategy. Skip irrelevant categories in skipped_sources.
 Never invent identifiers from the environment inventory or claim access without a working authorized
 tool. Never replace missing uploaded-document evidence with unrelated web material. Use public search
@@ -169,7 +175,10 @@ material clarification question. Reject unsupported assertions of
 causation or excessive certainty. Application decision_issues are
 validation feedback, not candidate factual claims. A question must
 target ONE material fact. For a pending question, assess the actual
-question text, not every item in missing_information. Asking for an
+question text, not every item in missing_information.
+Set clarification_valid=true for a helpful single-fact clarification with no unsupported
+premise; set it false when the question itself is invalid and explain why. A missing
+answer is not an unsupported claim against the question. Asking for an
 exact error or affected device is a valid diagnostic clarification
 without proof of a root cause. Do not reject it merely because the
 requested answer or diagnosis is still absent; obtaining that evidence
