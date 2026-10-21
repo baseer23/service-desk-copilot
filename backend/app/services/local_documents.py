@@ -266,7 +266,7 @@ class LocalDocumentRepository(DocumentRepository):
                     ),
                     "version": version,
                     "content_hash": hashlib.sha256(item["text"].encode()).hexdigest(),
-                    "source_provenance": "azure_document_intelligence",
+                    "source_provenance": "azure_document_intelligence" if extracted.get("method") == "document_intelligence" else "saved_local_extraction",
                     "link_status": "reference_only_unsaved" if temporary else "linked",
                 },
             )
@@ -293,11 +293,15 @@ class LocalDocumentRepository(DocumentRepository):
                 {
                     "object_id": paragraph_id, "object_type": "Paragraph",
                     "page": paragraph.get("page"), "position": paragraph.get("position"),
+                    "source_element_id": source_id,
+                    "azure_role": paragraph.get("role"),
+                    "span_offset": (paragraph.get("spans") or [{}])[0].get("offset"),
+                    "span_length": (paragraph.get("spans") or [{}])[0].get("length"),
                     "description": f"Paragraph role {paragraph.get('role') or 'body'} on page {paragraph.get('page')}",
                     "version": version, "content_hash": hashlib.sha256(
                         str(paragraph.get("text") or "").encode()
                     ).hexdigest(),
-                    "source_provenance": "azure_document_intelligence",
+                    "source_provenance": "azure_document_intelligence" if extracted.get("method") == "document_intelligence" else "saved_local_extraction",
                     "link_status": "reference_only_unsaved" if temporary else "linked",
                 },
             )
@@ -313,12 +317,15 @@ class LocalDocumentRepository(DocumentRepository):
                 identifier,
                 {
                     "object_id": cell_id, "object_type": "TableCell",
-                    "page": table.get("page"),
+                    "page": table.get("page"), "source_element_id": str(table.get("id")),
+                    "span_offset": (cell.get("spans") or [{}])[0].get("offset"),
+                    "span_length": (cell.get("spans") or [{}])[0].get("length"),
+                    "table_row": cell.get("row"), "table_column": cell.get("column"),
                     "position": cell.get("row", 0) * 100000 + cell.get("column", 0),
                     "description": f"Cell row {cell.get('row')} column {cell.get('column')} on page {table.get('page')}",
                     "version": version,
                     "content_hash": hashlib.sha256(str(cell.get("text") or "").encode()).hexdigest(),
-                    "source_provenance": "azure_document_intelligence",
+                    "source_provenance": "azure_document_intelligence" if extracted.get("method") == "document_intelligence" else "saved_local_extraction",
                     "link_status": "reference_only_unsaved" if temporary else "linked",
                 },
             )
