@@ -109,3 +109,7 @@ The upload, Azure Document Intelligence and Neo4j reference-graph changes do not
 ### 2026-10-21 observable investigation recovery
 
 The planning, evidence verification, activity-stream and Investigation Activity changes do not modify Voice or Speech code, SDK lifecycle, continuous recognition, transcript ownership or usage accounting. No Speech test, live Azure Speech request or physical microphone check was run; the existing live Speech blockers remain unchanged.
+
+### 2026-10-21 general intelligence experiment
+
+The read-only time, calculation, weather, mapping, currency and holiday capabilities do not modify Voice or Speech code, SDK lifecycle, continuous recognition, transcript ownership or usage accounting. No Speech request or physical microphone check was performed; prior Voice validation and blockers remain unchanged.

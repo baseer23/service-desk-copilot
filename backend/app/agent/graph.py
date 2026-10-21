@@ -48,6 +48,15 @@ LABELS = {
     "search_news": "Current news searched",
     "fetch_web_page": "Public page fetched",
     "get_current_time": "Current time checked",
+    "calculate_date_time": "Date and time calculated",
+    "calculate": "Calculation completed",
+    "convert_unit": "Units converted",
+    "geocode_location": "Location resolved",
+    "get_weather": "Weather checked",
+    "search_places": "Places searched",
+    "get_route": "Route estimated",
+    "convert_currency": "Exchange rate checked",
+    "get_holidays": "Holidays checked",
 }
 
 
@@ -204,11 +213,22 @@ class ServiceDeskAgent:
             "search_news": "Searching current news",
             "search_web": "Searching the public web",
             "fetch_web_page": "Reading a public source",
+            "calculate_date_time": "Calculating date and time",
+            "calculate": "Calculating exact arithmetic",
+            "convert_unit": "Converting units",
+            "geocode_location": "Resolving the location",
+            "get_weather": "Checking observed and forecast weather",
+            "search_places": "Searching mapped places",
+            "get_route": "Estimating route distance and duration",
+            "convert_currency": "Checking a dated exchange rate",
+            "get_holidays": "Checking scoped public holidays",
         }
         summary = summaries.get(name, "Reading connected tool evidence")
         details = {"tool": name}
-        if name in {"search_web", "search_news", "search_knowledge"}:
+        if name in {"search_web", "search_news", "search_knowledge", "search_places"}:
             details["query"] = str(arguments.get("query") or arguments.get("question") or "")[:500]
+        elif name in {"get_weather", "geocode_location"}:
+            details["query"] = str(arguments.get("location") or arguments.get("query") or "")[:500]
         elif name == "fetch_web_page":
             details["source_host"] = urlsplit(str(arguments.get("url", ""))).hostname or "public source"
         await emit("tool:" + name, "running", summary, **details)
@@ -885,11 +905,13 @@ class ServiceDeskAgent:
                 category="application_validation",
             ) from exc
         results = [None] * len(plan.tool_calls)
-        completed_signatures = []
+        attempted_signatures = []
         web_round = any(c.name in {"search_web", "search_news"} for c in plan.tool_calls)
 
         async def execute(index):
             call = plan.tool_calls[index]
+            signature = self._tool_signature(call.name, call.arguments)
+            attempted_signatures.append(signature)
             try:
                 if (
                     call.name in {"search_web", "search_news"}
@@ -901,10 +923,6 @@ class ServiceDeskAgent:
                     "name": call.name,
                     "output": output,
                 }
-                if not isinstance(output, dict) or output.get("status") not in {
-                    "error", "unavailable"
-                }:
-                    completed_signatures.append(self._tool_signature(call.name, call.arguments))
             except MCPToolError as exc:
                 await self.note(state, call.name, f"Capability failed: {call.name}", "tool_error")
                 results[index] = {
@@ -975,8 +993,9 @@ class ServiceDeskAgent:
             # conflicting Boolean said they were not yet factually verified.
             for url in selected_urls:
                 signature = self._tool_signature("fetch_web_page", {"url": url})
-                if signature in set(state.get("executed_tool_calls", [])) | set(completed_signatures):
+                if signature in set(state.get("executed_tool_calls", [])) | set(attempted_signatures):
                     continue
+                attempted_signatures.append(signature)
                 try:
                     fetched = await self._call(state, "fetch_web_page", {"url": url})
                 except MCPToolError as exc:
@@ -1010,7 +1029,6 @@ class ServiceDeskAgent:
                 }
                 results.append({"name": "fetch_web_page", "output": {
                     **fetched, "result": page, "items": [page]}})
-                completed_signatures.append(signature)
                 await emit("source_fetched", "completed", "Read article for evidence review",
                            sources=[{"title": page.get("title") or url, "url": page.get("url") or url}])
         return {
@@ -1018,7 +1036,7 @@ class ServiceDeskAgent:
             "web_pages_fetched": state.get("web_pages_fetched", 0),
             "plan_executed": True,
             "executed_tool_calls": list(
-                dict.fromkeys(state.get("executed_tool_calls", []) + completed_signatures)
+                dict.fromkeys(state.get("executed_tool_calls", []) + attempted_signatures)
             ),
             "research_rounds": state.get("research_rounds", 0) + int(web_round),
         }
@@ -1076,7 +1094,10 @@ class ServiceDeskAgent:
                 else "confirmed_fact"
                 if name in {"search_memory", "remember_fact"}
                 else "public_documentation"
-                if system == "public_web" or meta.get("source_type") == "web"
+                if system in {
+                    "public_web", "open_meteo", "openstreetmap", "osrm",
+                    "frankfurter", "nager_date",
+                } or meta.get("source_type") == "web"
                 else "document"
                 if name == "search_knowledge"
                 else "system_record"
@@ -1090,17 +1111,23 @@ class ServiceDeskAgent:
                     tool=name,
                     timestamp=stamp,
                     observed_at=stamp,
-                    source=row.get("source") or meta.get("source") or row.get("url") or name,
+                    source=(
+                        row.get("source") or meta.get("source")
+                        or row.get("url") or row.get("source_url") or name
+                    ),
                     content=row,
                     entities=state.get("analysis", {}).get("entities", []),
                     reliability=0 if kind == "tool_error" else result["reliability"],
                     relevance=self._source_relevance(name, row),
                     case_id=state["case_id"] if state.get("persist_case") is not False else None,
-                    url=row.get("url") or meta.get("url") or None,
+                    url=row.get("url") or row.get("source_url") or meta.get("url") or None,
                     doc_id=meta.get("doc_id"),
                     source_quality=(
                         "unclassified" if kind == "tool_error" else
-                        quality(row.get("url") or meta.get("url") or "", self.settings)
+                        quality(
+                            row.get("url") or row.get("source_url") or meta.get("url") or "",
+                            self.settings,
+                        )
                         if kind == "public_documentation"
                         else "fixture" if system == "local_fixture" else "internal"
                     ),

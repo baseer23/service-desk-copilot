@@ -32,7 +32,9 @@ def capability(source_system, reliability=0.9):
                 if (
                     (settings.deployment_mode == "production" or not settings.test_mode)
                     and fn.__name__ in {
-                        "search_web", "search_news", "fetch_web_page", "ingest_url"
+                        "search_web", "search_news", "fetch_web_page", "ingest_url",
+                        "get_weather", "geocode_location", "search_places", "get_route",
+                        "convert_currency", "get_holidays",
                     }
                     and not settings.enable_public_web_tools
                 ):
@@ -371,6 +373,88 @@ def get_current_time(timezone: str = "America/Halifax"):
         "date": current.date().isoformat(),
         "weekday": current.strftime("%A"),
     }
+
+
+@capability("system_time", 1.0)
+def calculate_date_time(
+    operation: Literal["current", "convert", "add_days", "difference", "relative"],
+    timezone_name: str = "America/Halifax",
+    source_timezone: str | None = None,
+    timestamp: str | None = None,
+    other_timestamp: str | None = None,
+    days: int = 0,
+    relative: str | None = None,
+):
+    """Current time, timezone conversion, date arithmetic/difference, or relative date using IANA zones."""
+    from backend.app.services.general_intelligence import date_time_operation
+
+    return date_time_operation(
+        operation, timezone_name, source_timezone, timestamp, other_timestamp, days, relative
+    )
+
+
+@capability("local_decimal", 1.0)
+def calculate(expression: str):
+    """Safely calculate arithmetic and percentages using exact decimal operations; no code execution."""
+    from backend.app.services.general_intelligence import calculate as calculate_expression
+
+    return calculate_expression(expression)
+
+
+@capability("local_conversion", 1.0)
+def convert_unit(value: float, from_unit: str, to_unit: str):
+    """Convert supported distance, mass, volume and temperature units deterministically."""
+    from backend.app.services.general_intelligence import convert_unit as convert
+
+    return convert(value, from_unit, to_unit)
+
+
+@capability("open_meteo", 0.9)
+def geocode_location(query: str, count: int = 5):
+    """Resolve a named location to coordinates and an IANA timezone before weather or routing."""
+    from backend.app.services.general_intelligence import geocode_location as geocode
+
+    return geocode(query, count)
+
+
+@capability("open_meteo", 0.9)
+def get_weather(location: str, forecast_days: int = 3, units: Literal["metric", "imperial"] = "metric"):
+    """Get current observations and dated daily forecast from Open-Meteo; alerts are not claimed."""
+    from backend.app.services.general_intelligence import get_weather as weather
+
+    return weather(location, forecast_days, units)
+
+
+@capability("openstreetmap", 0.8)
+def search_places(query: str, near: str | None = None, count: int = 5):
+    """Search OpenStreetMap places and nearby points of interest; ratings and hours are unavailable."""
+    from backend.app.services.general_intelligence import search_places as places
+
+    return places(query, near, count)
+
+
+@capability("osrm", 0.8)
+def get_route(origin: str, destination: str, mode: Literal["driving"] = "driving"):
+    """Estimate route distance and duration without live traffic after geocoding both locations."""
+    from backend.app.services.general_intelligence import get_route as route
+
+    return route(origin, destination, mode)
+
+
+@capability("frankfurter", 0.9)
+def convert_currency(amount: float, base: str, quote: str, rate_date: str = "latest"):
+    """Convert currencies using dated Frankfurter/ECB reference rates; not an executable market quote."""
+    from backend.app.services.general_intelligence import convert_currency as currency
+
+    return currency(amount, base, quote, rate_date)
+
+
+@capability("nager_date", 0.85)
+def get_holidays(country_code: str, year: int, subdivision: str | None = None):
+    """List public holidays by ISO country and optional subdivision, preserving national/subdivision scope."""
+    from backend.app.services.general_intelligence import get_holidays as holidays
+
+    return holidays(country_code, year, subdivision)
 
 
 @capability("public_web", 0.7)
