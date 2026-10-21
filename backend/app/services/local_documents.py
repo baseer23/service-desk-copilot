@@ -266,6 +266,10 @@ class LocalDocumentRepository(DocumentRepository):
                         f"{item['object_type']} reference on page {item.get('page')}"
                     ),
                     "version": version,
+                    "source_element_id": (
+                        item.get("source_id") or item.get("table_id")
+                        or item.get("figure_id") or item["object_id"]
+                    ),
                     "content_hash": hashlib.sha256(item["text"].encode()).hexdigest(),
                     "source_provenance": "azure_document_intelligence" if extracted.get("method") == "document_intelligence" else "saved_local_extraction",
                     "link_status": "reference_only_unsaved" if temporary else "linked",
@@ -284,6 +288,36 @@ class LocalDocumentRepository(DocumentRepository):
             parent, child = section_map.get(section.get("parent_id")), section_map.get(section.get("id"))
             if parent and child and parent != child:
                 graph.link_reference_objects(parent, child, "HAS_SECTION")
+        # Azure can identify a figure even when it has no caption. Retain
+        # its reference node instead of silently dropping a valid API element.
+        indexed_figure_ids = {
+            obj.get("figure_id") for obj in objects if obj["object_type"] == "Figure"
+        }
+        for figure in extracted.get("figures", []):
+            if figure.get("id") in indexed_figure_ids:
+                continue
+            figure_id = "FIG" + hashlib.sha256(
+                f"{identifier}:{figure.get('id')}:{figure.get('page')}".encode()
+            ).hexdigest()[:24]
+            graph.upsert_reference_object(
+                identifier,
+                {
+                    "object_id": figure_id, "object_type": "Figure",
+                    "page": figure.get("page"), "position": figure.get("position"),
+                    "source_element_id": str(figure.get("id") or ""),
+                    "description": f"Figure reference on page {figure.get('page')}",
+                    "version": version,
+                    "content_hash": hashlib.sha256(
+                        str(figure.get("caption") or "").encode()
+                    ).hexdigest(),
+                    "source_provenance": (
+                        "azure_document_intelligence"
+                        if extracted.get("method") == "document_intelligence"
+                        else "saved_local_extraction"
+                    ),
+                    "link_status": "reference_only_unsaved" if temporary else "linked",
+                },
+            )
         active_section_id = None
         for paragraph in paragraphs:
             if paragraph.get("role") in {"title", "sectionHeading"}:
