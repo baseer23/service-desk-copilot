@@ -63,6 +63,8 @@ class GraphRepository:
             "CREATE CONSTRAINT IF NOT EXISTS FOR (t:Table) REQUIRE t.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (f:Figure) REQUIRE f.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (p:Page) REQUIRE p.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (p:Paragraph) REQUIRE p.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (c:TableCell) REQUIRE c.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (t:Topic) REQUIRE t.id IS UNIQUE",
         ]
         with self._driver.session(database=self.database) as session:
@@ -131,7 +133,7 @@ class GraphRepository:
     def upsert_reference_object(self, doc_id: str, item: dict) -> None:
         """Persist bounded reference metadata only; actual content remains local."""
         label = item.get("object_type", "Chunk")
-        if label not in {"Chunk", "Table", "Figure", "Section"}:
+        if label not in {"Chunk", "Table", "Figure", "Section", "Paragraph", "TableCell"}:
             raise ValueError("Unsupported graph object type")
         description = re.sub(r"\s+", " ", str(item.get("description") or "")).strip()[:160]
 
@@ -182,6 +184,9 @@ class GraphRepository:
             "HAS_CHUNK",
             "HAS_TABLE",
             "HAS_FIGURE",
+            "HAS_PARAGRAPH",
+            "HAS_TABLECELL",
+            "HAS_CELL",
             "HAS_OBJECT",
             "REFERENCES_TABLE",
             "REFERENCES_FIGURE",
@@ -195,8 +200,8 @@ class GraphRepository:
         ]
         selected_types = [
             label
-            for label in (object_types or ["Chunk", "Table", "Figure", "Section"])
-            if label in {"Chunk", "Table", "Figure", "Section"}
+            for label in (object_types or ["Chunk", "Table", "Figure", "Section", "Paragraph", "TableCell"])
+            if label in {"Chunk", "Table", "Figure", "Section", "Paragraph", "TableCell"}
         ]
 
         def _tx(tx: Transaction):
@@ -229,6 +234,9 @@ class GraphRepository:
             "HAS_CHUNK",
             "HAS_TABLE",
             "HAS_FIGURE",
+            "HAS_PARAGRAPH",
+            "HAS_TABLECELL",
+            "HAS_CELL",
             "REFERENCES_TABLE",
             "REFERENCES_FIGURE",
             "MENTIONS",
