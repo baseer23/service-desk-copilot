@@ -155,6 +155,177 @@ class LocalDocumentRepository(DocumentRepository):
         self.prepare_graph_enrichment(identifier)
         return self.process(identifier)
 
+    def preview_graph(self, source, title, media_type):
+        """Analyze an unsaved upload and persist reference-only graph metadata.
+
+        No original, extraction JSON, vectors or document record are retained.
+        The graph metadata persists intentionally, even after the staged file
+        is deleted. A later saved upload of identical bytes reuses its doc ID.
+        """
+        import hashlib
+
+        if not (
+            self.settings.auto_document_graph_ingestion
+            and self.settings.azure_document_endpoint
+            and self.settings.neo4j_ingestion_enabled
+            and self.settings.neo4j_ingestion_user
+            and self.settings.neo4j_ingestion_password.get_secret_value()
+        ):
+            raise ValueError("Azure DI and the Neo4j ingestion writer are required")
+        digest = hashlib.sha256()
+        with open(source, "rb") as stream:
+            while block := stream.read(1024 * 1024):
+                digest.update(block)
+        identifier = digest.hexdigest()
+        extracted = self.extractor.extract_path(
+            source, media_type, enhanced=True, force_azure=True
+        )
+        from backend.app.store.graph_repo import GraphRepository
+        from neo4j import GraphDatabase
+        from backend.app.core.principal import current_principal
+
+        driver = GraphDatabase.driver(
+            self.settings.neo4j_uri,
+            auth=(
+                self.settings.neo4j_ingestion_user,
+                self.settings.neo4j_ingestion_password.get_secret_value(),
+            ),
+            connection_timeout=5,
+            max_transaction_retry_time=0,
+            connection_acquisition_timeout=5,
+        )
+        try:
+            driver.verify_connectivity()
+            graph = GraphRepository(
+                driver,
+                tenant_provider=lambda: current_principal(self.settings).tenant_id,
+                optional=False, allow_fixtures=False,
+                database=self.settings.neo4j_database,
+            )
+            graph.ensure_constraints()
+            objects = self._publish_reference_objects(
+                graph, identifier, title, extracted, temporary=True
+            )
+        finally:
+            driver.close()
+        # Excerpts are returned to the caller only; no local or Aura text copy.
+        preview = "\n\n".join(str(page.get("text") or "") for page in extracted["pages"])
+        return {
+            "id": identifier,
+            "text": preview[:40000],
+            "pages": len(extracted["pages"]),
+            "chunks": 0,
+            "graph_objects": objects,
+            "graph_link_status": "linked",
+            "method": "document_intelligence",
+            "saved": False,
+            "source_persisted": False,
+        }
+
+    def _publish_reference_objects(self, graph, identifier, title, extracted, *, temporary=False, version=1):
+        """Project Azure layout-derived, source-grounded structure into Aura.
+
+        All text/values remain outside Neo4j. Links represent actual hierarchy,
+        page membership or table-cell containment, not invented semantic facts.
+        """
+        import hashlib
+        from backend.app.services.chunking import split_structured
+
+        objects = split_structured(identifier, extracted, self.settings.chunk_tokens)
+        paragraphs = extracted.get("paragraphs", [])
+        cells = [
+            (table, cell)
+            for table in extracted.get("tables", [])
+            for cell in table.get("cells", [])
+        ]
+        if len(objects) + len(paragraphs) + len(cells) > 5000:
+            raise ValueError("Document contains too many graph reference objects")
+        graph.upsert_document(
+            identifier, str(title or "Untitled")[:160],
+            "unsaved_azure_layout_references" if temporary else "structured_local_document",
+            version=version, content_hash=identifier,
+        )
+        pages = sorted({
+            int(page)
+            for page in [
+                *[obj.get("page") for obj in objects],
+                *[item.get("page") for item in paragraphs],
+                *[table.get("page") for table in extracted.get("tables", [])],
+            ]
+            if page is not None
+        })
+        for page in pages:
+            graph.upsert_page(identifier, page, version)
+        for item in objects:
+            graph.upsert_reference_object(
+                identifier,
+                {
+                    **item,
+                    "description": (
+                        f"{item['object_type']} reference on page {item.get('page')}"
+                    ),
+                    "version": version,
+                    "content_hash": hashlib.sha256(item["text"].encode()).hexdigest(),
+                    "source_provenance": "azure_document_intelligence",
+                    "link_status": "reference_only_unsaved" if temporary else "linked",
+                },
+            )
+        section_map = {
+            obj.get("source_id"): obj["object_id"]
+            for obj in objects if obj["object_type"] == "Section"
+        }
+        for obj in objects:
+            if obj["object_type"] == "Chunk" and obj.get("section_id") in section_map:
+                graph.link_reference_objects(
+                    section_map[obj["section_id"]], obj["object_id"], "HAS_CHUNK"
+                )
+        for section in extracted.get("sections", []):
+            parent, child = section_map.get(section.get("parent_id")), section_map.get(section.get("id"))
+            if parent and child and parent != child:
+                graph.link_reference_objects(parent, child, "HAS_SECTION")
+        for paragraph in paragraphs:
+            source_id = str(paragraph.get("id") or "")
+            paragraph_id = "PAR" + hashlib.sha256(
+                f"{identifier}:{source_id}:{paragraph.get('page')}:{paragraph.get('position')}".encode()
+            ).hexdigest()[:24]
+            graph.upsert_reference_object(
+                identifier,
+                {
+                    "object_id": paragraph_id, "object_type": "Paragraph",
+                    "page": paragraph.get("page"), "position": paragraph.get("position"),
+                    "description": f"Paragraph role {paragraph.get('role') or 'body'} on page {paragraph.get('page')}",
+                    "version": version, "content_hash": hashlib.sha256(
+                        str(paragraph.get("text") or "").encode()
+                    ).hexdigest(),
+                    "source_provenance": "azure_document_intelligence",
+                    "link_status": "reference_only_unsaved" if temporary else "linked",
+                },
+            )
+        table_objects = {}
+        for obj in objects:
+            if obj["object_type"] == "Table":
+                table_objects.setdefault(obj.get("table_id"), []).append(obj["object_id"])
+        for table, cell in cells:
+            cell_id = "CELL" + hashlib.sha256(
+                f"{identifier}:{table.get('id')}:{cell.get('row')}:{cell.get('column')}".encode()
+            ).hexdigest()[:24]
+            graph.upsert_reference_object(
+                identifier,
+                {
+                    "object_id": cell_id, "object_type": "TableCell",
+                    "page": table.get("page"),
+                    "position": cell.get("row", 0) * 100000 + cell.get("column", 0),
+                    "description": f"Cell row {cell.get('row')} column {cell.get('column')} on page {table.get('page')}",
+                    "version": version,
+                    "content_hash": hashlib.sha256(str(cell.get("text") or "").encode()).hexdigest(),
+                    "source_provenance": "azure_document_intelligence",
+                    "link_status": "reference_only_unsaved" if temporary else "linked",
+                },
+            )
+            for table_id in table_objects.get(table.get("id"), []):
+                graph.link_reference_objects(table_id, cell_id, "HAS_CELL")
+        return len(objects) + len(paragraphs) + len(cells)
+
     def _link_structured(self, identifier, state):
         """Publish reference-only structure with explicitly separate writer credentials."""
         import json
@@ -201,47 +372,10 @@ class LocalDocumentRepository(DocumentRepository):
             extraction = json.loads(
                 self.blobs.get(identifier, state.get("extraction_artifact", "extraction.json"))
             )
-            graph.upsert_document(
-                identifier, str(state.get("title") or "Untitled")[:160],
-                "structured_local_document",
-                version=state.get("version", 1),
-                content_hash=state.get("content_hash", identifier),
+            self._publish_reference_objects(
+                graph, identifier, state.get("title"), extraction,
+                temporary=False, version=state.get("version", 1),
             )
-            objects = split_structured(identifier, extraction, self.settings.chunk_tokens)
-            pages = sorted({item.get("page") for item in objects if item.get("page") is not None})
-            for page in pages:
-                graph.upsert_page(identifier, page, state.get("version", 1))
-            for item in objects:
-                description = (
-                    f"{item['object_type']} reference for "
-                    f"{str(state.get('title') or 'Untitled')[:100]}"
-                    f" on page {item.get('page')}"
-                )
-                graph.upsert_reference_object(
-                    identifier,
-                    {
-                        **item,
-                        # Never send private source excerpts or table values to Aura.
-                        "description": description,
-                        "version": state.get("version", 1),
-                        "content_hash": hashlib.sha256(item["text"].encode()).hexdigest(),
-                        "source_provenance": "azure_document_intelligence"
-                        if state.get("document_processing") == "azure_di"
-                        else "saved_local_extraction",
-                        "link_status": "linked",
-                    },
-                )
-            sections = {
-                item.get("source_id"): item["object_id"]
-                for item in objects
-                if item["object_type"] == "Section"
-            }
-            chunks = [item for item in objects if item["object_type"] == "Chunk"]
-            for chunk in chunks:
-                if chunk.get("section_id") in sections:
-                    graph.link_reference_objects(
-                        sections[chunk["section_id"]], chunk["object_id"], "HAS_CHUNK"
-                    )
             return self._set_graph_status(identifier, state, "ready")
         except Exception:
             return self._set_graph_status(identifier, state, "graph_pending")
