@@ -312,6 +312,7 @@ def create_app(settings: Settings | None = None):
             "structured_ingestion_available": bool(
                 s.uses_record_store and app.state.graph_writer["available"]
             ),
+            "automatic_graph_ingestion_enabled": s.auto_document_graph_ingestion,
             "structured_ingestion_blocker": app.state.graph_writer["blocker"],
         }
 
