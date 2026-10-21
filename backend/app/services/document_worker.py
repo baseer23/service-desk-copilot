@@ -8,7 +8,7 @@ from backend.app.core.principal import Principal, principal_scope
 
 async def document_worker(settings, harness):
     while True:
-        for tenant in settings.auth_allowed_tenants:
+        for tenant in (settings.auth_allowed_tenants or [settings.voice_tenant_id]):
             with principal_scope(Principal(tenant, "document-worker")):
                 try:
                     documents = (await harness.invoke("list_documents", {}))["items"]
