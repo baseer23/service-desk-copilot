@@ -408,6 +408,12 @@ def create_app(settings: Settings | None = None):
         }.get(suffix)
         if media_type is None:
             raise HTTPException(400, "Choose a PDF, Word, image, .txt or .md document")
+        if s.auto_document_graph_ingestion and media_type in {"text/plain", "text/markdown"}:
+            raise HTTPException(
+                415,
+                "Azure Document Intelligence layout extraction does not accept .txt or .md "
+                "files. Upload PDF, DOCX or a supported image for Azure + Neo4j ingestion.",
+            )
         staging = (s.local_documents_dir / ".uploads").resolve()
         staging.mkdir(mode=0o700, parents=True, exist_ok=True)
         token = secrets.token_hex(32)
