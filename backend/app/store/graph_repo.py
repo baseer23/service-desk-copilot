@@ -144,7 +144,10 @@ class GraphRepository:
                 "n.page=$page, n.ordinal=$ordinal, n.description=$description, "
                 "n.document_hash=$document_hash, n.content_hash=$content_hash, "
                 "n.version=$version, n.source_provenance=$source_provenance, "
-                "n.link_status=$link_status, n.tenant_id=$tenant_id",
+                "n.link_status=$link_status, n.tenant_id=$tenant_id, "
+                "n.source_element_id=$source_element_id, n.azure_role=$azure_role, "
+                "n.span_offset=$span_offset, n.span_length=$span_length, "
+                "n.table_row=$table_row, n.table_column=$table_column",
                 id=self.scope(item["object_id"]),
                 original_id=item["object_id"],
                 document_id=doc_id,
@@ -157,6 +160,12 @@ class GraphRepository:
                 version=item.get("version", 1),
                 source_provenance=item.get("source_provenance"),
                 link_status=item.get("link_status", "linked"),
+                source_element_id=item.get("source_element_id"),
+                azure_role=item.get("azure_role"),
+                span_offset=item.get("span_offset"),
+                span_length=item.get("span_length"),
+                table_row=item.get("table_row"),
+                table_column=item.get("table_column"),
             )
             tx.run(
                 f"MATCH (p:Page {{id:$page_id}}), (n:{label} {{id:$id}}) "
