@@ -10,6 +10,7 @@ const STEP_LABELS: Record<string, string> = {
   evidence_collected: 'Evidence inventory',
   source_assessment: 'Document grading',
   verification_summary: 'Verification',
+  recovery: 'Recovery',
   final_assessment: 'Outcome',
   follow_up: 'Clarification',
 }

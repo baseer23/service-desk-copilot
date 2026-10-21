@@ -2,7 +2,7 @@ import asyncio
 import json
 import pytest
 from backend.app.agent.activity import activity_scope, instrument
-from backend.app.agent.models import InvestigationPlan
+from backend.app.agent.models import InvestigationPlan, RequestIntent
 from backend.app.models.provider_routing import provider_scope
 
 
@@ -166,6 +166,107 @@ def test_plan_streams_objective_and_agent_generated_research_questions(make_clie
         'source': 'live infrastructure',
         'reason': 'The request asks only about uploaded policy material',
     }]
+
+
+def test_empty_evidence_plan_is_retried_with_validation_feedback(make_client):
+    client = make_client({'MAX_RESEARCH_ROUNDS': '0'})
+    agent = client.app.state.agent
+    contexts = []
+
+    async def planned(stage, context, schema):
+        assert stage == 'plan'
+        contexts.append(context.copy())
+        if len(contexts) == 1:
+            return InvestigationPlan(
+                goal='Find the requested workspace requirements',
+                additional_evidence_useful=True,
+                unknowns=['The applicable documented requirements'],
+                stop_condition='The requirements are supported by a document passage',
+            )
+        return InvestigationPlan(
+            goal='Find the requested workspace requirements',
+            additional_evidence_useful=True,
+            unknowns=['The applicable documented requirements'],
+            tool_calls=[{
+                'name': 'search_knowledge',
+                'arguments': {'question': 'NSNP requirements'},
+                'reason': 'The user explicitly requested stored knowledge',
+            }],
+            stop_condition='The requirements are supported by a document passage',
+        )
+
+    agent.provider.generate_structured = planned
+    update = client.portal.call(agent.plan, {
+        'case_id': 'empty-plan-retry', 'persist_case': False,
+        'workflow': 'knowledge', 'ticket': {'summary': 'From knowledge tell me NSNP requirements'},
+        'intent': {'knowledge_source': 'documents'}, 'evidence': [],
+    })
+
+    assert len(contexts) == 2
+    assert 'requests no tool' in contexts[1]['plan_validation_feedback']
+    assert update['plan']['tool_calls'][0]['name'] == 'search_knowledge'
+
+
+@pytest.mark.parametrize('request_text', [
+    'From knowledge tell me what are the requirements of NSNP.',
+    'Check knowledge for the NSNP requirements.',
+    'According to my uploaded PDF, who was injured?',
+])
+def test_explicit_local_source_scope_overrides_general_classifier(make_client, request_text):
+    client = make_client()
+    agent = client.app.state.agent
+
+    async def classified(stage, context, schema):
+        assert stage == 'classify_intent'
+        return RequestIntent(
+            workflow='knowledge', knowledge_source='general', goal='Answer the request',
+            justification='Incorrectly treated as model knowledge',
+        )
+
+    agent.provider.generate_structured = classified
+    update = client.portal.call(agent.classify_intent, {
+        'case_id': 'source-scope', 'persist_case': False,
+        'ticket': {'summary': request_text}, 'chat_messages': [],
+    })
+    assert update['intent']['knowledge_source'] == 'documents'
+
+
+def test_verifier_gap_routes_to_bounded_replanning(make_client):
+    agent = make_client({'MAX_INVESTIGATION_CYCLES': '2'}).app.state.agent
+    state = {
+        'research_iteration': 1,
+        'decision': {'question_for_human': None},
+        'verification': {'should_continue_research': True},
+    }
+    assert agent.verification_route(state) == 'plan'
+    state['research_iteration'] = 2
+    assert agent.verification_route(state) == 'finalize'
+
+
+def test_from_knowledge_request_executes_local_retrieval(make_client):
+    client = make_client({'MAX_RESEARCH_ROUNDS': '0'})
+    client.post('/ingest/paste', json={
+        'title': 'NSNP eligibility guide',
+        'text': (
+            'Nova Scotia Nominee Program skilled worker requirements include a full-time '
+            'permanent job offer from a Nova Scotia employer, one year of related work '
+            'experience, and the required language proficiency for the occupation.'
+        ),
+    })
+    calls = []
+    original = client.app.state.agent.harness.invoke
+
+    async def record(name, arguments):
+        calls.append(name)
+        return await original(name, arguments)
+
+    client.app.state.agent.harness.invoke = record
+    body = client.post('/ask', json={
+        'summary': 'From knowledge tell me what are the requirements of NSNP.'
+    }).json()
+
+    assert 'search_knowledge' in calls
+    assert any(event.get('tool') == 'search_knowledge' for event in body['events'])
 
 
 def test_tool_completion_streams_concise_observations(make_client):

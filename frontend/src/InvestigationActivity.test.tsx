@@ -74,3 +74,16 @@ test('shows the validated source selection and skipped sources', () => {
   expect(screen.getByText(/Inspect the live database structure/)).toBeInTheDocument()
   expect(screen.getByText(/Documents cannot establish current database contents/)).toBeInTheDocument()
 })
+
+test('uses workflow labels without decorative question marks', () => {
+  render(<InvestigationActivity events={[{
+    sequence: 8,
+    kind: 'workflow',
+    stage: 'recovery',
+    status: 'completed',
+    summary: 'Recovery required: plan a new evidence lookup',
+    missing_information: ['Employment requirements remain unsupported'],
+  }]} busy={false} onCancel={vi.fn()} />)
+  expect(screen.getByText(/Recovery ·/)).toBeInTheDocument()
+  expect(screen.queryByText('?')).not.toBeInTheDocument()
+})

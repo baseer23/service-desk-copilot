@@ -105,3 +105,7 @@ The MCP normalization, public-research, inventory-context and Groq structured-ou
 ### 2026-10-21 automatic document-graph ingestion
 
 The upload, Azure Document Intelligence and Neo4j reference-graph changes do not modify Speech transport, SDK lifecycle, transcript ownership, continuous recognition or usage accounting. No Speech test, live Azure Speech request or physical microphone check was run for this revision.
+
+### 2026-10-21 observable investigation recovery
+
+The planning, evidence verification, activity-stream and Investigation Activity changes do not modify Voice or Speech code, SDK lifecycle, continuous recognition, transcript ownership or usage accounting. No Speech test, live Azure Speech request or physical microphone check was run; the existing live Speech blockers remain unchanged.

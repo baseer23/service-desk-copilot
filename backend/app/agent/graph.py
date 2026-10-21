@@ -626,9 +626,16 @@ class ServiceDeskAgent:
         )
         # Enforce explicit user-specified source scope, not keyword-based
         # topic routing. The planner still chooses relevant local tools.
+        request_text = state["ticket"]["summary"]
         explicit_local = bool(re.search(
-            r"\b(?:from|check|search|use)\s+(?:(?:my|our|the|saved|uploaded|internal)\s+){0,3}(?:knowledge|kb)\b",
-            state["ticket"]["summary"], flags=re.IGNORECASE,
+            r"(?:\b(?:from|check|search|use)\s+(?:(?:my|our|the|saved|uploaded|internal)\s+){0,3}(?:knowledge|kb)\b"
+            r"|\baccording\s+to\s+(?:(?:my|our|the)\s+)?(?:uploaded|saved|local)\s+(?:pdf|document|file|newspaper)\b)",
+            request_text, flags=re.IGNORECASE,
+        ))
+        explicit_public = bool(re.search(
+            r"\b(?:search|check|look\s+up)\s+(?:online|the\s+(?:web|internet))\b"
+            r"|\blatest\s+official\s+(?:requirements|rules|regulations|guidance)\b",
+            request_text, flags=re.IGNORECASE,
         ))
         if explicit_local and intent.workflow == "knowledge" and intent.knowledge_source != "documents":
             intent = intent.model_copy(update={
@@ -642,6 +649,20 @@ class ServiceDeskAgent:
                 "source_scope", "completed",
                 "Source scope constrained to the user's saved knowledge",
                 rationale="The request explicitly specified the local knowledge workspace.",
+            )
+        elif explicit_public and intent.workflow == "knowledge" and intent.knowledge_source != "public_web":
+            intent = intent.model_copy(update={
+                "knowledge_source": "public_web",
+                "public_topic": "web",
+                "justification": (
+                    "The user explicitly requested current public sources. "
+                    "Select authorized web evidence before answering."
+                ),
+            })
+            await emit(
+                "source_scope", "completed",
+                "Source scope constrained to current public sources",
+                rationale="The request explicitly asked for online or latest official information.",
             )
         await self.note(
             state, "classify_intent", f"Request classified: {intent.workflow}", self.provider.name()
@@ -1505,6 +1526,7 @@ class ServiceDeskAgent:
         plan = state.get("plan") or {}
         return (
             state.get("workflow") == "knowledge"
+            and state.get("intent", {}).get("knowledge_source") == "general"
             and not plan.get("tool_calls")
             and plan.get("additional_evidence_useful") is False
         )
@@ -1843,7 +1865,30 @@ class ServiceDeskAgent:
             rationale=verification.justification[:600],
             supported_count=len(verification.supported_claims),
             unsupported_count=len(verification.unsupported_claims),
+            next_action=(
+                "Plan a different authorized lookup for the unresolved evidence gap"
+                if verification.should_continue_research
+                and state.get("research_iteration", 0) < self.settings.max_investigation_cycles
+                else "Finalize with the specific remaining limitation"
+                if verification.unsupported_claims
+                else "Finalize the supported answer"
+            ),
         )
+        if (
+            not clarifying
+            and verification.should_continue_research
+            and state.get("research_iteration", 0) < self.settings.max_investigation_cycles
+        ):
+            await emit(
+                "recovery",
+                "completed",
+                "Recovery required: plan a new evidence lookup",
+                rationale=verification.justification[:600],
+                missing_information=(
+                    verification.missing_evidence + verification.unsupported_claims
+                )[:4],
+                next_action="Choose a new authorized source or meaningfully different query",
+            )
         result = {
             "verification": verification.model_dump(),
             "confidence": min(state.get("confidence", 0), verification.confidence),
@@ -1890,14 +1935,17 @@ class ServiceDeskAgent:
         if (
             not decision.get("question_for_human")
             and v.get("should_continue_research")
-            and state.get("research_iteration", 0) < 2
+            and state.get("research_iteration", 0) < self.settings.max_investigation_cycles
         ):
             # Verification identified a material gap. Ask the model to PLAN
             # a different authorized source instead of blindly regenerating
             # the same answer against unchanged evidence. One recovery pass
             # remains bounded by research_iteration.
             return "plan"
-        if state.get("decision_issues") and state.get("research_iteration", 0) < 2:
+        if (
+            state.get("decision_issues")
+            and state.get("research_iteration", 0) < self.settings.max_investigation_cycles
+        ):
             # One bounded schema/policy correction is allowed without another
             # source lookup. This cannot become an evidence-reconsideration loop.
             return "reason"
