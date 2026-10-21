@@ -377,6 +377,17 @@ def create_app(settings: Settings | None = None):
             "ms": 0, "duplicate": uploaded["duplicate"], "content_hash": uploaded["id"],
         }
 
+    def require_auto_graph_writer() -> None:
+        if not s.auto_document_graph_ingestion:
+            return
+        if not s.uses_record_store or not s.azure_document_endpoint or not app.state.graph_writer["available"]:
+            raise HTTPException(
+                503,
+                "Automatic Azure Document Intelligence + Neo4j ingestion requires "
+                "local persistent records, an Azure DI endpoint and an authorized "
+                "Neo4j ingestion writer. No cloud extraction was started.",
+            )
+
     async def document_upload(
         file: UploadFile, title: str | None, tool: str,
         ingestion_mode: str = "standard",
@@ -412,13 +423,17 @@ def create_app(settings: Settings | None = None):
                 arguments["title"] = title or file.filename
                 arguments["ingestion_mode"] = ingestion_mode
                 arguments["document_processing"] = document_processing
+            elif tool == "extract_staged_document" and s.auto_document_graph_ingestion:
+                arguments["title"] = title or file.filename
+                arguments["graph_enrich"] = True
             return (await app.state.agent.harness.invoke(tool, arguments))["result"]
         finally:
             staged.unlink(missing_ok=True)
 
     @app.post("/documents/extract")
     async def extract_upload(file: UploadFile = File(...)):
-        return await document_upload(file, None, "extract_staged_document")
+        require_auto_graph_writer()
+        return await document_upload(file, file.filename, "extract_staged_document")
 
     @app.post("/documents/upload")
     async def save_upload(
@@ -430,6 +445,9 @@ def create_app(settings: Settings | None = None):
             raise HTTPException(400, "ingestion_mode must be standard or structured_graph")
         if document_processing not in {"local", "azure_di"}:
             raise HTTPException(400, "document_processing must be local or azure_di")
+        require_auto_graph_writer()
+        if s.auto_document_graph_ingestion:
+            ingestion_mode, document_processing = "structured_graph", "azure_di"
         return await document_upload(
             file, title, "save_document", ingestion_mode, document_processing
         )
