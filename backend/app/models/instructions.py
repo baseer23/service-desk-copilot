@@ -30,12 +30,14 @@ implementation details or emit conflicting operations. Use needs_clarification w
 when the target, scope or exact characters are ambiguous.""",
     "classify_intent": """Classify the incoming request using conversation history. Stable facts
 and ordinary conversation use workflow=knowledge, knowledge_source=general and public_topic=none.
-Preserve explicit source scope: requests to answer "from knowledge", "from my document",
-"from the uploaded newspaper", or from the workspace are about LOCAL stored knowledge,
-regardless of whether the document itself covers a news event. Do not classify these
+Preserve explicit source scope: requests to answer "from knowledge", "check knowledge",
+"from my document", "from the uploaded newspaper", or from the workspace are about
+LOCAL stored knowledge (knowledge_source=documents), not stable model recall,
+regardless of whether the document itself covers a news event or government program.
+Do not reinterpret an explicit local-KB request as a request for general knowledge. Do not classify these
 as public_web merely because the subject is newsworthy. Do not invent internal evidence.
 News, recent events, latest developments and explicit internet searches use workflow=knowledge and
-knowledge_source=public_web; current-news requests use public_topic=news and other internet searches
+knowledge_source=public_web unless the user explicitly restricts sources to local knowledge; current-news requests use public_topic=news and other internet searches
 use public_topic=web. Resolve follow-ups from history: 'Can you search it?' after a question about
 Alberta retains Alberta in the goal and uses public_web. Expansion requests such as 'explain more',
 'give me steps', 'make it detailed', 'how exactly?' and 'what next?' retain the subject, model and
@@ -84,7 +86,12 @@ the structure of an intentionally unsaved preview but cannot establish its text;
 upload the original again when answering requires content that was not retained. Select connected live-system tools for current
 operational facts and combine sources only when each is justified. Select tools from the request,
 entities, evidence gaps and actual prior observations; justify each call. Set
-additional_evidence_useful=false only when a truthful answer can be produced without retrieval.
+additional_evidence_useful=false only for stable, general knowledge that does not need
+live or workspace evidence. Never classify government-program eligibility, application
+document requirements, regulations, current vendor behavior, or other changing
+requirements as stable general knowledge. If you determine additional evidence is
+useful, you MUST select an available tool or justify one necessary user clarification.
+Do not return empty tool_calls with additional_evidence_useful=true.
 Resolve references such as "those numbers" against supplied conversation before writing
 search queries. If there is grounded context, create a standalone content-specific retrieval
 query, not an unresolved pronoun. In a new conversation, catalog metadata can justify
@@ -329,8 +336,9 @@ def stage_instructions(stage: str, context: dict) -> str:
             " evidence lookup needs it. If the exact error is already supplied, choose the"
             " next missing diagnostic fact such as the client or device."
             " If verification rejected the previous candidate, treat its unsupported_claims and"
-            " missing_evidence as new observations. Revise the candidate, select an authorized"
-            " source, or ask one useful clarification; do not simply repeat the rejected answer."
+            " missing_evidence as new observations. Choose an authorized new source or a"
+            " meaningfully different query, or ask one useful clarification. Do not repeat the"
+            " rejected answer against unchanged evidence or fabricate missing document content."
             " Treat supplied list_documents evidence as the authoritative bounded workspace"
             " inventory. When the user asks which documents are available, enumerate every"
             " supplied inventory item and its relevant status; never ask the user to provide"
