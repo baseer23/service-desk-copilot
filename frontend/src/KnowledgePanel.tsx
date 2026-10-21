@@ -54,6 +54,7 @@ export default function KnowledgePanel({
   const [neo4jRead, setNeo4jRead] = useState(true)
   const [hybrid, setHybrid] = useState(false)
   const picker = useRef<HTMLInputElement>(null)
+  const autoGraph = readiness?.automatic_graph_ingestion_enabled === true
   const indexingBlocked = readiness?.semantic_ingestion_ready === false
   const urlBlocked = readiness?.url_ingestion_enabled === false
 
