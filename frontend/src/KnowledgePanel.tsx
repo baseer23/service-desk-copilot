@@ -110,7 +110,9 @@ export default function KnowledgePanel({
       }
       if (kind === 'extract') {
         setPreview(result.text ?? '')
-        setMessage(`Text preview is ready (${result.pages} page(s)).`)
+        setMessage(autoGraph
+          ? `Azure Document Intelligence extracted ${result.pages} page(s). Structural references are saved in Neo4j; the original was not saved in DeskMate.`
+          : `Text preview is ready (${result.pages} page(s)).`)
       } else if (result.status && result.status !== 'ready') {
         const stage: Record<string, string> = {
           queued: 'Extracting', extracting: 'Extracting', structuring: 'Structuring',
