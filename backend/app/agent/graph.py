@@ -729,6 +729,28 @@ class ServiceDeskAgent:
             plan = await self.provider.generate_structured("plan", context, InvestigationPlan)
             try:
                 self.harness.validate_plan(plan, state["workflow"])
+                if not plan.tool_calls and plan.additional_evidence_useful and not plan.clarification_needed:
+                    raise ValueError(
+                        "The plan says more evidence is required but requests no tool. "
+                        "Choose an authorized retrieval tool, ask one justified clarification, "
+                        "or, for stable general knowledge only, explicitly set "
+                        "additional_evidence_useful=false."
+                    )
+                if (
+                    state.get("workflow") == "knowledge"
+                    and state.get("intent", {}).get("knowledge_source") in {"documents", "public_web"}
+                    and not plan.tool_calls
+                    and not plan.clarification_needed
+                ):
+                    raise ValueError(
+                        "This question needs the selected source scope. Plan a real "
+                        "document/web retrieval or request one material clarification."
+                    )
+                if plan.tool_calls and not plan.additional_evidence_useful:
+                    raise ValueError(
+                        "Tool calls contradict additional_evidence_useful=false. "
+                        "Set it true when collecting observations."
+                    )
                 answered_questions = {
                     str(item.get("question") or "").strip().casefold()
                     for item in state.get("human_answers", [])
@@ -755,7 +777,7 @@ class ServiceDeskAgent:
                     if isinstance(exc, ValidationError)
                     else str(exc)
                     if str(exc).startswith("The proposed clarification was already answered")
-                    else "Choose only permitted capabilities from available_tools."
+                    else str(exc)[:500] or "Choose only permitted capabilities from available_tools."
                 )
         await self.note(
             state,
@@ -1400,8 +1422,17 @@ class ServiceDeskAgent:
         await emit(
             "evidence_evaluation",
             "completed",
-            "Evidence evaluated; deciding whether more information is needed",
+            "Assessment selected: " + (
+                "collect additional evidence" if requested_tools or decision.needs_web_research
+                else "ask for clarification" if decision.question_for_human
+                else "prepare a supported answer" if decision.enough_information and decision.answer
+                else "report remaining evidence gap"
+            ),
             rationale=(decision.decision_justification or decision.evidence_summary)[:600],
+            actions=[
+                {"tool": call.name, "reason": call.reason[:300]}
+                for call in requested_tools
+            ],
             research_queries=decision.research_queries,
             missing_information=[item.description for item in decision.missing_information[:4]],
             next_action=(
@@ -1779,7 +1810,9 @@ class ServiceDeskAgent:
         await emit(
             "verification_summary",
             "completed",
-            "Answer candidate verified against collected evidence",
+            "Verification found unresolved claims"
+            if verification.unsupported_claims
+            else "Verification accepted the candidate assessment",
             rationale=verification.justification[:600],
             supported_count=len(verification.supported_claims),
             unsupported_count=len(verification.unsupported_claims),
@@ -1832,11 +1865,11 @@ class ServiceDeskAgent:
             and v.get("should_continue_research")
             and state.get("research_iteration", 0) < 2
         ):
-            # The verifier supplied a new observation about a rejected answer.
-            # Allow exactly one bounded revision so the model can correct the
-            # answer, select a source, or ask a clarification. A second
-            # verification remains terminal for this evidence pass.
-            return "reason"
+            # Verification identified a material gap. Ask the model to PLAN
+            # a different authorized source instead of blindly regenerating
+            # the same answer against unchanged evidence. One recovery pass
+            # remains bounded by research_iteration.
+            return "plan"
         if state.get("decision_issues") and state.get("research_iteration", 0) < 2:
             # One bounded schema/policy correction is allowed without another
             # source lookup. This cannot become an evidence-reconsideration loop.
