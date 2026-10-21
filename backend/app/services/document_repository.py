@@ -48,15 +48,15 @@ class DocumentRepository:
         identifier = hashlib.sha256(data).hexdigest()
         previous = self.records.read("document", identifier)
         if previous:
+            payload = self._upgrade_duplicate(
+                identifier, previous["payload"], ingestion_mode, document_processing
+            )
             return {
-                "id": identifier,
-                "duplicate": True,
-                "chunks": previous["payload"].get("chunks", 0),
-                "status": previous["payload"]["status"],
-                "storage": "local",
-                "indexed": previous["payload"]["status"] == "ready",
-                "ingestion_mode": previous["payload"].get("ingestion_mode", "standard"),
-                "document_processing": previous["payload"].get("document_processing", "local"),
+                "id": identifier, "duplicate": True,
+                "chunks": payload.get("chunks", 0), "status": payload["status"],
+                "storage": "local", "indexed": payload["status"] == "ready",
+                "ingestion_mode": payload.get("ingestion_mode", "standard"),
+                "document_processing": payload.get("document_processing", "local"),
             }
         self.blobs.put(identifier, "original", data, media_type)
         payload = {
@@ -95,7 +95,9 @@ class DocumentRepository:
         identifier = digest.hexdigest()
         previous = self.records.read("document", identifier)
         if previous:
-            payload = previous["payload"]
+            payload = self._upgrade_duplicate(
+                identifier, previous["payload"], ingestion_mode, document_processing
+            )
             return {**payload, "duplicate": True, "storage": "local", "indexed": payload["status"] == "ready"}
         if ingestion_mode not in {"standard", "structured_graph"}:
             raise ValueError("ingestion_mode must be standard or structured_graph")
@@ -118,6 +120,25 @@ class DocumentRepository:
             self.records.write("document", identifier, payload, create_only=True, fields={"status": "queued"})
             versions.append(identifier)
         return {**payload, "duplicate": False, "storage": "local", "indexed": False}
+
+    def _upgrade_duplicate(self, identifier, previous, ingestion_mode, document_processing):
+        """Upgrade local duplicates once, preserving ambiguous paid-operation guards."""
+        if ingestion_mode != "structured_graph" or document_processing != "azure_di":
+            return previous
+        if previous.get("document_processing") != "azure_di":
+            updated = self.reprocess(identifier, document_processing="azure_di")
+            row = self.records.read("document", identifier)
+            updated = {**updated, "ingestion_mode": "structured_graph", "graph_link_status": "pending"}
+            self.records.write("document", identifier, updated, previous=row, fields={"status": updated["status"]})
+            return updated
+        if previous.get("ingestion_mode") != "structured_graph":
+            return self.prepare_graph_enrichment(identifier)
+        if previous.get("status") == "graph_pending" and previous.get("phase") == "link":
+            row = self.records.read("document", identifier)
+            updated = {**previous, "status": "queued"}
+            self.records.write("document", identifier, updated, previous=row, fields={"status": "queued"})
+            return updated
+        return previous
 
     def save(self, text: str, title: str | None, source_type: str, pages: int = 1):
         return self.upload(text.encode(), title, "text/plain")
