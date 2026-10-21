@@ -150,6 +150,37 @@ def test_structured_upload_mode_is_explicit_persisted_and_nonretroactive(make_cl
     assert duplicate["duplicate"] and duplicate["ingestion_mode"] == "structured_graph"
 
 
+def test_automatic_ingestion_accepts_plain_text_with_local_fallback(
+    make_client, monkeypatch
+):
+    import backend.app.services.local_documents as local_documents
+
+    monkeypatch.setattr(
+        local_documents,
+        "graph_writer_readiness",
+        lambda _settings: {"available": True, "blocker": None},
+    )
+    client = make_client(
+        {
+            "AUTO_DOCUMENT_GRAPH_INGESTION": "true",
+            "LOCAL_PERSISTENCE_ENABLED": "true",
+            "AZURE_DOCUMENT_ENDPOINT": None,
+            "NEO4J_URI": "neo4j+s://fictional.example",
+            "NEO4J_INGESTION_ENABLED": "true",
+            "NEO4J_INGESTION_USER": "isolated-writer",
+            "NEO4J_INGESTION_PASSWORD": "isolated-secret",
+        }
+    )
+    response = client.post(
+        "/documents/upload",
+        files={"file": ("notes.txt", b"Local fallback content", "text/plain")},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ingestion_mode"] == "structured_graph"
+    assert body["document_processing"] == "local"
+
+
 def test_simultaneous_local_cases_remain_separate(make_client):
     client = make_client()
     summaries = [

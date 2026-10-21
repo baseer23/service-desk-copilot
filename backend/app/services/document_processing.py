@@ -130,6 +130,9 @@ class AzureDocumentExtractor:
                                 {"offset": span.offset, "length": span.length}
                                 for span in getattr(cell, "spans", None) or []
                             ],
+                            "bounding_regions": _regions(
+                                getattr(cell, "bounding_regions", None) or [], offset
+                            ),
                         }
                         for cell in table.cells
                     ]

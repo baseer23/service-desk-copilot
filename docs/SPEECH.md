@@ -101,3 +101,7 @@ The upload changes do not alter Speech transport or recognition. Per explicit in
 ### 2026-10-20 recovery integration
 
 The MCP normalization, public-research, inventory-context and Groq structured-output recovery changes do not modify Speech transport, continuous recognition, transcript ownership, usage accounting or browser microphone behavior. No Speech test, live Azure Speech request or physical microphone check was run for this revision.
+
+### 2026-10-21 automatic document-graph ingestion
+
+The upload, Azure Document Intelligence and Neo4j reference-graph changes do not modify Speech transport, SDK lifecycle, transcript ownership, continuous recognition or usage accounting. No Speech test, live Azure Speech request or physical microphone check was run for this revision.

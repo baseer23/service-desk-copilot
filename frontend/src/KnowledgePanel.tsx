@@ -104,6 +104,9 @@ export default function KnowledgePanel({
         chunks: number
         duplicate?: boolean
         status?: string
+        method?: string
+        graph_nodes?: number
+        graph_relationships?: number
       }>(path, options)
       if (kind === 'index' && !readiness?.managed_documents && path === '/documents/upload' && result.id) {
         result = await request(`/documents/${result.id}/index`, post())
@@ -111,7 +114,7 @@ export default function KnowledgePanel({
       if (kind === 'extract') {
         setPreview(result.text ?? '')
         setMessage(autoGraph
-          ? `Azure Document Intelligence extracted ${result.pages} page(s). Structural references are saved in Neo4j; the original was not saved in DeskMate.`
+          ? `${result.method === 'document_intelligence' ? 'Azure Document Intelligence' : 'Local text fallback'} extracted ${result.pages} page(s). Neo4j linked ${result.graph_nodes ?? 0} nodes and ${result.graph_relationships ?? 0} relationships; the original and extracted text were not saved in DeskMate.`
           : `Text preview is ready (${result.pages} page(s)).`)
       } else if (result.status && result.status !== 'ready') {
         const stage: Record<string, string> = {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import hashlib
 import logging
@@ -147,7 +148,8 @@ class GraphRepository:
                 "n.link_status=$link_status, n.tenant_id=$tenant_id, "
                 "n.source_element_id=$source_element_id, n.azure_role=$azure_role, "
                 "n.span_offset=$span_offset, n.span_length=$span_length, "
-                "n.table_row=$table_row, n.table_column=$table_column",
+                "n.table_row=$table_row, n.table_column=$table_column, "
+                "n.bounding_regions_json=$bounding_regions_json",
                 id=self.scope(item["object_id"]),
                 original_id=item["object_id"],
                 document_id=doc_id,
@@ -166,6 +168,9 @@ class GraphRepository:
                 span_length=item.get("span_length"),
                 table_row=item.get("table_row"),
                 table_column=item.get("table_column"),
+                bounding_regions_json=json.dumps(
+                    item.get("bounding_regions", [])[:8], separators=(",", ":")
+                )[:4000],
             )
             tx.run(
                 f"MATCH (p:Page {{id:$page_id}}), (n:{label} {{id:$id}}) "

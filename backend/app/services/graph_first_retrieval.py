@@ -21,6 +21,8 @@ class GraphFirstRetrieval:
                 "HAS_CHUNK",
                 "HAS_TABLE",
                 "HAS_FIGURE",
+                "HAS_PARAGRAPH",
+                "HAS_CELL",
                 "REFERENCES_TABLE",
                 "REFERENCES_FIGURE",
                 "MENTIONS",

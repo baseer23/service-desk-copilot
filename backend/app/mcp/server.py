@@ -707,6 +707,8 @@ def list_available_context(question: str | None = None):
                 "tables": row.get("tables", 0),
                 "ingestion_mode": row.get("ingestion_mode"),
                 "graph_link_status": row.get("graph_link_status"),
+                "graph_nodes": row.get("graph_nodes"),
+                "graph_relationships": row.get("graph_relationships"),
                 "version": row.get("version", 1),
                 "created_at": row.get("created_at"),
                 "updated_at": row.get("updated_at"),

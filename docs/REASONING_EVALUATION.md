@@ -150,3 +150,9 @@ Focused stored-evidence checks exercised the production Chroma collection withou
 - Runtime: `/health` returned `status=ok`, Groq selected, local MCP/SQLite/Chroma ready, the official Neo4j MCP integration connected, and the separate direct Aura enrichment flag false; the frontend returned HTTP 200. DeskMate remained running through `make dev`.
 
 Focused regression checks executed in this revision passed (18 selected pytest cases across news flow, MCP shapes, source policy, provider recovery, inventory packing and clarification routing). Legacy full pytest, Vitest, Playwright and benchmark suites were intentionally not run.
+
+## Automatic document-graph reasoning boundary — 2026-10-21
+
+Saved structured uploads expose graph references that resolve only to tenant-owned local Chroma objects; actual text and page evidence remain the basis for answers. Unsaved previews deliberately create no local hydration record, so their Neo4j references produce a stale/unhydrated status rather than content evidence. Planner/reasoner instructions require the original to be uploaded again when the answer needs unretained text. Graph selection remains LLM-directed and optional rather than an unconditional query.
+
+Focused tests verified the reference-only privacy boundary, paragraph/table-cell relationships, versioned IDs, bounded retrieval and saved local hydration without calling Azure or production Neo4j. No live document question is claimed because automatic ingestion remains explicitly disabled and no billable extraction was authorized for this revision.

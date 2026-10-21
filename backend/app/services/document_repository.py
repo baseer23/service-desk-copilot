@@ -198,7 +198,9 @@ class DocumentRepository:
         phase = "structure"
         structured_texts = [
             item["text"]
-            for item in split_structured(identifier, extraction, self.settings.chunk_tokens)
+            for item in split_structured(
+                identifier, extraction, self.settings.chunk_tokens, state.get("version", 1)
+            )
         ]
         reusable = getattr(
             self.search_store, "reusable_vectors", lambda _identifier, _texts: None
@@ -355,7 +357,9 @@ class DocumentRepository:
             chunks = []
             ordinal = 0
             if state.get("ingestion_mode") == "structured_graph":
-                structured = split_structured(identifier, result, self.settings.chunk_tokens)
+                structured = split_structured(
+                    identifier, result, self.settings.chunk_tokens, state.get("version", 1)
+                )
                 for ordinal, item in enumerate(structured):
                     chunks.append(
                         {

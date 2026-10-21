@@ -67,7 +67,12 @@ def split_text(
     return chunks
 
 
-def split_structured(document_id: str, extraction: dict, chunk_tokens: int = DEFAULT_CHUNK_TOKENS):
+def split_structured(
+    document_id: str,
+    extraction: dict,
+    chunk_tokens: int = DEFAULT_CHUNK_TOKENS,
+    extraction_version: int = 1,
+):
     """Create stable, structure-aware searchable objects from a preserved extraction."""
     objects = []
 
@@ -75,7 +80,9 @@ def split_structured(document_id: str, extraction: dict, chunk_tokens: int = DEF
         text = str(text or "").strip()
         if not text:
             return
-        stable = hashlib.sha256(f"{document_id}:{kind}:{page}:{position}".encode()).hexdigest()[:24]
+        stable = hashlib.sha256(
+            f"{document_id}:{extraction_version}:{kind}:{page}:{position}".encode()
+        ).hexdigest()[:24]
         objects.append(
             {
                 "id": f"{document_id}-{kind.lower()}-{stable}",
@@ -160,6 +167,7 @@ def split_structured(document_id: str, extraction: dict, chunk_tokens: int = DEF
                 "\n".join(group),
                 table_id=table.get("id"),
                 row_group=group_index,
+                bounding_regions=table.get("bounding_regions", []),
             )
 
     for position, figure in enumerate(extraction.get("figures", [])):
@@ -174,6 +182,7 @@ def split_structured(document_id: str, extraction: dict, chunk_tokens: int = DEF
             figure_id=figure.get("id"),
             image_artifact=figure.get("image_artifact"),
             image_status=figure.get("image_status", "unsupported"),
+            bounding_regions=figure.get("bounding_regions", []),
         )
     return objects
 

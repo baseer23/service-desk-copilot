@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from zipfile import ZipFile
 
 import pytest
+from pydantic import SecretStr
 from backend.app.core.principal import Principal, principal_scope
 from backend.app.services.azure_document_formats import word_segments
 from backend.app.services.document_repository import DocumentRepository
@@ -311,3 +312,120 @@ def test_structured_mode_preserves_objects_and_stable_local_ids(settings):
     assert stored["tables"][0]["cells"][0]["row_span"] == 1
     assert "image_base64" not in stored["figures"][0]
     assert files.get(document["id"], stored["figures"][0]["image_artifact"]) == b"image"
+
+
+def test_plain_text_fallback_and_reference_counts_do_not_claim_azure(settings, tmp_path):
+    from backend.app.services.local_documents import (
+        LocalDocumentExtractor,
+        LocalDocumentRepository,
+    )
+    from backend.app.store.graph_repo import InMemoryGraphRepository
+
+    source = tmp_path / "notes.txt"
+    source.write_text("Heading\n\nA locally extracted support note.", encoding="utf-8")
+    extraction = LocalDocumentExtractor(settings, LocalRecords(settings)).extract_path(
+        source, "text/plain", enhanced=True, force_azure=True
+    )
+    assert extraction["method"] == "native_text"
+    assert extraction["metadata"]["classification_method"] == "local_text_fallback"
+
+    repository = object.__new__(LocalDocumentRepository)
+    repository.settings = SimpleNamespace(chunk_tokens=512)
+    graph = InMemoryGraphRepository()
+    counts = repository._publish_reference_objects(
+        graph, "d" * 64, "Local notes", extraction, temporary=True
+    )
+    assert counts == {"nodes": 3, "relationships": 2}
+    assert len(graph.references) == 1
+    assert "locally extracted support note" not in repr(graph.references).casefold()
+
+
+def test_azure_structure_counts_actual_nodes_and_relationships_without_text(settings):
+    from backend.app.services.local_documents import LocalDocumentRepository
+    from backend.app.store.graph_repo import InMemoryGraphRepository
+
+    extraction = {
+        "pages": [{"page": 1, "text": "Private body", "markdown": "Private body"}],
+        "paragraphs": [{
+            "id": "paragraph-1-0", "page": 1, "text": "Private body",
+            "role": None, "position": 0, "spans": [{"offset": 7, "length": 12}],
+        }],
+        "sections": [],
+        "tables": [{
+            "id": "table-1-0", "page": 1,
+            "cells": [{
+                "row": 0, "column": 0, "text": "Private cell",
+                "spans": [{"offset": 22, "length": 12}],
+            }],
+        }],
+        "figures": [{"id": "figure-1", "page": 1, "caption": None, "position": 0}],
+        "method": "document_intelligence",
+    }
+    repository = object.__new__(LocalDocumentRepository)
+    repository.settings = SimpleNamespace(chunk_tokens=512)
+    graph = InMemoryGraphRepository()
+    counts = repository._publish_reference_objects(
+        graph, "a" * 64, "Structured", extraction, temporary=False
+    )
+    assert counts == {"nodes": 7, "relationships": 7}
+    serialized = repr(graph.references)
+    assert "Private body" not in serialized and "Private cell" not in serialized
+    assert {item["object_type"] for item in graph.references.values()} == {
+        "Chunk", "Table", "Paragraph", "TableCell", "Figure",
+    }
+    first_ids = set(graph.references)
+    second_graph = InMemoryGraphRepository()
+    repository._publish_reference_objects(
+        second_graph, "a" * 64, "Structured", extraction, temporary=False, version=2
+    )
+    assert first_ids.isdisjoint(second_graph.references)
+
+
+def test_unsaved_preview_returns_text_but_persists_only_reference_metadata(
+    settings, tmp_path, monkeypatch
+):
+    import sys
+    from backend.app.services.local_documents import LocalDocumentRepository
+    from backend.app.store.graph_repo import InMemoryGraphRepository
+    import backend.app.store.graph_repo as graph_module
+
+    source = tmp_path / "preview.pdf"
+    source.write_bytes(b"temporary-original")
+    extraction = {
+        "pages": [{"page": 1, "text": "Preview-only private text", "markdown": ""}],
+        "paragraphs": [], "sections": [], "tables": [], "figures": [],
+        "method": "document_intelligence",
+    }
+    graph = InMemoryGraphRepository()
+
+    class Driver:
+        def verify_connectivity(self):
+            return None
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(graph_module, "GraphRepository", lambda *_args, **_kwargs: graph)
+    monkeypatch.setitem(
+        sys.modules,
+        "neo4j",
+        SimpleNamespace(GraphDatabase=SimpleNamespace(driver=lambda *_args, **_kwargs: Driver())),
+    )
+    repository = object.__new__(LocalDocumentRepository)
+    repository.settings = settings.model_copy(
+        update={
+            "auto_document_graph_ingestion": True,
+            "azure_document_endpoint": "https://isolated.example",
+            "neo4j_ingestion_enabled": True,
+            "neo4j_ingestion_user": "writer",
+            "neo4j_ingestion_password": SecretStr("secret"),
+        }
+    )
+    repository.extractor = SimpleNamespace(
+        extract_path=lambda *_args, **_kwargs: extraction
+    )
+    result = repository.preview_graph(source, "Unsaved preview", "application/pdf")
+    assert result["text"] == "Preview-only private text"
+    assert result["saved"] is False and result["source_persisted"] is False
+    assert result["graph_nodes"] == 3 and result["graph_relationships"] == 2
+    assert "Preview-only private text" not in repr(graph.references)

@@ -64,6 +64,22 @@ class LocalDocumentExtractor:
         self.settings, self.records = settings, records
 
     def extract(self, data, media_type, enhanced=False, force_azure=False):
+        if media_type in {"text/plain", "text/markdown"}:
+            text = data.decode("utf-8-sig")
+            if not text.strip():
+                raise ValueError("The document contains no readable text")
+            return {
+                "pages": [{"page": 1, "text": text, "markdown": text, "spans": []}],
+                "paragraphs": [], "sections": [], "tables": [], "figures": [],
+                "method": "native_text",
+                "metadata": {
+                    "format": media_type, "page_count": 1, "table_count": 0,
+                    "classification": "text_document",
+                    "classification_method": "local_text_fallback",
+                    "structured": enhanced,
+                    "image_understanding": "not_applicable",
+                },
+            }
         # Native extraction avoids uploading ordinary PDFs to any cloud service.
         if media_type == "application/pdf" and not force_azure:
             from backend.app.services.local_pdf import extract_pdf_pages
@@ -95,6 +111,8 @@ class LocalDocumentExtractor:
                 extractor.credential.close()
 
     def extract_path(self, path, media_type, enhanced=False, force_azure=False, **callbacks):
+        if media_type in {"text/plain", "text/markdown"}:
+            return self.extract(path.read_bytes(), media_type, enhanced, force_azure=False)
         if media_type == "application/pdf" and not force_azure:
             from backend.app.services.local_pdf import extract_pdf_pages_path
 
@@ -162,11 +180,10 @@ class LocalDocumentRepository(DocumentRepository):
         The graph metadata persists intentionally, even after the staged file
         is deleted. A later saved upload of identical bytes reuses its doc ID.
         """
-        import hashlib
-
+        local_text = media_type in {"text/plain", "text/markdown"}
         if not (
             self.settings.auto_document_graph_ingestion
-            and self.settings.azure_document_endpoint
+            and (local_text or self.settings.azure_document_endpoint)
             and self.settings.neo4j_ingestion_enabled
             and self.settings.neo4j_ingestion_user
             and self.settings.neo4j_ingestion_password.get_secret_value()
@@ -178,7 +195,7 @@ class LocalDocumentRepository(DocumentRepository):
                 digest.update(block)
         identifier = digest.hexdigest()
         extracted = self.extractor.extract_path(
-            source, media_type, enhanced=True, force_azure=True
+            source, media_type, enhanced=True, force_azure=not local_text
         )
         from backend.app.store.graph_repo import GraphRepository
         from neo4j import GraphDatabase
@@ -203,7 +220,7 @@ class LocalDocumentRepository(DocumentRepository):
                 database=self.settings.neo4j_database,
             )
             graph.ensure_constraints()
-            objects = self._publish_reference_objects(
+            graph_counts = self._publish_reference_objects(
                 graph, identifier, title, extracted, temporary=True
             )
         finally:
@@ -215,9 +232,10 @@ class LocalDocumentRepository(DocumentRepository):
             "text": preview[:40000],
             "pages": len(extracted["pages"]),
             "chunks": 0,
-            "graph_objects": objects,
+            "graph_nodes": graph_counts["nodes"],
+            "graph_relationships": graph_counts["relationships"],
             "graph_link_status": "linked",
-            "method": "document_intelligence",
+            "method": extracted.get("method", "unknown"),
             "saved": False,
             "source_persisted": False,
         }
@@ -228,10 +246,11 @@ class LocalDocumentRepository(DocumentRepository):
         All text/values remain outside Neo4j. Links represent actual hierarchy,
         page membership or table-cell containment, not invented semantic facts.
         """
-        import hashlib
         from backend.app.services.chunking import split_structured
 
-        objects = split_structured(identifier, extracted, self.settings.chunk_tokens)
+        objects = split_structured(
+            identifier, extracted, self.settings.chunk_tokens, version
+        )
         paragraphs = extracted.get("paragraphs", [])
         cells = [
             (table, cell)
@@ -240,6 +259,7 @@ class LocalDocumentRepository(DocumentRepository):
         ]
         if len(objects) + len(paragraphs) + len(cells) > 5000:
             raise ValueError("Document contains too many graph reference objects")
+        node_count, relationship_count = 1, 0
         graph.upsert_document(
             identifier, str(title or "Untitled")[:160],
             "unsaved_azure_layout_references" if temporary else "structured_local_document",
@@ -257,6 +277,8 @@ class LocalDocumentRepository(DocumentRepository):
         })
         for page in pages:
             graph.upsert_page(identifier, page, version)
+            node_count += 1
+            relationship_count += 1
         for item in objects:
             graph.upsert_reference_object(
                 identifier,
@@ -270,11 +292,14 @@ class LocalDocumentRepository(DocumentRepository):
                         item.get("source_id") or item.get("table_id")
                         or item.get("figure_id") or item["object_id"]
                     ),
+                    "bounding_regions": item.get("bounding_regions", []),
                     "content_hash": hashlib.sha256(item["text"].encode()).hexdigest(),
                     "source_provenance": "azure_document_intelligence" if extracted.get("method") == "document_intelligence" else "saved_local_extraction",
                     "link_status": "reference_only_unsaved" if temporary else "linked",
                 },
             )
+            node_count += 1
+            relationship_count += 1
         section_map = {
             obj.get("source_id"): obj["object_id"]
             for obj in objects if obj["object_type"] == "Section"
@@ -284,10 +309,12 @@ class LocalDocumentRepository(DocumentRepository):
                 graph.link_reference_objects(
                     section_map[obj["section_id"]], obj["object_id"], "HAS_CHUNK"
                 )
+                relationship_count += 1
         for section in extracted.get("sections", []):
             parent, child = section_map.get(section.get("parent_id")), section_map.get(section.get("id"))
             if parent and child and parent != child:
                 graph.link_reference_objects(parent, child, "HAS_SECTION")
+                relationship_count += 1
         # Azure can identify a figure even when it has no caption. Retain
         # its reference node instead of silently dropping a valid API element.
         indexed_figure_ids = {
@@ -297,7 +324,7 @@ class LocalDocumentRepository(DocumentRepository):
             if figure.get("id") in indexed_figure_ids:
                 continue
             figure_id = "FIG" + hashlib.sha256(
-                f"{identifier}:{figure.get('id')}:{figure.get('page')}".encode()
+                f"{identifier}:{version}:{figure.get('id')}:{figure.get('page')}".encode()
             ).hexdigest()[:24]
             graph.upsert_reference_object(
                 identifier,
@@ -305,6 +332,7 @@ class LocalDocumentRepository(DocumentRepository):
                     "object_id": figure_id, "object_type": "Figure",
                     "page": figure.get("page"), "position": figure.get("position"),
                     "source_element_id": str(figure.get("id") or ""),
+                    "bounding_regions": figure.get("bounding_regions", []),
                     "description": f"Figure reference on page {figure.get('page')}",
                     "version": version,
                     "content_hash": hashlib.sha256(
@@ -318,6 +346,8 @@ class LocalDocumentRepository(DocumentRepository):
                     "link_status": "reference_only_unsaved" if temporary else "linked",
                 },
             )
+            node_count += 1
+            relationship_count += 1
         active_section_id = None
         for paragraph in paragraphs:
             if paragraph.get("role") in {"title", "sectionHeading"}:
@@ -325,7 +355,7 @@ class LocalDocumentRepository(DocumentRepository):
                 active_section_id = section_map.get(heading_key)
             source_id = str(paragraph.get("id") or "")
             paragraph_id = "PAR" + hashlib.sha256(
-                f"{identifier}:{source_id}:{paragraph.get('page')}:{paragraph.get('position')}".encode()
+                f"{identifier}:{version}:{source_id}:{paragraph.get('page')}:{paragraph.get('position')}".encode()
             ).hexdigest()[:24]
             graph.upsert_reference_object(
                 identifier,
@@ -333,6 +363,7 @@ class LocalDocumentRepository(DocumentRepository):
                     "object_id": paragraph_id, "object_type": "Paragraph",
                     "page": paragraph.get("page"), "position": paragraph.get("position"),
                     "source_element_id": source_id,
+                    "bounding_regions": paragraph.get("bounding_regions", []),
                     "azure_role": paragraph.get("role"),
                     "span_offset": (paragraph.get("spans") or [{}])[0].get("offset"),
                     "span_length": (paragraph.get("spans") or [{}])[0].get("length"),
@@ -344,21 +375,25 @@ class LocalDocumentRepository(DocumentRepository):
                     "link_status": "reference_only_unsaved" if temporary else "linked",
                 },
             )
+            node_count += 1
+            relationship_count += 1
             if active_section_id:
                 graph.link_reference_objects(active_section_id, paragraph_id, "HAS_PARAGRAPH")
+                relationship_count += 1
         table_objects = {}
         for obj in objects:
             if obj["object_type"] == "Table":
                 table_objects.setdefault(obj.get("table_id"), []).append(obj["object_id"])
         for table, cell in cells:
             cell_id = "CELL" + hashlib.sha256(
-                f"{identifier}:{table.get('id')}:{cell.get('row')}:{cell.get('column')}".encode()
+                f"{identifier}:{version}:{table.get('id')}:{cell.get('row')}:{cell.get('column')}".encode()
             ).hexdigest()[:24]
             graph.upsert_reference_object(
                 identifier,
                 {
                     "object_id": cell_id, "object_type": "TableCell",
                     "page": table.get("page"), "source_element_id": str(table.get("id")),
+                    "bounding_regions": cell.get("bounding_regions", []),
                     "span_offset": (cell.get("spans") or [{}])[0].get("offset"),
                     "span_length": (cell.get("spans") or [{}])[0].get("length"),
                     "table_row": cell.get("row"), "table_column": cell.get("column"),
@@ -370,14 +405,16 @@ class LocalDocumentRepository(DocumentRepository):
                     "link_status": "reference_only_unsaved" if temporary else "linked",
                 },
             )
+            node_count += 1
+            relationship_count += 1
             for table_id in table_objects.get(table.get("id"), []):
                 graph.link_reference_objects(table_id, cell_id, "HAS_CELL")
-        return len(objects) + len(paragraphs) + len(cells)
+                relationship_count += 1
+        return {"nodes": node_count, "relationships": relationship_count}
 
     def _link_structured(self, identifier, state):
         """Publish reference-only structure with explicitly separate writer credentials."""
         import json
-        from backend.app.services.chunking import split_structured
 
         configured = (
             self.settings.neo4j_ingestion_enabled
@@ -420,18 +457,20 @@ class LocalDocumentRepository(DocumentRepository):
             extraction = json.loads(
                 self.blobs.get(identifier, state.get("extraction_artifact", "extraction.json"))
             )
-            self._publish_reference_objects(
+            graph_counts = self._publish_reference_objects(
                 graph, identifier, state.get("title"), extraction,
                 temporary=False, version=state.get("version", 1),
             )
-            return self._set_graph_status(identifier, state, "ready")
+            return self._set_graph_status(
+                identifier, state, "ready", graph_counts=graph_counts
+            )
         except Exception:
             return self._set_graph_status(identifier, state, "graph_pending")
         finally:
             if driver:
                 driver.close()
 
-    def _set_graph_status(self, identifier, state, status):
+    def _set_graph_status(self, identifier, state, status, graph_counts=None):
         row = self.records.read("document", identifier)
         updated = {
             **state,
@@ -440,5 +479,10 @@ class LocalDocumentRepository(DocumentRepository):
             "local_index_ready": bool(state.get("chunks")),
             "graph_link_status": "linked" if status == "ready" else "pending",
         }
+        if graph_counts:
+            updated.update(
+                graph_nodes=graph_counts["nodes"],
+                graph_relationships=graph_counts["relationships"],
+            )
         self.records.write("document", identifier, updated, previous=row, fields={"status": status})
         return updated

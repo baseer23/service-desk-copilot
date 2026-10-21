@@ -377,12 +377,14 @@ def create_app(settings: Settings | None = None):
             "ms": 0, "duplicate": uploaded["duplicate"], "content_hash": uploaded["id"],
         }
 
-    async def require_auto_graph_writer() -> None:
+    async def require_auto_graph_writer(*, requires_azure: bool) -> None:
         if not s.auto_document_graph_ingestion:
             return
-        if not s.uses_record_store or not s.azure_document_endpoint:
+        if not s.uses_record_store or (requires_azure and not s.azure_document_endpoint):
             raise HTTPException(
-                503, "Automatic ingestion requires a persistent local document store and Azure DI endpoint."
+                503,
+                "Automatic ingestion requires a persistent local document store"
+                + (" and Azure DI endpoint." if requires_azure else "."),
             )
         # Revalidate the writer BEFORE starting a potentially billable extraction.
         from backend.app.services.local_documents import graph_writer_readiness
@@ -415,12 +417,8 @@ def create_app(settings: Settings | None = None):
         }.get(suffix)
         if media_type is None:
             raise HTTPException(400, "Choose a PDF, Word, image, .txt or .md document")
-        if s.auto_document_graph_ingestion and media_type in {"text/plain", "text/markdown"}:
-            raise HTTPException(
-                415,
-                "Azure Document Intelligence layout extraction does not accept .txt or .md "
-                "files. Upload PDF, DOCX or a supported image for Azure + Neo4j ingestion.",
-            )
+        local_text = media_type in {"text/plain", "text/markdown"}
+        await require_auto_graph_writer(requires_azure=not local_text)
         staging = (s.local_documents_dir / ".uploads").resolve()
         staging.mkdir(mode=0o700, parents=True, exist_ok=True)
         token = secrets.token_hex(32)
@@ -435,7 +433,10 @@ def create_app(settings: Settings | None = None):
                 tool = "save_staged_document"
                 arguments["title"] = title or file.filename
                 arguments["ingestion_mode"] = ingestion_mode
-                arguments["document_processing"] = document_processing
+                arguments["document_processing"] = (
+                    "local" if s.auto_document_graph_ingestion and local_text
+                    else document_processing
+                )
             elif tool == "extract_staged_document" and s.auto_document_graph_ingestion:
                 arguments["title"] = title or file.filename
                 arguments["graph_enrich"] = True
@@ -445,7 +446,6 @@ def create_app(settings: Settings | None = None):
 
     @app.post("/documents/extract")
     async def extract_upload(file: UploadFile = File(...)):
-        await require_auto_graph_writer()
         return await document_upload(file, file.filename, "extract_staged_document")
 
     @app.post("/documents/upload")
@@ -458,7 +458,6 @@ def create_app(settings: Settings | None = None):
             raise HTTPException(400, "ingestion_mode must be standard or structured_graph")
         if document_processing not in {"local", "azure_di"}:
             raise HTTPException(400, "document_processing must be local or azure_di")
-        await require_auto_graph_writer()
         if s.auto_document_graph_ingestion:
             ingestion_mode, document_processing = "structured_graph", "azure_di"
         return await document_upload(
@@ -467,6 +466,7 @@ def create_app(settings: Settings | None = None):
 
     @app.post("/documents/paste")
     async def save_pasted_document(body: IngestPasteRequest):
+        await require_auto_graph_writer(requires_azure=False)
         return (
             await app.state.agent.harness.invoke(
                 "save_document",
@@ -474,6 +474,10 @@ def create_app(settings: Settings | None = None):
                     "data_base64": base64.b64encode(body.text.encode()).decode(),
                     "title": body.title,
                     "media_type": "text/plain",
+                    "ingestion_mode": (
+                        "structured_graph" if s.auto_document_graph_ingestion else "standard"
+                    ),
+                    "document_processing": "local",
                 },
             )
         )["result"]

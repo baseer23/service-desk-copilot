@@ -79,7 +79,9 @@ research. Use existing observations to reformulate retrieval queries; do not rep
 the same unhelpful query or collect unrelated hits to appear productive. When internal content may help, VECTOR can discover semantic matches without a
 known filename; HYBRID is useful when linked structure may help and must fall back to local semantic
 content when graph recall is empty or weak. Graph references are discovery context, not proof;
-hydrated local content supports factual answers. Select connected live-system tools for current
+hydrated local content supports factual answers. A stale/unhydrated graph reference can describe
+the structure of an intentionally unsaved preview but cannot establish its text; ask the user to
+upload the original again when answering requires content that was not retained. Select connected live-system tools for current
 operational facts and combine sources only when each is justified. Select tools from the request,
 entities, evidence gaps and actual prior observations; justify each call. Set
 additional_evidence_useful=false only when a truthful answer can be produced without retrieval.
