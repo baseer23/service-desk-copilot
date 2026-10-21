@@ -79,8 +79,8 @@ export default function KnowledgePanel({
         const body = new FormData()
         body.append('file', file)
         if (title) body.append('title', title)
-        body.append('document_processing', azureDi ? 'azure_di' : 'local')
-        body.append('ingestion_mode', hybrid ? 'structured_graph' : 'standard')
+        body.append('document_processing', autoGraph || azureDi ? 'azure_di' : 'local')
+        body.append('ingestion_mode', autoGraph || hybrid ? 'structured_graph' : 'standard')
         options = { method: 'POST', body }
         path =
           readiness?.managed_documents && kind !== 'extract' ? '/documents/upload' :
@@ -162,27 +162,33 @@ export default function KnowledgePanel({
     <section className="card knowledge-card">
       <h2>Documents and knowledge</h2>
       <div className="knowledge-switches" aria-label="Knowledge processing options">
-        <Switch label="Azure Document Intelligence" checked={azureDi}
-          disabled={busy || readiness?.azure_document_intelligence_available === false}
+        <Switch label="Azure Document Intelligence" checked={autoGraph || azureDi}
+          disabled={autoGraph || busy || readiness?.azure_document_intelligence_available === false}
           onChange={setAzureDi} />
         <Switch label="Neo4j Read" checked={neo4jRead}
           disabled={busy || readiness?.neo4j_read_available === false}
           onChange={setNeo4jRead} />
-        <Switch label="Azure DI + Neo4j Hybrid" checked={hybrid}
-          disabled={busy || !azureDi || !neo4jRead || readiness?.structured_ingestion_available !== true}
+        <Switch label="Azure DI + Neo4j Hybrid" checked={autoGraph || hybrid}
+          disabled={autoGraph || busy || !azureDi || !neo4jRead || readiness?.structured_ingestion_available !== true}
           onChange={setHybrid} />
         <p className="muted knowledge-switch-note">
-          {readiness?.azure_document_intelligence_available === false
-            ? 'Azure Document Intelligence is unavailable; local document processing remains available. '
-            : 'Azure processing runs only when you upload a document. '}
+          {autoGraph
+            ? 'Automatic ingestion is enabled: every file upload uses Azure Document Intelligence and writes reference-only nodes and links to Neo4j. Extraction previews do not save the original locally, but their graph references persist. Azure processing may incur charges. '
+            : readiness?.azure_document_intelligence_available === false
+              ? 'Azure Document Intelligence is unavailable; local document processing remains available. '
+              : 'Azure processing runs only when you upload a document. '}
           {readiness?.neo4j_read_available === false
             ? 'Neo4j read is unavailable. '
             : 'Neo4j access is read-only. '}
-          {readiness?.structured_ingestion_available !== true
-            ? 'Hybrid ingestion is unavailable until the backend writer is verified.'
-            : hybrid
-              ? 'Hybrid is ON: uploads use Azure extraction, local ChromaDB, and Neo4j references.'
-              : 'Hybrid is OFF: uploads remain local and do not write graph references.'}
+          {autoGraph
+            ? readiness?.structured_ingestion_available === true
+              ? 'Saved uploads are also indexed into local ChromaDB.'
+              : 'Neo4j ingestion writer is not ready: uploads will be blocked until configured.'
+            : readiness?.structured_ingestion_available !== true
+              ? 'Hybrid ingestion is unavailable until the backend writer is verified.'
+              : hybrid
+                ? 'Hybrid is ON: uploads use Azure extraction, local ChromaDB, and Neo4j references.'
+                : 'Hybrid is OFF: uploads remain local and do not write graph references.'}
         </p>
       </div>
       <div className={`document-drop ${dragging ? 'dragging' : ''}`} onDragOver={event => { event.preventDefault(); setDragging(true) }} onDragLeave={() => setDragging(false)} onDrop={event => { event.preventDefault(); setDragging(false); chooseFile(event.dataTransfer.files[0]) }}>
