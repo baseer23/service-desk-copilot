@@ -63,6 +63,8 @@ class GraphRepository:
             "CREATE CONSTRAINT IF NOT EXISTS FOR (t:Table) REQUIRE t.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (f:Figure) REQUIRE f.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (p:Page) REQUIRE p.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (p:Paragraph) REQUIRE p.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (c:TableCell) REQUIRE c.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (t:Topic) REQUIRE t.id IS UNIQUE",
         ]
         with self._driver.session(database=self.database) as session:
@@ -131,7 +133,7 @@ class GraphRepository:
     def upsert_reference_object(self, doc_id: str, item: dict) -> None:
         """Persist bounded reference metadata only; actual content remains local."""
         label = item.get("object_type", "Chunk")
-        if label not in {"Chunk", "Table", "Figure", "Section"}:
+        if label not in {"Chunk", "Table", "Figure", "Section", "Paragraph", "TableCell"}:
             raise ValueError("Unsupported graph object type")
         description = re.sub(r"\s+", " ", str(item.get("description") or "")).strip()[:160]
 
@@ -142,7 +144,10 @@ class GraphRepository:
                 "n.page=$page, n.ordinal=$ordinal, n.description=$description, "
                 "n.document_hash=$document_hash, n.content_hash=$content_hash, "
                 "n.version=$version, n.source_provenance=$source_provenance, "
-                "n.link_status=$link_status, n.tenant_id=$tenant_id",
+                "n.link_status=$link_status, n.tenant_id=$tenant_id, "
+                "n.source_element_id=$source_element_id, n.azure_role=$azure_role, "
+                "n.span_offset=$span_offset, n.span_length=$span_length, "
+                "n.table_row=$table_row, n.table_column=$table_column",
                 id=self.scope(item["object_id"]),
                 original_id=item["object_id"],
                 document_id=doc_id,
@@ -155,6 +160,12 @@ class GraphRepository:
                 version=item.get("version", 1),
                 source_provenance=item.get("source_provenance"),
                 link_status=item.get("link_status", "linked"),
+                source_element_id=item.get("source_element_id"),
+                azure_role=item.get("azure_role"),
+                span_offset=item.get("span_offset"),
+                span_length=item.get("span_length"),
+                table_row=item.get("table_row"),
+                table_column=item.get("table_column"),
             )
             tx.run(
                 f"MATCH (p:Page {{id:$page_id}}), (n:{label} {{id:$id}}) "
@@ -182,6 +193,9 @@ class GraphRepository:
             "HAS_CHUNK",
             "HAS_TABLE",
             "HAS_FIGURE",
+            "HAS_PARAGRAPH",
+            "HAS_TABLECELL",
+            "HAS_CELL",
             "HAS_OBJECT",
             "REFERENCES_TABLE",
             "REFERENCES_FIGURE",
@@ -195,8 +209,8 @@ class GraphRepository:
         ]
         selected_types = [
             label
-            for label in (object_types or ["Chunk", "Table", "Figure", "Section"])
-            if label in {"Chunk", "Table", "Figure", "Section"}
+            for label in (object_types or ["Chunk", "Table", "Figure", "Section", "Paragraph", "TableCell"])
+            if label in {"Chunk", "Table", "Figure", "Section", "Paragraph", "TableCell"}
         ]
 
         def _tx(tx: Transaction):
@@ -229,6 +243,9 @@ class GraphRepository:
             "HAS_CHUNK",
             "HAS_TABLE",
             "HAS_FIGURE",
+            "HAS_PARAGRAPH",
+            "HAS_TABLECELL",
+            "HAS_CELL",
             "REFERENCES_TABLE",
             "REFERENCES_FIGURE",
             "MENTIONS",

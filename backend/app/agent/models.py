@@ -189,11 +189,12 @@ class GraphLookupPlan(StructuredModel):
     concepts: list[str] = Field(default_factory=list, max_length=10)
     relationship_types: list[Literal[
         "HAS_OBJECT", "HAS_SECTION", "HAS_CHUNK", "HAS_TABLE", "HAS_FIGURE",
+        "HAS_PARAGRAPH", "HAS_TABLECELL", "HAS_CELL",
         "REFERENCES_TABLE", "REFERENCES_FIGURE", "MENTIONS", "RELATED_TO",
     ]] = Field(default_factory=list, max_length=10)
     document_ids: list[str] = Field(default_factory=list, max_length=10)
-    object_types: list[Literal["Chunk", "Table", "Figure", "Section"]] = Field(
-        default_factory=lambda: ["Chunk", "Table", "Figure", "Section"]
+    object_types: list[Literal["Chunk", "Table", "Figure", "Section", "Paragraph", "TableCell"]] = Field(
+        default_factory=lambda: ["Chunk", "Table", "Figure", "Section", "Paragraph", "TableCell"]
     )
     limit: int = Field(default=20, ge=1, le=20)
 

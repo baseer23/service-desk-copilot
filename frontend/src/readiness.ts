@@ -28,6 +28,7 @@ export interface ReadinessReport {
   semantic_ingestion_blocker?: string | null
   url_ingestion_enabled?: boolean
   structured_ingestion_available?: boolean
+  automatic_graph_ingestion_enabled?: boolean
   structured_ingestion_blocker?: string | null
   azure_document_intelligence_available?: boolean
   neo4j_read_available?: boolean

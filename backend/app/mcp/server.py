@@ -493,9 +493,23 @@ def save_staged_document(
 
 
 @capability("local_document")
-def extract_staged_document(upload_token: str, media_type: str = "application/pdf"):
-    """Preview a server-staged document without base64 transport."""
+def extract_staged_document(
+    upload_token: str, media_type: str = "application/pdf",
+    title: str | None = None, graph_enrich: bool = False,
+):
+    """Extract a preview; when explicitly enabled, run Azure DI and publish only graph references.
+
+    The staged original is deleted by the HTTP caller. No original or
+    full extracted text is persisted in the preview path.
+    """
     path = _staged_path(upload_token)
+    if graph_enrich:
+        if not get_settings().auto_document_graph_ingestion:
+            raise ValueError("Automatic Azure graph ingestion has not been authorized")
+        repository = documents()
+        if not hasattr(repository, "preview_graph"):
+            raise ValueError("Azure graph preview requires the local document repository")
+        return repository.preview_graph(path, title or "Unsaved upload", media_type)
     from backend.app.services.document_extract import extract_document_path
 
     return extract_document_path(path, media_type)

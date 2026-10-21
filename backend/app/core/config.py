@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     azure_document_endpoint: str = ""
     azure_document_api_version: str = "2024-11-30"
     azure_document_free_tier: bool = True
+    # Explicit opt-in: each upload may create a billable Azure DI request and
+    # persist structural metadata to the separately authorized Neo4j writer.
+    auto_document_graph_ingestion: bool = False
     azure_key_vault_url: str = ""
     azure_session_secret_name: str = "deskmate-session-signing-key"
     auth_client_id: str = ""
