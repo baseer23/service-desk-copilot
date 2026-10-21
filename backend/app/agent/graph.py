@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 from datetime import datetime, timezone
 from hashlib import sha256
 from urllib.parse import urlsplit
@@ -623,6 +624,25 @@ class ServiceDeskAgent:
             },
             RequestIntent,
         )
+        # Enforce explicit user-specified source scope, not keyword-based
+        # topic routing. The planner still chooses relevant local tools.
+        explicit_local = bool(re.search(
+            r"\b(?:from|check|search|use)\s+(?:(?:my|our|the|saved|uploaded|internal)\s+){0,3}(?:knowledge|kb)\b",
+            state["ticket"]["summary"], flags=re.IGNORECASE,
+        ))
+        if explicit_local and intent.workflow == "knowledge" and intent.knowledge_source != "documents":
+            intent = intent.model_copy(update={
+                "knowledge_source": "documents", "public_topic": "none",
+                "justification": (
+                    "The user explicitly requested local knowledge. "
+                    "Select authorized local evidence before answering."
+                ),
+            })
+            await emit(
+                "source_scope", "completed",
+                "Source scope constrained to the user's saved knowledge",
+                rationale="The request explicitly specified the local knowledge workspace.",
+            )
         await self.note(
             state, "classify_intent", f"Request classified: {intent.workflow}", self.provider.name()
         )
@@ -1240,10 +1260,17 @@ class ServiceDeskAgent:
             for item in evidence
             if item.get("url") and item["source_type"] == "public_documentation"
         ][-6:]
+        retrieved = self.usable_evidence({"evidence": evidence})
+        discovery_leads = sum(
+            item["tool"] in {"search_web", "search_news"} for item in evidence
+        )
+        tool_errors = sum(item["source_type"] == "tool_error" for item in evidence)
         await emit(
             "evidence_collected",
             "completed",
-            f"Evidence collected: {len(evidence)} items; {len(contradictions)} contradictions",
+            f"Evidence reviewed: {len(retrieved)} retrieved source records, "
+            f"{discovery_leads} search leads, {tool_errors} errors; "
+            f"{len(contradictions)} contradictions",
             sources=public_sources,
             accepted_document_count=sum(
                 item.get("assessment") == "accepted" for item in retrieval_candidates
