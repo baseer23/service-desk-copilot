@@ -248,6 +248,7 @@ class LocalDocumentRepository(DocumentRepository):
         pages = sorted({
             int(page)
             for page in [
+                *[page.get("page") for page in extracted.get("pages", [])],
                 *[obj.get("page") for obj in objects],
                 *[item.get("page") for item in paragraphs],
                 *[table.get("page") for table in extracted.get("tables", [])],
@@ -283,7 +284,11 @@ class LocalDocumentRepository(DocumentRepository):
             parent, child = section_map.get(section.get("parent_id")), section_map.get(section.get("id"))
             if parent and child and parent != child:
                 graph.link_reference_objects(parent, child, "HAS_SECTION")
+        active_section_id = None
         for paragraph in paragraphs:
+            if paragraph.get("role") in {"title", "sectionHeading"}:
+                heading_key = f"section-{paragraph.get('page')}-{paragraph.get('position')}"
+                active_section_id = section_map.get(heading_key)
             source_id = str(paragraph.get("id") or "")
             paragraph_id = "PAR" + hashlib.sha256(
                 f"{identifier}:{source_id}:{paragraph.get('page')}:{paragraph.get('position')}".encode()
@@ -305,6 +310,8 @@ class LocalDocumentRepository(DocumentRepository):
                     "link_status": "reference_only_unsaved" if temporary else "linked",
                 },
             )
+            if active_section_id:
+                graph.link_reference_objects(active_section_id, paragraph_id, "HAS_PARAGRAPH")
         table_objects = {}
         for obj in objects:
             if obj["object_type"] == "Table":
