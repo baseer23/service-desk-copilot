@@ -68,6 +68,27 @@ def test_upsert_entity_and_link(mock_driver):
     assert mock_driver.execute_write.call_count == 2
 
 
+def test_semantic_search_is_owner_scoped_bounded_and_parameterized():
+    captured = []
+
+    class Driver:
+        def execute_read(self, callback):
+            class Tx:
+                def run(self, query, **parameters):
+                    captured.append((query, parameters))
+                    return []
+
+            return callback(Tx())
+
+    repo = GraphRepository(Driver(), tenant_provider=lambda: "tenant-a")
+    hostile = "name' MATCH (n) DETACH DELETE n"
+    assert repo.search_semantic_memory("owner-a", hostile, 999) == []
+    query, parameters = captured[0]
+    assert hostile not in query
+    assert parameters["tenant"] == "tenant-a" and parameters["owner"] == "owner-a"
+    assert parameters["limit"] == 20 and len(parameters["terms"]) <= 10
+
+
 def test_aura_repository_end_to_end(monkeypatch, tmp_path):
     import sys
     import types

@@ -146,8 +146,9 @@ def test_structured_upload_mode_is_explicit_persisted_and_nonretroactive(make_cl
         "/documents/upload",
         files=files,
         data={"ingestion_mode": "standard"},
-    ).json()
-    assert duplicate["duplicate"] and duplicate["ingestion_mode"] == "structured_graph"
+    )
+    assert duplicate.status_code == 400
+    assert "cannot be disabled" in duplicate.json()["detail"]
 
 
 def test_automatic_ingestion_accepts_plain_text_with_local_fallback(
