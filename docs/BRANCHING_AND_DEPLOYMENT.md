@@ -50,6 +50,8 @@ Repository administrators should keep `main` as the default branch and configure
 
 These controls must be verified in GitHub Settings; workflow files alone cannot prove that repository protection or reviewer rules are active.
 
+Audit result on 2026-10-23: GitHub reports `main` as the default branch and the connected account as a repository administrator. The connected GitHub App returned `403 Resource not accessible by integration` for all three branch-protection reads and exposes no protection/environment mutation operation. Protection and Environment reviewer configuration therefore remain an explicit manual administrator action, not a claimed completed control.
+
 ## Release and rollback
 
 After staging approval, promote the exact staging commit to `main`, rerun release validation, and create an immutable semantic tag such as `v0.1.0`. Record the previous `main` SHA as the rollback point. Roll back application code with a new revert commit or redeploy a previously verified release tag; do not reset shared history. Database and document rollback is a separate, operator-authorized recovery procedure and must preserve originals and backups.
