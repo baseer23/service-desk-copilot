@@ -203,8 +203,19 @@ def strict_schema(value: dict[str, Any]) -> dict[str, Any] | None:
 
 
 class AzureOpenAIProvider:
-    def __init__(self, settings: Settings, client: Any = None) -> None:
-        if not settings.azure_foundry_endpoint or not settings.azure_model_deployment:
+    def __init__(
+        self,
+        settings: Settings,
+        client: Any = None,
+        *,
+        deployment: str | None = None,
+        provider_name: str = "azure_openai",
+        reasoning_model: bool = False,
+    ) -> None:
+        self.deployment = deployment if deployment is not None else settings.azure_model_deployment
+        self.provider_name = provider_name
+        self.reasoning_model = reasoning_model
+        if not settings.azure_foundry_endpoint or not self.deployment:
             raise LLMError("Azure OpenAI endpoint and deployment must be configured")
         self.settings = settings
         self.request_lock = asyncio.Lock()
@@ -248,7 +259,7 @@ class AzureOpenAIProvider:
             raise LLMError("Azure OpenAI initialization failed") from None
 
     def name(self) -> str:
-        return "azure_openai"
+        return self.provider_name
 
     def as_runnable(self):
         from langchain_core.runnables import RunnableLambda
@@ -277,7 +288,7 @@ class AzureOpenAIProvider:
             await model_event(
                 kind="context_compaction",
                 status="completed",
-                provider="azure_openai",
+                provider=self.provider_name,
                 stage=stage,
                 summary="Azure model context compacted while retaining source references",
                 original_tokens=report.original_tokens,
@@ -295,14 +306,18 @@ class AzureOpenAIProvider:
                 {"messages": messages, "response_format": response_format}
             ) + 256
 
-            def request(output_bound: int = output_bound) -> Any:
+            def request(
+                output_bound: int = output_bound,
+                request_messages: list[dict[str, str]] = messages,
+                request_format: dict[str, Any] = response_format,
+            ) -> Any:
                 return self.client.chat.completions.create(
-                    model=self.settings.azure_model_deployment,
-                    messages=messages,
-                    response_format=response_format,
+                    model=self.deployment,
+                    messages=request_messages,
+                    response_format=request_format,
                     max_completion_tokens=output_bound,
-                    temperature=0,
                     timeout=self.settings.model_timeout_sec,
+                    **({} if self.reasoning_model else {"temperature": 0}),
                 )
 
             try:
@@ -323,7 +338,7 @@ class AzureOpenAIProvider:
                 await model_event(
                     kind="llm_usage",
                     status="completed",
-                    provider="azure_openai",
+                    provider=self.provider_name,
                     stage=stage,
                     summary="Azure OpenAI request completed",
                     usage={key: value for key, value in usage.items() if isinstance(value, int)},
@@ -334,7 +349,7 @@ class AzureOpenAIProvider:
                 await model_event(
                     kind="llm_error",
                     status="failed",
-                    provider="azure_openai",
+                    provider=self.provider_name,
                     stage=stage,
                     category=category,
                     request_id=request_id,

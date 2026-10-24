@@ -48,9 +48,44 @@ class IngestUrlRequest(BaseModel):
     max_pages: int | None = Field(default=None, ge=1, le=10)
 
 
+class IngestedUrlSource(BaseModel):
+    title: str
+    url: str
+    content_hash: str
+    chunks: int = Field(ge=0)
+    duplicate: bool = False
+
+
 class IngestUrlResponse(IngestPasteResponse):
     pages: int
     skipped_urls: list[str] = Field(default_factory=list)
+    sources: list[IngestedUrlSource] = Field(default_factory=list)
+
+
+class WebsiteRegistrationRequest(BaseModel):
+    url: str = Field(min_length=8, max_length=2048)
+    max_depth: int = Field(default=1, ge=0, le=3)
+    max_pages: int = Field(default=20, ge=1, le=1000)
+    request_budget: int = Field(default=40, ge=1, le=2000)
+    allow_subdomains: bool = False
+
+
+class WebsiteRegistrationResponse(BaseModel):
+    id: str
+    root_url: str
+    origin: str
+    allowed_hosts: list[str]
+    allow_subdomains: bool
+    max_depth: int
+    max_pages: int
+    request_budget: int
+    status: str
+    monitoring_active: bool
+    crawl_status: str
+    graph_link_status: str
+    created_at: str
+    updated_at: str
+    duplicate: bool = False
 
 
 class CaseCreateRequest(BaseModel):

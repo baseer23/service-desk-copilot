@@ -4,7 +4,7 @@ DeskMate investigates IT service-desk problems using stateful LangGraph workflow
 
 The Mac stores original documents and extraction artifacts in private local files, knowledge/vectors in persistent ChromaDB, and transactional cases, transcripts, checkpoints, ownership and financial history in SQLite. SentenceTransformers generates embeddings locally. Optional online Neo4j Aura supplies graph relationships; its absence leaves supported vector-only investigations available.
 
-The top-bar selector chooses **Groq** (default) or **Azure OpenAI** for subsequent requests and persists that choice in this browser. It never silently falls back. Azure AI Speech performs continuous **Speech-to-Text only**; model responses are text. Azure Document Intelligence remains optional for extraction. Azure does not provide application persistence.
+The top-bar selector chooses **Groq** (default), **Azure OpenAI**, or an independently deployed **Azure OpenAI GPT-5 Nano** for subsequent requests and persists that choice in this browser. It never silently falls back. Azure AI Speech performs continuous **Speech-to-Text only**; model responses are text. Azure Document Intelligence remains optional for extraction. Azure does not provide application persistence.
 
 ## Run locally
 
@@ -25,7 +25,9 @@ Open **http://127.0.0.1:5173**. FastAPI runs on port 8000 and owns its MCP subpr
 ## Configure
 
 - Groq: private `GROQ_API_KEY` and `GROQ_MODEL_NAME`. Account/model rate limits are discovered from response headers; exact optional RPM/TPD settings come from the account's current Limits page.
-- Azure OpenAI: `AZURE_FOUNDRY_ENDPOINT`, `AZURE_MODEL_DEPLOYMENT` and preferably Azure CLI/Entra authentication. Provider quotas, rate limits and authentication remain in effect; DeskMate does not impose a spending ledger or fallback provider.
+- Azure OpenAI: `AZURE_FOUNDRY_ENDPOINT`, `AZURE_MODEL_DEPLOYMENT` and preferably Azure CLI/Entra authentication. GPT-5 Nano additionally requires its own `AZURE_GPT5_NANO_DEPLOYMENT`; it never aliases or falls back to the ordinary deployment. The model must already be available and deployed in the configured Azure resource. Regional availability, deployment type, quota and actual billing vary. Indicative October 2026 Global Standard pricing is US$0.05/M input tokens and US$0.40/M output tokens; verify the account-specific Azure price before use. Provider quotas, rate limits and authentication remain in effect; DeskMate does not impose a spending ledger or fallback provider.
+
+For local website ingestion, set `ALLOW_URL_INGEST=true` and restart the backend. The Knowledge URL tab performs a bounded public HTTP(S) crawl, indexes readable HTML with local embeddings, and remains searchable when Neo4j is unavailable. `ENABLE_PUBLIC_WEB_TOOLS` separately controls live web research and is not required for an explicitly submitted ingestion URL. JavaScript-only pages are not rendered.
 - Local persistence: `LOCAL_PERSISTENCE_ENABLED=true`, `CASE_DB_PATH`, `CHROMA_DIR`, `LOCAL_DOCUMENTS_DIR`; keep `store/local/` and `store/backups/` private and ignored.
 - Optional graph: `NEO4J_URI`, `NEO4J_USER`, private `NEO4J_PASSWORD`, and `NEO4J_DATABASE`. The [official read-only Neo4j MCP setup](docs/NEO4J_MCP.md) adds dynamically discovered Aura evidence over a FastAPI-owned local stdio process. Unavailable Aura is reported honestly; no production graph fixtures are substituted.
 - Continuous transcription: `SPEECH_ENABLED`, `AZURE_SPEECH_ENDPOINT`, language and conservative estimated CAD/hour. Use a compatible existing resource and Entra role assignments; see [Speech](docs/SPEECH.md).

@@ -17,6 +17,15 @@ interface Match {
   }
 }
 
+interface WebsiteRegistration {
+  id: string
+  root_url: string
+  status: string
+  monitoring_active: boolean
+  crawl_status: string
+  graph_link_status: string
+}
+
 function Switch({ label, checked, disabled, onChange }: {
   label: string
   checked: boolean
@@ -52,10 +61,55 @@ export default function KnowledgePanel({
   const [dragging, setDragging] = useState(false)
   const [azureDi, setAzureDi] = useState(true)
   const [neo4jRead, setNeo4jRead] = useState(true)
+  const [websites, setWebsites] = useState<WebsiteRegistration[]>([])
   const picker = useRef<HTMLInputElement>(null)
   const autoGraph = readiness?.automatic_graph_ingestion_enabled === true
   const indexingBlocked = readiness?.semantic_ingestion_ready === false
   const urlBlocked = readiness?.url_ingestion_enabled === false
+
+  async function loadWebsites() {
+    if (urlBlocked) return
+    try {
+      const result = await request<{ items: WebsiteRegistration[] }>('/websites')
+      setWebsites(result.items ?? [])
+    } catch {
+      // One-time URL ingestion remains usable when the registration capability is unavailable.
+    }
+  }
+
+  async function registerWebsite() {
+    if (!text.trim()) return
+    setBusy(true)
+    setError('')
+    setMessage('')
+    try {
+      const result = await request<WebsiteRegistration & { duplicate: boolean }>(
+        '/websites',
+        post({ url: text }),
+      )
+      setMessage(result.duplicate
+        ? 'This website is already registered. Monitoring has not been started.'
+        : 'Website registered with bounded scope. Monitoring has not been started.')
+      await loadWebsites()
+    } catch (caught) {
+      setError((caught as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function setWebsitePaused(website: WebsiteRegistration, paused: boolean) {
+    setBusy(true)
+    setError('')
+    try {
+      await request(`/websites/${website.id}/${paused ? 'pause' : 'resume'}`, post())
+      await loadWebsites()
+    } catch (caught) {
+      setError((caught as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
 
   function chooseFile(selected: File | undefined) {
     if (!selected) return
@@ -73,6 +127,7 @@ export default function KnowledgePanel({
     try {
       let path: string
       let options: RequestInit
+      if (mode === 'url') setMessage('Fetching and extracting the public website…')
       if (mode === 'pdf') {
         if (!file) throw new Error('Choose a document first.')
         const body = new FormData()
@@ -106,6 +161,7 @@ export default function KnowledgePanel({
         method?: string
         graph_nodes?: number
         graph_relationships?: number
+        sources?: Array<{ title: string; url: string; chunks: number; duplicate: boolean }>
       }>(path, options)
       if (kind === 'index' && !readiness?.managed_documents && path === '/documents/upload' && result.id) {
         result = await request(`/documents/${result.id}/index`, post())
@@ -132,11 +188,18 @@ export default function KnowledgePanel({
             : 'Your document is saved. Search available knowledge or return when processing is complete.',
         )
       } else {
-        setMessage(
-          result.duplicate
-            ? 'This content is already in knowledge.'
-            : 'Your document was added to knowledge.',
-        )
+        if (mode === 'url') {
+          const source = result.sources?.[0]
+          setMessage(result.duplicate
+            ? `This website content is already indexed${source ? `: ${source.title} (${source.url})` : '.'}`
+            : `${source?.title ?? 'Website'} is searchable from ${source?.url ?? text} (${result.chunks} chunk${result.chunks === 1 ? '' : 's'} indexed).`)
+        } else {
+          setMessage(
+            result.duplicate
+              ? 'This content is already in knowledge.'
+              : 'Your document was added to knowledge.',
+          )
+        }
       }
     } catch (caught) {
       setError((caught as Error).message)
@@ -151,7 +214,7 @@ export default function KnowledgePanel({
     setError('')
     try {
       const result = await request<{ items: Match[] }>(
-        `/knowledge/search?question=${encodeURIComponent(query)}`,
+        `/knowledge/search?question=${encodeURIComponent(query)}&mode=KEYWORD`,
       )
       setMatches(result.items)
       setSearched(true)
@@ -271,10 +334,20 @@ export default function KnowledgePanel({
         >
           {busy ? 'Working…' : 'Add to knowledge'}
         </button>
+        {mode === 'url' && (
+          <button
+            type="button"
+            className="secondary"
+            disabled={busy || urlBlocked || !text.trim()}
+            onClick={() => void registerWebsite()}
+          >
+            Register website
+          </button>
+        )}
         {indexingBlocked && <p className="muted">Document processing is temporarily unavailable. You can still save documents and search available knowledge.</p>}
         {mode === 'url' && urlBlocked && (
           <p className="muted">
-            Web page uploads are currently unavailable. You can upload a document or paste its text.
+            Website ingestion is disabled. Set ALLOW_URL_INGEST=true in your local .env and restart the backend.
           </p>
         )}
         {mode !== 'url' && (
@@ -298,6 +371,27 @@ export default function KnowledgePanel({
           </button>
         )}
       </form>
+      {websites.length > 0 && (
+        <section aria-label="Registered websites">
+          <h3>Registered websites</h3>
+          <p className="muted">Registration saves scope and budgets. Continuous monitoring is not active yet.</p>
+          <ul>
+            {websites.map((website) => (
+              <li key={website.id}>
+                <span>{website.root_url} — {website.status}; crawl {website.crawl_status}; graph {website.graph_link_status}</span>{' '}
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={busy}
+                  onClick={() => void setWebsitePaused(website, website.status !== 'paused')}
+                >
+                  {website.status === 'paused' ? 'Resume registration' : 'Pause'}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
       {error && <p role="alert">{error}</p>}
       <p role="status" className="muted">
         {busy && mode === 'pdf' ? 'Uploading and processing…' : message}
@@ -338,6 +432,7 @@ export default function KnowledgePanel({
               {match.metadata.extraction_method === 'document_intelligence' ? ' · Azure Document Intelligence layout' : ''}
               {match.metadata.table_count ? ` · ${match.metadata.table_count} table${match.metadata.table_count === 1 ? '' : 's'}` : ''}
               {match.metadata.doc_id && readiness?.managed_documents && <a href={`/documents/${encodeURIComponent(match.metadata.doc_id)}/download`}>View source</a>}
+              {match.metadata.source?.startsWith('http') && <> · <a href={match.metadata.source} target="_blank" rel="noreferrer">Open website</a></>}
             </small>
           </article>
         ))}

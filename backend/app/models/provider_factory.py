@@ -17,6 +17,13 @@ def get_provider(settings: Settings) -> CaseReasoningProvider:
         return GroqProvider(settings)
     if settings.generation_provider == "azure_openai":
         return AzureOpenAIProvider(settings)
+    if settings.generation_provider == "azure_gpt5_nano":
+        return AzureOpenAIProvider(
+            settings,
+            deployment=settings.azure_gpt5_nano_deployment,
+            provider_name="azure_gpt5_nano",
+            reasoning_model=True,
+        )
     raise ValueError("Only configured Groq or Azure OpenAI reasoning is supported")
 
 

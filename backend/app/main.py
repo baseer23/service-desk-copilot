@@ -8,7 +8,7 @@ import secrets
 import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,6 +34,8 @@ from backend.app.models.dto import (
     IngestPdfResponse,
     IngestUrlRequest,
     IngestUrlResponse,
+    WebsiteRegistrationRequest,
+    WebsiteRegistrationResponse,
 )
 from backend.app.models.provider import LLMError
 from backend.app.models.provider_factory import get_selectable_provider as get_provider
@@ -257,10 +259,12 @@ def create_app(settings: Settings | None = None):
             selection = request.headers.get("X-DeskMate-Provider", s.generation_provider)
             if s.test_mode and s.generation_provider == "stub":
                 selection = "stub"
-            if selection not in {"groq", "azure_openai", "stub"} or (
+            if selection not in {"groq", "azure_openai", "azure_gpt5_nano", "stub"} or (
                 selection == "stub" and not s.test_mode
             ):
-                raise HTTPException(422, "Choose Groq or Azure OpenAI")
+                raise HTTPException(
+                    422, "Choose Groq, Azure OpenAI, or Azure OpenAI GPT-5 Nano"
+                )
             with principal_scope(actor), provider_scope(selection):
                 return await call_next(request)
         except HTTPException as error:
@@ -340,7 +344,8 @@ def create_app(settings: Settings | None = None):
             speech_configured=report.voice.configured,
             embedding_provider=s.embed_provider,
             azure_openai_configured=(
-                selected_provider(s) == "azure_openai" and report.reasoning.configured
+                selected_provider(s) in {"azure_openai", "azure_gpt5_nano"}
+                and report.reasoning.configured
             ),
             readiness=report.model_dump(),
         )
@@ -597,21 +602,67 @@ def create_app(settings: Settings | None = None):
         ).process(session, body.summary, body.request_id, body.expected_version)
 
     @app.get("/knowledge/search")
-    async def search_local_knowledge(question: str):
+    async def search_local_knowledge(
+        question: str, mode: Literal["HYBRID", "VECTOR", "KEYWORD"] = "KEYWORD"
+    ):
         if not question.strip() or len(question) > 2000:
             raise HTTPException(422, "Search text must contain 1 to 2000 characters")
         result = await app.state.agent.harness.invoke(
-            "search_knowledge", {"question": question, "mode": "KEYWORD", "top_k": 6}
+            "search_knowledge", {"question": question, "mode": mode, "top_k": 6}
         )
-        return {"mode": "keyword", "generated_answer": False, "items": result["items"]}
+        return {"mode": mode.casefold(), "generated_answer": False, "items": result["items"]}
 
     @app.post("/ingest/url", response_model=IngestUrlResponse)
     async def ingest_url(body: IngestUrlRequest):
         if not s.allow_url_ingest:
             raise HTTPException(403, "URL ingestion is disabled")
-        return (
-            await app.state.agent.harness.invoke("ingest_url", body.model_dump(exclude_none=True))
-        )["result"]
+        result = await app.state.agent.harness.invoke(
+            "ingest_url", body.model_dump(exclude_none=True)
+        )
+        if result.get("status") == "error":
+            raise HTTPException(422, result.get("error") or "Website ingestion failed")
+        return result["result"]
+
+    @app.post("/websites", response_model=WebsiteRegistrationResponse)
+    async def register_website(body: WebsiteRegistrationRequest):
+        if not s.allow_url_ingest:
+            raise HTTPException(403, "Website registration is disabled")
+        result = await app.state.agent.harness.invoke("register_website", body.model_dump())
+        if result.get("status") == "error":
+            raise HTTPException(422, result.get("error") or "Website registration failed")
+        return result["result"]
+
+    @app.get("/websites")
+    async def list_websites():
+        result = await app.state.agent.harness.invoke("list_websites", {})
+        if result.get("status") == "error":
+            raise HTTPException(503, result.get("error") or "Website registrations unavailable")
+        return {"items": result["result"]}
+
+    @app.get("/websites/{website_id}")
+    async def get_website(website_id: str):
+        result = await app.state.agent.harness.invoke("get_website", {"website_id": website_id})
+        if result.get("status") == "error":
+            raise HTTPException(404, result.get("error") or "Website registration not found")
+        return result["result"]
+
+    @app.post("/websites/{website_id}/pause")
+    async def pause_website(website_id: str):
+        result = await app.state.agent.harness.invoke(
+            "pause_website_monitor", {"website_id": website_id}
+        )
+        if result.get("status") == "error":
+            raise HTTPException(404, result.get("error") or "Website registration not found")
+        return result["result"]
+
+    @app.post("/websites/{website_id}/resume")
+    async def resume_website(website_id: str):
+        result = await app.state.agent.harness.invoke(
+            "resume_website_monitor", {"website_id": website_id}
+        )
+        if result.get("status") == "error":
+            raise HTTPException(404, result.get("error") or "Website registration not found")
+        return result["result"]
 
     async def load(case_id):
         state = (await app.state.agent.harness.invoke("get_case", {"case_id": case_id}))["result"]
@@ -650,7 +701,7 @@ def create_app(settings: Settings | None = None):
                 status_code=502,
                 content={
                     "detail": llm_error_detail(exc)
-                    if selected_provider(s) == "azure_openai"
+                    if selected_provider(s) in {"azure_openai", "azure_gpt5_nano"}
                     else (
                         "The investigation could not finish. Your saved work is preserved."
                         if s.deployment_mode == "production"
@@ -803,7 +854,7 @@ def create_app(settings: Settings | None = None):
             raise HTTPException(
                 502,
                 llm_error_detail(exc)
-                if selected_provider(s) == "azure_openai"
+                if selected_provider(s) in {"azure_openai", "azure_gpt5_nano"}
                 else (
                     "The investigation could not finish. Please try again later."
                     if s.deployment_mode == "production"

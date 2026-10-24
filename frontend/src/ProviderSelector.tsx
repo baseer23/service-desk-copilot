@@ -20,6 +20,7 @@ export function ProviderSelector(): JSX.Element {
     <select aria-label="Reasoning provider" value={selected} onChange={event => setSelectedProvider(event.target.value as ReasoningProvider)} style={{ border: '1px solid #dbe2ea', borderRadius: '.55rem', padding: '.45rem .6rem', background: 'white', color: '#233249' }}>
       <option value="groq">Groq</option>
       <option value="azure_openai">Azure OpenAI</option>
+      <option value="azure_gpt5_nano">Azure OpenAI — GPT-5 Nano (Low Cost)</option>
     </select>
   </label>
 }

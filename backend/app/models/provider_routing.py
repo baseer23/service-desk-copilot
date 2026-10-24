@@ -26,8 +26,10 @@ def selected_provider(settings: Settings) -> str:
 def provider_scope(
     selection: str | None, event_sink: Callable[[dict], Any] | None = None
 ) -> Iterator[None]:
-    if selection is not None and selection not in {"groq", "azure_openai", "stub"}:
-        raise LLMError("Choose Groq or Azure OpenAI")
+    if selection is not None and selection not in {
+        "groq", "azure_openai", "azure_gpt5_nano", "stub"
+    }:
+        raise LLMError("Choose Groq, Azure OpenAI, or Azure OpenAI GPT-5 Nano")
     token = _selection.set(selection)
     route_token = _route.set(
         {"selected": selection, "active": selection, "fallback_attempted": False}
@@ -71,11 +73,20 @@ class SelectableReasoningProvider:
                 missing.append("GROQ_API_KEY")
             if not self.settings.groq_model_name:
                 missing.append("GROQ_MODEL_NAME")
-        elif provider == "azure_openai":
+        elif provider in {"azure_openai", "azure_gpt5_nano"}:
             if not self.settings.azure_foundry_endpoint:
                 missing.append("AZURE_FOUNDRY_ENDPOINT")
-            if not self.settings.azure_model_deployment:
-                missing.append("AZURE_MODEL_DEPLOYMENT")
+            deployment = (
+                self.settings.azure_gpt5_nano_deployment
+                if provider == "azure_gpt5_nano"
+                else self.settings.azure_model_deployment
+            )
+            if not deployment:
+                missing.append(
+                    "AZURE_GPT5_NANO_DEPLOYMENT"
+                    if provider == "azure_gpt5_nano"
+                    else "AZURE_MODEL_DEPLOYMENT"
+                )
             if not self.settings.azure_use_entra_id and not self.settings.azure_openai_api_key:
                 missing.append("AZURE_OPENAI_API_KEY")
         elif not self.settings.test_mode:

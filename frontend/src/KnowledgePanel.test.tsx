@@ -78,3 +78,40 @@ test('hybrid policy is always on and applies to the selected upload', async () =
   expect(body.get('ingestion_mode')).toBe('structured_graph')
   expect(await screen.findByText('Extracting → Ready')).toBeInTheDocument()
 })
+
+test('URL ingestion explains disabled configuration and reports searchable provenance', async () => {
+  const disabled = render(
+    <KnowledgePanel readiness={{ url_ingestion_enabled: false } as ReadinessReport} />,
+  )
+  const user = userEvent.setup()
+  await user.click(screen.getByRole('button', { name: 'URL' }))
+  expect(screen.getByText(/Set ALLOW_URL_INGEST=true/)).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Add to knowledge' })).toBeDisabled()
+  disabled.unmount()
+
+  const fetch = vi.fn(async (path: string, _init?: RequestInit) => Response.json(
+    path === '/ingest/url'
+      ? {
+          pages: 1,
+          chunks: 2,
+          duplicate: false,
+          sources: [{
+            title: 'MFA Guide',
+            url: 'https://example.com/mfa',
+            chunks: 2,
+            duplicate: false,
+          }],
+        }
+      : { items: [] },
+  ))
+  vi.stubGlobal('fetch', fetch)
+  render(<KnowledgePanel readiness={{ url_ingestion_enabled: true } as ReadinessReport} />)
+  await user.click(screen.getByRole('button', { name: 'URL' }))
+  await user.type(screen.getByLabelText('Public page URL'), 'https://example.com/mfa')
+  await user.click(screen.getByRole('button', { name: 'Add to knowledge' }))
+  expect(await screen.findByText(/MFA Guide is searchable.*2 chunks indexed/)).toBeInTheDocument()
+  const request = fetch.mock.calls.find(([path]) => path === '/ingest/url')
+  expect(JSON.parse(request?.[1]?.body as string)).toEqual({
+    url: 'https://example.com/mfa',
+  })
+})

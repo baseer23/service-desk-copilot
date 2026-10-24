@@ -171,6 +171,55 @@ def test_provider_factory_and_entra_authentication(settings, monkeypatch):
     assert "api_key" not in captured and captured["max_retries"] == 0
 
 
+@pytest.mark.asyncio
+async def test_gpt5_nano_uses_independent_deployment_without_unsupported_temperature(settings):
+    from backend.app.models.provider_factory import get_provider
+
+    payloads = []
+
+    def create(**kwargs):
+        payloads.append(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"status":"ok"}'))],
+            usage=None,
+        )
+
+    config = settings.model_copy(
+        update={
+            "generation_provider": "azure_gpt5_nano",
+            "azure_foundry_endpoint": "https://example.openai.azure.com",
+            "azure_model_deployment": "regular-deployment",
+            "azure_gpt5_nano_deployment": "nano-deployment",
+        }
+    )
+    model = get_provider(config)
+    model.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+    result = await model.generate_structured("readiness", {}, Probe)
+
+    assert result.status == "ok"
+    assert model.name() == "azure_gpt5_nano"
+    assert payloads[0]["model"] == "nano-deployment"
+    assert "temperature" not in payloads[0]
+    assert payloads[0]["max_completion_tokens"] == 80
+
+
+def test_gpt5_nano_requires_its_own_deployment(settings):
+    from backend.app.models.provider_factory import get_provider
+
+    config = settings.model_copy(
+        update={
+            "generation_provider": "azure_gpt5_nano",
+            "azure_foundry_endpoint": "https://example.openai.azure.com",
+            "azure_model_deployment": "regular-deployment",
+            "azure_gpt5_nano_deployment": "",
+        }
+    )
+    with pytest.raises(LLMError, match="endpoint and deployment"):
+        get_provider(config)
+
+
 @pytest.mark.parametrize(
     "schema,stage,valid",
     [
