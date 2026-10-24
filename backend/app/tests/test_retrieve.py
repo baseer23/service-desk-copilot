@@ -91,7 +91,9 @@ def test_structured_hybrid_reads_graph_references_before_local_content():
     class Graph(GraphStub):
         def fetch_structured_references(self, concepts, limit, **constraints):
             calls.append("graph")
-            assert constraints["object_types"] == ["Chunk", "Table", "Figure", "Section"]
+            assert constraints["object_types"] == [
+                "Chunk", "Table", "Figure", "Section", "Paragraph", "TableCell"
+            ]
             return [{"object_id": "C17", "object_type": "Chunk", "document_id": "doc-1", "page": 5}]
 
     class Vector(VectorStub):

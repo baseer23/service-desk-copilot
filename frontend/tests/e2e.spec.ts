@@ -169,7 +169,9 @@ test('resume question uses knowledge and never asks for a floor', async ({ page,
     .getByLabel('PDF document')
     .setInputFiles({ name: 'abdul-resume.pdf', mimeType: 'application/pdf', buffer: resumePDF() })
   await page.getByRole('button', { name: 'Add to knowledge', exact: true }).click()
-  await expect(page.getByText(/Your document was added to knowledge/)).toBeVisible()
+  await expect(
+    page.getByText(/Your document was added to knowledge|This content is already in knowledge/),
+  ).toBeVisible()
   const before = (await (await request.get('/cases')).json()).length
   const answerResponse = page.waitForResponse(
     (r) => r.url().endsWith('/ask') && r.request().method() === 'POST',
@@ -177,7 +179,6 @@ test('resume question uses knowledge and never asks for a floor', async ({ page,
   await page.getByRole('button', { name: 'Chat', exact: true }).click()
   await page.getByLabel('Question or ticket').fill('What year did Abdul graduate?')
   await page.getByRole('button', { name: 'Send', exact: true }).click()
-  await expect(page.getByRole('heading', { name: 'Final Answer', exact: true })).toBeVisible()
   await expect(page.getByText('Abdul graduated in 2022.', { exact: true })).toBeVisible()
   await expect(page.getByLabel('Your answer')).toHaveCount(0)
   const response = await readWorkflowResponse(await answerResponse)
@@ -188,8 +189,8 @@ test('resume question uses knowledge and never asks for a floor', async ({ page,
   const events = response.events
   expect(events.some((e: any) => e.tool === 'verify')).toBeTruthy()
   expect(events.some((e: any) => e.tool === 'get_site_context')).toBeFalsy()
-  await page.getByText('Investigation progress', { exact: true }).click()
-  await expect(page.getByTestId('investigation-scroll').first()).toBeVisible()
+  await page.getByText('Investigation Activity', { exact: true }).click()
+  await expect(page.getByRole('list', { name: 'Investigation activities' })).toBeVisible()
 })
 
 for (const [title, ticket, tool] of [

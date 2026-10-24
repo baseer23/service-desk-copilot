@@ -67,7 +67,12 @@ def extract_document_path(path: Path, media_type: str) -> dict:
         raise DocumentError("Preview is available for PDF or UTF-8 text documents", 400)
     from backend.app.services.local_pdf import extract_pdf_pages_path
 
-    pages = extract_pdf_pages_path(path)
+    try:
+        pages = extract_pdf_pages_path(path)
+    except DocumentError:
+        raise
+    except Exception:
+        raise DocumentError("PDF could not be parsed") from None
     return {
         "text": "\n\n".join(page["text"] for page in pages),
         "pages": len(pages), "method": "pdf_text", "ocr_available": ocr_available(),
@@ -130,7 +135,7 @@ def _pdf_worker(data: bytes) -> dict:
 
 if __name__ == "__main__":
     try:
-        print(json.dumps(_pdf_worker(sys.stdin.buffer.read(MAX_BYTES + 1))))
+        print(json.dumps(_pdf_worker(sys.stdin.buffer.read())))
     except DocumentError as error:
         print(json.dumps({"error": str(error)}))
         sys.exit(1)

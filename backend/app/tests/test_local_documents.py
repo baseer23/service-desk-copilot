@@ -125,6 +125,7 @@ def test_local_save_semantic_index_real_chroma_dedup_and_retrieval(make_client):
 def test_structured_upload_mode_is_explicit_persisted_and_nonretroactive(make_client):
     client = make_client(
         {
+            "__GRAPH_WRITER_AVAILABLE": True,
             "NEO4J_URI": "neo4j+s://fictional.example",
             "NEO4J_INGESTION_ENABLED": "true",
             "NEO4J_INGESTION_USER": "isolated-writer",

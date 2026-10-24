@@ -68,6 +68,15 @@ def make_client(monkeypatch, tmp_path):
             from backend.app.main import create_app
             import backend.app.main as main
 
+            if (env or {}).get("__GRAPH_WRITER_AVAILABLE"):
+                import backend.app.services.local_documents as local_documents
+
+                monkeypatch.setattr(
+                    local_documents,
+                    "graph_writer_readiness",
+                    lambda _settings: {"available": True, "blocker": None},
+                )
+
             app = create_app(Settings(_env_file=None))
             monkeypatch.setattr(main, "app", app)
             return stack.enter_context(TestClient(app))

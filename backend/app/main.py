@@ -372,8 +372,9 @@ def create_app(settings: Settings | None = None):
                 "index_document", {"document_id": uploaded["id"]}
             )
         )["result"]
+        pages = processed.get("pages", uploaded.get("pages", 1))
         return {
-            "pages": processed["pages"], "chunks": processed["chunks"],
+            "pages": pages, "chunks": processed["chunks"],
             "entities": 0, "vector_count": processed["chunks"],
             "ms": 0, "duplicate": uploaded["duplicate"], "content_hash": uploaded["id"],
         }

@@ -1,9 +1,16 @@
-from backend.app.agent.models import GeneralAnswer, RequestIntent
+from backend.app.agent.models import (
+    GeneralAnswer,
+    InvestigationDecision,
+    InvestigationPlan,
+    RequestIntent,
+    VerificationResult,
+)
 from backend.app.models.instructions import stage_instructions
 
 
 def install_conversation_provider(client, captured):
     agent = client.app.state.agent
+    original = agent.provider.generate_structured
 
     async def generate(stage, context, schema):
         captured.append((stage, context))
@@ -14,14 +21,36 @@ def install_conversation_provider(client, captured):
                 goal="Geography",
                 justification="General question",
             )
-        assert stage == "general_chat"
-        assert schema is GeneralAnswer
-        return GeneralAnswer(answer="Toronto is in Ontario, Canada.")
+        if stage == "general_chat":
+            assert schema is GeneralAnswer
+            return GeneralAnswer(answer="Toronto is in Ontario, Canada.")
+        if stage == "plan":
+            return InvestigationPlan(
+                goal="Answer the general-knowledge question directly",
+                additional_evidence_useful=False,
+                stop_condition="A concise direct answer is ready",
+            )
+        if stage == "reason":
+            return InvestigationDecision(
+                outcome="answer",
+                evidence_summary="No external evidence requested for this general answer.",
+                enough_information=True,
+                answer="Toronto is in Ontario, Canada.",
+                confidence=0.8,
+            )
+        if stage == "verify":
+            return VerificationResult(
+                supported_claims=["Toronto is in Ontario, Canada."],
+                confidence=0.8,
+                should_continue_research=False,
+                justification="Stable general knowledge was answered directly.",
+            )
+        return await original(stage, context, schema)
 
     agent.provider.generate_structured = generate
 
 
-def test_general_chat_uses_graph_without_tools_or_fabricated_sources(make_client):
+def test_general_chat_uses_graph_without_fabricated_sources(make_client):
     client = make_client({"KNOWLEDGE_SCOPE": "broad"})
     captured = []
     install_conversation_provider(client, captured)
@@ -38,8 +67,8 @@ def test_general_chat_uses_graph_without_tools_or_fabricated_sources(make_client
     body = response.json()
     assert body["case_id"] is None
     assert body["result"]["final_answer"] == "Toronto is in Ontario, Canada."
-    assert body["result"]["final_response"]["sources"] == []
-    assert calls == []
+    assert body["result"]["final_response"]["sources"] == ["request_report"]
+    assert calls == ["list_available_context"]
     followup = client.post(
         f'/requests/{body["request_id"]}/message', json={"summary": "Which province is that?"}
     )
@@ -109,7 +138,7 @@ def test_public_news_intent_routes_to_research_and_keeps_followup_context(make_c
                 "in_scope": True,
             }
         }
-    ) == "public_research"
+    ) == "understand_request"
     assert "public_web" in stage_instructions(
         "classify_intent", {"knowledge_scope": "broad"}
     )

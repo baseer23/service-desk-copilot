@@ -243,14 +243,17 @@ async def test_local_pdf_pipeline_keeps_original_and_legacy_ingest_response(sett
 
     repo = LocalDocumentRepository(
         cfg,
-        extractor=SimpleNamespace(extract=extract),
+        extractor=SimpleNamespace(
+            extract=extract,
+            extract_path=lambda path, media: extract(path.read_bytes(), media),
+        ),
         embeddings=SimpleNamespace(embed_texts=embed),
     )
     monkeypatch.setattr(server, "get_settings", lambda: cfg)
     monkeypatch.setattr(server, "documents", lambda: repo)
     data = b"%PDF-fictional-original-binary"
     result = await server.ingest_document(base64.b64encode(data).decode(), "Fictional PDF")
-    assert result.status == "ok"
+    assert result.status == "ok", result.error
     response = IngestPdfResponse.model_validate(result.result)
     assert response.pages == 1 and response.chunks == 1 and calls == ["extract", "embed"]
     assert repo.blobs.get(response.content_hash, "original") == data

@@ -538,10 +538,8 @@ def test_unknown_internal_ip_does_not_hallucinate(tmp_path, monkeypatch):
         result = response.json()["result"]
         assert result["workflow"] == "knowledge"
         assert result["status"] == "insufficient_information" and result["confidence"] == 0
-        assert (
-            result["final_response"]["answer"] is None
-            and not result["final_response"]["sources"][1:]
-        )
+        assert "could not verify" in result["final_response"]["answer"]
+        assert not result["final_response"]["sources"][1:]
         assert any(
             "evidence" in u.lower() or "information" in u.lower() for u in result["uncertainty"]
         )
@@ -561,7 +559,7 @@ def test_failed_web_fetch_retains_insufficiency_without_answer(tmp_path, monkeyp
         assert response.status_code == 200, response.text
         result = response.json()["result"]
         assert result["status"] == "insufficient_information" and result["confidence"] == 0
-        assert result["final_response"]["answer"] is None
+        assert "Some evidence sources failed" in result["final_response"]["answer"]
         assert any(
             "fetch_web_page unavailable" in uncertainty for uncertainty in result["uncertainty"]
         )
