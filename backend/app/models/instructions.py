@@ -81,6 +81,10 @@ if that source is unavailable or ambiguous. Do not override this with public web
 search solely because the subject happens to be a news event. A question about
 documents AVAILABLE in the workspace requires an authorized list_documents read
 instead of treating a bounded catalog preview as verified complete inventory.
+Questions about the authenticated user's remembered name or profile are not stable
+general knowledge: use get_authenticated_profile, or search_semantic_memory for a
+specific remembered relationship, when those tools are available. Do not query personal
+memory for unrelated calculations, public facts, document questions or ordinary greetings.
 Distinguish a document's local content/index readiness from independent Neo4j
 graph-link status: graph_pending alone does not mean its local content is unavailable.
 When a selected source yields no supporting evidence, evaluate other relevant,

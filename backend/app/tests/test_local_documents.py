@@ -125,6 +125,7 @@ def test_local_save_semantic_index_real_chroma_dedup_and_retrieval(make_client):
 def test_structured_upload_mode_is_explicit_persisted_and_nonretroactive(make_client):
     client = make_client(
         {
+            "__GRAPH_WRITER_AVAILABLE": True,
             "NEO4J_URI": "neo4j+s://fictional.example",
             "NEO4J_INGESTION_ENABLED": "true",
             "NEO4J_INGESTION_USER": "isolated-writer",
@@ -146,8 +147,9 @@ def test_structured_upload_mode_is_explicit_persisted_and_nonretroactive(make_cl
         "/documents/upload",
         files=files,
         data={"ingestion_mode": "standard"},
-    ).json()
-    assert duplicate["duplicate"] and duplicate["ingestion_mode"] == "structured_graph"
+    )
+    assert duplicate.status_code == 400
+    assert "cannot be disabled" in duplicate.json()["detail"]
 
 
 def test_automatic_ingestion_accepts_plain_text_with_local_fallback(

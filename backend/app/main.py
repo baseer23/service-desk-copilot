@@ -194,7 +194,7 @@ def create_app(settings: Settings | None = None):
         CORSMiddleware,
         allow_origins=s.allowed_origins,
         allow_credentials=True,
-        allow_methods=["GET", "POST"],
+        allow_methods=["GET", "POST", "DELETE"],
         allow_headers=["Content-Type", "Authorization", "X-DeskMate-Provider"],
     )
     from backend.app.speech.api import register_speech_routes
@@ -312,6 +312,7 @@ def create_app(settings: Settings | None = None):
             "structured_ingestion_available": bool(
                 s.uses_record_store and app.state.graph_writer["available"]
             ),
+            "hybrid_policy_enabled": True,
             "automatic_graph_ingestion_enabled": s.auto_document_graph_ingestion,
             "structured_ingestion_blocker": app.state.graph_writer["blocker"],
         }
@@ -371,8 +372,9 @@ def create_app(settings: Settings | None = None):
                 "index_document", {"document_id": uploaded["id"]}
             )
         )["result"]
+        pages = processed.get("pages", uploaded.get("pages", 1))
         return {
-            "pages": processed["pages"], "chunks": processed["chunks"],
+            "pages": pages, "chunks": processed["chunks"],
             "entities": 0, "vector_count": processed["chunks"],
             "ms": 0, "duplicate": uploaded["duplicate"], "content_hash": uploaded["id"],
         }
@@ -399,7 +401,7 @@ def create_app(settings: Settings | None = None):
 
     async def document_upload(
         file: UploadFile, title: str | None, tool: str,
-        ingestion_mode: str = "standard",
+        ingestion_mode: str = "structured_graph",
         document_processing: str = "local",
     ):
         from pathlib import Path
@@ -451,11 +453,11 @@ def create_app(settings: Settings | None = None):
     @app.post("/documents/upload")
     async def save_upload(
         file: UploadFile = File(...), title: str | None = Form(None),
-        ingestion_mode: str = Form("standard"),
+        ingestion_mode: str = Form("structured_graph"),
         document_processing: str = Form("local"),
     ):
-        if ingestion_mode not in {"standard", "structured_graph"}:
-            raise HTTPException(400, "ingestion_mode must be standard or structured_graph")
+        if ingestion_mode != "structured_graph":
+            raise HTTPException(400, "Hybrid ingestion is required and cannot be disabled")
         if document_processing not in {"local", "azure_di"}:
             raise HTTPException(400, "document_processing must be local or azure_di")
         if s.auto_document_graph_ingestion:
@@ -474,9 +476,7 @@ def create_app(settings: Settings | None = None):
                     "data_base64": base64.b64encode(body.text.encode()).decode(),
                     "title": body.title,
                     "media_type": "text/plain",
-                    "ingestion_mode": (
-                        "structured_graph" if s.auto_document_graph_ingestion else "standard"
-                    ),
+                    "ingestion_mode": "structured_graph",
                     "document_processing": "local",
                 },
             )
@@ -623,6 +623,12 @@ def create_app(settings: Settings | None = None):
         await require_reasoning()
         try:
             state, events = await app.state.agent.run_request(request_id, summary, answer, message)
+            assertion = summary if summary is not None else message
+            if assertion and s.uses_record_store:
+                await app.state.agent.harness.invoke(
+                    "capture_semantic_memory",
+                    {"text": assertion, "conversation_id": request_id},
+                )
             return AskResponse(
                 request_id=request_id,
                 intent="knowledge_question" if state["workflow"] == "knowledge" else "service_desk",
@@ -674,6 +680,14 @@ def create_app(settings: Settings | None = None):
         if "text/event-stream" in request.headers.get("accept", ""):
             return stream_operation(request, lambda: request_result(uuid.uuid4().hex, body.summary))
         return await request_result(uuid.uuid4().hex, body.summary)
+
+    @app.get("/memory/profile")
+    async def memory_profile():
+        return (await app.state.agent.harness.invoke("get_authenticated_profile", {}))["result"]
+
+    @app.delete("/memory/profile")
+    async def forget_memory_profile():
+        return (await app.state.agent.harness.invoke("forget_authenticated_profile", {}))["result"]
 
     @app.post("/requests/{request_id}/resume", response_model=AskResponse)
     async def resume_request(request: Request, request_id: str, body: CaseResumeRequest):

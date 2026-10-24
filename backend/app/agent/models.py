@@ -250,6 +250,64 @@ class MemoryFact(StructuredModel):
         return v
 
 
+SemanticEntityType = Literal[
+    "User", "Person", "Organization", "Project", "Location", "Technology"
+]
+
+
+class SemanticEntity(StructuredModel):
+    id: str = Field(min_length=1, max_length=160)
+    entity_type: SemanticEntityType
+    name: str = Field(min_length=1, max_length=240)
+    tenant_id: str = Field(min_length=1, max_length=160)
+    owner_id: str = Field(min_length=1, max_length=160)
+
+
+class SemanticSource(StructuredModel):
+    id: str = Field(min_length=1, max_length=160)
+    source_type: Literal["conversation", "document"]
+    source_id: str = Field(min_length=1, max_length=240)
+    content_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
+    observed_at: str
+    excerpt: str = Field(min_length=1, max_length=1000)
+
+    @field_validator("observed_at")
+    @classmethod
+    def semantic_timestamp_valid(cls, value):
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return value
+
+
+class SemanticFact(StructuredModel):
+    id: str = Field(min_length=1, max_length=160)
+    subject_id: str = Field(min_length=1, max_length=160)
+    predicate: Literal["NAME", "WORKS_AT", "MEMBER_OF", "USES", "LOCATED_IN", "RELATED_TO"]
+    value: str = Field(min_length=1, max_length=500)
+    tenant_id: str = Field(min_length=1, max_length=160)
+    owner_id: str = Field(min_length=1, max_length=160)
+    confidence: float = Field(ge=0, le=1)
+    status: Literal["confirmed", "superseded", "revoked"] = "confirmed"
+    source_id: str = Field(min_length=1, max_length=160)
+    supersedes_id: str | None = Field(default=None, max_length=160)
+
+
+class SemanticRelationship(StructuredModel):
+    id: str = Field(min_length=1, max_length=160)
+    source_entity_id: str = Field(min_length=1, max_length=160)
+    relationship: Literal["WORKS_AT", "MEMBER_OF", "USES", "LOCATED_IN", "RELATED_TO"]
+    target_entity_id: str = Field(min_length=1, max_length=160)
+    fact_id: str = Field(min_length=1, max_length=160)
+    source_id: str = Field(min_length=1, max_length=160)
+    confidence: float = Field(ge=0, le=1)
+
+
+class SemanticMemoryBatch(StructuredModel):
+    entities: list[SemanticEntity] = Field(default_factory=list, max_length=20)
+    facts: list[SemanticFact] = Field(default_factory=list, max_length=20)
+    relationships: list[SemanticRelationship] = Field(default_factory=list, max_length=20)
+    sources: list[SemanticSource] = Field(default_factory=list, min_length=1, max_length=10)
+
+
 class CapabilityResult(StructuredModel):
     tool: str
     source_system: str

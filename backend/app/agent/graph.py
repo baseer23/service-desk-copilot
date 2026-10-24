@@ -35,6 +35,8 @@ from backend.app.services.web import relevant_excerpt
 LABELS = {
     "search_memory": "Memory searched",
     "search_remembered_facts": "Cross-case memory searched",
+    "get_authenticated_profile": "Authenticated profile checked",
+    "search_semantic_memory": "Personal memory searched",
     "search_previous_tickets": "Previous incidents searched",
     "get_user_context": "User context checked",
     "get_company_context": "Company context checked",

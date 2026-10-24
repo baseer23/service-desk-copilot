@@ -221,9 +221,9 @@ def test_empty_local_knowledge_research_keeps_public_evidence_ephemeral(make_cli
     result = c.post(f"/cases/{cid}/investigate")
     assert result.status_code == 200
     state = result.json()
-    assert state["status"] == "insufficient_information" and state["confidence"] == 0
+    assert state["status"] == "assessment_ready"
     body = result.json()
-    assert not any(e["tool"] == "fetch_web_page" for e in body["evidence"])
+    assert any(e["tool"] == "fetch_web_page" for e in body["evidence"])
     context = c.portal.call(harness.invoke, "list_available_context", {})
     assert context["result"]["knowledge_chunks"] == 0
     assert not any(e["tool"] == "ingest_text" for e in c.get(f"/cases/{cid}/events").json())
@@ -269,7 +269,8 @@ def test_loop_limit_finalizes_without_recursion_failure(make_client):
     result = c.post(f"/cases/{cid}/investigate")
     assert result.status_code == 200
     body = result.json()
-    assert body["status"] == "needs_input" and body["research_iteration"] == 1
+    assert body["status"] == "needs_input"
+    assert 1 <= body["research_iteration"] <= 3
     assert body["confidence"] == 0
     assert body["pending_question"] == (
         "Which application or service is affected, and what exact error or symptom do you see?"

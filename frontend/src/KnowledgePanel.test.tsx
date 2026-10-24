@@ -50,7 +50,7 @@ test('never lists or fetches saved documents while preserving upload and search'
   expect(fetch).not.toHaveBeenCalled()
 })
 
-test('knowledge switches default on, on, off and apply to the selected upload', async () => {
+test('hybrid policy is always on and applies to the selected upload', async () => {
   const fetch = vi.fn(async () => Response.json({ chunks: 1, status: 'queued' }))
   vi.stubGlobal('fetch', fetch)
   render(
@@ -67,13 +67,14 @@ test('knowledge switches default on, on, off and apply to the selected upload', 
   const user = userEvent.setup()
   expect(screen.getByRole('switch', { name: 'Azure Document Intelligence' })).toBeChecked()
   expect(screen.getByRole('switch', { name: 'Neo4j Read' })).toBeChecked()
-  expect(screen.getByRole('switch', { name: 'Azure DI + Neo4j Hybrid' })).not.toBeChecked()
+  expect(screen.getByRole('switch', { name: 'Local + Neo4j Hybrid' })).toBeChecked()
+  expect(screen.getByRole('switch', { name: 'Local + Neo4j Hybrid' })).toBeDisabled()
   const file = new File(['structured content'], 'structured.pdf', { type: 'application/pdf' })
   await user.upload(screen.getByLabelText('PDF document'), file)
   await user.click(screen.getByRole('button', { name: 'Add to knowledge' }))
   const calls = fetch.mock.calls as unknown as [string, RequestInit][]
   const body = calls[0][1].body as FormData
   expect(body.get('document_processing')).toBe('azure_di')
-  expect(body.get('ingestion_mode')).toBe('standard')
+  expect(body.get('ingestion_mode')).toBe('structured_graph')
   expect(await screen.findByText('Extracting → Ready')).toBeInTheDocument()
 })

@@ -30,6 +30,7 @@ export interface ReadinessReport {
   structured_ingestion_available?: boolean
   automatic_graph_ingestion_enabled?: boolean
   structured_ingestion_blocker?: string | null
+  hybrid_policy_enabled?: boolean
   azure_document_intelligence_available?: boolean
   neo4j_read_available?: boolean
   voice_validation_scope?: 'not_checked' | 'configuration' | 'transport'

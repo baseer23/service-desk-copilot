@@ -17,6 +17,7 @@ class StubProvider:
         )
         lower = text.lower()
         if stage == "classify_intent":
+            broad_scope = context.get("knowledge_scope") == "broad"
             current_news = any(
                 term in lower for term in ("what's going on", "news", "latest", "recent events")
             )
@@ -45,7 +46,7 @@ class StubProvider:
             return schema.model_validate(
                 {
                     "workflow": "knowledge" if knowledge or unrelated or current_news else "service_desk",
-                    "in_scope": not unrelated,
+                    "in_scope": broad_scope or not unrelated,
                     "knowledge_source": "public_web" if current_news else "documents",
                     "public_topic": "news" if current_news else "none",
                     "goal": text,

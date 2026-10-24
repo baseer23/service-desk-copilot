@@ -43,3 +43,9 @@ npm --prefix frontend run test:e2e
 Automated fixtures stay in temporary stores. They do not establish live model, Neo4j or physical microphone success. Live evaluators require explicit opt-in and respect existing spending controls. Never upload normal user knowledge merely to populate a demonstration.
 
 Read the [current architecture and verification report](docs/ARCHITECTURE_SIMPLIFICATION.md), [reasoning evaluation](docs/REASONING_EVALUATION.md), [Speech behavior](docs/SPEECH.md), and [local retrieval](docs/RAG.md). Earlier Azure persistence/Voice Live reviews are historical records, not active setup instructions.
+
+## Development and releases
+
+DeskMate uses `dev` for active integration, `staging` for preproduction validation and `main` for production-ready releases. Temporary feature branches merge into `dev`; promotion then proceeds through pull requests from `dev` to `staging` and from `staging` to `main`. Do not push feature work directly to `main` or force-push a permanent branch.
+
+See [Branching and deployment](docs/BRANCHING_AND_DEPLOYMENT.md) for required checks, rollback, environment isolation, branch protection and the 2026-10-23 branch reconciliation report. The repository currently provides validation gates but no configured hosting target, so workflows do not claim a live deployment.

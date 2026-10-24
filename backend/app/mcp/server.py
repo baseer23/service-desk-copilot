@@ -134,6 +134,16 @@ def managed_records():
 
 
 @lru_cache
+def semantic_memory():
+    from backend.app.services.semantic_memory import AuthorizedSemanticGraph, SemanticMemoryService
+
+    settings = get_settings()
+    return SemanticMemoryService(
+        settings, records=managed_records(), graph=AuthorizedSemanticGraph(settings)
+    )
+
+
+@lru_cache
 def environment():
     from backend.app.adapters.embeddings import get_embedding_provider
     from backend.app.rag.retrieve import Retriever
@@ -243,6 +253,35 @@ def search_graph(entities: list[str], limit: int = 12):
     if not 1 <= limit <= 30:
         raise ValueError("limit must be between 1 and 30")
     return graph.search_relationships(entities, limit)
+
+
+@capability("semantic_memory", 1.0)
+def get_authenticated_profile():
+    """Return confirmed profile facts for the authenticated tenant and owner only."""
+    semantic_memory().retry_pending(limit=10)
+    profile = semantic_memory().profile()
+    return {"name": profile["name"], "facts": profile["facts"], "graph_status": profile["graph_status"]}
+
+
+@capability("semantic_memory", 1.0)
+def search_semantic_memory(query: str, limit: int = 10):
+    """Search bounded confirmed personal memory; tenant and owner come from signed authority."""
+    semantic_memory().retry_pending(limit=10)
+    return semantic_memory().search(query, limit)
+
+
+@capability("semantic_memory", 1.0)
+def capture_semantic_memory(text: str, conversation_id: str, allow_personal_memory: bool = True):
+    """Application-controlled capture of explicit first-person identity assertions."""
+    return semantic_memory().capture_conversation(
+        text, conversation_id, allow_personal_memory=allow_personal_memory
+    )
+
+
+@capability("semantic_memory", 1.0)
+def forget_authenticated_profile():
+    """Application-controlled revocation of the authenticated owner's personal memory."""
+    return {"revoked": semantic_memory().forget_profile()}
 
 
 @capability("local_fixture")
@@ -530,10 +569,12 @@ def save_document(
     data_base64: str,
     title: str | None = None,
     media_type: str = "application/pdf",
-    ingestion_mode: Literal["standard", "structured_graph"] = "standard",
+    ingestion_mode: Literal["structured_graph"] = "structured_graph",
     document_processing: Literal["local", "azure_di"] = "local",
 ):
     """Operator-controlled extraction and local staging; never creates fake semantic vectors."""
+    if ingestion_mode != "structured_graph":
+        raise ValueError("Hybrid ingestion is required and cannot be disabled")
     if get_settings().uses_record_store:
         data = base64.b64decode(data_base64, validate=True)
         return documents().upload(data, title, media_type, ingestion_mode, document_processing)
@@ -567,10 +608,25 @@ def save_staged_document(
     upload_token: str,
     title: str | None = None,
     media_type: str = "application/pdf",
-    ingestion_mode: Literal["standard", "structured_graph"] = "standard",
+    ingestion_mode: Literal["structured_graph"] = "structured_graph",
     document_processing: Literal["local", "azure_di"] = "local",
 ):
     """Persist a server-staged upload without transporting its bytes through MCP."""
+    if ingestion_mode != "structured_graph":
+        raise ValueError("Hybrid ingestion is required and cannot be disabled")
+    if not get_settings().uses_record_store:
+        from backend.app.services.document_extract import extract_document_path
+
+        result = extract_document_path(_staged_path(upload_token), media_type)
+        return {
+            **documents().save(
+                result["text"], title,
+                "pdf" if media_type == "application/pdf" else "text",
+                result["pages"],
+            ),
+            "ingestion_mode": "structured_graph",
+            "graph_link_status": "pending",
+        }
     return documents().upload_path(
         _staged_path(upload_token), title, media_type, ingestion_mode, document_processing
     )

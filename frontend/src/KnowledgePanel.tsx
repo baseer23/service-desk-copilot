@@ -52,7 +52,6 @@ export default function KnowledgePanel({
   const [dragging, setDragging] = useState(false)
   const [azureDi, setAzureDi] = useState(true)
   const [neo4jRead, setNeo4jRead] = useState(true)
-  const [hybrid, setHybrid] = useState(false)
   const picker = useRef<HTMLInputElement>(null)
   const autoGraph = readiness?.automatic_graph_ingestion_enabled === true
   const indexingBlocked = readiness?.semantic_ingestion_ready === false
@@ -80,7 +79,7 @@ export default function KnowledgePanel({
         body.append('file', file)
         if (title) body.append('title', title)
         body.append('document_processing', autoGraph || azureDi ? 'azure_di' : 'local')
-        body.append('ingestion_mode', autoGraph || hybrid ? 'structured_graph' : 'standard')
+        body.append('ingestion_mode', 'structured_graph')
         options = { method: 'POST', body }
         path =
           readiness?.managed_documents && kind !== 'extract' ? '/documents/upload' :
@@ -173,9 +172,8 @@ export default function KnowledgePanel({
         <Switch label="Neo4j Read" checked={neo4jRead}
           disabled={busy || readiness?.neo4j_read_available === false}
           onChange={setNeo4jRead} />
-        <Switch label="Azure DI + Neo4j Hybrid" checked={autoGraph || hybrid}
-          disabled={autoGraph || busy || !azureDi || !neo4jRead || readiness?.structured_ingestion_available !== true}
-          onChange={setHybrid} />
+        <Switch label="Local + Neo4j Hybrid" checked disabled
+          onChange={() => undefined} />
         <p className="muted knowledge-switch-note">
           {autoGraph
             ? 'Automatic ingestion is enabled: every file upload uses Azure Document Intelligence and writes reference-only nodes and links to Neo4j. Extraction previews do not save the original locally, but their graph references persist. Azure processing may incur charges. '
@@ -185,15 +183,9 @@ export default function KnowledgePanel({
           {readiness?.neo4j_read_available === false
             ? 'Neo4j read is unavailable. '
             : 'Neo4j access is read-only. '}
-          {autoGraph
-            ? readiness?.structured_ingestion_available === true
-              ? 'Saved uploads are also indexed into local ChromaDB.'
-              : 'Neo4j ingestion writer is not ready: uploads will be blocked until configured.'
-            : readiness?.structured_ingestion_available !== true
-              ? 'Hybrid ingestion is unavailable until the backend writer is verified.'
-              : hybrid
-                ? 'Hybrid is ON: uploads use Azure extraction, local ChromaDB, and Neo4j references.'
-                : 'Hybrid is OFF: uploads remain local and do not write graph references.'}
+          {readiness?.structured_ingestion_available === true
+            ? 'Hybrid policy is always ON: saved content is indexed locally and linked to Neo4j.'
+            : 'Hybrid policy remains ON. Local indexing continues and Neo4j links stay pending until the authorized writer is available.'}
         </p>
       </div>
       <div className={`document-drop ${dragging ? 'dragging' : ''}`} onDragOver={event => { event.preventDefault(); setDragging(true) }} onDragLeave={() => setDragging(false)} onDrop={event => { event.preventDefault(); setDragging(false); chooseFile(event.dataTransfer.files[0]) }}>

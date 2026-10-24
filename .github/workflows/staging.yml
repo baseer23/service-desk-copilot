@@ -1,0 +1,60 @@
+name: Staging validation
+
+on:
+  push:
+    branches: [staging]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: staging-validation
+  cancel-in-progress: false
+
+jobs:
+  preproduction:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment: staging
+    env:
+      TEST_MODE: "true"
+      DATA_PLATFORM: local
+      LOCAL_PERSISTENCE_ENABLED: "true"
+      DEPLOYMENT_MODE: local
+      ENABLE_LOCAL_FIXTURES: "true"
+      GENERATION_PROVIDER: stub
+      EMBED_PROVIDER: stub
+      NEO4J_URI: ""
+      MCP_SERVERS: "[]"
+      SPEECH_ENABLED: "false"
+      ALLOW_URL_INGEST: "false"
+      VOICE_SESSION_SIGNING_KEY: staging-isolated-signing-key-xxxxxxxxxxxxxxxxxxxxxxx
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install isolated runtime
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -r requirements.txt
+          .venv/bin/python -m pip check
+          npm --prefix frontend ci
+          npx --prefix frontend playwright install --with-deps chromium
+      - name: Persistent memory and integration tests
+        run: .venv/bin/python -m pytest backend/app/tests -q
+      - name: Browser validation
+        run: npm --prefix frontend run test:e2e
+      - name: Production frontend build
+        run: npm --prefix frontend run build
+      - name: Deployment status
+        run: echo "Validation complete; no hosting target is configured, so no deployment was attempted."
+
