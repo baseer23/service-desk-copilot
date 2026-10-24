@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [dev, staging, main]
+  push:
+    branches: [dev, staging, main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TEST_MODE: "true"
+      DATA_PLATFORM: local
+      LOCAL_PERSISTENCE_ENABLED: "false"
+      DEPLOYMENT_MODE: local
+      ENABLE_LOCAL_FIXTURES: "true"
+      GENERATION_PROVIDER: stub
+      EMBED_PROVIDER: stub
+      NEO4J_URI: ""
+      MCP_SERVERS: "[]"
+      SPEECH_ENABLED: "false"
+      ALLOW_URL_INGEST: "false"
+      VOICE_SESSION_SIGNING_KEY: ci-isolated-signing-key-xxxxxxxxxxxxxxxxxxxxxxxxxxxx
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install Python dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -r requirements.txt
+          .venv/bin/python -m pip check
+      - name: Install frontend dependencies
+        run: npm --prefix frontend ci
+      - name: Python syntax and fatal lint checks
+        run: |
+          .venv/bin/python -m compileall -q backend/app
+          .venv/bin/ruff check backend --select E9,F63,F7,F82
+      - name: Focused backend regressions
+        run: >-
+          .venv/bin/python -m pytest -q
+          backend/app/tests/test_semantic_memory.py
+          backend/app/tests/test_graph_repo.py
+          backend/app/tests/test_mcp.py
+          backend/app/tests/test_mcp_security.py
+          backend/app/tests/test_multi_mcp.py
+          backend/app/tests/test_general_intelligence.py
+          backend/app/tests/test_scope_source_policy.py
+          backend/app/tests/test_activity_stream.py
+          backend/app/tests/test_web_research.py
+          backend/app/tests/test_local_document_jobs.py
+      - name: Frontend type checks
+        run: npm --prefix frontend run typecheck
+      - name: Frontend tests and production build
+        run: |
+          npm --prefix frontend test
+          npm --prefix frontend run build
+

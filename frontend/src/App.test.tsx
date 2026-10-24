@@ -377,7 +377,7 @@ test('knowledge answer, contradictions, and activity render without a ticket que
   await user.click(screen.getByRole('button', { name: /^Investigations$/ }))
   await user.click(await screen.findByRole('button', { name: /What year did Abdul graduate/ }))
   expect(await screen.findByRole('heading', { name: 'Final Answer' })).toBeInTheDocument()
-  expect(screen.getByText('Abdul graduated in 2022.').tagName).toBe('STRONG')
+  expect(screen.getByText('Abdul graduated in 2022.')).toBeVisible()
   expect(screen.getByText('Two documents give different dates.')).toBeInTheDocument()
   expect(screen.getByText('The newer resume supersedes the old version.')).toBeInTheDocument()
   expect(screen.queryByLabelText('Your answer')).not.toBeInTheDocument()

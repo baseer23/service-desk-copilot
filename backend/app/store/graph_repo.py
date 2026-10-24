@@ -67,6 +67,8 @@ class GraphRepository:
             "CREATE CONSTRAINT IF NOT EXISTS FOR (p:Paragraph) REQUIRE p.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (c:TableCell) REQUIRE c.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (t:Topic) REQUIRE t.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (f:SemanticFact) REQUIRE f.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (s:ConversationSource) REQUIRE s.id IS UNIQUE",
         ]
         with self._driver.session(database=self.database) as session:
             for statement in statements:
@@ -428,6 +430,118 @@ class GraphRepository:
 
         return self._execute_read(read) or []
 
+    def upsert_semantic_memory(self, batch) -> None:
+        """Idempotently publish validated, owner-scoped facts and provenance."""
+        allowed_labels = {"User", "Person", "Organization", "Project", "Location", "Technology"}
+        tenant = self.tenant()
+        for entity in batch.entities:
+            if entity.entity_type not in allowed_labels:
+                raise ValueError("Unsupported semantic entity type")
+            if tenant is not None and entity.tenant_id != tenant:
+                raise PermissionError("Semantic entity tenant mismatch")
+
+            def write_entity(tx, entity=entity):
+                tx.run(
+                    f"MERGE (e:{entity.entity_type} {{id:$id}}) "
+                    "SET e.name=$name, e.tenant_id=$tenant, e.owner_id=$owner, e.updated_at=timestamp()",
+                    id=self.scope(entity.id), name=entity.name,
+                    tenant=entity.tenant_id, owner=entity.owner_id,
+                )
+
+            self._execute_write(write_entity)
+        for source in batch.sources:
+            def write_source(tx, source=source):
+                tx.run(
+                    "MERGE (s:ConversationSource {id:$id}) "
+                    "SET s.source_type=$source_type, s.source_id=$source_id, "
+                    "s.content_hash=$content_hash, s.observed_at=$observed_at, "
+                    "s.tenant_id=$tenant, s.updated_at=timestamp()",
+                    id=self.scope(source.id), source_type=source.source_type,
+                    source_id=source.source_id, content_hash=source.content_hash,
+                    observed_at=source.observed_at, tenant=tenant,
+                )
+
+            self._execute_write(write_source)
+        for fact in batch.facts:
+            if tenant is not None and fact.tenant_id != tenant:
+                raise PermissionError("Semantic fact tenant mismatch")
+
+            def write_fact(tx, fact=fact):
+                tx.run(
+                    "MATCH (subject {id:$subject_id}) "
+                    "WHERE subject.tenant_id=$tenant AND subject.owner_id=$owner "
+                    "MERGE (f:SemanticFact {id:$fact_id}) "
+                    "SET f.predicate=$predicate, f.value=$value, f.confidence=$confidence, "
+                    "f.status=$status, f.tenant_id=$tenant, f.owner_id=$owner, "
+                    "f.original_id=$original_id, f.updated_at=timestamp() "
+                    "MERGE (subject)-[:HAS_FACT]->(f) "
+                    "WITH f MATCH (s:ConversationSource {id:$source_id}) "
+                    "WHERE s.tenant_id=$tenant MERGE (f)-[:SUPPORTED_BY]->(s)",
+                    subject_id=self.scope(fact.subject_id), fact_id=self.scope(fact.id),
+                    predicate=fact.predicate, value=fact.value, confidence=fact.confidence,
+                    status=fact.status, tenant=fact.tenant_id, owner=fact.owner_id,
+                    source_id=self.scope(fact.source_id), original_id=fact.id,
+                )
+                if fact.supersedes_id:
+                    tx.run(
+                        "MATCH (new:SemanticFact {id:$new_id}), (old:SemanticFact {id:$old_id}) "
+                        "WHERE new.tenant_id=$tenant AND new.owner_id=$owner "
+                        "AND old.tenant_id=$tenant AND old.owner_id=$owner "
+                        "SET old.status='superseded' MERGE (new)-[:SUPERSEDES]->(old)",
+                        new_id=self.scope(fact.id), old_id=self.scope(fact.supersedes_id),
+                        tenant=fact.tenant_id, owner=fact.owner_id,
+                    )
+
+            self._execute_write(write_fact)
+        allowed_relationships = {"WORKS_AT", "MEMBER_OF", "USES", "LOCATED_IN", "RELATED_TO"}
+        for relation in batch.relationships:
+            if relation.relationship not in allowed_relationships:
+                raise ValueError("Unsupported semantic relationship")
+
+            def write_relationship(tx, relation=relation):
+                tx.run(
+                    f"MATCH (source {{id:$source_id}}), (target {{id:$target_id}}), "
+                    "(fact:SemanticFact {id:$fact_id}), (provenance:ConversationSource {id:$provenance_id}) "
+                    "WHERE source.tenant_id=$tenant AND source.owner_id=$owner "
+                    "AND target.tenant_id=$tenant AND target.owner_id=$owner "
+                    f"MERGE (source)-[r:{relation.relationship} {{fact_id:$fact_id}}]->(target) "
+                    "SET r.confidence=$confidence, r.source_id=$provenance_id",
+                    source_id=self.scope(relation.source_entity_id),
+                    target_id=self.scope(relation.target_entity_id),
+                    fact_id=self.scope(relation.fact_id),
+                    provenance_id=self.scope(relation.source_id),
+                    tenant=tenant,
+                    owner=next(
+                        entity.owner_id for entity in batch.entities
+                        if entity.id == relation.source_entity_id
+                    ),
+                    confidence=relation.confidence,
+                )
+
+            self._execute_write(write_relationship)
+
+    def search_semantic_memory(self, owner_id: str, query: str, limit: int = 10):
+        """Bounded, tenant/owner-scoped confirmed fact retrieval; no caller Cypher."""
+        terms = [term for term in query.casefold().split() if term][:10]
+        if not terms:
+            return []
+
+        def read(tx):
+            rows = tx.run(
+                "MATCH (:User)-[:HAS_FACT]->(f:SemanticFact)-[:SUPPORTED_BY]->(s:ConversationSource) "
+                "WHERE f.tenant_id=$tenant AND f.owner_id=$owner AND f.status='confirmed' "
+                "AND any(term IN $terms WHERE toLower(f.predicate) CONTAINS term "
+                "OR toLower(f.value) CONTAINS term) "
+                "RETURN coalesce(f.original_id,f.id) AS id, f.predicate AS predicate, "
+                "f.value AS value, f.confidence AS confidence, s.source_id AS source_id "
+                "LIMIT $limit",
+                tenant=self.tenant(), owner=owner_id, terms=terms,
+                limit=min(max(limit, 1), 20),
+            )
+            return [dict(row) for row in rows]
+
+        return self._execute_read(read) or []
+
     def ping(self) -> bool:
         """Return True when the database responds to a trivial read."""
 
@@ -518,6 +632,12 @@ class UnavailableGraphRepository:
     def search_relationships(self, entities, limit=12):
         return []
 
+    def upsert_semantic_memory(self, *args, **kwargs):
+        return None
+
+    def search_semantic_memory(self, *args, **kwargs):
+        return []
+
     def ping(self):
         return False
 
@@ -531,6 +651,7 @@ class InMemoryGraphRepository:
         self.chunks: MutableMapping[str, Dict[str, Any]] = {}
         self.entity_links: MutableMapping[str, Dict[str, Any]] = {}
         self.references: MutableMapping[str, Dict[str, Any]] = {}
+        self.semantic_facts: MutableMapping[str, Dict[str, Any]] = {}
 
     def ensure_constraints(self) -> None:  # pragma: no cover - no-op for in-memory variant
         """In-memory store has no constraints to create."""
@@ -652,6 +773,20 @@ class InMemoryGraphRepository:
         """In-memory store is always available."""
 
         return True
+
+    def upsert_semantic_memory(self, batch) -> None:
+        for fact in batch.facts:
+            if fact.supersedes_id in self.semantic_facts:
+                self.semantic_facts[fact.supersedes_id]["status"] = "superseded"
+            self.semantic_facts[fact.id] = fact.model_dump()
+
+    def search_semantic_memory(self, owner_id, query, limit=10):
+        terms = query.casefold().split()
+        return [
+            fact for fact in self.semantic_facts.values()
+            if fact["owner_id"] == owner_id and fact["status"] == "confirmed"
+            and any(term in (fact["predicate"] + " " + fact["value"]).casefold() for term in terms)
+        ][:limit]
 
 
 def _safe_rel(rel: str) -> str:

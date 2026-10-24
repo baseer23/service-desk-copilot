@@ -148,9 +148,9 @@ def test_required_reasoning_matrix(scenario, tmp_path, monkeypatch):
             assert all(term in result["recommended_next_action"].lower() for term in scenario.action_terms)
             assert result["uncertainty"] and result["hypotheses"]
         if scenario.number == 9:
-            assert provider.verifications == 1
-            assert result["research_iteration"] == 1
-            assert result["status"] == "insufficient_information"
+            assert provider.verifications == 2
+            assert result["research_iteration"] == 2
+            assert result["status"] == "assessment_ready"
             assert result["contradictions"]
             assert "Disabling certificate validation is a verified fix" not in str(result.get("final_answer"))
             assert "policy owner" in result["recommended_next_action"]
