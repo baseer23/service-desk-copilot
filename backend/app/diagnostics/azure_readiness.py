@@ -41,7 +41,9 @@ async def local_checks(settings: Settings) -> tuple[StoreCheck, StoreCheck]:
 
 async def validate_live(settings: Settings, report: ReadinessReport) -> ReadinessReport:
     """One explicitly authorized Azure OpenAI text probe; no Speech/audio request."""
-    if settings.test_mode or settings.generation_provider != "azure_openai":
+    if settings.test_mode or settings.generation_provider not in {
+        "azure_openai", "azure_gpt5_nano"
+    }:
         raise ValueError("LIVE_REQUIRES_AZURE_TEXT_MODE")
     if not report.reasoning.configured:
         raise ValueError("LIVE_CONFIGURATION_MISSING")
@@ -61,7 +63,15 @@ async def validate_live(settings: Settings, report: ReadinessReport) -> Readines
     report.live_azure_validated = False
     reasoning = None
     try:
-        reasoning = AzureOpenAIProvider(settings)
+        if settings.generation_provider == "azure_gpt5_nano":
+            reasoning = AzureOpenAIProvider(
+                settings,
+                deployment=settings.azure_gpt5_nano_deployment,
+                provider_name="azure_gpt5_nano",
+                reasoning_model=True,
+            )
+        else:
+            reasoning = AzureOpenAIProvider(settings)
         report.reasoning.locally_initialized = True
         await asyncio.wait_for(
             reasoning.generate_structured(
@@ -111,7 +121,11 @@ def rows(settings: Settings, report: ReadinessReport, signed_in: str) -> dict[st
         "Runtime mode": report.runtime_mode,
         "Selected reasoning provider": report.selected_provider,
         "Azure reasoning endpoint": found(settings.azure_foundry_endpoint),
-        "Reasoning deployment": found(settings.azure_model_deployment),
+        "Reasoning deployment": found(
+            settings.azure_gpt5_nano_deployment
+            if settings.generation_provider == "azure_gpt5_nano"
+            else settings.azure_model_deployment
+        ),
         "Reasoning authentication": auth_method(settings),
         "Local embeddings": "YES"
         if settings.embed_provider == "sentence_transformers"

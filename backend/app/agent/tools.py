@@ -41,6 +41,8 @@ READ_TOOLS = {
     "get_case_history",
     "list_available_context",
     "list_documents",
+    "list_websites",
+    "get_website",
     "list_registry",
     "resolve_entity",
     "reload_registry",
@@ -67,6 +69,8 @@ KNOWLEDGE_TOOLS = {
     "get_holidays",
     "list_available_context",
     "list_documents",
+    "list_websites",
+    "get_website",
 }
 
 

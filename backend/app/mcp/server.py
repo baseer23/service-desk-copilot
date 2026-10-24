@@ -32,7 +32,7 @@ def capability(source_system, reliability=0.9):
                 if (
                     (settings.deployment_mode == "production" or not settings.test_mode)
                     and fn.__name__ in {
-                        "search_web", "search_news", "fetch_web_page", "ingest_url",
+                        "search_web", "search_news", "fetch_web_page",
                         "get_weather", "geocode_location", "search_places", "get_route",
                         "convert_currency", "get_holidays",
                     }
@@ -131,6 +131,13 @@ def managed_records():
     from backend.app.store.local_records import record_store
 
     return record_store(get_settings())
+
+
+@lru_cache
+def websites():
+    from backend.app.services.websites import WebsiteRepository
+
+    return WebsiteRepository(managed_records())
 
 
 @lru_cache
@@ -737,13 +744,71 @@ def ingest_url(url: str, max_depth: int | None = None, max_pages: int | None = N
         url, CrawlLimits(depth, pages, s.url_max_total_chars, s.url_rate_limit_sec)
     )
     totals = {"chunks": 0, "entities": 0, "vector_count": 0, "ms": 0}
+    sources = []
     for page in result.pages:
         item = environment()[3].ingest_text(
             page.title, page.content, source=page.url, source_type="url", url=page.url
         )
+        sources.append(
+            {
+                "title": page.title,
+                "url": page.url,
+                "content_hash": item.content_hash,
+                "chunks": item.chunks,
+                "duplicate": item.duplicate,
+            }
+        )
         for key in totals:
             totals[key] += getattr(item, key)
-    return {**totals, "pages": len(result.pages), "skipped_urls": result.skipped_urls}
+    return {
+        **totals,
+        "pages": len(result.pages),
+        "skipped_urls": result.skipped_urls,
+        "sources": sources,
+        "duplicate": bool(sources) and all(source["duplicate"] for source in sources),
+    }
+
+
+@capability("website_registry", 1)
+def register_website(
+    url: str,
+    max_depth: int = 1,
+    max_pages: int = 20,
+    request_budget: int = 40,
+    allow_subdomains: bool = False,
+):
+    """Register an authorized public website without starting a crawl."""
+    return websites().register(
+        url,
+        max_depth=max_depth,
+        max_pages=max_pages,
+        request_budget=request_budget,
+        allow_subdomains=allow_subdomains,
+    )
+
+
+@capability("website_registry", 1)
+def list_websites():
+    """List tenant-scoped website registrations and honest operational status."""
+    return websites().list()
+
+
+@capability("website_registry", 1)
+def get_website(website_id: str):
+    """Read one tenant-scoped website registration."""
+    return websites().get(website_id)
+
+
+@capability("website_registry", 1)
+def pause_website_monitor(website_id: str):
+    """Pause future work while preserving registration and indexed evidence."""
+    return websites().set_paused(website_id, True)
+
+
+@capability("website_registry", 1)
+def resume_website_monitor(website_id: str):
+    """Restore ready state without claiming that a scheduler is active."""
+    return websites().set_paused(website_id, False)
 
 
 @capability("sqlite_memory", 1)

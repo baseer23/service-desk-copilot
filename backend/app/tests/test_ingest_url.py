@@ -219,6 +219,13 @@ def test_url_ingest_end_to_end(fake_site, make_client, tmp_path, monkeypatch):
             json={"url": "https://example.com/start", "max_depth": 1, "max_pages": 2},
         )
         body = response.json()
+        found = client.get(
+            "/knowledge/search", params={"question": "How do I reset MFA?", "mode": "HYBRID"}
+        ).json()
+        duplicate = client.post(
+            "/ingest/url",
+            json={"url": "https://example.com/start", "max_depth": 1, "max_pages": 2},
+        ).json()
 
         graph_repo = local_graph
     finally:
@@ -228,6 +235,14 @@ def test_url_ingest_end_to_end(fake_site, make_client, tmp_path, monkeypatch):
     assert body["pages"] == 2
     assert body["chunks"] > 0
     assert body["vector_count"] == body["chunks"]
+    assert body["sources"][0]["title"] == "Root"
+    assert body["sources"][0]["url"] == "https://example.com/start"
+    assert len(body["sources"][0]["content_hash"]) == 64
+    assert found["mode"] == "hybrid"
+    assert found["items"]
+    assert found["items"][0]["metadata"]["url"].startswith("https://example.com/")
+    assert duplicate["duplicate"] is True
+    assert duplicate["chunks"] == 0
 
     assert graph_repo is not None
     if hasattr(graph_repo, "documents"):

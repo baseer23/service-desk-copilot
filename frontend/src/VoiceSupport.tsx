@@ -561,7 +561,7 @@ export default function VoiceSupport({
       )}
       {!!transcriptTurns.length && <Transcript turns={transcriptTurns} />}
       <div className="readiness-summary" aria-label="Voice conversation status">
-        <p>AI provider: <strong>{localStorage.getItem('deskmate.reasoning-provider') === 'azure_openai' ? 'Azure OpenAI' : 'Groq'}</strong></p>
+        <p>AI provider: <strong>{localStorage.getItem('deskmate.reasoning-provider') === 'azure_gpt5_nano' ? 'Azure OpenAI — GPT-5 Nano' : localStorage.getItem('deskmate.reasoning-provider') === 'azure_openai' ? 'Azure OpenAI' : 'Groq'}</strong></p>
       </div>
       {emailState && (
         <div className="readiness-summary" aria-label="Interpreted email status">

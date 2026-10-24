@@ -1,6 +1,8 @@
 # Reasoning, retrieval and capability boundaries
 
-The active flow is React → FastAPI → LangGraph supervisor → LangChain tools → MCP → local or connected capabilities. The selected Groq/Azure OpenAI provider is request-scoped, applies to every reasoning stage and does not change embeddings or Speech recognition. Instructions live in `backend/app/models/instructions.py`.
+The active flow is React → FastAPI → LangGraph supervisor → LangChain tools → MCP → local or connected capabilities. The selected Groq, Azure OpenAI, or independently configured Azure GPT-5 Nano provider is request-scoped, applies to every reasoning stage and does not change embeddings or Speech recognition. Instructions live in `backend/app/models/instructions.py`.
+
+Knowledge URL ingestion is controlled by `ALLOW_URL_INGEST`, independently of the live-research `ENABLE_PUBLIC_WEB_TOOLS` flag. It validates public destinations and redirects, applies bounded depth/page/byte limits, extracts readable HTML, and indexes it into the existing local embedding collection with title, canonical URL, content hash and chunk provenance. The Knowledge excerpt search retains deterministic keyword retrieval; the LangGraph knowledge workflow uses hybrid semantic retrieval for grounded questions. The API also accepts explicit `HYBRID` and `VECTOR` modes. Neo4j remains optional.
 
 ## Investigation graph
 

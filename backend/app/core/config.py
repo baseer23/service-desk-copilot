@@ -19,7 +19,7 @@ class Settings(BaseSettings):
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     ]
-    generation_provider: Literal["groq", "azure_openai", "stub"] = "groq"
+    generation_provider: Literal["groq", "azure_openai", "azure_gpt5_nano", "stub"] = "groq"
     embed_provider: Literal["sentence_transformers", "stub"] = "sentence_transformers"
     test_mode: bool = False
     deployment_mode: Literal["local", "production"] = "local"
@@ -67,6 +67,7 @@ class Settings(BaseSettings):
         ),
     )
     azure_model_deployment: str = ""
+    azure_gpt5_nano_deployment: str = ""
     azure_openai_api_version: str = "2024-10-21"
     azure_openai_api_key: SecretStr | None = Field(default=None, repr=False)
     azure_use_entra_id: bool = True

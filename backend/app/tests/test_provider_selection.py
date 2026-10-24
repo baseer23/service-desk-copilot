@@ -117,9 +117,10 @@ async def test_request_selection_isolated_between_concurrent_graphs_and_nested_t
 
             return selected_provider(settings), await asyncio.create_task(child())
 
-    assert await asyncio.gather(graph("groq"), graph("azure_openai")) == [
+    assert await asyncio.gather(graph("groq"), graph("azure_openai"), graph("azure_gpt5_nano")) == [
         ("groq", "groq"),
         ("azure_openai", "azure_openai"),
+        ("azure_gpt5_nano", "azure_gpt5_nano"),
     ]
     assert selected_provider(settings) == "groq"
 
@@ -143,7 +144,7 @@ async def test_common_langchain_runnable_routes_every_stage_and_preserves_no_fal
         lambda settings: Provider(settings.generation_provider),
     )
     router = SelectableReasoningProvider(configured(settings))
-    for name in ("groq", "azure_openai"):
+    for name in ("groq", "azure_openai", "azure_gpt5_nano"):
         with provider_scope(name):
             for stage in ("classify_intent", "plan", "reason", "verify", "general_chat"):
                 assert (
@@ -151,10 +152,27 @@ async def test_common_langchain_runnable_routes_every_stage_and_preserves_no_fal
                 ).answer == "Supported"
     assert routed == [
         (name, stage)
-        for name in ("groq", "azure_openai")
+        for name in ("groq", "azure_openai", "azure_gpt5_nano")
         for stage in ("classify_intent", "plan", "reason", "verify", "general_chat")
     ]
-    assert set(router._providers) == {"groq", "azure_openai"}
+    assert set(router._providers) == {"groq", "azure_openai", "azure_gpt5_nano"}
+
+
+def test_nano_readiness_requires_independent_deployment(settings):
+    router = SelectableReasoningProvider(
+        configured(
+            settings,
+            generation_provider="azure_gpt5_nano",
+            azure_foundry_endpoint="https://example.openai.azure.com",
+            azure_model_deployment="regular-deployment",
+            azure_gpt5_nano_deployment="",
+        )
+    )
+    assert router.configuration() == {
+        "provider": "azure_gpt5_nano",
+        "configured": False,
+        "missing": ["AZURE_GPT5_NANO_DEPLOYMENT"],
+    }
 
 
 @pytest.mark.asyncio
