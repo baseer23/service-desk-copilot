@@ -82,6 +82,12 @@ def test_general_conversation_survives_restart_and_missing_id_is_safe(make_clien
     install_conversation_provider(first, [])
     body = first.post("/ask", json={"summary": "Where is Toronto?"}).json()
     restored = make_client({"KNOWLEDGE_SCOPE": "broad"})
+    history = restored.get("/conversations")
+    assert history.status_code == 200
+    assert history.json()[0]["conversation_id"] == body["request_id"]
+    detail = restored.get(f'/conversations/{body["request_id"]}')
+    assert detail.status_code == 200
+    assert detail.json()["result"]["chat_messages"][0]["content"] == "Where is Toronto?"
     captured = []
     install_conversation_provider(restored, captured)
     response = restored.post(
@@ -90,6 +96,7 @@ def test_general_conversation_survives_restart_and_missing_id_is_safe(make_clien
     assert response.status_code == 200
     assert captured[-1][1]["conversation"][0]["content"] == "Where is Toronto?"
     assert restored.post("/requests/missing/message", json={"summary": "Hello"}).status_code == 404
+    assert restored.get("/conversations/missing").status_code == 404
 
 
 def test_general_conversation_followup_is_owner_scoped(make_client):

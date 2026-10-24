@@ -1,7 +1,7 @@
 import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, expect, test, vi } from 'vitest'
-import App, { type Case } from './App'
+import App, { ACTIVE_CONVERSATION_KEY, type Case } from './App'
 
 const initial: Case = {
   case_id: 'case-unit',
@@ -22,7 +22,23 @@ const initial: Case = {
 }
 afterEach(() => {
   cleanup()
+  localStorage.clear()
   vi.unstubAllGlobals()
+})
+
+test('restores the active conversation after a refresh', async () => {
+  const current = { ...initial, workflow: 'knowledge', status: 'assessment_ready', final_answer: 'Azure.', chat_messages: [{ role: 'user', content: 'Which cloud?' }, { role: 'assistant', content: 'Azure.' }] }
+  localStorage.setItem(ACTIVE_CONVERSATION_KEY, 'chat-restored')
+  const fetch = vi.fn(async (url: string) => {
+    if (url === '/cases' || url === '/conversations') return Response.json([])
+    if (url === '/conversations/chat-restored') return Response.json({ request_id: 'chat-restored', case_id: null, result: current, events: [] })
+    return Response.json({})
+  })
+  vi.stubGlobal('fetch', fetch)
+  render(<App />)
+  expect(await screen.findByText('Which cloud?')).toBeInTheDocument()
+  expect(screen.getByText('Azure.')).toBeInTheDocument()
+  expect(localStorage.getItem(ACTIVE_CONVERSATION_KEY)).toBe('chat-restored')
 })
 
 test('workspace navigation switches focused views without breaking knowledge inputs', async () => {
@@ -183,7 +199,7 @@ test('can submit again after an empty proxy response', async () => {
   vi.stubGlobal(
     'fetch',
     vi.fn(async (url: string) => {
-      if (url === '/cases') return Response.json([])
+      if (url === '/cases' || url === '/conversations') return Response.json([])
       if (url === '/readiness') return Response.json({})
       if (url === '/documents') return Response.json([])
       if (url === '/speech/readiness') return Response.json({ ready: false })

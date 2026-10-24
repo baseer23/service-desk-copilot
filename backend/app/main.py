@@ -152,9 +152,11 @@ def create_app(settings: Settings | None = None):
                     await app.state.agent.initialize()
                     from backend.app.voice.history import VoiceHistory
                     from backend.app.conversation.sessions import ConversationSessions
+                    from backend.app.services.conversation_history import ConversationHistory
 
                     app.state.voice = VoiceHistory(s)
                     app.state.conversation_sessions = ConversationSessions()
+                    app.state.conversation_history = ConversationHistory(s)
                     app.state.provider_initialized = provider is not None
                     try:
                         local = await app.state.agent.harness.invoke("get_local_storage_status", {})
@@ -623,12 +625,13 @@ def create_app(settings: Settings | None = None):
         await require_reasoning()
         try:
             state, events = await app.state.agent.run_request(request_id, summary, answer, message)
-            assertion = summary if summary is not None else message
+            assertion = summary if summary is not None else message if message is not None else answer
             if assertion and s.uses_record_store:
                 await app.state.agent.harness.invoke(
                     "capture_semantic_memory",
                     {"text": assertion, "conversation_id": request_id},
                 )
+            await asyncio.to_thread(app.state.conversation_history.save_turn, request_id, state)
             return AskResponse(
                 request_id=request_id,
                 intent="knowledge_question" if state["workflow"] == "knowledge" else "service_desk",
@@ -688,6 +691,36 @@ def create_app(settings: Settings | None = None):
     @app.delete("/memory/profile")
     async def forget_memory_profile():
         return (await app.state.agent.harness.invoke("forget_authenticated_profile", {}))["result"]
+
+    @app.get("/conversations")
+    async def list_conversations():
+        return await asyncio.to_thread(app.state.conversation_history.list)
+
+    @app.get("/conversations/{conversation_id}", response_model=AskResponse)
+    async def get_conversation(conversation_id: str):
+        record = await asyncio.to_thread(app.state.conversation_history.get, conversation_id)
+        if record is None:
+            raise HTTPException(404, "Conversation not found")
+        snapshot = await app.state.agent.graph.aget_state(app.state.agent.config(conversation_id))
+        if not snapshot.values:
+            raise HTTPException(409, "Conversation checkpoint is unavailable; it was not replaced")
+        state = dict(snapshot.values)
+        from backend.app.core.principal import current_principal
+
+        if state.get("request_owner") and state["request_owner"] != current_principal(s).owner_id:
+            raise HTTPException(404, "Conversation not found")
+        events = []
+        if record.get("linked_case_id"):
+            events = (await app.state.agent.harness.invoke(
+                "get_case_history", {"case_id": conversation_id}
+            ))["items"]
+        return AskResponse(
+            request_id=conversation_id,
+            intent="knowledge_question" if state.get("workflow") == "knowledge" else "service_desk",
+            case_id=record.get("linked_case_id"),
+            result=state,
+            events=events,
+        )
 
     @app.post("/requests/{request_id}/resume", response_model=AskResponse)
     async def resume_request(request: Request, request_id: str, body: CaseResumeRequest):
