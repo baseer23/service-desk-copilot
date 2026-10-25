@@ -284,6 +284,12 @@ def forget_authenticated_profile():
     return {"revoked": semantic_memory().forget_profile()}
 
 
+@capability("semantic_memory", 1.0)
+def forget_semantic_memory(fact_id: str):
+    """Application-controlled revocation of one authenticated owner's fact."""
+    return {"revoked": semantic_memory().forget(fact_id)}
+
+
 @capability("local_fixture")
 def search_previous_tickets(
     query: str, user: str | None = None, company: str | None = None, site: str | None = None

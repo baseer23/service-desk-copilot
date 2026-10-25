@@ -195,6 +195,15 @@ class VectorChromaStore:
         except Exception as exc:
             raise StorageError("Chroma count failed") from exc
 
+    def delete(self, identifiers):
+        """Idempotently remove records without resetting their collection."""
+        if not identifiers:
+            return
+        try:
+            self._collection.delete(ids=list(identifiers))
+        except Exception as exc:
+            raise StorageError("Chroma delete failed; authoritative records were preserved") from exc
+
     def search_keywords(self, question, top_k=6):
         """Read existing document text without generating a query embedding."""
         from backend.app.repositories.documents import (

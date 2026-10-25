@@ -514,6 +514,7 @@ class ServiceDeskAgent:
                 "retrieval_candidates": [],
                 "confirmed_facts": [],
                 "remembered_facts": [],
+                "personal_memory": [],
                 "human_answers": [],
                 "contradictions": [],
                 "research_iteration": 0,
@@ -535,6 +536,22 @@ class ServiceDeskAgent:
             if not snapshot.next or snapshot.values.get("status") != "needs_input":
                 raise ValueError("This request is not awaiting human input")
             graph_input = Command(resume=answer)
+        memory_query = message if message is not None else summary if summary is not None else answer
+        personal_memory = []
+        if memory_query:
+            try:
+                memory_result = await self.harness.invoke(
+                    "search_semantic_memory", {"query": memory_query, "limit": 5}
+                )
+                personal_memory = (memory_result.get("result") or {}).get("facts", [])
+            except Exception:
+                personal_memory = []
+        if isinstance(graph_input, dict):
+            graph_input["personal_memory"] = personal_memory
+        elif personal_memory:
+            await self.graph.aupdate_state(
+                self.config(request_id), {"personal_memory": personal_memory}
+            )
         try:
             await self.graph.ainvoke(graph_input, self.config(request_id))
             state = dict((await self.graph.aget_state(self.config(request_id))).values)
@@ -605,6 +622,7 @@ class ServiceDeskAgent:
                 "intent",
                 "analysis",
                 "remembered_facts",
+                "personal_memory",
                 "confirmed_facts",
                 "human_answers",
                 "contradictions",

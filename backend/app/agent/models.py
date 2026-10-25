@@ -270,6 +270,7 @@ class SemanticSource(StructuredModel):
     content_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
     observed_at: str
     excerpt: str = Field(min_length=1, max_length=1000)
+    owner_id: str | None = Field(default=None, max_length=160)
 
     @field_validator("observed_at")
     @classmethod
@@ -281,7 +282,13 @@ class SemanticSource(StructuredModel):
 class SemanticFact(StructuredModel):
     id: str = Field(min_length=1, max_length=160)
     subject_id: str = Field(min_length=1, max_length=160)
-    predicate: Literal["NAME", "WORKS_AT", "MEMBER_OF", "USES", "LOCATED_IN", "RELATED_TO"]
+    predicate: Literal[
+        "NAME", "PREFERRED_CLOUD", "CURRENT_PROJECT", "WORKS_AT", "MEMBER_OF",
+        "USES", "LOCATED_IN", "RELATED_TO", "PERSONAL_NOTE",
+    ]
+    category: Literal[
+        "identity", "preference", "project", "employment", "technology", "personal_note"
+    ] = "personal_note"
     value: str = Field(min_length=1, max_length=500)
     tenant_id: str = Field(min_length=1, max_length=160)
     owner_id: str = Field(min_length=1, max_length=160)

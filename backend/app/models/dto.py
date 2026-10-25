@@ -61,6 +61,11 @@ class CaseResumeRequest(BaseModel):
     answer: str = Field(min_length=1, max_length=2000)
 
 
+class MemorySaveRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=2000)
+    conversation_id: str | None = Field(default=None, min_length=1, max_length=240)
+
+
 class LegacyEvidence(BaseModel):
     tool: str
     source: str

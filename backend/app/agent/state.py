@@ -27,6 +27,7 @@ class InvestigationState(TypedDict, total=False):
     executed_tool_calls: list[str]
     available_context: dict[str, Any]
     remembered_facts: list[dict[str, Any]]
+    personal_memory: list[dict[str, Any]]
     confirmed_facts: list[dict[str, Any]]
     human_answers: list[dict[str, Any]]
     hypotheses: list[dict[str, Any]]

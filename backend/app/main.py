@@ -34,6 +34,7 @@ from backend.app.models.dto import (
     IngestPdfResponse,
     IngestUrlRequest,
     IngestUrlResponse,
+    MemorySaveRequest,
 )
 from backend.app.models.provider import LLMError
 from backend.app.models.provider_factory import get_selectable_provider as get_provider
@@ -624,13 +625,13 @@ def create_app(settings: Settings | None = None):
     async def request_result(request_id, summary=None, answer=None, message=None):
         await require_reasoning()
         try:
-            state, events = await app.state.agent.run_request(request_id, summary, answer, message)
             assertion = summary if summary is not None else message if message is not None else answer
             if assertion and s.uses_record_store:
                 await app.state.agent.harness.invoke(
                     "capture_semantic_memory",
                     {"text": assertion, "conversation_id": request_id},
                 )
+            state, events = await app.state.agent.run_request(request_id, summary, answer, message)
             await asyncio.to_thread(app.state.conversation_history.save_turn, request_id, state)
             return AskResponse(
                 request_id=request_id,
@@ -691,6 +692,35 @@ def create_app(settings: Settings | None = None):
     @app.delete("/memory/profile")
     async def forget_memory_profile():
         return (await app.state.agent.harness.invoke("forget_authenticated_profile", {}))["result"]
+
+    @app.post("/memory/save")
+    async def save_memory(body: MemorySaveRequest):
+        if not s.local_persistence_enabled:
+            raise HTTPException(503, "Durable personal memory is disabled")
+        result = (await app.state.agent.harness.invoke(
+            "capture_semantic_memory",
+            {"text": body.text, "conversation_id": body.conversation_id or uuid.uuid4().hex},
+        ))["result"]
+        if not result.get("captured") and result.get("reason") != "duplicate":
+            raise HTTPException(422, "An explicit remember instruction is required")
+        return result
+
+    @app.get("/memory")
+    async def list_memory(query: str | None = None, limit: int = 10):
+        if query:
+            return (await app.state.agent.harness.invoke(
+                "search_semantic_memory", {"query": query, "limit": limit}
+            ))["result"]
+        return (await app.state.agent.harness.invoke("get_authenticated_profile", {}))["result"]
+
+    @app.delete("/memory/{fact_id}")
+    async def forget_memory(fact_id: str):
+        result = (await app.state.agent.harness.invoke(
+            "forget_semantic_memory", {"fact_id": fact_id}
+        ))["result"]
+        if not result.get("revoked"):
+            raise HTTPException(404, "Memory fact not found")
+        return result
 
     @app.get("/conversations")
     async def list_conversations():
