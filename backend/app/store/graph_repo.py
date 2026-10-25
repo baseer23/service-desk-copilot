@@ -455,10 +455,10 @@ class GraphRepository:
                     "MERGE (s:ConversationSource {id:$id}) "
                     "SET s.source_type=$source_type, s.source_id=$source_id, "
                     "s.content_hash=$content_hash, s.observed_at=$observed_at, "
-                    "s.tenant_id=$tenant, s.updated_at=timestamp()",
+                    "s.tenant_id=$tenant, s.owner_id=$owner, s.updated_at=timestamp()",
                     id=self.scope(source.id), source_type=source.source_type,
                     source_id=source.source_id, content_hash=source.content_hash,
-                    observed_at=source.observed_at, tenant=tenant,
+                    observed_at=source.observed_at, tenant=tenant, owner=source.owner_id,
                 )
 
             self._execute_write(write_source)
@@ -471,14 +471,15 @@ class GraphRepository:
                     "MATCH (subject {id:$subject_id}) "
                     "WHERE subject.tenant_id=$tenant AND subject.owner_id=$owner "
                     "MERGE (f:SemanticFact {id:$fact_id}) "
-                    "SET f.predicate=$predicate, f.value=$value, f.confidence=$confidence, "
+                    "SET f.predicate=$predicate, f.category=$category, f.value=$value, f.confidence=$confidence, "
                     "f.status=$status, f.tenant_id=$tenant, f.owner_id=$owner, "
                     "f.original_id=$original_id, f.updated_at=timestamp() "
                     "MERGE (subject)-[:HAS_FACT]->(f) "
                     "WITH f MATCH (s:ConversationSource {id:$source_id}) "
                     "WHERE s.tenant_id=$tenant MERGE (f)-[:SUPPORTED_BY]->(s)",
                     subject_id=self.scope(fact.subject_id), fact_id=self.scope(fact.id),
-                    predicate=fact.predicate, value=fact.value, confidence=fact.confidence,
+                    predicate=fact.predicate, category=fact.category,
+                    value=fact.value, confidence=fact.confidence,
                     status=fact.status, tenant=fact.tenant_id, owner=fact.owner_id,
                     source_id=self.scope(fact.source_id), original_id=fact.id,
                 )

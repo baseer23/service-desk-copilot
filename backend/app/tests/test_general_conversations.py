@@ -68,7 +68,7 @@ def test_general_chat_uses_graph_without_fabricated_sources(make_client):
     assert body["case_id"] is None
     assert body["result"]["final_answer"] == "Toronto is in Ontario, Canada."
     assert body["result"]["final_response"]["sources"] == ["request_report"]
-    assert calls == ["list_available_context"]
+    assert calls == ["search_semantic_memory", "list_available_context"]
     followup = client.post(
         f'/requests/{body["request_id"]}/message', json={"summary": "Which province is that?"}
     )
