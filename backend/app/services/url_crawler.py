@@ -50,7 +50,7 @@ class CrawlResult:
     pages_visited: int = 0
 
 
-class CrawlError(Exception):
+class CrawlError(ValueError):
     """Raised when URL ingestion cannot proceed."""
 
 
@@ -101,6 +101,10 @@ class UrlCrawler:
 
             last_fetch = self._respect_rate_limit(last_fetch, limits.rate_limit_sec)
             response = self._safe_get(current_url)
+            if response is None and depth == 0 and current_url == self._normalize_url(root_url):
+                alias = self._www_alias_url(current_url)
+                if alias:
+                    response = self._safe_get(alias)
             if response is None:
                 result.skipped_urls.append(current_url)
                 continue
@@ -113,7 +117,12 @@ class UrlCrawler:
             html = response.text
             page_url = self._normalize_url(response.url or current_url)
             parsed_page = urlparse(page_url)
-            if parsed_page.scheme != parsed_root.scheme or parsed_page.netloc != parsed_root.netloc:
+            if not result.pages and self._is_www_redirect_alias(parsed_root, parsed_page):
+                # fetch_response validated every redirect target before requesting it.
+                # Adopt only the common apex <-> www canonical transition as the
+                # crawl origin; all subsequent traversal remains same-origin.
+                parsed_root = parsed_page
+            elif parsed_page.scheme != parsed_root.scheme or parsed_page.netloc != parsed_root.netloc:
                 result.skipped_urls.append(page_url)
                 continue
 
@@ -147,6 +156,10 @@ class UrlCrawler:
                     if link not in seen_urls:
                         queue.append((link, depth + 1))
 
+        if not result.pages:
+            raise CrawlError(
+                "No public HTML pages could be retrieved. Check the address, robots.txt policy, and website availability."
+            )
         return result
 
     def _default_limits(self) -> CrawlLimits:
@@ -164,14 +177,22 @@ class UrlCrawler:
 
         robots_url = urlunsplit((parsed_root.scheme, parsed_root.netloc, "/robots.txt", "", ""))
         parser = RobotFileParser()
+        # Keep robots-response cookies isolated. Some CDNs issue a host-scoped
+        # bot-management cookie for robots.txt that causes a subsequent HTML
+        # request in the same session to be rejected even though both requests
+        # are independently public and allowed.
+        robots_session = requests.Session()
+        robots_session.headers.update(self._session.headers)
         try:
-            response = fetch_response(robots_url, self._session, self._settings.web_max_bytes)
+            response = fetch_response(robots_url, robots_session, self._settings.web_max_bytes)
             if response.status_code >= 400:
                 parser.parse([])
             else:
                 parser.parse(response.text.splitlines())
         except requests.RequestException:
             parser.parse([])
+        finally:
+            robots_session.close()
         parser.modified()
         return parser
 
@@ -209,6 +230,31 @@ class UrlCrawler:
         """Return a normalised URL suitable for deduplication."""
 
         return normalize_url(url)
+
+    @staticmethod
+    def _www_alias_url(url: str) -> str | None:
+        parsed = urlparse(url)
+        if not parsed.hostname or parsed.hostname.startswith("www."):
+            return None
+        hostname = "www." + parsed.hostname
+        netloc = hostname + (f":{parsed.port}" if parsed.port else "")
+        return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, ""))
+
+    @staticmethod
+    def _is_www_redirect_alias(root: ParseResult, destination: ParseResult) -> bool:
+        def host(value: ParseResult) -> str:
+            return (value.hostname or "").lower().removeprefix("www.")
+
+        def port(value: ParseResult) -> int:
+            return value.port or (443 if value.scheme == "https" else 80)
+
+        return (
+            root.scheme == destination.scheme
+            and port(root) == port(destination)
+            and host(root) == host(destination)
+            and root.hostname != destination.hostname
+            and "www." in {(root.hostname or "")[:4].lower(), (destination.hostname or "")[:4].lower()}
+        )
 
     def _canonical_url(self, soup: BeautifulSoup, fallback_url: str) -> str:
         """Resolve a canonical URL from the page when provided."""

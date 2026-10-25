@@ -34,13 +34,14 @@ Open **http://127.0.0.1:5173**. FastAPI runs on port 8000 and owns its MCP subpr
 ## Verification
 
 ```bash
-.venv/bin/python -m pytest backend/app/tests -q
-npm --prefix frontend test
-npm --prefix frontend run build
-npm --prefix frontend run test:e2e
+make test-fast       # changed-code development loop
+make test-memory     # conversation and personal-memory acceptance
+make test-mcp        # MCP contracts, transport and security
+make test-ui         # React components
+make test-regression # complete offline PR/release gate
 ```
 
-Automated fixtures stay in temporary stores. They do not establish live model, Neo4j or physical microphone success. Live evaluators require explicit opt-in and respect existing spending controls. Never upload normal user knowledge merely to populate a demonstration.
+These profiles are fail-closed against non-loopback network access and keep automated fixtures in temporary stores. They do not establish live model, Neo4j or physical microphone success. `make test-live` is separate and refuses to start without both explicit live-profile and authorization flags. Never upload normal user knowledge merely to populate a demonstration. See [Testing profiles](docs/TESTING.md) and the [test inventory](docs/TEST_INVENTORY.md).
 
 Read the [current architecture and verification report](docs/ARCHITECTURE_SIMPLIFICATION.md), [reasoning evaluation](docs/REASONING_EVALUATION.md), [Speech behavior](docs/SPEECH.md), and [local retrieval](docs/RAG.md). Earlier Azure persistence/Voice Live reviews are historical records, not active setup instructions.
 

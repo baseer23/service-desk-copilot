@@ -46,6 +46,9 @@ LABELS = {
     "get_recent_changes": "Recent changes checked",
     "search_knowledge": "Knowledge searched",
     "search_graph": "Relationships searched",
+    "search_knowledge_entities": "Knowledge entities searched",
+    "get_knowledge_entity_context": "Entity relationships inspected",
+    "get_entity_document_references": "Entity documents located",
     "search_web": "Public sources searched",
     "search_news": "Current news searched",
     "fetch_web_page": "Public page fetched",
@@ -212,6 +215,9 @@ class ServiceDeskAgent:
         summaries = {
             "search_knowledge": knowledge_summary,
             "search_graph": "Querying knowledge relationships",
+            "search_knowledge_entities": "Searching linked knowledge entities",
+            "get_knowledge_entity_context": "Inspecting linked entity context",
+            "get_entity_document_references": "Locating documents linked to the entity",
             "search_news": "Searching current news",
             "search_web": "Searching the public web",
             "fetch_web_page": "Reading a public source",
@@ -514,6 +520,7 @@ class ServiceDeskAgent:
                 "retrieval_candidates": [],
                 "confirmed_facts": [],
                 "remembered_facts": [],
+                "personal_memory": [],
                 "human_answers": [],
                 "contradictions": [],
                 "research_iteration": 0,
@@ -535,6 +542,22 @@ class ServiceDeskAgent:
             if not snapshot.next or snapshot.values.get("status") != "needs_input":
                 raise ValueError("This request is not awaiting human input")
             graph_input = Command(resume=answer)
+        memory_query = message if message is not None else summary if summary is not None else answer
+        personal_memory = []
+        if memory_query:
+            try:
+                memory_result = await self.harness.invoke(
+                    "search_semantic_memory", {"query": memory_query, "limit": 5}
+                )
+                personal_memory = (memory_result.get("result") or {}).get("facts", [])
+            except Exception:
+                personal_memory = []
+        if isinstance(graph_input, dict):
+            graph_input["personal_memory"] = personal_memory
+        elif personal_memory:
+            await self.graph.aupdate_state(
+                self.config(request_id), {"personal_memory": personal_memory}
+            )
         try:
             await self.graph.ainvoke(graph_input, self.config(request_id))
             state = dict((await self.graph.aget_state(self.config(request_id))).values)
@@ -605,6 +628,7 @@ class ServiceDeskAgent:
                 "intent",
                 "analysis",
                 "remembered_facts",
+                "personal_memory",
                 "confirmed_facts",
                 "human_answers",
                 "contradictions",

@@ -478,6 +478,11 @@ class LocalDocumentRepository(DocumentRepository):
             "phase": "complete" if status == "ready" else "link",
             "local_index_ready": bool(state.get("chunks")),
             "graph_link_status": "linked" if status == "ready" else "pending",
+            "semantic_graph_status": (
+                state.get("semantic_graph_status", "pending")
+                if status == "ready" and self.settings.semantic_graph_ingestion_enabled
+                else state.get("semantic_graph_status", "disabled")
+            ),
         }
         if graph_counts:
             updated.update(

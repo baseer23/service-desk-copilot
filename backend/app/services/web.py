@@ -78,9 +78,15 @@ def fetch_response(url, session=None, max_bytes=2_000_000):
             response.close()
             if not location:
                 raise FetchError("Redirect lacks a destination")
-            url = urljoin(url, location)
+            redirected = urljoin(url, location)
             # Validate BEFORE any request to the redirect target.
-            validate_public_url(url)
+            validate_public_url(redirected)
+            if urlsplit(redirected).hostname != urlsplit(url).hostname:
+                # Public ingestion has no authenticated browsing state. Do not
+                # allow a parent-domain cookie set by one host to influence a
+                # validated redirect target (or carry state across origins).
+                session.cookies.clear()
+            url = redirected
             continue
         try:
             response.raise_for_status()

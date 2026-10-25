@@ -78,6 +78,27 @@ type AskResponse = {
   result: Omit<Case, 'case_id' | 'thread_id'>
   events: Event[]
 }
+type Conversation = {
+  conversation_id: string
+  title: string
+  workflow: string
+  status: string
+  updated_at: string
+  linked_case_id: string | null
+  last_message_preview: string
+}
+
+export const ACTIVE_CONVERSATION_KEY = 'deskmate.active-conversation'
+
+function validConversations(value: unknown): Conversation[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is Conversation => Boolean(
+        item && typeof item === 'object' &&
+        typeof (item as Conversation).conversation_id === 'string' &&
+        typeof (item as Conversation).title === 'string',
+      ))
+    : []
+}
 
 function AnswerText({ value }: { value: string }): JSX.Element {
   const inline = (text: string) => text.split(/(\*\*[^*]+\*\*)/g).map((part, index) =>
@@ -123,11 +144,12 @@ function AnswerText({ value }: { value: string }): JSX.Element {
 export default function App(): JSX.Element {
   // This custom data hook accepts no effect callback.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  const { readiness, refresh, checking } = useReadiness()
+  const { readiness, refresh, checking, error: readinessError } = useReadiness()
   const blocker = reasoningBlocker(readiness)
   const [ticket, setTicket] = useState('')
   const [active, setActive] = useState<Case | null>(null)
   const [cases, setCases] = useState<Case[]>([])
+  const [conversations, setConversations] = useState<Conversation[]>([])
   const [events, setEvents] = useState<Event[]>([])
   const [answer, setAnswer] = useState('')
   const [busy, setBusy] = useState(false)
@@ -162,8 +184,33 @@ export default function App(): JSX.Element {
 
 
   useEffect(() => {
-    request<Case[]>('/cases')
-      .then(setCases)
+    Promise.all([request<Case[]>('/cases'), request<Conversation[]>('/conversations')])
+      .then(async ([savedCases, savedConversations]) => {
+        setCases(savedCases)
+        setConversations(validConversations(savedConversations))
+        const id = localStorage.getItem(ACTIVE_CONVERSATION_KEY)
+        if (!id) return
+        try {
+          const restored = await request<AskResponse>(`/conversations/${id}`)
+          if (!restored.result || typeof restored.result.status !== 'string') {
+            localStorage.removeItem(ACTIVE_CONVERSATION_KEY)
+            return
+          }
+          setActive({
+            ...restored.result,
+            case_id: restored.case_id || restored.request_id,
+            thread_id: restored.request_id,
+            transient: !restored.case_id,
+          })
+          setEvents(restored.events)
+        } catch (caught) {
+          if ((caught as Error & { status?: number }).status === 404) {
+            localStorage.removeItem(ACTIVE_CONVERSATION_KEY)
+          } else {
+            setError((caught as Error).message)
+          }
+        }
+      })
       .catch((e) => setError(e.message))
   }, [])
 
@@ -184,7 +231,12 @@ export default function App(): JSX.Element {
       transient: !response.case_id,
     })
     setEvents(response.events)
-    setCases(await request<Case[]>('/cases'))
+    localStorage.setItem(ACTIVE_CONVERSATION_KEY, response.request_id)
+    const [savedCases, savedConversations] = await Promise.all([
+      request<Case[]>('/cases'), request<Conversation[]>('/conversations'),
+    ])
+    setCases(savedCases)
+    setConversations(validConversations(savedConversations))
   }
   async function start(event: FormEvent) {
     event.preventDefault()
@@ -261,6 +313,20 @@ export default function App(): JSX.Element {
       setBusy(false)
     }
   }
+  async function openConversation(id: string) {
+    setSection('Chat')
+    setBusy(true)
+    setError('')
+    setAnswer('')
+    try {
+      const restored = await request<AskResponse>(`/conversations/${id}`)
+      await displayRequest(restored)
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
   async function saveRequest() {
     if (!ticket.trim()) return
     setBusy(true)
@@ -309,8 +375,12 @@ export default function App(): JSX.Element {
       <main className={`workspace-main ${section.toLowerCase()}`}>
         <section hidden={section !== 'Chat'} className="chat-workspace" id="chat" aria-label="Chat workspace">
           <div className="workspace-heading"><div><span className="eyebrow">YOUR AI SERVICE DESK</span><h2>{active ? 'Let’s keep going' : 'How can I help?'}</h2></div>
-            <button type="button" className="button button-neutral" disabled={busy} onClick={() => { setActive(null); setEvents([]); setTicket(''); setAnswer(''); setError('') }}>New conversation</button>
+            <button type="button" className="button button-neutral" disabled={busy} onClick={() => { localStorage.removeItem(ACTIVE_CONVERSATION_KEY); setActive(null); setEvents([]); setTicket(''); setAnswer(''); setError('') }}>New conversation</button>
           </div>
+          {!!conversations.length && <aside className="conversation-history" aria-label="Conversation history">
+            <h3>Recent conversations</h3>
+            <ul>{conversations.map(item => <li key={item.conversation_id}><button type="button" disabled={busy} className={active?.thread_id === item.conversation_id ? 'selected' : ''} onClick={() => void openConversation(item.conversation_id)}><span>{item.title}</span><small>{item.workflow.replace(/_/g, ' ')}</small></button></li>)}</ul>
+          </aside>}
           {!active && <div className="chat-welcome"><span className="welcome-mark" aria-hidden="true">D</span><h3>A little help, a clearer day.</h3><p>Work through an IT issue, ask a question, or find an answer in your documents.</p><div className="suggestion-row">{['My VPN is not connecting', 'Help with multi-factor sign-in', 'Find an answer in my documents'].map(suggestion => <button type="button" key={suggestion} onClick={() => setTicket(suggestion)}>{suggestion}</button>)}</div></div>}
           <form onSubmit={start} className="main-composer">
             <label htmlFor="ticket">Question or ticket</label>
@@ -324,7 +394,7 @@ export default function App(): JSX.Element {
         <section hidden={section !== 'Investigations'} className="history-workspace" id="investigations" aria-label="Investigation history">
           <InvestigationHistory cases={cases} selected={active?.case_id} busy={busy} onOpen={openCase} allowSamples={readiness?.runtime_mode === 'isolated_demo'} />
         </section>
-        <section hidden={section !== 'Knowledge'} id="knowledge-workspace" className="knowledge-workspace" aria-label="Knowledge workspace"><KnowledgePanel readiness={readiness} /></section>
+        <section hidden={section !== 'Knowledge'} id="knowledge-workspace" className="knowledge-workspace" aria-label="Knowledge workspace"><KnowledgePanel readiness={readiness} readinessChecking={checking} readinessError={readinessError} /></section>
         <section hidden={section !== 'Voice'} id="voice" className="voice-workspace">{section === 'Voice' && <VoiceSupport onCaseCreated={openCase} readiness={readiness} />}</section>
         <div hidden={!['Chat', 'Investigations'].includes(section)}><InvestigationActivity events={activity} busy={busy && investigation.current !== null} onCancel={() => investigation.current?.abort()} /></div>
         <div className="investigation-panel" hidden={!active || !['Chat', 'Investigations'].includes(section)}>

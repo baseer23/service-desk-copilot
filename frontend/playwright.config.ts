@@ -20,6 +20,8 @@ export default defineConfig({
       reuseExistingServer: false,
       timeout: 60_000,
       env: {
+        DESKMATE_TEST_PROFILE: 'offline',
+        DESKMATE_ALLOW_LIVE_API_TESTS: 'false',
         TEST_MODE: 'true',
         DATA_PLATFORM: 'local',
         LOCAL_PERSISTENCE_ENABLED: 'false',
@@ -27,7 +29,7 @@ export default defineConfig({
         DEPLOYMENT_MODE: 'local',
         ENABLE_LOCAL_FIXTURES: 'true',
         GENERATION_PROVIDER: 'stub',
-        KNOWLEDGE_SCOPE: 'support',
+        KNOWLEDGE_SCOPE: 'broad',
         RESEARCH_SOURCE_POLICY: 'prefer_primary',
         MAX_INVESTIGATION_CYCLES: '8',
         // Research routing has backend tests with explicit external-service mocks.
@@ -49,7 +51,11 @@ export default defineConfig({
       cwd: resolve(root, 'frontend'),
       url: 'http://127.0.0.1:5184',
       reuseExistingServer: false,
-      env: { API_PROXY_TARGET: 'http://127.0.0.1:8011' },
+      env: {
+        API_PROXY_TARGET: 'http://127.0.0.1:8011',
+        DESKMATE_TEST_PROFILE: 'offline',
+        DESKMATE_ALLOW_LIVE_API_TESTS: 'false',
+      },
     },
   ],
 })

@@ -174,3 +174,15 @@ Forty-plus deterministic/MCP checks passed for numerical correctness, argument s
 Focused deterministic scenarios cover explicit name capture, restart persistence, duplicate suppression, correction/supersession, graph-unavailable queuing, tenant/owner isolation, per-request opt-out, unrelated third-person text, revocation and mocked graph delivery. Profile retrieval is an ordinary bounded MCP read selected only when applicable; ordinary calculations and unrelated questions do not automatically query semantic memory. Documents continue to use the separate source-grounded structured-reference graph and cannot silently rewrite authenticated profile facts.
 
 The focused semantic-memory/graph suite passed 14 tests, 31 related MCP/security/document-job tests passed, the Knowledge Panel suite passed four tests, and the production frontend build passed. The evaluation used temporary SQLite and an in-memory graph sink. It did not call a reasoning provider, Azure Document Intelligence or production Neo4j, and therefore does not claim live extraction quality, live Aura persistence or end-to-end model selection of the new profile tools.
+
+## Persistent conversation and general personal-memory evaluation — 2026-10-25
+
+The deterministic acceptance coverage now includes checkpoint-backed conversation listing/restoration, React active-thread restoration, explicit general facts, semantic/paraphrased recall, correction history, duplicate suppression, optional graph delivery, individual forgetting and owner isolation. Personal memories enter reasoning in a dedicated state field and remain distinct from operational case facts and retrieved document/web evidence.
+
+Focused non-billable checks completed before the final no-test instruction: 11 general-conversation checks, 15 React App checks and nine semantic-memory checks passed. No later full regression, build, browser or live integration run is claimed. Live-provider answer quality and live Aura reconciliation remain opt-in acceptance work.
+
+## Document semantic graph evaluation status — 2026-10-25
+
+The new reasoning contracts separate source-grounded document extraction from conservative graph placement. Extraction outputs retain logical object references; placement must choose reuse, creation or unresolved exactly once per entity and cannot name an existing ID outside the bounded tenant candidate set. Graph-first retrieval converts entity-linked document references back through `LocalKnowledgeStore.resolve_object_ids`, so Neo4j remains discovery context and Chroma text remains answer evidence.
+
+No evaluation command was executed because this task explicitly prohibited tests, lint and builds. No live model or Aura claim is made. A later authorized acceptance run should cover multi-section resume, duplicate-entity reuse across uploads, unresolved mentions, conflicting source claims, stale reference reporting, tenant isolation and vector-only behavior during Aura outages.

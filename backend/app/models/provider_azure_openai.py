@@ -26,6 +26,8 @@ TOKEN_LIMITS = {
     "reason": 1500,
     "verify": 800,
     "evaluate_sources": 350,
+    "document_graph_extract": 1500,
+    "graph_placement": 1200,
 }
 
 

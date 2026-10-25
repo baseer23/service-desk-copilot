@@ -34,6 +34,7 @@ from backend.app.models.dto import (
     IngestPdfResponse,
     IngestUrlRequest,
     IngestUrlResponse,
+    MemorySaveRequest,
 )
 from backend.app.models.provider import LLMError
 from backend.app.models.provider_factory import get_selectable_provider as get_provider
@@ -152,9 +153,11 @@ def create_app(settings: Settings | None = None):
                     await app.state.agent.initialize()
                     from backend.app.voice.history import VoiceHistory
                     from backend.app.conversation.sessions import ConversationSessions
+                    from backend.app.services.conversation_history import ConversationHistory
 
                     app.state.voice = VoiceHistory(s)
                     app.state.conversation_sessions = ConversationSessions()
+                    app.state.conversation_history = ConversationHistory(s)
                     app.state.provider_initialized = provider is not None
                     try:
                         local = await app.state.agent.harness.invoke("get_local_storage_status", {})
@@ -609,9 +612,12 @@ def create_app(settings: Settings | None = None):
     async def ingest_url(body: IngestUrlRequest):
         if not s.allow_url_ingest:
             raise HTTPException(403, "URL ingestion is disabled")
-        return (
-            await app.state.agent.harness.invoke("ingest_url", body.model_dump(exclude_none=True))
-        )["result"]
+        outcome = await app.state.agent.harness.invoke(
+            "ingest_url", body.model_dump(exclude_none=True)
+        )
+        if outcome.get("status") != "ok" or not isinstance(outcome.get("result"), dict):
+            raise HTTPException(502, outcome.get("error") or "Website ingestion failed")
+        return outcome["result"]
 
     async def load(case_id):
         state = (await app.state.agent.harness.invoke("get_case", {"case_id": case_id}))["result"]
@@ -622,13 +628,14 @@ def create_app(settings: Settings | None = None):
     async def request_result(request_id, summary=None, answer=None, message=None):
         await require_reasoning()
         try:
-            state, events = await app.state.agent.run_request(request_id, summary, answer, message)
-            assertion = summary if summary is not None else message
+            assertion = summary if summary is not None else message if message is not None else answer
             if assertion and s.uses_record_store:
                 await app.state.agent.harness.invoke(
                     "capture_semantic_memory",
                     {"text": assertion, "conversation_id": request_id},
                 )
+            state, events = await app.state.agent.run_request(request_id, summary, answer, message)
+            await asyncio.to_thread(app.state.conversation_history.save_turn, request_id, state)
             return AskResponse(
                 request_id=request_id,
                 intent="knowledge_question" if state["workflow"] == "knowledge" else "service_desk",
@@ -688,6 +695,65 @@ def create_app(settings: Settings | None = None):
     @app.delete("/memory/profile")
     async def forget_memory_profile():
         return (await app.state.agent.harness.invoke("forget_authenticated_profile", {}))["result"]
+
+    @app.post("/memory/save")
+    async def save_memory(body: MemorySaveRequest):
+        if not s.local_persistence_enabled:
+            raise HTTPException(503, "Durable personal memory is disabled")
+        result = (await app.state.agent.harness.invoke(
+            "capture_semantic_memory",
+            {"text": body.text, "conversation_id": body.conversation_id or uuid.uuid4().hex},
+        ))["result"]
+        if not result.get("captured") and result.get("reason") != "duplicate":
+            raise HTTPException(422, "An explicit remember instruction is required")
+        return result
+
+    @app.get("/memory")
+    async def list_memory(query: str | None = None, limit: int = 10):
+        if query:
+            return (await app.state.agent.harness.invoke(
+                "search_semantic_memory", {"query": query, "limit": limit}
+            ))["result"]
+        return (await app.state.agent.harness.invoke("get_authenticated_profile", {}))["result"]
+
+    @app.delete("/memory/{fact_id}")
+    async def forget_memory(fact_id: str):
+        result = (await app.state.agent.harness.invoke(
+            "forget_semantic_memory", {"fact_id": fact_id}
+        ))["result"]
+        if not result.get("revoked"):
+            raise HTTPException(404, "Memory fact not found")
+        return result
+
+    @app.get("/conversations")
+    async def list_conversations():
+        return await asyncio.to_thread(app.state.conversation_history.list)
+
+    @app.get("/conversations/{conversation_id}", response_model=AskResponse)
+    async def get_conversation(conversation_id: str):
+        record = await asyncio.to_thread(app.state.conversation_history.get, conversation_id)
+        if record is None:
+            raise HTTPException(404, "Conversation not found")
+        snapshot = await app.state.agent.graph.aget_state(app.state.agent.config(conversation_id))
+        if not snapshot.values:
+            raise HTTPException(409, "Conversation checkpoint is unavailable; it was not replaced")
+        state = dict(snapshot.values)
+        from backend.app.core.principal import current_principal
+
+        if state.get("request_owner") and state["request_owner"] != current_principal(s).owner_id:
+            raise HTTPException(404, "Conversation not found")
+        events = []
+        if record.get("linked_case_id"):
+            events = (await app.state.agent.harness.invoke(
+                "get_case_history", {"case_id": conversation_id}
+            ))["items"]
+        return AskResponse(
+            request_id=conversation_id,
+            intent="knowledge_question" if state.get("workflow") == "knowledge" else "service_desk",
+            case_id=record.get("linked_case_id"),
+            result=state,
+            events=events,
+        )
 
     @app.post("/requests/{request_id}/resume", response_model=AskResponse)
     async def resume_request(request: Request, request_id: str, body: CaseResumeRequest):

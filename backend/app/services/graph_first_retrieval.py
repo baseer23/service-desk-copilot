@@ -45,6 +45,20 @@ class GraphFirstRetrieval:
                 object_types=plan.object_types,
                 relationships=plan.relationship_types,
             )
+            # Semantic entities are discovery anchors. Only their source object
+            # references are hydrated; graph metadata itself is not answer evidence.
+            candidate_lookup = getattr(self.graph_repo, "find_entity_candidates", None)
+            document_lookup = getattr(self.graph_repo, "find_related_documents", None)
+            if candidate_lookup and document_lookup:
+                for term in [*plan.entities, *plan.concepts][:10]:
+                    for candidate in candidate_lookup(term, limit=5):
+                        for document in document_lookup(candidate["id"], limit=10):
+                            references.extend({
+                                "object_id": object_id,
+                                "object_type": "SemanticEvidence",
+                                "document_id": document.get("document_id"),
+                                "description": document.get("summary", ""),
+                            } for object_id in document.get("object_ids", []))
         except Exception:
             return [], "unavailable"
         if not references:
@@ -53,7 +67,7 @@ class GraphFirstRetrieval:
         if resolver is None:
             return [], "unavailable"
         query = self.embeddings.embed_texts([question])[0]
-        object_ids = [row["object_id"] for row in references]
+        object_ids = list(dict.fromkeys(row["object_id"] for row in references))
         try:
             hydrated = resolver(object_ids, query)
         except TypeError:
