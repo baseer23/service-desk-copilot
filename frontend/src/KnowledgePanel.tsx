@@ -17,6 +17,28 @@ interface Match {
   }
 }
 
+function normalizePublicUrl(value: string): string {
+  const candidate = value.trim()
+  if (!candidate) throw new Error('Enter a public website address.')
+  const hasScheme = /^[a-z][a-z0-9+.-]*:/i.test(candidate)
+  if (hasScheme && !/^https?:\/\//i.test(candidate)) {
+    throw new Error('Use an HTTP or HTTPS website address.')
+  }
+  if (!hasScheme && !/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?::\d{1,5})?(?:[/?#].*)?$/i.test(candidate)) {
+    throw new Error('Enter a valid public domain, such as ngenuity.ca.')
+  }
+  let parsed: URL
+  try {
+    parsed = new URL(hasScheme ? candidate : `https://${candidate}`)
+  } catch {
+    throw new Error('Enter a valid HTTP or HTTPS website address.')
+  }
+  if (!parsed.hostname || parsed.username || parsed.password) {
+    throw new Error('Enter a public website address without embedded credentials.')
+  }
+  return parsed.toString()
+}
+
 function Switch({ label, checked, disabled, onChange }: {
   label: string
   checked: boolean
@@ -35,8 +57,12 @@ function Switch({ label, checked, disabled, onChange }: {
 
 export default function KnowledgePanel({
   readiness,
+  readinessChecking = false,
+  readinessError = null,
 }: {
   readiness: ReadinessReport | null
+  readinessChecking?: boolean
+  readinessError?: string | null
 }): JSX.Element {
   const [mode, setMode] = useState<'paste' | 'pdf' | 'url'>('paste')
   const [text, setText] = useState('')
@@ -55,7 +81,9 @@ export default function KnowledgePanel({
   const picker = useRef<HTMLInputElement>(null)
   const autoGraph = readiness?.automatic_graph_ingestion_enabled === true
   const indexingBlocked = readiness?.semantic_ingestion_ready === false
-  const urlBlocked = readiness?.url_ingestion_enabled === false
+  const urlDisabledByConfiguration = readiness?.url_ingestion_enabled === false
+  const urlReadinessUnavailable = readiness === null
+  const urlBlocked = urlDisabledByConfiguration || urlReadinessUnavailable
 
   function chooseFile(selected: File | undefined) {
     if (!selected) return
@@ -92,9 +120,16 @@ export default function KnowledgePanel({
                 : '/documents/upload'
       } else {
         if (!text.trim()) throw new Error('Enter knowledge text or a URL first.')
+        if (mode === 'url' && readiness?.url_ingestion_enabled !== true) {
+          throw new Error(urlDisabledByConfiguration
+            ? 'Web page uploads are disabled by workspace configuration.'
+            : 'DeskMate cannot verify URL-ingestion readiness. Check the backend connection and retry.')
+        }
         path =
           mode === 'url' ? '/ingest/url' : kind === 'save' || readiness?.managed_documents ? '/documents/paste' : '/ingest/paste'
-        options = post(mode === 'url' ? { url: text } : { title: title || null, text })
+        const content = mode === 'url' ? normalizePublicUrl(text) : text
+        if (mode === 'url') setText(content)
+        options = post(mode === 'url' ? { url: content } : { title: title || null, text: content })
       }
       let result = await request<{
         id?: string
@@ -135,7 +170,9 @@ export default function KnowledgePanel({
         setMessage(
           result.duplicate
             ? 'This content is already in knowledge.'
-            : 'Your document was added to knowledge.',
+            : mode === 'url'
+              ? `${result.pages ?? 0} public page(s) were added to knowledge.`
+              : 'Your document was added to knowledge.',
         )
       }
     } catch (caught) {
@@ -249,7 +286,9 @@ export default function KnowledgePanel({
             {mode === 'url' ? (
               <input
                 id="knowledge"
-                type="url"
+                type="text"
+                inputMode="url"
+                placeholder="https://example.com or example.com"
                 required
                 value={text}
                 onChange={(event) => setText(event.target.value)}
@@ -267,16 +306,26 @@ export default function KnowledgePanel({
         )}
         <button
           className="secondary"
-          disabled={busy || (indexingBlocked && !readiness?.managed_documents) || (mode === 'url' && urlBlocked)}
+          disabled={busy || (indexingBlocked && !readiness?.managed_documents) || (mode === 'url' && (urlBlocked || readinessChecking))}
         >
           {busy ? 'Working…' : 'Add to knowledge'}
         </button>
         {indexingBlocked && <p className="muted">Document processing is temporarily unavailable. You can still save documents and search available knowledge.</p>}
-        {mode === 'url' && urlBlocked && (
+        {mode === 'url' && urlDisabledByConfiguration && (
           <p className="muted">
-            Web page uploads are currently unavailable. You can upload a document or paste its text.
+            Web page uploads are disabled by workspace configuration. You can upload a document or paste its text.
           </p>
         )}
+        {mode === 'url' && readinessChecking && <p className="muted">Checking whether web page uploads are available…</p>}
+        {mode === 'url' && !readinessChecking && urlReadinessUnavailable && (
+          <p className="muted">{readinessError
+            ? `Readiness check failed: ${readinessError}`
+            : 'The backend is unavailable, so web page upload readiness cannot be verified.'}</p>
+        )}
+        {mode === 'url' && readiness?.url_ingestion_enabled === true && !busy && (
+          <p className="muted">Web page uploads are enabled. Public URL security and robots.txt rules still apply.</p>
+        )}
+        {mode === 'url' && busy && <p className="muted">Crawling and indexing a bounded set of public pages…</p>}
         {mode !== 'url' && (
           <button
             type="button"

@@ -44,28 +44,35 @@ export function useReadiness(supplied?: ReadinessReport | null): {
   readiness: ReadinessReport | null
   refresh: () => Promise<void>
   checking: boolean
+  error: string | null
 } {
   const [readiness, setReadiness] = useState<ReadinessReport | null>(supplied ?? null)
   const [checking, setChecking] = useState(false)
+  const [error, setError] = useState<string | null>(null)
   const refresh = useCallback(async () => {
     setChecking(true)
+    setError(null)
     try {
       const report = await request<ReadinessReport>('/readiness')
-      setReadiness(report.runtime_mode && typeof report.text_ready === 'boolean' && typeof report.voice_ready === 'boolean' ? report : null)
-    } catch {
+      if (!report.runtime_mode || typeof report.text_ready !== 'boolean' || typeof report.voice_ready !== 'boolean') {
+        throw new Error('DeskMate readiness returned an invalid response.')
+      }
+      setReadiness(report)
+    } catch (caught) {
       setReadiness(null)
+      setError((caught as Error).message || 'DeskMate readiness could not be checked.')
     } finally {
       setChecking(false)
     }
   }, [])
   useEffect(() => {
     if (supplied === undefined) void refresh()
-    else setReadiness(supplied)
+    else { setReadiness(supplied); setError(null) }
   }, [supplied, refresh])
   useEffect(() => {
     const update = () => void refresh()
     window.addEventListener(providerChangedEvent, update)
     return () => window.removeEventListener(providerChangedEvent, update)
   }, [refresh])
-  return { readiness, refresh, checking }
+  return { readiness, refresh, checking, error }
 }

@@ -612,9 +612,12 @@ def create_app(settings: Settings | None = None):
     async def ingest_url(body: IngestUrlRequest):
         if not s.allow_url_ingest:
             raise HTTPException(403, "URL ingestion is disabled")
-        return (
-            await app.state.agent.harness.invoke("ingest_url", body.model_dump(exclude_none=True))
-        )["result"]
+        outcome = await app.state.agent.harness.invoke(
+            "ingest_url", body.model_dump(exclude_none=True)
+        )
+        if outcome.get("status") != "ok" or not isinstance(outcome.get("result"), dict):
+            raise HTTPException(502, outcome.get("error") or "Website ingestion failed")
+        return outcome["result"]
 
     async def load(case_id):
         state = (await app.state.agent.harness.invoke("get_case", {"case_id": case_id}))["result"]
