@@ -44,6 +44,7 @@ class ConversationHistory:
             "updated_at": now,
             "linked_case_id": conversation_id if state.get("persist_case") else None,
             "last_message_preview": str(preview)[:240],
+            "activity": old.get("activity", []),
         }
         return self.records.write(
             "conversation",
@@ -54,6 +55,20 @@ class ConversationHistory:
             tenant=actor.tenant_id,
             fields={"owner_id": actor.owner_id, "status": payload["status"]},
         )["payload"]
+
+    def save_activity(
+        self, conversation_id: str, activity: list[dict], *, principal: Principal | None = None
+    ) -> None:
+        actor = principal or current_principal(self.settings)
+        previous = self.records.read("conversation", conversation_id, tenant=actor.tenant_id)
+        if not previous or previous.get("owner_id") != actor.owner_id:
+            return
+        payload = {**previous["payload"], "activity": activity[-200:]}
+        self.records.write(
+            "conversation", conversation_id, payload, previous=previous,
+            tenant=actor.tenant_id,
+            fields={"owner_id": actor.owner_id, "status": payload["status"]},
+        )
 
     def list(self, *, principal: Principal | None = None, limit: int = 100) -> list[dict]:
         actor = principal or current_principal(self.settings)

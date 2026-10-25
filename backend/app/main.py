@@ -13,6 +13,7 @@ from typing import Any
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import SecretStr
+from pydantic import BaseModel, Field
 from starlette.responses import Response
 
 from backend.app.agent.checkpoints import checkpoint_store
@@ -42,6 +43,11 @@ from backend.app.models.provider_routing import provider_scope, selected_provide
 from backend.app.mcp.multi import MultiMCPClient
 from backend.app.services.web import FetchError, UnsafeURL
 from backend.app.store.vector_chroma import StorageError
+
+
+class WorkspaceResetConfirm(BaseModel):
+    confirmation: str = Field(min_length=6, max_length=20)
+    confirmation_token: str = Field(min_length=20, max_length=200)
 
 
 def llm_error_detail(error: LLMError) -> dict[str, Any]:
@@ -174,11 +180,16 @@ def create_app(settings: Settings | None = None):
                         ingestion_task = asyncio.create_task(
                             document_worker(s, app.state.agent.harness)
                         )
+                        app.state.ingestion_task = ingestion_task
                     yield
         finally:
-            if ingestion_task:
-                ingestion_task.cancel()
-                await asyncio.gather(ingestion_task, return_exceptions=True)
+            active_ingestion = getattr(app.state, "ingestion_task", ingestion_task)
+            for task in {ingestion_task, active_ingestion} - {None}:
+                task.cancel()
+            if ingestion_task or active_ingestion:
+                await asyncio.gather(
+                    *({ingestion_task, active_ingestion} - {None}), return_exceptions=True
+                )
             await app.state.speech.close()
             await mcp.close()
             if provider and hasattr(provider, "aclose"):
@@ -257,6 +268,14 @@ def create_app(settings: Settings | None = None):
         try:
             mutation_origin(request, s)
             actor = await authenticate(request, s)
+            from backend.app.services.workspace_reset import workspace_blocked
+
+            if (
+                request.method in {"POST", "PUT", "PATCH", "DELETE"}
+                and workspace_blocked(actor.tenant_id)
+                and not request.url.path.startswith("/admin/workspace-reset/")
+            ):
+                raise HTTPException(423, "This workspace is being reset. Try again shortly.")
             selection = request.headers.get("X-DeskMate-Provider", s.generation_provider)
             if s.test_mode and s.generation_provider == "stub":
                 selection = "stub"
@@ -274,6 +293,48 @@ def create_app(settings: Settings | None = None):
         if not current_principal(s).operator:
             raise HTTPException(403, "This action requires an administrator.")
         return (await app.state.voice.store(readiness)).model_dump()
+
+    @app.post("/admin/workspace-reset/prepare")
+    async def prepare_workspace_reset():
+        actor = current_principal(s)
+        if not actor.operator:
+            raise HTTPException(403, "This action requires an administrator.")
+        from backend.app.services.workspace_reset import WorkspaceReset
+
+        return await asyncio.to_thread(WorkspaceReset(s).prepare, actor.tenant_id, actor.owner_id)
+
+    @app.post("/admin/workspace-reset/confirm")
+    async def confirm_workspace_reset(body: WorkspaceResetConfirm):
+        actor = current_principal(s)
+        if not actor.operator:
+            raise HTTPException(403, "This action requires an administrator.")
+        if body.confirmation != "DELETE":
+            raise HTTPException(422, "Type DELETE exactly to confirm the workspace reset")
+        from backend.app.agent.streaming import cancel_workspace_streams
+        from backend.app.services.workspace_reset import WorkspaceReset
+
+        await cancel_workspace_streams(actor.tenant_id)
+        ingestion = getattr(app.state, "ingestion_task", None)
+        if ingestion and not ingestion.done():
+            ingestion.cancel()
+            await asyncio.gather(ingestion, return_exceptions=True)
+        try:
+            result = await WorkspaceReset(s).confirm(
+                actor.tenant_id, actor.owner_id, body.confirmation_token
+            )
+            if result["status"] == "complete":
+                app.state.conversation_sessions.clear()
+                await asyncio.to_thread(app.state.conversation_history.records.close)
+                if s.uses_record_store:
+                    from backend.app.services.document_worker import document_worker
+
+                    app.state.ingestion_task = asyncio.create_task(
+                        document_worker(s, app.state.agent.harness),
+                        name="document-worker-after-reset",
+                    )
+            return result
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     def readiness() -> ReadinessReport:
         from backend.app.diagnostics.readiness import configuration_readiness
@@ -753,6 +814,7 @@ def create_app(settings: Settings | None = None):
             case_id=record.get("linked_case_id"),
             result=state,
             events=events,
+            activity=record.get("activity", []),
         )
 
     @app.post("/requests/{request_id}/resume", response_model=AskResponse)
@@ -771,8 +833,19 @@ def create_app(settings: Settings | None = None):
 
     def stream_operation(request: Request, operation):
         from backend.app.agent.streaming import investigation_stream
+        actor = current_principal(s)
 
-        return investigation_stream(request, s, operation)
+        async def persist_activity(result, activity):
+            request_id = getattr(result, "request_id", None)
+            if request_id:
+                await asyncio.to_thread(
+                    app.state.conversation_history.save_activity,
+                    request_id,
+                    activity,
+                    principal=actor,
+                )
+
+        return investigation_stream(request, s, operation, persist_activity)
 
     @app.post("/ask/stream")
     async def ask_stream(request: Request, body: CaseCreateRequest):

@@ -77,7 +77,10 @@ type AskResponse = {
   case_id: string | null
   result: Omit<Case, 'case_id' | 'thread_id'>
   events: Event[]
+  activity?: ActivityEvent[]
 }
+type ResetPreview = { confirmation_token: string; expires_at: number; inventory: { records: number; vectors: number; files: number; unresolved_vectors: number } }
+type ResetResult = { status: string; stores: Record<string, { status: string; deleted?: number | boolean; unresolved?: number }> }
 type Conversation = {
   conversation_id: string
   title: string
@@ -156,6 +159,12 @@ export default function App(): JSX.Element {
   const [error, setError] = useState('')
   const [section, setSection] = useState('Chat')
   const [activity, setActivity] = useState<ActivityEvent[]>([])
+  const [resetPreview, setResetPreview] = useState<ResetPreview | null>(null)
+  const [resetConfirmation, setResetConfirmation] = useState('')
+  const [resetting, setResetting] = useState(false)
+  const [resetResult, setResetResult] = useState<ResetResult | null>(null)
+  const [notice, setNotice] = useState('')
+  const [knowledgeGeneration, setKnowledgeGeneration] = useState(0)
   const investigation = useRef<AbortController | null>(null)
   useEffect(() => () => investigation.current?.abort(), [])
 
@@ -203,6 +212,7 @@ export default function App(): JSX.Element {
             transient: !restored.case_id,
           })
           setEvents(restored.events)
+          setActivity(restored.activity ?? [])
         } catch (caught) {
           if ((caught as Error & { status?: number }).status === 404) {
             localStorage.removeItem(ACTIVE_CONVERSATION_KEY)
@@ -231,12 +241,37 @@ export default function App(): JSX.Element {
       transient: !response.case_id,
     })
     setEvents(response.events)
+    if (response.activity?.length) setActivity(response.activity)
     localStorage.setItem(ACTIVE_CONVERSATION_KEY, response.request_id)
     const [savedCases, savedConversations] = await Promise.all([
       request<Case[]>('/cases'), request<Conversation[]>('/conversations'),
     ])
     setCases(savedCases)
     setConversations(validConversations(savedConversations))
+  }
+  async function prepareReset() {
+    setError(''); setResetResult(null)
+    try { setResetPreview(await request<ResetPreview>('/admin/workspace-reset/prepare', post({}))) }
+    catch (caught) { setError((caught as Error).message) }
+  }
+  async function confirmReset() {
+    if (!resetPreview || resetConfirmation !== 'DELETE') return
+    setResetting(true); setError('')
+    try {
+      const result = await request<ResetResult>('/admin/workspace-reset/confirm', post({ confirmation: resetConfirmation, confirmation_token: resetPreview.confirmation_token }))
+      setResetResult(result)
+      if (result.status !== 'complete') {
+        setError('The reset is incomplete. Some external data remains; retry or review the server store status.')
+        return
+      }
+      investigation.current?.abort()
+      localStorage.removeItem(ACTIVE_CONVERSATION_KEY)
+      setActive(null); setCases([]); setConversations([]); setEvents([]); setActivity([]); setTicket(''); setAnswer('')
+      setKnowledgeGeneration(value => value + 1); setResetPreview(null); setResetConfirmation('')
+      setNotice('Workspace history deleted. DeskMate is ready for a new session.')
+      await refresh()
+    } catch (caught) { setError((caught as Error).message) }
+    finally { setResetting(false) }
   }
   async function start(event: FormEvent) {
     event.preventDefault()
@@ -372,10 +407,11 @@ export default function App(): JSX.Element {
           {error}
         </div>
       )}
+      {notice && <div className="success-banner" role="status">{notice}</div>}
       <main className={`workspace-main ${section.toLowerCase()}`}>
         <section hidden={section !== 'Chat'} className="chat-workspace" id="chat" aria-label="Chat workspace">
           <div className="workspace-heading"><div><span className="eyebrow">YOUR AI SERVICE DESK</span><h2>{active ? 'Let’s keep going' : 'How can I help?'}</h2></div>
-            <button type="button" className="button button-neutral" disabled={busy} onClick={() => { localStorage.removeItem(ACTIVE_CONVERSATION_KEY); setActive(null); setEvents([]); setTicket(''); setAnswer(''); setError('') }}>New conversation</button>
+            <div className="workspace-actions"><button type="button" className="button button-neutral" disabled={busy} onClick={() => { localStorage.removeItem(ACTIVE_CONVERSATION_KEY); setActive(null); setEvents([]); setActivity([]); setTicket(''); setAnswer(''); setError('') }}>New conversation</button><button type="button" className="button button-danger" disabled={busy} onClick={() => void prepareReset()}>Delete history</button></div>
           </div>
           {!!conversations.length && <aside className="conversation-history" aria-label="Conversation history">
             <h3>Recent conversations</h3>
@@ -394,9 +430,9 @@ export default function App(): JSX.Element {
         <section hidden={section !== 'Investigations'} className="history-workspace" id="investigations" aria-label="Investigation history">
           <InvestigationHistory cases={cases} selected={active?.case_id} busy={busy} onOpen={openCase} allowSamples={readiness?.runtime_mode === 'isolated_demo'} />
         </section>
-        <section hidden={section !== 'Knowledge'} id="knowledge-workspace" className="knowledge-workspace" aria-label="Knowledge workspace"><KnowledgePanel readiness={readiness} readinessChecking={checking} readinessError={readinessError} /></section>
+        <section hidden={section !== 'Knowledge'} id="knowledge-workspace" className="knowledge-workspace" aria-label="Knowledge workspace"><KnowledgePanel key={knowledgeGeneration} readiness={readiness} readinessChecking={checking} readinessError={readinessError} /></section>
         <section hidden={section !== 'Voice'} id="voice" className="voice-workspace">{section === 'Voice' && <VoiceSupport onCaseCreated={openCase} readiness={readiness} />}</section>
-        <div hidden={!['Chat', 'Investigations'].includes(section)}><InvestigationActivity events={activity} busy={busy && investigation.current !== null} onCancel={() => investigation.current?.abort()} /></div>
+        <div className="activity-column" hidden={!['Chat', 'Investigations'].includes(section)}><InvestigationActivity events={activity} busy={busy && investigation.current !== null} onCancel={() => investigation.current?.abort()} /></div>
         <div className="investigation-panel" hidden={!active || !['Chat', 'Investigations'].includes(section)}>
           {!active ? (
             <section className="empty-state">
@@ -661,6 +697,7 @@ export default function App(): JSX.Element {
           )}
         </div>
       </main>
+      {resetPreview && <div className="modal-backdrop" role="presentation"><section className="reset-modal" role="dialog" aria-modal="true" aria-labelledby="reset-title"><h2 id="reset-title">Delete all DeskMate history?</h2><p>This permanently removes your conversations, investigations, uploaded documents, knowledge, memories, and associated Neo4j and ChromaDB data from this workspace. This cannot be undone.</p><dl><dt>SQLite records</dt><dd>{resetPreview.inventory.records}</dd><dt>ChromaDB vectors</dt><dd>{resetPreview.inventory.vectors}</dd><dt>Uploaded files</dt><dd>{resetPreview.inventory.files}</dd></dl>{resetPreview.inventory.unresolved_vectors > 0 && <p className="error-banner">{resetPreview.inventory.unresolved_vectors} legacy vector entries have no tenant owner and will be retained.</p>}{resetResult && <div className="reset-results"><strong>Deletion result: {resetResult.status}</strong><ul>{Object.entries(resetResult.stores).map(([store, value]) => <li key={store}>{store}: {value.status}{value.unresolved ? ` (${value.unresolved} unresolved)` : ''}</li>)}</ul></div>}<label htmlFor="reset-confirmation">Type DELETE to confirm</label><input id="reset-confirmation" value={resetConfirmation} onChange={event => setResetConfirmation(event.target.value)} autoComplete="off"/><div className="modal-actions"><button className="button button-neutral" disabled={resetting} onClick={() => { setResetPreview(null); setResetConfirmation(''); setResetResult(null) }}>Cancel</button><button className="button button-danger" disabled={resetConfirmation !== 'DELETE' || resetting} onClick={() => void confirmReset()}>{resetting ? 'Deleting…' : resetResult?.status === 'incomplete' ? 'Retry deletion' : 'Permanently delete'}</button></div></section></div>}
       <footer>DeskMate · Thoughtful support, one conversation at a time.</footer>
     </div>
   )

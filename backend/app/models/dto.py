@@ -127,6 +127,7 @@ class AskResponse(BaseModel):
     case_id: str | None
     result: RequestResult
     events: list[CaseEvent]
+    activity: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class EmailTurnRequest(BaseModel):

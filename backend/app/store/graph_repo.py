@@ -683,6 +683,34 @@ class GraphRepository:
         except Exception:  # pragma: no cover - depends on runtime connectivity
             return False
 
+    def delete_workspace_graph(self, tenant_id: str, batch_size: int = 500) -> dict:
+        """Delete only nodes carrying an exact tenant owner marker, in bounded batches."""
+        if not tenant_id or self.tenant_provider and tenant_id != self.tenant():
+            raise PermissionError("Graph reset tenant mismatch")
+
+        def count(tx):
+            return tx.run(
+                "MATCH (n) WHERE n.tenant_id=$tenant_id RETURN count(n) AS total",
+                tenant_id=tenant_id,
+            ).single()["total"]
+
+        total = int(self._execute_read(count) or 0)
+        deleted = 0
+        while True:
+            def remove(tx):
+                return tx.run(
+                    "MATCH (n) WHERE n.tenant_id=$tenant_id WITH n LIMIT $limit "
+                    "DETACH DELETE n RETURN count(*) AS deleted",
+                    tenant_id=tenant_id, limit=min(max(batch_size, 1), 1000),
+                ).single()["deleted"]
+
+            removed = int(self._execute_write(remove) or 0)
+            deleted += removed
+            if removed == 0:
+                break
+        remaining = int(self._execute_read(count) or 0)
+        return {"status": "cleared" if remaining == 0 else "incomplete", "deleted": deleted, "before": total, "remaining": remaining}
+
     def _execute_write(self, func: Callable[[Transaction], T]) -> T:
         try:
             if hasattr(self._driver, "execute_write"):
@@ -779,6 +807,9 @@ class UnavailableGraphRepository:
     def ping(self):
         return False
 
+    def delete_workspace_graph(self, tenant_id, batch_size=500):
+        return {"status": "unavailable", "deleted": 0, "remaining": None}
+
 
 class InMemoryGraphRepository:
     """Minimal in-memory substitute implementing the GraphRepository interface."""
@@ -795,6 +826,12 @@ class InMemoryGraphRepository:
 
     def ensure_constraints(self) -> None:  # pragma: no cover - no-op for in-memory variant
         """In-memory store has no constraints to create."""
+
+    def delete_workspace_graph(self, tenant_id, batch_size=500):
+        deleted = sum(map(len, (self.documents, self.chunks, self.entity_links, self.references, self.semantic_facts)))
+        self.documents.clear(); self.chunks.clear(); self.entity_links.clear(); self.references.clear(); self.semantic_facts.clear()
+        self.knowledge_relationships.clear(); self.document_mentions.clear()
+        return {"status": "cleared", "deleted": deleted, "remaining": 0}
 
     def upsert_document(
         self, doc_id: str, title: Optional[str] = None, source: str = "paste", **metadata

@@ -186,3 +186,7 @@ Focused non-billable checks completed before the final no-test instruction: 11 g
 The new reasoning contracts separate source-grounded document extraction from conservative graph placement. Extraction outputs retain logical object references; placement must choose reuse, creation or unresolved exactly once per entity and cannot name an existing ID outside the bounded tenant candidate set. Graph-first retrieval converts entity-linked document references back through `LocalKnowledgeStore.resolve_object_ids`, so Neo4j remains discovery context and Chroma text remains answer evidence.
 
 No evaluation command was executed because this task explicitly prohibited tests, lint and builds. No live model or Aura claim is made. A later authorized acceptance run should cover multi-section resume, duplicate-entity reuse across uploads, unresolved mentions, conflicting source claims, stale reference reporting, tenant isolation and vector-only behavior during Aura outages.
+
+## Human-readable investigation activity — 2026-10-25
+
+Existing SSE activity is now reduced into Understanding, Planning, Searching, Evaluating, Verifying and Outcome sections without an additional model call. Repeated low-level events update their stage, while the full allowlisted operational log remains expandable and is restored with the owner-scoped conversation record. Python compilation and TypeScript no-emit checking passed; no reasoning tests or live model calls were run. Natural-language fidelity against live Groq/Azure event combinations remains an opt-in acceptance check.
