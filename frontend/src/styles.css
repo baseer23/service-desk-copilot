@@ -628,14 +628,21 @@ h1, h2, h3 { font-family: inherit; }
 .masthead h1 { font-size: 23px; letter-spacing: -.8px; }
 .masthead p { font-size: 12px; }
 .brand-mark { width: 38px; height: 38px; border-radius: 12px; font-size: 22px; background: #244a3b; }
-.runtime-label { background: white; border-color: #e0e8e3; }
+.workspace-menu { position: relative; margin-left: auto; }
+.workspace-menu summary { list-style: none; cursor: pointer; user-select: none; }
+.workspace-menu summary::-webkit-details-marker { display: none; }
+.workspace-menu .runtime-label { display: flex; align-items: center; gap: 7px; background: white; border-color: #e0e8e3; }
+.workspace-menu[open] .runtime-label { border-color: #97b6a3; box-shadow: 0 0 0 2px #dce9df; }
+.workspace-menu-popover { position: absolute; z-index: 50; top: calc(100% + 8px); right: 0; width: 190px; padding: 7px; background: white; border: 1px solid #dce5df; border-radius: 11px; box-shadow: 0 12px 30px #203d291c; }
+.workspace-menu-danger { width: 100%; border: 0; border-radius: 8px; padding: 10px 12px; text-align: left; background: transparent; color: #9a3026; font: inherit; font-size: 13px; font-weight: 600; }
+.workspace-menu-danger:hover:not(:disabled), .workspace-menu-danger:focus-visible { background: #fff0ed; outline: none; }
+.workspace-menu-danger:disabled { opacity: .55; }
 .workspace-nav { display: flex; gap: 6px; padding: 6px; border: 1px solid #e0e7e2; border-radius: 14px; background: #fff; width: fit-content; margin: 0 auto 30px; }
 .workspace-nav button { background: transparent; color: #64756b; border: 0; padding: 11px 27px; border-radius: 9px; font-size: 14px; font-weight: 600; }
 .workspace-nav button:hover { background: #f1f5f2; }
 .workspace-nav button.active { background: #244a3b; color: #fff; box-shadow: 0 2px 5px #244a3b20; }
 .workspace-main { display: flex; flex-direction: column; gap: 20px; margin: 0 auto; max-width: 940px; min-height: 65vh; }
 .workspace-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 20px; }
-.workspace-actions { display: flex; gap: 8px; }
 .button-danger { background: #fff4f2; border: 1px solid #e3aaa2; color: #8e3028; }
 .button-danger:hover:not(:disabled) { background: #fbe5e1; }
 .workspace-heading h2 { font-size: 26px; margin: 0; font-weight: 650; letter-spacing: -.7px; }
@@ -771,7 +778,8 @@ footer { border: 0; margin-top: 30px; font-size: 11px; }
   .workspace-main { margin-top: 0; gap: 12px; }
   .workspace-main.chat, .workspace-main.investigations { display: flex; max-width: 940px; }
   .activity-column { order: 2; }
-  .workspace-actions { flex-wrap: wrap; justify-content: flex-end; }
+  .workspace-menu .runtime-label { display: flex; font-size: 11px; padding: 8px 10px; }
+  .workspace-menu-popover { width: 170px; }
   .workspace-heading h2 { font-size: 22px; }
   .workspace-heading .button { font-size: 11px; min-height: 38px; padding: 9px; }
   .chat-welcome { padding: 38px 6px 20px; }

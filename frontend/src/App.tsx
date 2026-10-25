@@ -394,7 +394,12 @@ export default function App(): JSX.Element {
           <p>Your support workspace</p>
         </div>
         <ProviderSelector />
-        <span className="runtime-label">{readiness?.runtime_mode==='isolated_demo' ? 'Isolated demo' : 'Your workspace'}</span>
+        <details className="workspace-menu">
+          <summary className="runtime-label">{readiness?.runtime_mode==='isolated_demo' ? 'Isolated demo' : 'Your workspace'} <span aria-hidden="true">▾</span></summary>
+          <div className="workspace-menu-popover" role="menu">
+            <button type="button" role="menuitem" className="workspace-menu-danger" disabled={busy} onClick={event => { event.currentTarget.closest('details')?.removeAttribute('open'); void prepareReset() }}>Delete history</button>
+          </div>
+        </details>
       </header>
       <nav className="workspace-nav" aria-label="Workspace">
         {([['Chat', 'chat'], ['Investigations', 'investigations'], ['Knowledge', 'knowledge-workspace'], ['Voice', 'voice']] as const).map(([name, id]) => (
@@ -411,7 +416,7 @@ export default function App(): JSX.Element {
       <main className={`workspace-main ${section.toLowerCase()}`}>
         <section hidden={section !== 'Chat'} className="chat-workspace" id="chat" aria-label="Chat workspace">
           <div className="workspace-heading"><div><span className="eyebrow">YOUR AI SERVICE DESK</span><h2>{active ? 'Let’s keep going' : 'How can I help?'}</h2></div>
-            <div className="workspace-actions"><button type="button" className="button button-neutral" disabled={busy} onClick={() => { localStorage.removeItem(ACTIVE_CONVERSATION_KEY); setActive(null); setEvents([]); setActivity([]); setTicket(''); setAnswer(''); setError('') }}>New conversation</button><button type="button" className="button button-danger" disabled={busy} onClick={() => void prepareReset()}>Delete history</button></div>
+            <button type="button" className="button button-neutral" disabled={busy} onClick={() => { localStorage.removeItem(ACTIVE_CONVERSATION_KEY); setActive(null); setEvents([]); setActivity([]); setTicket(''); setAnswer(''); setError('') }}>New conversation</button>
           </div>
           {!!conversations.length && <aside className="conversation-history" aria-label="Conversation history">
             <h3>Recent conversations</h3>
