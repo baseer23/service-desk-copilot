@@ -413,7 +413,7 @@ export default function App(): JSX.Element {
         </div>
       )}
       {notice && <div className="success-banner" role="status">{notice}</div>}
-      <main className={`workspace-main ${section.toLowerCase()}`}>
+      <main className={`workspace-main ${section.toLowerCase()}${section === 'Chat' && activity.length > 0 ? ' with-activity' : ''}`}>
         <section hidden={section !== 'Chat'} className="chat-workspace" id="chat" aria-label="Chat workspace">
           <div className="workspace-heading"><div><span className="eyebrow">YOUR AI SERVICE DESK</span><h2>{active ? 'Let’s keep going' : 'How can I help?'}</h2></div>
             <button type="button" className="button button-neutral" disabled={busy} onClick={() => { localStorage.removeItem(ACTIVE_CONVERSATION_KEY); setActive(null); setEvents([]); setActivity([]); setTicket(''); setAnswer(''); setError('') }}>New conversation</button>
