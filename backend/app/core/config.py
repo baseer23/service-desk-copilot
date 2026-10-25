@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     # Explicit opt-in: each upload may create a billable Azure DI request and
     # persist structural metadata to the separately authorized Neo4j writer.
     auto_document_graph_ingestion: bool = False
+    semantic_graph_ingestion_enabled: bool = False
+    semantic_graph_max_llm_calls_per_job: int = Field(default=30, ge=1, le=100)
+    semantic_graph_batch_chars: int = Field(default=12000, ge=1000, le=50000)
+    semantic_graph_max_entities_per_document: int = Field(default=100, ge=1, le=500)
+    semantic_graph_max_relationships_per_document: int = Field(default=200, ge=1, le=1000)
     azure_key_vault_url: str = ""
     azure_session_secret_name: str = "deskmate-session-signing-key"
     auth_client_id: str = ""

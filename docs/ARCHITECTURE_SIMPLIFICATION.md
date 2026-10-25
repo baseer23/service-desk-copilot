@@ -220,3 +220,11 @@ Default pytest, CI and Playwright configuration now declares the offline profile
 `make test-fast` maps the merge-base, staged, unstaged and untracked paths to conservative backend/UI checks and expands unknown backend contracts to the complete offline suite. `make test-regression` is the full offline PR gate. Seven generic browser status variants were consolidated into stronger retained VPN, MFA and printer scenarios, while a real-browser conversation-refresh check was added. The inventory and profile matrix are recorded in `docs/TEST_INVENTORY.md` and `docs/TESTING.md`.
 
 Per user instruction, this testing refactor was not executed. No before/after duration is claimed; the next authorized regression should record pytest durations and Playwright reporting before further consolidation.
+
+## Source-grounded document semantic graph — 2026-10-25
+
+Structured uploads now retain the existing extraction, Chroma indexing and reference-only Neo4j projection, then optionally enter a separately configured semantic stage. Bounded page/section batches are interpreted through the selected structured-reasoning provider; cursors, section proposals, candidate snapshots and placement plans persist in tenant-scoped SQLite under a versioned pipeline key. Provider context redacts common secret assignments and treats all document text as untrusted data. The stage never repeats extraction or embeddings.
+
+The writer uses flexible `Entity.kind` values and generic `RELATED_TO.predicate` relationships. Conservative model placement may reuse only tenant-scoped candidate IDs returned by discovery; trusted Python validates decisions and logical evidence IDs before parameterized writes. `GraphMention` and `GraphClaim` records connect entities and relationships to the canonical `Document` plus existing structured object IDs, while full text remains local and in Chroma. Personal conversation memory remains a separate graph domain. Semantic ingestion is disabled by default and requires both its explicit setting and the dedicated Neo4j writer.
+
+Per user instruction, no tests, lint, build, paid provider call, Azure extraction, or live Neo4j write was executed for this change. Live provider extraction quality, Aura permissions, and end-to-end placement remain acceptance blockers until explicitly authorized.

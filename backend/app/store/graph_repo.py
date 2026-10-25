@@ -60,6 +60,9 @@ class GraphRepository:
             "CREATE CONSTRAINT IF NOT EXISTS FOR (c:Chunk) REQUIRE c.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (e:Entity) REQUIRE e.id IS UNIQUE",
             "CREATE INDEX IF NOT EXISTS FOR (e:Entity) ON (e.name)",
+            "CREATE INDEX IF NOT EXISTS FOR (e:Entity) ON (e.normalized_name)",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (c:GraphClaim) REQUIRE c.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (m:GraphMention) REQUIRE m.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (s:Section) REQUIRE s.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (t:Table) REQUIRE t.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (f:Figure) REQUIRE f.id IS UNIQUE",
@@ -416,9 +419,9 @@ class GraphRepository:
                 "MATCH path=(seed)-[*1..2]-(neighbor:Entity) "
                 "UNWIND relationships(path) AS r "
                 "WITH r WHERE ($tenant IS NULL OR (startNode(r).tenant_id=$tenant AND endNode(r).tenant_id=$tenant)) "
-                'AND type(r) IN ["WORKS_AT","HAS_SITE","USES","AFFECTS","APPLIES_TO","INVOLVES","ASSOCIATED_WITH"] '
+                'AND (type(r) IN ["WORKS_AT","HAS_SITE","USES","AFFECTS","APPLIES_TO","INVOLVES","ASSOCIATED_WITH"] OR type(r)="RELATED_TO") '
                 "AND ($allow_fixtures OR coalesce(r.source_system, '') <> 'local_fixture') "
-                "RETURN DISTINCT startNode(r).name AS subject, type(r) AS predicate, "
+                "RETURN DISTINCT startNode(r).name AS subject, coalesce(r.predicate,type(r)) AS predicate, "
                 "endNode(r).name AS object, r.source_system AS source_system, "
                 "toString(r.observed_at) AS observed_at LIMIT $limit",
                 terms=terms,
@@ -429,6 +432,131 @@ class GraphRepository:
             return [dict(row) for row in rows]
 
         return self._execute_read(read) or []
+
+    def find_entity_candidates(self, name, entity_type=None, aliases=None, identifiers=None, limit=20):
+        """Find compact candidate identities without mutating the graph."""
+        terms = list(dict.fromkeys(v.casefold() for v in [name, *(aliases or [])] if v.strip()))[:20]
+        identifier_values = [str(v).casefold() for v in (identifiers or {}).values() if str(v).strip()][:20]
+
+        def read(tx):
+            rows = tx.run(
+                "MATCH (e:Entity) WHERE e.tenant_id=$tenant AND ("
+                "toLower(coalesce(e.normalized_name,e.name,'')) IN $terms OR "
+                "any(a IN coalesce(e.aliases,[]) WHERE toLower(a) IN $terms) OR "
+                "any(v IN $identifiers WHERE toLower(coalesce(e.identifiers_json,'')) CONTAINS v)) "
+                "RETURN coalesce(e.original_id,toLower(e.name)) AS id,e.name AS name,"
+                "coalesce(e.kind,e.type) AS kind,e.aliases AS aliases,e.description AS description "
+                "ORDER BY CASE WHEN toLower(coalesce(e.normalized_name,e.name,''))=$name THEN 0 ELSE 1 END "
+                "LIMIT $limit",
+                tenant=self.tenant(), terms=terms, identifiers=identifier_values,
+                name=name.casefold(), limit=min(max(limit, 1), 20),
+            )
+            return [dict(row) for row in rows]
+        return self._execute_read(read) or []
+
+    def get_entity_neighborhood(self, entity_id, max_hops=2, limit=30):
+        hops = 1 if max_hops <= 1 else 2
+        query = (
+            f"MATCH (seed:Entity {{id:$id}}) WHERE seed.tenant_id=$tenant "
+            f"OPTIONAL MATCH path=(seed)-[*1..{hops}]-(other:Entity) "
+            "WHERE other.tenant_id=$tenant UNWIND relationships(path) AS r "
+            "RETURN DISTINCT coalesce(startNode(r).original_id,toLower(startNode(r).name)) AS source_id,"
+            "startNode(r).name AS source,coalesce(r.predicate,type(r)) AS predicate,"
+            "coalesce(endNode(r).original_id,toLower(endNode(r).name)) AS target_id,endNode(r).name AS target LIMIT $limit"
+        )
+        def read(tx):
+            return [dict(row) for row in tx.run(query, id=self.scope(entity_id), tenant=self.tenant(), limit=min(max(limit, 1), 30))]
+        return {"entity_id": entity_id, "relationships": self._execute_read(read) or []}
+
+    def find_related_documents(self, entity_id, limit=20):
+        def read(tx):
+            rows = tx.run(
+                "MATCH (e:Entity {id:$id}) WHERE e.tenant_id=$tenant "
+                "MATCH (e)<-[:REFERS_TO]-(m:GraphMention)-[:MENTIONED_IN]->(d:Document) "
+                "OPTIONAL MATCH (m)-[:SUPPORTED_BY]->(o) "
+                "RETURN coalesce(d.original_id,d.id) AS document_id,d.title AS title,"
+                "d.summary AS summary,collect(DISTINCT coalesce(o.original_id,o.id))[0..50] AS object_ids LIMIT $limit",
+                id=self.scope(entity_id), tenant=self.tenant(), limit=min(max(limit, 1), 20),
+            )
+            return [dict(row) for row in rows]
+        return self._execute_read(read) or []
+
+    def existing_entity_ids(self, entity_ids):
+        logical = list(dict.fromkeys(entity_ids))[:100]
+        def read(tx):
+            rows = tx.run("MATCH (e:Entity) WHERE e.tenant_id=$tenant AND e.id IN $ids "
+                          "RETURN coalesce(e.original_id,toLower(e.name)) AS id",
+                          tenant=self.tenant(), ids=[self.scope(value) for value in logical])
+            return [row["id"] for row in rows]
+        return set(self._execute_read(read) or [])
+
+    def update_document_semantics(self, document_id, *, document_type, summary, status):
+        def write(tx):
+            tx.run("MATCH (d:Document {id:$id}) WHERE d.tenant_id=$tenant "
+                   "SET d.document_type=$type,d.summary=$summary,d.semantic_graph_status=$status,d.semantic_updated_at=timestamp()",
+                   id=self.scope(document_id), tenant=self.tenant(), type=document_type[:160], summary=summary[:1200], status=status)
+        self._execute_write(write)
+
+    def upsert_knowledge_entities(self, entities):
+        for entity in entities:
+            def write(tx, entity=entity):
+                tx.run("MERGE (e:Entity {id:$id}) ON CREATE SET e.created_at=timestamp() "
+                       "SET e.original_id=$original_id,e.tenant_id=$tenant,e.name=$name,e.normalized_name=$normalized,"
+                       "e.kind=$kind,e.aliases=$aliases,e.identifiers_json=$identifiers,e.description=$description,e.updated_at=timestamp()",
+                       id=self.scope(entity["id"]), original_id=entity["id"], tenant=self.tenant(),
+                       name=entity["name"][:240], normalized=entity["name"].casefold()[:240], kind=entity["kind"][:100],
+                       aliases=[str(v)[:240] for v in entity.get("aliases", [])[:20]],
+                       identifiers=json.dumps(entity.get("identifiers", {}), sort_keys=True)[:4000],
+                       description=str(entity.get("description", ""))[:1200])
+            self._execute_write(write)
+        return {"upserted": len(entities)}
+
+    def upsert_knowledge_relationships(self, relationships):
+        for item in relationships:
+            evidence = list(dict.fromkeys(item.get("evidence_object_ids", [])))[:50]
+            claim_id = "claim_" + hashlib.sha256(json.dumps({
+                "s": item["source_id"], "p": item["predicate"], "o": item["target_id"],
+                "d": item["document_id"], "e": evidence}, sort_keys=True).encode()).hexdigest()[:32]
+            def write_scoped(tx, item=item, evidence=evidence, claim_id=claim_id):
+                tx.run("MATCH (a:Entity {id:$source}),(b:Entity {id:$target}),(d:Document {id:$document}) "
+                       "WHERE a.tenant_id=$tenant AND b.tenant_id=$tenant AND d.tenant_id=$tenant "
+                       "MERGE (a)-[r:RELATED_TO {predicate:$predicate}]->(b) ON CREATE SET r.created_at=timestamp() SET r.updated_at=timestamp() "
+                       "MERGE (c:GraphClaim {id:$claim}) SET c.original_id=$claim_original,c.tenant_id=$tenant,c.predicate=$predicate,"
+                       "c.confidence=$confidence,c.is_explicit=$explicit,c.description=$description,c.observed_at=$observed_at,c.status='documented' "
+                       "MERGE (c)-[:SUBJECT]->(a) MERGE (c)-[:OBJECT]->(b) MERGE (c)-[:DOCUMENTED_IN]->(d)",
+                       source=self.scope(item["source_id"]), target=self.scope(item["target_id"]), document=self.scope(item["document_id"]),
+                       tenant=self.tenant(), predicate=item["predicate"][:64], claim=self.scope(claim_id), claim_original=claim_id,
+                       confidence=float(item.get("confidence", 0)), explicit=bool(item.get("is_explicit", True)),
+                       description=str(item.get("description", ""))[:1200], observed_at=item.get("observed_at"))
+                if evidence:
+                    tx.run("MATCH (c:GraphClaim {id:$claim}) UNWIND $evidence AS oid "
+                           "MATCH (o {id:oid}) WHERE c.tenant_id=$tenant AND o.tenant_id=$tenant "
+                           "MERGE (c)-[:SUPPORTED_BY]->(o)", claim=self.scope(claim_id),
+                           evidence=[self.scope(v) for v in evidence], tenant=self.tenant())
+            self._execute_write(write_scoped)
+        return {"upserted": len(relationships)}
+
+    def link_document_mentions(self, document_id, mentions):
+        for item in mentions:
+            mention_id = "mention_" + hashlib.sha256(f"{document_id}:{item['mention_id']}".encode()).hexdigest()[:32]
+            def write(tx, item=item, mention_id=mention_id):
+                tx.run("MATCH (d:Document {id:$document}) WHERE d.tenant_id=$tenant "
+                       "MERGE (m:GraphMention {id:$mention}) SET m.original_id=$mention_original,m.tenant_id=$tenant,"
+                       "m.name=$name,m.kind=$kind,m.status=$status MERGE (m)-[:MENTIONED_IN]->(d)",
+                       document=self.scope(document_id), tenant=self.tenant(), mention=self.scope(mention_id),
+                       mention_original=mention_id, name=item["name"][:240], kind=item["kind"][:100], status=item["status"])
+                evidence = item.get("evidence_object_ids", [])[:50]
+                if evidence:
+                    tx.run("MATCH (m:GraphMention {id:$mention}) UNWIND $evidence AS oid "
+                           "MATCH (o {id:oid}) WHERE m.tenant_id=$tenant AND o.tenant_id=$tenant "
+                           "MERGE (m)-[:SUPPORTED_BY]->(o)", mention=self.scope(mention_id),
+                           evidence=[self.scope(v) for v in evidence], tenant=self.tenant())
+                if item.get("entity_id"):
+                    tx.run("MATCH (m:GraphMention {id:$mention}),(e:Entity {id:$entity}) "
+                           "WHERE m.tenant_id=$tenant AND e.tenant_id=$tenant MERGE (m)-[:REFERS_TO]->(e)",
+                           mention=self.scope(mention_id), entity=self.scope(item["entity_id"]), tenant=self.tenant())
+            self._execute_write(write)
+        return {"linked": len(mentions)}
 
     def upsert_semantic_memory(self, batch) -> None:
         """Idempotently publish validated, owner-scoped facts and provenance."""
@@ -633,6 +761,15 @@ class UnavailableGraphRepository:
     def search_relationships(self, entities, limit=12):
         return []
 
+    def find_entity_candidates(self, *args, **kwargs): return []
+    def get_entity_neighborhood(self, entity_id, **kwargs): return {"entity_id": entity_id, "relationships": []}
+    def find_related_documents(self, *args, **kwargs): return []
+    def existing_entity_ids(self, entity_ids): return set()
+    def upsert_knowledge_entities(self, entities): return {"upserted": 0}
+    def upsert_knowledge_relationships(self, relationships): return {"upserted": 0}
+    def link_document_mentions(self, document_id, mentions): return {"linked": 0}
+    def update_document_semantics(self, *args, **kwargs): return None
+
     def upsert_semantic_memory(self, *args, **kwargs):
         return None
 
@@ -653,6 +790,8 @@ class InMemoryGraphRepository:
         self.entity_links: MutableMapping[str, Dict[str, Any]] = {}
         self.references: MutableMapping[str, Dict[str, Any]] = {}
         self.semantic_facts: MutableMapping[str, Dict[str, Any]] = {}
+        self.knowledge_relationships: list[dict] = []
+        self.document_mentions: list[dict] = []
 
     def ensure_constraints(self) -> None:  # pragma: no cover - no-op for in-memory variant
         """In-memory store has no constraints to create."""
@@ -769,6 +908,46 @@ class InMemoryGraphRepository:
                     {"id": chunk_id, "text": chunk["text"], "metadata": metadata, "score": 0.0}
                 )
         return collected[:limit]
+
+    def find_entity_candidates(self, name, entity_type=None, aliases=None, identifiers=None, limit=20):
+        terms = {name.casefold(), *(value.casefold() for value in aliases or [])}
+        return [{"id": key, "name": value["name"], "kind": value.get("kind") or value.get("type")}
+                for key, value in self.entity_links.items()
+                if value["name"].casefold() in terms][:limit]
+
+    def get_entity_neighborhood(self, entity_id, max_hops=2, limit=30):
+        return {"entity_id": entity_id, "relationships": [row for row in self.knowledge_relationships
+                if entity_id in {row.get("source_id"), row.get("target_id")}][:limit]}
+
+    def find_related_documents(self, entity_id, limit=20):
+        rows = []
+        for mention in self.document_mentions:
+            if mention.get("entity_id") == entity_id:
+                doc = self.documents.get(mention["document_id"], {})
+                rows.append({"document_id": mention["document_id"], "title": doc.get("title"),
+                             "summary": doc.get("summary"), "object_ids": mention.get("evidence_object_ids", [])})
+        return rows[:limit]
+
+    def existing_entity_ids(self, entity_ids):
+        return {value for value in entity_ids if value in self.entity_links}
+
+    def upsert_knowledge_entities(self, entities):
+        for item in entities:
+            self.entity_links[item["id"]] = {**item, "type": item["kind"], "chunks": set()}
+        return {"upserted": len(entities)}
+
+    def upsert_knowledge_relationships(self, relationships):
+        self.knowledge_relationships.extend(relationships)
+        return {"upserted": len(relationships)}
+
+    def link_document_mentions(self, document_id, mentions):
+        self.document_mentions.extend({**item, "document_id": document_id} for item in mentions)
+        return {"linked": len(mentions)}
+
+    def update_document_semantics(self, document_id, *, document_type, summary, status):
+        self.documents.setdefault(document_id, {}).update(
+            document_type=document_type, summary=summary, semantic_graph_status=status
+        )
 
     def ping(self) -> bool:
         """In-memory store is always available."""

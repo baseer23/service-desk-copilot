@@ -180,3 +180,9 @@ The focused semantic-memory/graph suite passed 14 tests, 31 related MCP/security
 The deterministic acceptance coverage now includes checkpoint-backed conversation listing/restoration, React active-thread restoration, explicit general facts, semantic/paraphrased recall, correction history, duplicate suppression, optional graph delivery, individual forgetting and owner isolation. Personal memories enter reasoning in a dedicated state field and remain distinct from operational case facts and retrieved document/web evidence.
 
 Focused non-billable checks completed before the final no-test instruction: 11 general-conversation checks, 15 React App checks and nine semantic-memory checks passed. No later full regression, build, browser or live integration run is claimed. Live-provider answer quality and live Aura reconciliation remain opt-in acceptance work.
+
+## Document semantic graph evaluation status — 2026-10-25
+
+The new reasoning contracts separate source-grounded document extraction from conservative graph placement. Extraction outputs retain logical object references; placement must choose reuse, creation or unresolved exactly once per entity and cannot name an existing ID outside the bounded tenant candidate set. Graph-first retrieval converts entity-linked document references back through `LocalKnowledgeStore.resolve_object_ids`, so Neo4j remains discovery context and Chroma text remains answer evidence.
+
+No evaluation command was executed because this task explicitly prohibited tests, lint and builds. No live model or Aura claim is made. A later authorized acceptance run should cover multi-section resume, duplicate-entity reuse across uploads, unresolved mentions, conflicting source claims, stale reference reporting, tenant isolation and vector-only behavior during Aura outages.

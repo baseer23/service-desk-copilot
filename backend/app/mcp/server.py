@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import inspect
 from datetime import datetime, timezone
 from functools import lru_cache, wraps
 from typing import Any, Literal
@@ -52,7 +53,11 @@ def capability(source_system, reliability=0.9):
                             "reason": "This organizational data source is not connected.",
                         }
                     else:
-                        result = await asyncio.to_thread(fn, *args, **kwargs)
+                        result = (
+                            await fn(*args, **kwargs)
+                            if inspect.iscoroutinefunction(fn)
+                            else await asyncio.to_thread(fn, *args, **kwargs)
+                        )
                 rows = result if isinstance(result, list) else [result] if result else []
                 status = (
                     "unavailable"
@@ -253,6 +258,35 @@ def search_graph(entities: list[str], limit: int = 12):
     if not 1 <= limit <= 30:
         raise ValueError("limit must be between 1 and 30")
     return graph.search_relationships(entities, limit)
+
+
+@capability("neo4j_aura")
+def search_knowledge_entities(query: str, limit: int = 20):
+    """Find tenant-scoped semantic entities and compact candidate metadata."""
+    _, graph, driver, _, _ = environment()
+    if not driver:
+        return {"available": False, "reason": "Aura is not connected; local retrieval remains available."}
+    if not 1 <= limit <= 20:
+        raise ValueError("limit must be between 1 and 20")
+    return graph.find_entity_candidates(query, limit=limit)
+
+
+@capability("neo4j_aura")
+def get_knowledge_entity_context(entity_id: str):
+    """Return a bounded tenant-scoped semantic neighborhood for one known entity ID."""
+    _, graph, driver, _, _ = environment()
+    if not driver:
+        return {"available": False, "reason": "Aura is not connected; local retrieval remains available."}
+    return graph.get_entity_neighborhood(entity_id, max_hops=2, limit=30)
+
+
+@capability("neo4j_aura")
+def get_entity_document_references(entity_id: str):
+    """Return linked document and logical Chroma object references for an entity."""
+    _, graph, driver, _, _ = environment()
+    if not driver:
+        return {"available": False, "reason": "Aura is not connected; local retrieval remains available."}
+    return graph.find_related_documents(entity_id, limit=20)
 
 
 @capability("semantic_memory", 1.0)
@@ -705,6 +739,41 @@ def enrich_document_graph(document_id: str):
     if enrich is None:
         raise ValueError("Graph enrichment is unavailable for this document store")
     return enrich(document_id)
+
+
+@capability("document_semantic_graph")
+async def enrich_document_semantic_graph(document_id: str):
+    """Authorized ingestion-stage semantic linking; never exposed to the chat planner."""
+    settings = get_settings()
+    if not settings.semantic_graph_ingestion_enabled:
+        raise ValueError("Semantic graph ingestion is not enabled")
+    if not (settings.neo4j_ingestion_enabled and settings.neo4j_uri
+            and settings.neo4j_ingestion_user and settings.neo4j_ingestion_password.get_secret_value()):
+        raise ValueError("The authorized Neo4j ingestion writer is not configured")
+    from neo4j import GraphDatabase
+    from backend.app.core.principal import current_principal
+    from backend.app.models.provider_factory import get_selectable_provider
+    from backend.app.services.capabilities import knowledge_stores
+    from backend.app.services.document_semantic_graph import DocumentSemanticGraphService
+    from backend.app.store.graph_repo import GraphRepository
+
+    driver = GraphDatabase.driver(settings.neo4j_uri, auth=(settings.neo4j_ingestion_user,
+        settings.neo4j_ingestion_password.get_secret_value()), connection_timeout=5,
+        max_transaction_retry_time=0, connection_acquisition_timeout=5)
+    provider = get_selectable_provider(settings)
+    try:
+        driver.verify_connectivity()
+        graph = GraphRepository(driver,
+            tenant_provider=lambda: current_principal(settings).tenant_id,
+            optional=False, allow_fixtures=False, database=settings.neo4j_database)
+        graph.ensure_constraints()
+        vector, _, _ = knowledge_stores(settings, connect_graph=False, records=managed_records())
+        return await DocumentSemanticGraphService(
+            settings, documents(), managed_records(), provider, graph, vector
+        ).enrich(document_id)
+    finally:
+        await provider.aclose()
+        driver.close()
 
 
 @capability("document_store")

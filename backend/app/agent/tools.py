@@ -13,6 +13,9 @@ from pydantic import ConfigDict, create_model
 READ_TOOLS = {
     "search_knowledge",
     "search_graph",
+    "search_knowledge_entities",
+    "get_knowledge_entity_context",
+    "get_entity_document_references",
     "search_previous_tickets",
     "get_ticket",
     "get_user_context",
@@ -48,6 +51,9 @@ READ_TOOLS = {
 KNOWLEDGE_TOOLS = {
     "search_knowledge",
     "search_graph",
+    "search_knowledge_entities",
+    "get_knowledge_entity_context",
+    "get_entity_document_references",
     "search_memory",
     "search_remembered_facts",
     "get_authenticated_profile",
