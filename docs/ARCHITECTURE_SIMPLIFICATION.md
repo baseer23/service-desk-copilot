@@ -212,3 +212,11 @@ Ordinary chat threads now have a tenant/owner-scoped SQLite registry whose ident
 Explicit remember commands now produce validated identity, preference, project, employment, technology or generic-note facts without a model call. SQLite remains authoritative for confirmed, superseded and revoked facts and for source, vector and graph delivery jobs. A model-specific `personal_memory_local_*` Chroma collection embeds only normalized facts, checks tenant/owner authority against SQLite on every result and removes superseded/revoked vectors. Neo4j remains an optional idempotent projection with minimal provenance; an outage leaves local recall available and its graph job pending. Relevant facts are loaded into the separate LangGraph `personal_memory` field before reasoning.
 
 Before the instruction to stop executing tests, focused checks passed for the 11 general-conversation scenarios, 15 React App scenarios and nine semantic-memory scenarios. The final backfill and graph-metadata edits were inspected but were not followed by another test run. No live model, public web, Azure service or Neo4j write was executed.
+
+## Offline test profiles and change-aware selection — 2026-10-25
+
+Default pytest, CI and Playwright configuration now declares the offline profile, forces local stubs and installs a fail-closed socket guard. Loopback and Unix sockets remain available for FastAPI, Vite and real MCP stdio; named or non-loopback destinations fail before a provider SDK can connect, even if local credentials exist. Live tests are separately marked and require two explicit authorization settings.
+
+`make test-fast` maps the merge-base, staged, unstaged and untracked paths to conservative backend/UI checks and expands unknown backend contracts to the complete offline suite. `make test-regression` is the full offline PR gate. Seven generic browser status variants were consolidated into stronger retained VPN, MFA and printer scenarios, while a real-browser conversation-refresh check was added. The inventory and profile matrix are recorded in `docs/TEST_INVENTORY.md` and `docs/TESTING.md`.
+
+Per user instruction, this testing refactor was not executed. No before/after duration is claimed; the next authorized regression should record pytest durations and Playwright reporting before further consolidation.

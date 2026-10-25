@@ -1,3 +1,5 @@
+import pytest
+
 from backend.app.agent.models import (
     GeneralAnswer,
     InvestigationDecision,
@@ -6,6 +8,8 @@ from backend.app.agent.models import (
     VerificationResult,
 )
 from backend.app.models.instructions import stage_instructions
+
+pytestmark = pytest.mark.integration
 
 
 def install_conversation_provider(client, captured):
@@ -114,6 +118,22 @@ def test_general_conversation_followup_is_owner_scoped(make_client):
 
     with pytest.raises(KeyError):
         client.portal.call(other_user)
+
+
+@pytest.mark.memory
+def test_two_general_conversations_are_listed_and_reopen_independently(make_client):
+    client = make_client({"KNOWLEDGE_SCOPE": "broad"})
+    install_conversation_provider(client, [])
+    first = client.post("/ask", json={"summary": "Where is Toronto?"}).json()
+    second = client.post("/ask", json={"summary": "Where is Ottawa?"}).json()
+    history = client.get("/conversations").json()
+    assert {item["conversation_id"] for item in history} == {
+        first["request_id"], second["request_id"]
+    }
+    for response, question in ((first, "Where is Toronto?"), (second, "Where is Ottawa?")):
+        restored = client.get(f'/conversations/{response["request_id"]}').json()
+        assert restored["request_id"] == response["request_id"]
+        assert restored["result"]["chat_messages"][0]["content"] == question
 
 
 def test_support_scope_cannot_enter_general_generation(make_client):

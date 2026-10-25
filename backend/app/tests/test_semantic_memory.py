@@ -1,6 +1,10 @@
+import pytest
+
 from backend.app.core.principal import Principal, principal_scope
 from backend.app.services.semantic_memory import SemanticMemoryService
 from backend.app.store.local_records import LocalRecords
+
+pytestmark = [pytest.mark.memory, pytest.mark.integration]
 
 
 class GraphSink:
@@ -108,6 +112,7 @@ def test_general_explicit_memory_semantic_recall_correction_and_idempotency(sett
     duplicate = memory.capture_conversation("Please remember I prefer Azure.", "cloud-two")
     assert not duplicate["captured"] and duplicate["reason"] == "duplicate"
     assert len([fact for fact in memory.profile()["facts"] if fact["predicate"] == "PREFERRED_CLOUD"]) == 1
+    assert memory.vector.count() == 1
 
     restarted = SemanticMemoryService(configured, LocalRecords(configured), sink)
     recalled = restarted.search("Which cloud platform do I like to deploy to?")
@@ -147,3 +152,16 @@ def test_memory_http_api_reports_save_search_and_delete(make_client):
     deleted = client.delete(f'/memory/{body["fact"]["id"]}')
     assert deleted.status_code == 200 and deleted.json()["revoked"]
     assert client.get("/memory", params={"query": "my project"}).json()["facts"] == []
+
+
+def test_offline_graph_job_reconciles_without_changing_local_fact(settings, tmp_path):
+    sink = GraphSink()
+    sink.available = False
+    memory, _ = service(settings, tmp_path, sink)
+    saved = memory.capture_conversation("Remember that I use ChromaDB.", "offline")
+    assert saved["graph_status"] == "graph_pending"
+    assert memory.search("Which technology do I use?")["facts"][0]["value"] == "ChromaDB"
+    sink.available = True
+    reconciled = memory.retry_pending()
+    assert reconciled["linked"] == 1
+    assert memory.records.read("semantic_graph_job", saved["fact"]["id"])["payload"]["status"] == "linked"

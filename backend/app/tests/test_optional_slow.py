@@ -13,6 +13,7 @@ except ImportError:  # pragma: no cover
 
 
 @pytest.mark.slow
+@pytest.mark.live
 def test_ingestion_with_aura(make_client, tmp_path):  # pragma: no cover - slow path
     if os.getenv("RUN_AURA_TESTS") != "1":
         pytest.skip("Set RUN_AURA_TESTS=1 with isolated Aura credentials")
