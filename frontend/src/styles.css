@@ -667,13 +667,17 @@ h1, h2, h3 { font-family: inherit; }
 .availability-note { display: flex; gap: 12px; align-items: center; font-size: 13px; color: #796332; }
 .availability-note p { margin: 10px 0 0; }
 .investigation-panel { order: 2; }
-.workspace-main.chat, .workspace-main.investigations { max-width: 1180px; display: grid; grid-template-columns: minmax(0, 3fr) minmax(300px, 2fr); align-items: start; }
-.workspace-main.chat > .chat-workspace > .workspace-heading,
-.workspace-main.chat > .chat-workspace > .conversation-history,
-.workspace-main.chat > .chat-workspace > .chat-welcome,
-.workspace-main.chat > .chat-workspace > .main-composer { grid-column: 1 / -1; }
-.workspace-main.chat > .investigation-panel, .workspace-main.investigations > .investigation-panel { grid-column: 1; }
-.activity-column { grid-column: 2; grid-row: span 2; min-width: 0; }
+.workspace-main.chat.with-activity { max-width: 1180px; display: grid; grid-template-columns: minmax(0, 3fr) minmax(300px, 2fr); align-items: start; }
+/* Investigations is a full-width list, not the chat's two-column activity layout. */
+.workspace-main.investigations > .history-workspace,
+.workspace-main.investigations > .investigation-panel { width: 100%; min-width: 0; }
+.workspace-main.chat.with-activity > .chat-workspace > .workspace-heading,
+.workspace-main.chat.with-activity > .chat-workspace > .conversation-history,
+.workspace-main.chat.with-activity > .chat-workspace > .chat-welcome,
+.workspace-main.chat.with-activity > .chat-workspace > .main-composer { grid-column: 1 / -1; }
+.workspace-main.chat.with-activity > .investigation-panel { grid-column: 1; }
+.activity-column { min-width: 0; width: 100%; }
+.workspace-main.chat.with-activity > .activity-column { grid-column: 2; grid-row: span 2; }
 .working-panel { position: sticky; top: 18px; }
 .working-heading { display: flex; justify-content: space-between; gap: 10px; align-items: start; }
 .working-heading h2 { margin: 0; font-size: 18px; }
@@ -776,7 +780,7 @@ footer { border: 0; margin-top: 30px; font-size: 11px; }
   .workspace-nav { width: 100%; justify-content: space-between; gap: 2px; margin-bottom: 24px; }
   .workspace-nav button { padding: 10px 8px; flex: 1; font-size: 12px; }
   .workspace-main { margin-top: 0; gap: 12px; }
-  .workspace-main.chat, .workspace-main.investigations { display: flex; max-width: 940px; }
+  .workspace-main.chat, .workspace-main.chat.with-activity, .workspace-main.investigations { display: flex; max-width: 940px; }
   .activity-column { order: 2; }
   .workspace-menu .runtime-label { display: flex; font-size: 11px; padding: 8px 10px; }
   .workspace-menu-popover { width: 170px; }
