@@ -307,8 +307,9 @@ def test_invalid_model_plan_gets_one_bounded_schema_revision_without_dispatch(ma
     before = agent.harness.invocation_count
     result = client.portal.call(agent.plan, state)
     assert len(contexts) == 2
-    assert contexts[1]["plan_validation_feedback"][0]["type"] == "literal_error"
-    assert "input" not in contexts[1]["plan_validation_feedback"][0]
+    assert contexts[1]["plan_validation_feedback"]["validation_error_code"] == "INVALID_TOOL_ARGUMENTS"
+    assert contexts[1]["plan_validation_feedback"]["tool_name"] == "search_knowledge"
+    assert contexts[1]["plan_validation_feedback"]["actual_argument_names"] == ["mode", "question"]
     assert result["plan"]["tool_calls"][0]["arguments"]["mode"] == "HYBRID"
     assert agent.harness.invocation_count == before
 

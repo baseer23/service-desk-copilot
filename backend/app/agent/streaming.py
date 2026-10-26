@@ -28,6 +28,8 @@ _SAFE_ACTIVITY_FIELDS = {
     "sufficient_evidence", "objective", "research_queries", "research_questions",
     "findings", "missing_information", "next_action", "question", "conclusion",
     "actions", "skipped_sources", "sources", "category", "request_id",
+    "provider", "validation_error_code", "tool_name", "expected_argument_names",
+    "actual_argument_names", "attempt_number",
 }
 
 

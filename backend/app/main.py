@@ -56,6 +56,7 @@ def llm_error_detail(error: LLMError) -> dict[str, Any]:
         return {
             "code": "APPLICATION_VALIDATION_FAILED",
             "message": "DeskMate rejected an invalid investigation step. Collected evidence was preserved.",
+            **error.diagnostics,
         }
     messages = {
         "authentication": "Azure OpenAI authentication failed. Sign in to Entra again and retry.",

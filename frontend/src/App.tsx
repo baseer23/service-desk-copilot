@@ -405,7 +405,7 @@ export default function App(): JSX.Element {
     setError('')
     try {
       await displayRequest(await investigate<AskResponse>(`/requests/${active.case_id}/message`, { summary: message }))
-    } catch (caught) { setError((caught as Error).message) }
+    } catch (caught) { setAnswer(current => current || message); setError((caught as Error).message) }
     finally { setPendingMessage(''); setBusy(false) }
   }
 

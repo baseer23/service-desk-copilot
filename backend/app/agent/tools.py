@@ -4,6 +4,7 @@ from typing import Any, Literal
 from referencing.exceptions import Unresolvable
 from backend.app.mcp.schema import checked_schema, validator, planning_schema
 from jsonschema.exceptions import ValidationError as SchemaValidationError
+from pydantic import ValidationError as PydanticValidationError
 
 from langchain_core.tools import StructuredTool
 from pydantic import ConfigDict, create_model
@@ -74,6 +75,34 @@ KNOWLEDGE_TOOLS = {
     "list_available_context",
     "list_documents",
 }
+
+
+class PlanValidationError(ValueError):
+    """Safe description of a rejected model plan; never includes argument values."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        tool_name: str | None = None,
+        expected_argument_names: list[str] | None = None,
+        actual_argument_names: list[str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.tool_name = tool_name
+        self.expected_argument_names = expected_argument_names or []
+        self.actual_argument_names = actual_argument_names or []
+
+    def feedback(self) -> dict[str, Any]:
+        return {
+            "validation_error_code": self.code,
+            **({"tool_name": self.tool_name} if self.tool_name else {}),
+            "expected_argument_names": self.expected_argument_names,
+            "actual_argument_names": self.actual_argument_names,
+            "message": str(self)[:500],
+        }
 
 
 # Session inspection and write tools are application-controlled, never model-planned.
@@ -173,17 +202,46 @@ class AgentToolHarness:
         return {name for name in permitted if available(self.descriptors.get(name, {}))}
 
     def validate_arguments(self, name, arguments):
+        descriptor = self.descriptors.get(name)
+        if not descriptor:
+            raise PlanValidationError(
+                "UNKNOWN_TOOL", f"Unknown capability: {name}", tool_name=name
+            )
+        schema = descriptor["inputSchema"]
+        expected = sorted(schema.get("properties", {}))
         try:
-            validator(self.descriptors[name]["inputSchema"]).validate(arguments)
+            validator(schema).validate(arguments)
         except (SchemaValidationError, Unresolvable, RecursionError):
-            raise ValueError("Tool arguments do not match its discovered schema") from None
+            raise PlanValidationError(
+                "INVALID_TOOL_ARGUMENTS",
+                "Tool arguments do not match its discovered schema",
+                tool_name=name,
+                expected_argument_names=expected,
+                actual_argument_names=sorted(arguments),
+            ) from None
 
     def validate_plan(self, plan, workflow):
         allowed = self.allowed_names(workflow)
         for call in plan.tool_calls:
             if call.name not in allowed or call.name not in self.tools:
-                raise ValueError(f"Capability not permitted in {workflow}: {call.name}")
-            self.tools[call.name].args_schema.model_validate(call.arguments)
+                raise PlanValidationError(
+                    "TOOL_NOT_PERMITTED",
+                    f"Capability not permitted in {workflow}: {call.name}",
+                    tool_name=call.name,
+                )
+            expected = sorted(
+                self.descriptors[call.name]["inputSchema"].get("properties", {})
+            )
+            try:
+                self.tools[call.name].args_schema.model_validate(call.arguments)
+            except PydanticValidationError:
+                raise PlanValidationError(
+                    "INVALID_TOOL_ARGUMENTS",
+                    "Tool arguments do not match its discovered schema",
+                    tool_name=call.name,
+                    expected_argument_names=expected,
+                    actual_argument_names=sorted(call.arguments),
+                ) from None
             self.validate_arguments(call.name, call.arguments)
 
     def schemas(self, workflow="service_desk"):

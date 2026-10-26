@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import re
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -26,7 +27,7 @@ from backend.app.agent.models import (
 )
 from backend.app.agent.scope import SCOPE_MESSAGE
 from backend.app.agent.state import InvestigationState
-from backend.app.agent.tools import AgentToolHarness
+from backend.app.agent.tools import AgentToolHarness, PlanValidationError
 from backend.app.mcp.client import MCPToolError
 from backend.app.models.provider import LLMError
 from backend.app.services.source_policy import permits, quality, rank_sources
@@ -63,6 +64,8 @@ LABELS = {
     "convert_currency": "Exchange rate checked",
     "get_holidays": "Holidays checked",
 }
+
+logger = logging.getLogger(__name__)
 
 
 def now():
@@ -817,7 +820,8 @@ class ServiceDeskAgent:
             try:
                 self.harness.validate_plan(plan, state["workflow"])
                 if not plan.tool_calls and plan.additional_evidence_useful and not plan.clarification_needed:
-                    raise ValueError(
+                    raise PlanValidationError(
+                        "EVIDENCE_FLAG_WITHOUT_ACTION",
                         "The plan says more evidence is required but requests no tool. "
                         "Choose an authorized retrieval tool, ask one justified clarification, "
                         "or, for stable general knowledge only, explicitly set "
@@ -829,12 +833,14 @@ class ServiceDeskAgent:
                     and not plan.tool_calls
                     and not plan.clarification_needed
                 ):
-                    raise ValueError(
+                    raise PlanValidationError(
+                        "REQUIRED_SOURCE_NOT_SELECTED",
                         "This question needs the selected source scope. Plan a real "
                         "document/web retrieval or request one material clarification."
                     )
                 if plan.tool_calls and not plan.additional_evidence_useful:
-                    raise ValueError(
+                    raise PlanValidationError(
+                        "TOOL_CALLS_WITH_EVIDENCE_DISABLED",
                         "Tool calls contradict additional_evidence_useful=false. "
                         "Set it true when collecting observations."
                     )
@@ -848,18 +854,47 @@ class ServiceDeskAgent:
                     and plan.clarification_question
                     and plan.clarification_question.strip().casefold() in answered_questions
                 ):
-                    raise ValueError(
+                    raise PlanValidationError(
+                        "REPEATED_CLARIFICATION",
                         "The proposed clarification was already answered. Build a new plan using "
                         "the confirmed human answer."
                     )
                 break
-            except ValueError as exc:
+            except (ValueError, PlanValidationError) as exc:
+                diagnostics = self._plan_validation_diagnostics(
+                    state, exc, attempt + 1
+                )
+                await self._emit_validation_failure(diagnostics)
                 if attempt:
+                    if self._asks_authenticated_identity(state):
+                        plan = InvestigationPlan(
+                            goal="Check the authenticated user's confirmed profile",
+                            additional_evidence_useful=True,
+                            source_strategy=(
+                                "Use the tenant- and owner-scoped authenticated profile capability."
+                            ),
+                            unknowns=["Whether a confirmed profile name is available"],
+                            tool_calls=[{
+                                "name": "get_authenticated_profile",
+                                "arguments": {},
+                                "reason": "The answer must come from confirmed personal memory.",
+                            }],
+                            stop_condition=(
+                                "Stop after the authenticated profile returns a confirmed name or no name."
+                            ),
+                        )
+                        self.harness.validate_plan(plan, state["workflow"])
+                        break
                     raise LLMError(
                         "Model plan failed tool permission or argument validation",
                         category="application_validation",
+                        request_id=state.get("case_id"),
+                        diagnostics=diagnostics,
                     ) from exc
                 context["plan_validation_feedback"] = (
+                    exc.feedback()
+                    if isinstance(exc, PlanValidationError)
+                    else
                     exc.errors(include_input=False, include_url=False)
                     if isinstance(exc, ValidationError)
                     else str(exc)
@@ -921,14 +956,63 @@ class ServiceDeskAgent:
             "tools_discovered": True,
         }
 
+    @staticmethod
+    def _asks_authenticated_identity(state):
+        text = " ".join(
+            str(item.get("content", ""))
+            for item in [*state.get("chat_messages", [])[-4:], {
+                "content": state.get("ticket", {}).get("summary", "")
+            }]
+        ).casefold()
+        return bool(
+            re.search(r"\b(?:what(?:'s|s|\s+is)|tell\s+me)\s+my\s+(?:name|profile|identity)\b", text)
+            or re.search(r"\bwho\s+am\s+i\b", text)
+        )
+
+    def _plan_validation_diagnostics(self, state, error, attempt):
+        details = error.feedback() if isinstance(error, PlanValidationError) else {
+            "validation_error_code": "PLAN_CONTRACT_INVALID",
+            "expected_argument_names": [],
+            "actual_argument_names": [],
+        }
+        details.pop("message", None)
+        return {
+            "request_id": state.get("case_id"),
+            "provider": self.provider.name(),
+            "stage": "plan",
+            "attempt_number": attempt,
+            **details,
+        }
+
+    async def _emit_validation_failure(self, diagnostics):
+        logger.warning(
+            "Investigation validation rejected provider=%s stage=%s code=%s "
+            "tool=%s expected_arguments=%s actual_arguments=%s attempt=%s request_id=%s",
+            diagnostics.get("provider"), diagnostics.get("stage"),
+            diagnostics.get("validation_error_code"), diagnostics.get("tool_name"),
+            diagnostics.get("expected_argument_names", []),
+            diagnostics.get("actual_argument_names", []),
+            diagnostics.get("attempt_number"), diagnostics.get("request_id"),
+        )
+        event_details = {key: value for key, value in diagnostics.items() if key != "stage"}
+        await emit(
+            diagnostics.get("stage", "application_validation"), "failed",
+            "The proposed investigation step did not match its validated contract",
+            **event_details,
+        )
+
     async def execute_tools(self, state):
         plan = InvestigationPlan.model_validate(state["plan"])
         try:
             self.harness.validate_plan(plan, state["workflow"])
         except ValueError as exc:
+            diagnostics = self._plan_validation_diagnostics(state, exc, 1)
+            await self._emit_validation_failure(diagnostics)
             raise LLMError(
                 "Model plan failed tool permission or argument validation",
                 category="application_validation",
+                request_id=state.get("case_id"),
+                diagnostics=diagnostics,
             ) from exc
         results = [None] * len(plan.tool_calls)
         attempted_signatures = []
@@ -1379,12 +1463,45 @@ class ServiceDeskAgent:
                     state, [identifier for item in decision.hypotheses for identifier in item.evidence_ids]
                 )
                 break
-            except LLMError:
+            except LLMError as exc:
                 if attempt:
-                    raise
+                    permitted = {e["id"] for e in state.get("evidence", [])}
+                    decision = decision.model_copy(update={
+                        "outcome": "cannot_verify",
+                        "hypotheses": [
+                            item.model_copy(update={
+                                "evidence_ids": [identifier for identifier in item.evidence_ids if identifier in permitted],
+                                "status": "plausible",
+                            })
+                            for item in decision.hypotheses
+                        ],
+                        "answer": None,
+                        "enough_information": False,
+                        "confidence": 0,
+                        "uncertainty": list(dict.fromkeys([
+                            *decision.uncertainty,
+                            "The proposed answer could not be tied to available evidence.",
+                        ])),
+                    })
+                    await self._emit_validation_failure({
+                        "request_id": state.get("case_id"),
+                        "provider": self.provider.name(),
+                        "stage": "reason",
+                        "validation_error_code": "UNKNOWN_EVIDENCE_REFERENCE",
+                        "expected_argument_names": sorted(
+                            e["id"] for e in state.get("evidence", [])
+                        ),
+                        "actual_argument_names": sorted(exc.diagnostics.get("invalid_evidence_ids", [])),
+                        "attempt_number": attempt + 1,
+                    })
+                    break
+                permitted = sorted(e["id"] for e in state.get("evidence", []))
                 context["reason_validation_feedback"] = (
-                    "The prior decision cited evidence identifiers that do not exist. Cite only "
-                    "exact IDs supplied in evidence, or leave evidence_ids empty."
+                    "Remove these invalid evidence IDs: "
+                    + ", ".join(exc.diagnostics.get("invalid_evidence_ids", []))
+                    + ". Permitted evidence IDs are: "
+                    + (", ".join(permitted) if permitted else "none")
+                    + ". Cite only exact permitted IDs or leave evidence_ids empty."
                 )
         # Carry forward the planner's grounded clarification decision. A
         # retrieval-free clarification must not become an unsupported answer or
@@ -1841,10 +1958,13 @@ class ServiceDeskAgent:
                 "web_pages_fetched": state.get("web_pages_fetched", 0)}
 
     def _validate_evidence_refs(self, state, ids):
-        if set(ids) - {e["id"] for e in state.get("evidence", [])}:
+        invalid = sorted(set(ids) - {e["id"] for e in state.get("evidence", [])})
+        if invalid:
             raise LLMError(
                 "Structured reasoning cited unknown evidence identifiers",
                 category="application_validation",
+                request_id=state.get("case_id"),
+                diagnostics={"invalid_evidence_ids": invalid},
             )
 
     async def verify(self, state):

@@ -70,6 +70,27 @@ test('general conversation sends follow-ups to the existing request', async () =
   await waitFor(() => expect(fetch.mock.calls.some(([url]) => url === '/requests/chat-one/message')).toBe(true))
 })
 
+test('restores a failed follow-up in the composer without duplicating prior messages', async () => {
+  const current = { ...initial, workflow: 'knowledge', status: 'assessment_ready', final_answer: 'First answer.', chat_messages: [{ role: 'user', content: 'First question' }, { role: 'assistant', content: 'First answer.' }] }
+  localStorage.setItem(ACTIVE_CONVERSATION_KEY, 'chat-failure')
+  const fetch = vi.fn(async (url: string) => {
+    if (url === '/cases' || url === '/conversations') return Response.json([])
+    if (url === '/conversations/chat-failure') return Response.json({ request_id: 'chat-failure', case_id: null, result: current, events: [] })
+    if (url.endsWith('/message')) return Response.json({ detail: { message: 'The plan was rejected.' } }, { status: 502 })
+    return Response.json({})
+  })
+  vi.stubGlobal('fetch', fetch)
+  const user = userEvent.setup()
+  render(<App />)
+  const composer = await screen.findByLabelText('Reply to this conversation')
+  await user.type(composer, 'Please try this follow-up')
+  await user.click(within(screen.getByLabelText('Conversation')).getByRole('button', { name: 'Send message' }))
+  expect(await screen.findByRole('alert')).toHaveTextContent('The plan was rejected.')
+  expect(composer).toHaveValue('Please try this follow-up')
+  expect(within(screen.getByLabelText('Conversation')).getAllByText('First answer.')).toHaveLength(1)
+  expect(within(screen.getByLabelText('Conversation')).getByRole('button', { name: 'Send message' })).toBeEnabled()
+})
+
 test('creates a case, shows real event data, resumes human input and renders assessment', async () => {
   const user = userEvent.setup()
   let current = initial
