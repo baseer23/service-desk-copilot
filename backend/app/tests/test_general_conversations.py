@@ -8,8 +8,16 @@ from backend.app.agent.models import (
     VerificationResult,
 )
 from backend.app.models.instructions import stage_instructions
+from backend.app.models.dto import RequestResult
 
 pytestmark = pytest.mark.integration
+
+
+def test_empty_legacy_final_response_is_restored_as_absent():
+    restored = RequestResult.model_validate(
+        {"ticket": {}, "status": "assessment_ready", "final_response": {}}
+    )
+    assert restored.final_response is None
 
 
 def install_conversation_provider(client, captured):

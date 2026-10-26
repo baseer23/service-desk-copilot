@@ -1,6 +1,6 @@
 from backend.app.agent.models import Hypothesis, FinalResponse, EvidenceItem
 from typing import Any, Literal
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, Field, computed_field, model_validator
 from backend.app.agent.models import MemoryFact
 
 
@@ -108,6 +108,14 @@ class RequestResult(BaseModel):
     final_answer: str | None = None
     chat_messages: list[dict[str, str]] = Field(default_factory=list)
     research_iteration: int = 0
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_empty_legacy_final_response(cls, value):
+        """Treat old empty response placeholders as absent without rewriting history."""
+        if isinstance(value, dict) and value.get("final_response") == {}:
+            value = {**value, "final_response": None}
+        return value
 
 
 class CaseResponse(RequestResult):
