@@ -236,3 +236,11 @@ The API now provides operator-only prepare/confirm reset routes with an expiring
 The chat UI adds the guarded reset modal and a responsive 60/40 conversation/activity layout. Live activity is grouped into six user-readable stages, retains the complete event log under Technical activity, and persists only allowlisted visible event fields for conversation restoration.
 
 Executed non-billable checks: Python bytecode compilation, TypeScript no-emit type checking, and Git whitespace validation passed. No reset, test suite, live provider request, Chroma deletion, file deletion, or Aura operation was executed. Legacy vectors without reliable tenant ownership and workspace-owned backups/staged files without ownership metadata remain retained and must be reported rather than deleted.
+
+## Continuous chat and durable URL ingestion — 2026-10-26
+
+Chat now renders the checkpoint-backed message list as one chronological transcript, appending the current summary only when it is absent from saved messages. Follow-up submission appears immediately as a pending user turn, transcript scrolling follows new content only while the reader remains near the bottom, and desktop activity uses a stable 65/35 transcript/activity grid that stacks on mobile. The redundant Recent conversations panel was removed without changing conversation persistence or case architecture.
+
+URL ingestion now requires the same public-web, local-MCP and private-store conditions reported by readiness. Crawled pages enter `LocalDocumentRepository`, preserving immutable local source/provenance, compatible Chroma vectors and reference-only Neo4j delivery; graph failure returns `graph_pending` without rolling back local knowledge. Crawler and MCP failures expose bounded safe error codes rather than internal exceptions.
+
+Focused checks passed: four URL-ingestion backend tests, 19 App/Knowledge frontend tests, Python compilation, TypeScript no-emit checking, Git whitespace validation and a live headless browser layout/menu check. A single bounded live `example.com` ingestion returned HTTP 400 and a read-only search confirmed no item was persisted; it was not retried because the mutation result must not be assumed safe to repeat. Runtime health and frontend returned HTTP 200. Aura enrichment was unavailable, and no graph write, reset, paid model call or full test suite was performed.

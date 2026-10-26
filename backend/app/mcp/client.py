@@ -21,9 +21,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 class MCPToolError(RuntimeError):
     """Server tool failure; the connection remains usable."""
 
-    def __init__(self, message: str, status_code: int = 502) -> None:
+    def __init__(self, message: str, status_code: int = 502, code: str | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.code = code
 
 
 class MCPConnectionError(RuntimeError):
@@ -266,6 +267,7 @@ class DeskMateMCPClient:
                                     raise MCPToolError(
                                         f'MCP tool {name} failed: {value.get("error")}',
                                         (value.get("result") or {}).get("http_status", 502),
+                                        (value.get("result") or {}).get("code"),
                                     )
                             if not future.done():
                                 future.set_result(value)

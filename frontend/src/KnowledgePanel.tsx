@@ -141,6 +141,10 @@ export default function KnowledgePanel({
         method?: string
         graph_nodes?: number
         graph_relationships?: number
+        local_index_ready?: boolean
+        graph_link_status?: 'linked' | 'pending' | 'not_configured'
+        semantic_graph_status?: string
+        failed_pages?: number
       }>(path, options)
       if (kind === 'index' && !readiness?.managed_documents && path === '/documents/upload' && result.id) {
         result = await request(`/documents/${result.id}/index`, post())
@@ -150,6 +154,15 @@ export default function KnowledgePanel({
         setMessage(autoGraph
           ? `${result.method === 'document_intelligence' ? 'Azure Document Intelligence' : 'Local text fallback'} extracted ${result.pages} page(s). Neo4j linked ${result.graph_nodes ?? 0} nodes and ${result.graph_relationships ?? 0} relationships; the original and extracted text were not saved in DeskMate.`
           : `Text preview is ready (${result.pages} page(s)).`)
+      } else if (mode === 'url' && result.local_index_ready) {
+        const indexed = `${result.pages ?? 0} public page(s) were added to local knowledge.`
+        const failed = result.failed_pages ? ` ${result.failed_pages} page(s) could not be indexed.` : ''
+        const graph = result.graph_link_status === 'linked'
+          ? result.semantic_graph_status === 'linked'
+            ? ' Neo4j semantic linking is complete.'
+            : ' Neo4j references are linked; semantic enrichment is pending.'
+          : ' Local knowledge is ready; Neo4j linking remains pending.'
+        setMessage(indexed + failed + graph)
       } else if (result.status && result.status !== 'ready') {
         const stage: Record<string, string> = {
           queued: 'Extracting', extracting: 'Extracting', structuring: 'Structuring',
@@ -313,7 +326,7 @@ export default function KnowledgePanel({
         {indexingBlocked && <p className="muted">Document processing is temporarily unavailable. You can still save documents and search available knowledge.</p>}
         {mode === 'url' && urlDisabledByConfiguration && (
           <p className="muted">
-            Web page uploads are disabled by workspace configuration. You can upload a document or paste its text.
+            {readiness?.url_ingestion_blocker ?? 'Web page uploads are disabled by workspace configuration.'} You can upload a document or paste its text.
           </p>
         )}
         {mode === 'url' && readinessChecking && <p className="muted">Checking whether web page uploads are available…</p>}

@@ -190,3 +190,9 @@ No evaluation command was executed because this task explicitly prohibited tests
 ## Human-readable investigation activity — 2026-10-25
 
 Existing SSE activity is now reduced into Understanding, Planning, Searching, Evaluating, Verifying and Outcome sections without an additional model call. Repeated low-level events update their stage, while the full allowlisted operational log remains expandable and is restored with the owner-scoped conversation record. Python compilation and TypeScript no-emit checking passed; no reasoning tests or live model calls were run. Natural-language fidelity against live Groq/Azure event combinations remains an opt-in acceptance check.
+
+## Chat transcript and URL-ingestion evaluation — 2026-10-26
+
+Focused React checks cover chronological multi-turn rendering, current-summary deduplication, follow-up submission and the Knowledge ingestion status contract. A live headless browser confirmed the transcript/activity desktop split, workspace reset menu and safe Cancel path, plus Knowledge and Voice tab accessibility. Four isolated backend checks exercised public-web authorization, durable local indexing, retrieval and graph-linked reporting using temporary stores.
+
+The live service reported local MCP/private stores ready and URL ingestion enabled, while direct Aura enrichment was unavailable. One bounded `example.com` request returned HTTP 400 and produced no searchable local item; it was not repeated. This revision therefore claims the repaired deterministic ingestion boundary, not a successful production crawl or live graph projection. No reasoning provider, paid Azure operation or full regression suite was invoked.

@@ -51,6 +51,12 @@ class IngestUrlRequest(BaseModel):
 class IngestUrlResponse(IngestPasteResponse):
     pages: int
     skipped_urls: list[str] = Field(default_factory=list)
+    document_ids: list[str] = Field(default_factory=list)
+    local_index_ready: bool = False
+    graph_link_status: Literal["linked", "pending", "not_configured"] = "pending"
+    semantic_graph_status: str = "pending"
+    status: Literal["ready", "graph_pending", "partial"] = "ready"
+    failed_pages: int = Field(default=0, ge=0)
 
 
 class CaseCreateRequest(BaseModel):

@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import inspect
+import logging
 from datetime import datetime, timezone
 from functools import lru_cache, wraps
 from typing import Any, Literal
@@ -15,6 +16,13 @@ from mcp.server.fastmcp import Context, FastMCP
 
 server = FastMCP("deskmate")
 fixtures = FixtureRepository()
+
+
+class URLIngestError(ValueError):
+    def __init__(self, code: str, message: str, status_code: int):
+        super().__init__(message)
+        self.code = code
+        self.status_code = status_code
 
 
 def capability(source_system, reliability=0.9):
@@ -93,7 +101,12 @@ def capability(source_system, reliability=0.9):
                     status="error",
                     error=message,
                     result=(
-                        {"http_status": exc.status_code} if hasattr(exc, "status_code") else None
+                        {
+                            **({"http_status": exc.status_code} if hasattr(exc, "status_code") else {}),
+                            **({"code": exc.code} if hasattr(exc, "code") else {}),
+                        }
+                        if hasattr(exc, "status_code") or hasattr(exc, "code")
+                        else None
                     ),
                 )
 
@@ -802,23 +815,95 @@ def ingest_url(url: str, max_depth: int | None = None, max_pages: int | None = N
     from backend.app.services.url_crawler import CrawlLimits, UrlCrawler
 
     s = get_settings()
-    if not s.allow_url_ingest:
-        raise ValueError("URL ingestion is disabled")
+    if not s.allow_url_ingest or not s.enable_public_web_tools:
+        raise URLIngestError(
+            "PUBLIC_WEB_DISABLED",
+            "Website ingestion is disabled by workspace authorization.",
+            403,
+        )
+    if not s.uses_record_store:
+        raise URLIngestError(
+            "VECTOR_INDEX_FAILED", "Local website indexing is unavailable.", 503
+        )
     depth = s.url_max_depth if max_depth is None else max_depth
     pages = s.url_max_pages if max_pages is None else max_pages
     if not 0 <= depth <= 3 or not 1 <= pages <= 10:
         raise ValueError("Invalid crawl limits")
-    result = UrlCrawler(s).crawl(
-        url, CrawlLimits(depth, pages, s.url_max_total_chars, s.url_rate_limit_sec)
-    )
-    totals = {"chunks": 0, "entities": 0, "vector_count": 0, "ms": 0}
-    for page in result.pages:
-        item = environment()[3].ingest_text(
-            page.title, page.content, source=page.url, source_type="url", url=page.url
+    try:
+        result = UrlCrawler(s).crawl(
+            url, CrawlLimits(depth, pages, s.url_max_total_chars, s.url_rate_limit_sec)
         )
-        for key in totals:
-            totals[key] += getattr(item, key)
-    return {**totals, "pages": len(result.pages), "skipped_urls": result.skipped_urls}
+    except Exception as exc:
+        if hasattr(exc, "code"):
+            raise
+        logging.getLogger(__name__).warning(
+            "URL crawl failed safely (%s)", type(exc).__name__
+        )
+        if isinstance(exc, ValueError):
+            raise URLIngestError("URL_BLOCKED", str(exc), 400) from exc
+        raise URLIngestError(
+            "WEBSITE_UNAVAILABLE",
+            "The website could not be retrieved. Check its address or availability.",
+            502,
+        ) from exc
+    totals = {"chunks": 0, "entities": 0, "vector_count": 0, "ms": 0}
+    repository = documents()
+    document_ids = []
+    states = []
+    failed_pages = 0
+    duplicates = []
+    retrieved_at = datetime.now(timezone.utc).isoformat()
+    for page in result.pages:
+        try:
+            uploaded = repository.upload(
+                page.content.encode("utf-8"),
+                page.title,
+                "text/plain",
+                "structured_graph",
+                "local",
+                source_type="url",
+                source_url=page.url,
+                canonical_url=page.canonical_url or page.url,
+                retrieved_at=retrieved_at,
+            )
+            state = repository.process(uploaded["id"])
+            document_ids.append(uploaded["id"])
+            states.append(state)
+            duplicates.append(bool(uploaded.get("duplicate")))
+            totals["chunks"] += int(state.get("chunks", 0))
+            totals["vector_count"] += int(state.get("chunks", 0))
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "URL page indexing failed safely (%s)", type(exc).__name__
+            )
+            failed_pages += 1
+    if not states:
+        raise URLIngestError(
+            "VECTOR_INDEX_FAILED",
+            "The website was retrieved, but local knowledge indexing failed.",
+            502,
+        )
+    local_ready = all(state.get("local_index_ready") for state in states)
+    graph_link_status = (
+        "linked" if all(state.get("graph_link_status") == "linked" for state in states)
+        else "pending"
+    )
+    semantic_statuses = {state.get("semantic_graph_status", "pending") for state in states}
+    semantic_graph_status = semantic_statuses.pop() if len(semantic_statuses) == 1 else "pending"
+    status = "partial" if failed_pages else "ready" if graph_link_status == "linked" else "graph_pending"
+    return {
+        **totals,
+        "pages": len(states),
+        "failed_pages": failed_pages,
+        "skipped_urls": result.skipped_urls,
+        "document_ids": document_ids,
+        "duplicate": bool(duplicates) and all(duplicates),
+        "content_hash": document_ids[0] if len(document_ids) == 1 else None,
+        "local_index_ready": local_ready,
+        "graph_link_status": graph_link_status,
+        "semantic_graph_status": semantic_graph_status,
+        "status": status,
+    }
 
 
 @capability("sqlite_memory", 1)

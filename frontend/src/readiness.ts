@@ -27,6 +27,7 @@ export interface ReadinessReport {
   semantic_ingestion_ready?: boolean
   semantic_ingestion_blocker?: string | null
   url_ingestion_enabled?: boolean
+  url_ingestion_blocker?: string | null
   structured_ingestion_available?: boolean
   automatic_graph_ingestion_enabled?: boolean
   structured_ingestion_blocker?: string | null

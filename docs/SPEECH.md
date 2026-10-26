@@ -113,3 +113,7 @@ The planning, evidence verification, activity-stream and Investigation Activity 
 ### 2026-10-21 general intelligence experiment
 
 The read-only time, calculation, weather, mapping, currency and holiday capabilities do not modify Voice or Speech code, SDK lifecycle, continuous recognition, transcript ownership or usage accounting. No Speech request or physical microphone check was performed; prior Voice validation and blockers remain unchanged.
+
+### 2026-10-26 chat and URL-ingestion repair
+
+The chat transcript and URL knowledge-ingestion changes do not modify Speech transport, SDK lifecycle, transcript ownership, continuous recognition or usage accounting. The Voice workspace remained accessible in a browser check; no microphone access, recognition session or live Azure Speech validation was performed.

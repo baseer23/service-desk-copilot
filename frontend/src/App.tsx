@@ -166,7 +166,31 @@ export default function App(): JSX.Element {
   const [notice, setNotice] = useState('')
   const [knowledgeGeneration, setKnowledgeGeneration] = useState(0)
   const investigation = useRef<AbortController | null>(null)
+  const chatLog = useRef<HTMLDivElement | null>(null)
+  const keepChatAtBottom = useRef(true)
+  const [pendingMessage, setPendingMessage] = useState('')
   useEffect(() => () => investigation.current?.abort(), [])
+
+  const savedMessages = active?.chat_messages ?? []
+  const summaryFallback = active?.ticket.summary.trim() ?? ''
+  const timelineMessages = active
+    ? savedMessages.some(message => message.role === 'user' && message.content.trim() === summaryFallback)
+      ? savedMessages
+      : [...savedMessages, ...(summaryFallback ? [{ role: 'user', content: summaryFallback }] : [])]
+    : []
+  useEffect(() => {
+    keepChatAtBottom.current = true
+    requestAnimationFrame(() => {
+      if (chatLog.current) chatLog.current.scrollTop = chatLog.current.scrollHeight
+    })
+  }, [active?.thread_id])
+  useEffect(() => {
+    if (keepChatAtBottom.current) {
+      requestAnimationFrame(() => {
+        if (chatLog.current) chatLog.current.scrollTop = chatLog.current.scrollHeight
+      })
+    }
+  }, [timelineMessages.length, pendingMessage])
 
   async function investigate<T>(path: string, body?: unknown): Promise<T> {
     investigation.current?.abort()
@@ -374,13 +398,15 @@ export default function App(): JSX.Element {
   async function continueChat(event: FormEvent) {
     event.preventDefault()
     if (!active?.transient || !answer.trim()) return
+    const message = answer.trim()
+    setPendingMessage(message)
+    setAnswer('')
     setBusy(true)
     setError('')
     try {
-      await displayRequest(await investigate<AskResponse>(`/requests/${active.case_id}/message`, { summary: answer.trim() }))
-      setAnswer('')
+      await displayRequest(await investigate<AskResponse>(`/requests/${active.case_id}/message`, { summary: message }))
     } catch (caught) { setError((caught as Error).message) }
-    finally { setBusy(false) }
+    finally { setPendingMessage(''); setBusy(false) }
   }
 
   return (
@@ -418,27 +444,23 @@ export default function App(): JSX.Element {
           <div className="workspace-heading"><div><span className="eyebrow">YOUR AI SERVICE DESK</span><h2>{active ? 'Let’s keep going' : 'How can I help?'}</h2></div>
             <button type="button" className="button button-neutral" disabled={busy} onClick={() => { localStorage.removeItem(ACTIVE_CONVERSATION_KEY); setActive(null); setEvents([]); setActivity([]); setTicket(''); setAnswer(''); setError('') }}>New conversation</button>
           </div>
-          {!!conversations.length && <aside className="conversation-history" aria-label="Conversation history">
-            <h3>Recent conversations</h3>
-            <ul>{conversations.map(item => <li key={item.conversation_id}><button type="button" disabled={busy} className={active?.thread_id === item.conversation_id ? 'selected' : ''} onClick={() => void openConversation(item.conversation_id)}><span>{item.title}</span><small>{item.workflow.replace(/_/g, ' ')}</small></button></li>)}</ul>
-          </aside>}
           {!active && <div className="chat-welcome"><span className="welcome-mark" aria-hidden="true">D</span><h3>A little help, a clearer day.</h3><p>Work through an IT issue, ask a question, or find an answer in your documents.</p><div className="suggestion-row">{['My VPN is not connecting', 'Help with multi-factor sign-in', 'Find an answer in my documents'].map(suggestion => <button type="button" key={suggestion} onClick={() => setTicket(suggestion)}>{suggestion}</button>)}</div></div>}
-          <form onSubmit={start} className="main-composer">
+          {!active && <form onSubmit={start} className="main-composer">
             <label htmlFor="ticket">Question or ticket</label>
             <textarea id="ticket" rows={3} placeholder="Message DeskMate…" value={ticket} onChange={e => setTicket(e.target.value)} required />
             <div className="composer-actions"><button type="button" className="button button-neutral" onClick={() => navigate('Voice', 'voice')} aria-label="Open voice support"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8"/></svg></button>
               <div><button type="button" className="button button-subtle" disabled={busy || !ticket.trim()} onClick={() => void saveRequest()}>Save request</button><button className="button button-primary" disabled={busy || !ticket.trim() || (readiness !== null && !readiness.text_ready)} aria-busy={busy}>{busy ? 'Investigating…' : 'Send'}</button></div>
             </div>
             {blocker && <div className="availability-note"><p role="status">{blocker}</p><button type="button" className="button button-subtle" disabled={checking || busy} onClick={() => void refresh()}>Check availability</button></div>}
-          </form>
+          </form>}
         </section>
         <section hidden={section !== 'Investigations'} className="history-workspace" id="investigations" aria-label="Investigation history">
           <InvestigationHistory cases={cases} selected={active?.case_id} busy={busy} onOpen={openCase} allowSamples={readiness?.runtime_mode === 'isolated_demo'} />
         </section>
         <section hidden={section !== 'Knowledge'} id="knowledge-workspace" className="knowledge-workspace" aria-label="Knowledge workspace"><KnowledgePanel key={knowledgeGeneration} readiness={readiness} readinessChecking={checking} readinessError={readinessError} /></section>
         <section hidden={section !== 'Voice'} id="voice" className="voice-workspace">{section === 'Voice' && <VoiceSupport onCaseCreated={openCase} readiness={readiness} />}</section>
-        <div className="activity-column" hidden={!['Chat', 'Investigations'].includes(section)}><InvestigationActivity events={activity} busy={busy && investigation.current !== null} onCancel={() => investigation.current?.abort()} /></div>
-        <div className="investigation-panel" hidden={!active || !['Chat', 'Investigations'].includes(section)}>
+        <div className={`chat-layout${section === 'Chat' && activity.length ? ' with-activity' : ''}`} hidden={!active || !['Chat', 'Investigations'].includes(section)}>
+        <div className="chat-thread"><div className="investigation-panel">
           {!active ? (
             <section className="empty-state">
               <div aria-hidden="true">◎</div>
@@ -463,7 +485,7 @@ export default function App(): JSX.Element {
                   {active.status.replace(/_/g, ' ')}
                 </span>
               </div>
-              <p className="ticket-summary">{active.ticket.summary}</p>
+              {section === 'Investigations' && <p className="ticket-summary">{active.ticket.summary}</p>}
               {!active.chat_messages?.length && (active.final_response?.answer || active.final_answer) && (
                 <section className="card knowledge-answer">
                   <h2>Final Answer</h2>
@@ -473,10 +495,11 @@ export default function App(): JSX.Element {
               {active.workflow === 'knowledge' && !active.chat_messages?.length && !active.final_response?.answer && !active.final_answer && (
                 <section className="card knowledge-answer"><h2>Answer</h2><p>{active.status === 'insufficient_information' ? 'The available evidence does not support an answer yet.' : 'Gathering and verifying supporting documents…'}</p></section>
               )}
-              {!!active.chat_messages?.length && <section className="card conversation-card" aria-label="Conversation">
+              {!!timelineMessages.length && <section className="card conversation-card" aria-label="Conversation">
                 <h2 className="sr-only">Conversation</h2>
-                <div className="chat-history" role="log" aria-live="polite">
-                  {active.chat_messages.map((message, index) => <div key={index} className={`chat-message ${message.role}`}><strong>{message.role === 'user' ? 'You' : 'DeskMate'}</strong>{message.role === 'assistant' ? <AnswerText value={message.content} /> : <p>{message.content}</p>}</div>)}
+                <div ref={chatLog} className="chat-history" role="log" aria-live="polite" onScroll={event => { const node = event.currentTarget; keepChatAtBottom.current = node.scrollHeight - node.scrollTop - node.clientHeight < 100 }}>
+                  {timelineMessages.map((message, index) => <div key={`${message.role}-${index}`} className={`chat-message ${message.role}`}><strong>{message.role === 'user' ? 'You' : 'DeskMate'}</strong>{message.role === 'assistant' ? <AnswerText value={message.content} /> : <p>{message.content}</p>}</div>)}
+                  {pendingMessage && <div className="chat-message user pending"><strong>You</strong><p>{pendingMessage}</p><small>Sending…</small></div>}
                 </div>
                 <form onSubmit={continueChat} className="chat-reply">
                   <label htmlFor="chat-reply">Reply to this conversation</label>
@@ -700,6 +723,8 @@ export default function App(): JSX.Element {
               </>}
             </>
           )}
+        </div></div>
+        <div className="chat-activity"><InvestigationActivity events={activity} busy={busy && investigation.current !== null} onCancel={() => investigation.current?.abort()} /></div>
         </div>
       </main>
       {resetPreview && <div className="modal-backdrop" role="presentation"><section className="reset-modal" role="dialog" aria-modal="true" aria-labelledby="reset-title"><h2 id="reset-title">Delete all DeskMate history?</h2><p>This permanently removes your conversations, investigations, uploaded documents, knowledge, memories, and associated Neo4j and ChromaDB data from this workspace. This cannot be undone.</p><dl><dt>SQLite records</dt><dd>{resetPreview.inventory.records}</dd><dt>ChromaDB vectors</dt><dd>{resetPreview.inventory.vectors}</dd><dt>Uploaded files</dt><dd>{resetPreview.inventory.files}</dd></dl>{resetPreview.inventory.unresolved_vectors > 0 && <p className="error-banner">{resetPreview.inventory.unresolved_vectors} legacy vector entries have no tenant owner and will be retained.</p>}{resetResult && <div className="reset-results"><strong>Deletion result: {resetResult.status}</strong><ul>{Object.entries(resetResult.stores).map(([store, value]) => <li key={store}>{store}: {value.status}{value.unresolved ? ` (${value.unresolved} unresolved)` : ''}</li>)}</ul></div>}<label htmlFor="reset-confirmation">Type DELETE to confirm</label><input id="reset-confirmation" value={resetConfirmation} onChange={event => setResetConfirmation(event.target.value)} autoComplete="off"/><div className="modal-actions"><button className="button button-neutral" disabled={resetting} onClick={() => { setResetPreview(null); setResetConfirmation(''); setResetResult(null) }}>Cancel</button><button className="button button-danger" disabled={resetConfirmation !== 'DELETE' || resetting} onClick={() => void confirmReset()}>{resetting ? 'Deleting…' : resetResult?.status === 'incomplete' ? 'Retry deletion' : 'Permanently delete'}</button></div></section></div>}

@@ -39,6 +39,7 @@ class CrawledPage:
     url: str
     title: str
     content: str
+    canonical_url: str = ""
 
 
 @dataclass
@@ -52,6 +53,11 @@ class CrawlResult:
 
 class CrawlError(ValueError):
     """Raised when URL ingestion cannot proceed."""
+
+    def __init__(self, code: str, message: str, status_code: int = 422):
+        super().__init__(message)
+        self.code = code
+        self.status_code = status_code
 
 
 class UrlCrawler:
@@ -68,12 +74,15 @@ class UrlCrawler:
     def crawl(self, root_url: str, overrides: Optional[CrawlLimits] = None) -> CrawlResult:
         """Crawl the supplied root URL and return extracted content."""
 
-        validate_public_url(root_url)
+        try:
+            validate_public_url(root_url)
+        except ValueError as exc:
+            raise CrawlError("URL_BLOCKED", str(exc), 400) from exc
         parsed_root = urlparse(root_url)
         if parsed_root.scheme not in {"http", "https"}:
-            raise CrawlError("Only HTTP/HTTPS schemes are supported.")
+            raise CrawlError("URL_BLOCKED", "Only HTTP/HTTPS schemes are supported.", 400)
         if not parsed_root.netloc:
-            raise CrawlError("URL must include a hostname.")
+            raise CrawlError("URL_BLOCKED", "URL must include a hostname.", 400)
 
         limits = overrides or self._default_limits()
         robot_parser = self._load_robots(parsed_root)
@@ -83,6 +92,8 @@ class UrlCrawler:
         seen_hashes: Set[str] = set()
         total_chars = 0
         result = CrawlResult()
+        robots_blocked = False
+        retrieved_html = False
         last_fetch = 0.0
 
         while queue and len(result.pages) < limits.max_pages:
@@ -96,6 +107,7 @@ class UrlCrawler:
                 continue
 
             if not self._can_fetch(robot_parser, current_url):
+                robots_blocked = robots_blocked or depth == 0
                 result.skipped_urls.append(current_url)
                 continue
 
@@ -113,6 +125,7 @@ class UrlCrawler:
             if "text/html" not in content_type:
                 result.skipped_urls.append(current_url)
                 continue
+            retrieved_html = True
 
             html = response.text
             page_url = self._normalize_url(response.url or current_url)
@@ -144,7 +157,12 @@ class UrlCrawler:
                 break
 
             result.pages.append(
-                CrawledPage(url=canonical_url, title=title or canonical_url, content=text)
+                CrawledPage(
+                    url=page_url,
+                    canonical_url=canonical_url,
+                    title=title or canonical_url,
+                    content=text,
+                )
             )
             total_chars += len(text)
             result.pages_visited += 1
@@ -157,8 +175,16 @@ class UrlCrawler:
                         queue.append((link, depth + 1))
 
         if not result.pages:
+            if robots_blocked:
+                raise CrawlError(
+                    "ROBOTS_DISALLOWED", "The website does not allow this page to be indexed.", 403
+                )
+            if retrieved_html:
+                raise CrawlError("CRAWL_EMPTY", "The website returned no readable page content.")
             raise CrawlError(
-                "No public HTML pages could be retrieved. Check the address, robots.txt policy, and website availability."
+                "WEBSITE_UNAVAILABLE",
+                "The website could not be retrieved. Check its address or availability.",
+                502,
             )
         return result
 
@@ -189,10 +215,12 @@ class UrlCrawler:
                 parser.parse([])
             else:
                 parser.parse(response.text.splitlines())
-        except requests.RequestException:
+        except Exception:
             parser.parse([])
         finally:
-            robots_session.close()
+            close = getattr(robots_session, "close", None)
+            if callable(close):
+                close()
         parser.modified()
         return parser
 
@@ -223,7 +251,7 @@ class UrlCrawler:
             if response.status_code != 200:
                 return None
             return response
-        except requests.RequestException:
+        except Exception:
             return None
 
     def _normalize_url(self, url: str) -> str:

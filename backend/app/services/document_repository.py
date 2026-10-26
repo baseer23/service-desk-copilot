@@ -36,6 +36,11 @@ class DocumentRepository:
         media_type: str,
         ingestion_mode: str = "standard",
         document_processing: str = "local",
+        *,
+        source_type: str | None = None,
+        source_url: str = "",
+        canonical_url: str = "",
+        retrieved_at: str = "",
     ):
         if ingestion_mode not in {"standard", "structured_graph"}:
             raise ValueError("ingestion_mode must be standard or structured_graph")
@@ -62,7 +67,12 @@ class DocumentRepository:
         payload = {
             "id": identifier,
             "title": title or "Untitled",
-            "source_type": "pdf" if media_type == "application/pdf" else "document",
+            "source_type": source_type or (
+                "pdf" if media_type == "application/pdf" else "document"
+            ),
+            "source_url": source_url,
+            "canonical_url": canonical_url or source_url,
+            "retrieved_at": retrieved_at,
             "media_type": media_type,
             "status": "queued",
             "phase": "extract",
@@ -389,6 +399,9 @@ class DocumentRepository:
                                     if table["page"] == item["page"]
                                 ),
                                 "source": "/documents/" + identifier + "/download",
+                                "url": state.get("source_url", ""),
+                                "canonical_url": state.get("canonical_url", ""),
+                                "retrieved_at": state.get("retrieved_at", ""),
                                 "content_hash": identifier,
                                 "version": state.get("version", 1),
                                 "family": state.get("family"),
@@ -442,6 +455,9 @@ class DocumentRepository:
                                         if table["page"] == page["page"]
                                     ),
                                     "source": "/documents/" + identifier + "/download",
+                                    "url": state.get("source_url", ""),
+                                    "canonical_url": state.get("canonical_url", ""),
+                                    "retrieved_at": state.get("retrieved_at", ""),
                                     "content_hash": identifier,
                                     "version": state.get("version", 1),
                                     "family": state.get("family"),

@@ -363,6 +363,7 @@ def create_app(settings: Settings | None = None):
             "local_ocr_available": report.local_ocr_available,
             "semantic_ingestion_ready": report.semantic_ingestion_ready,
             "url_ingestion_enabled": report.url_ingestion_enabled,
+            "url_ingestion_blocker": report.url_ingestion_blocker,
             "managed_documents": s.uses_record_store,
             "azure_document_intelligence_available": bool(
                 s.uses_record_store and s.azure_document_endpoint
@@ -671,13 +672,39 @@ def create_app(settings: Settings | None = None):
 
     @app.post("/ingest/url", response_model=IngestUrlResponse)
     async def ingest_url(body: IngestUrlRequest):
-        if not s.allow_url_ingest:
-            raise HTTPException(403, "URL ingestion is disabled")
-        outcome = await app.state.agent.harness.invoke(
-            "ingest_url", body.model_dump(exclude_none=True)
-        )
+        if not s.allow_url_ingest or not s.enable_public_web_tools:
+            raise HTTPException(403, {
+                "code": "PUBLIC_WEB_DISABLED",
+                "message": "Website ingestion is disabled by workspace authorization.",
+            })
+        if not s.uses_record_store:
+            raise HTTPException(503, {
+                "code": "VECTOR_INDEX_FAILED",
+                "message": "Local website indexing is unavailable in this workspace.",
+            })
+        try:
+            outcome = await app.state.agent.harness.invoke(
+                "ingest_url", body.model_dump(exclude_none=True)
+            )
+        except MCPToolError as exc:
+            code = getattr(exc, "code", None) or "WEBSITE_UNAVAILABLE"
+            messages = {
+                "PUBLIC_WEB_DISABLED": "Website ingestion is disabled by workspace authorization.",
+                "URL_BLOCKED": "That address is not an allowed public website.",
+                "ROBOTS_DISALLOWED": "The website does not allow this page to be indexed.",
+                "WEBSITE_UNAVAILABLE": "The website could not be retrieved. Check its address or availability.",
+                "CRAWL_EMPTY": "The website returned no readable page content.",
+                "VECTOR_INDEX_FAILED": "The website was retrieved, but local knowledge indexing failed.",
+            }
+            raise HTTPException(
+                exc.status_code if exc.status_code in {400, 403, 422, 502, 503} else 502,
+                {"code": code, "message": messages.get(code, messages["WEBSITE_UNAVAILABLE"])},
+            ) from exc
         if outcome.get("status") != "ok" or not isinstance(outcome.get("result"), dict):
-            raise HTTPException(502, outcome.get("error") or "Website ingestion failed")
+            raise HTTPException(502, {
+                "code": "VECTOR_INDEX_FAILED",
+                "message": "The website was retrieved, but local knowledge indexing failed.",
+            })
         return outcome["result"]
 
     async def load(case_id):
