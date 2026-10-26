@@ -245,6 +245,12 @@ URL ingestion now requires the same public-web, local-MCP and private-store cond
 
 Focused checks passed: four URL-ingestion backend tests, 19 App/Knowledge frontend tests, Python compilation, TypeScript no-emit checking, Git whitespace validation and a live headless browser layout/menu check. A single bounded live `example.com` ingestion returned HTTP 400 and a read-only search confirmed no item was persisted; it was not retried because the mutation result must not be assumed safe to repeat. Runtime health and frontend returned HTTP 200. Aura enrichment was unavailable, and no graph write, reset, paid model call or full test suite was performed.
 
+## Existing document-ingestion activation — 2026-10-26
+
+The private local profile now enables the existing persistence, URL/public-web, structural Neo4j and semantic document-graph switches. Previously linked documents whose semantic status was durably recorded as `disabled` are moved to `pending` when structural linking next succeeds under an enabled semantic configuration, allowing the existing worker to discover them without changing the ingestion architecture. The private `.env` remains ignored and no credential values are committed.
+
+A minimal authorized check confirmed local Chroma retrieval, MCP readiness, Azure Document Intelligence readiness, Neo4j read connectivity and the dedicated structured writer preflight. Re-linking one existing authorized URL document completed with four structural nodes and three relationships. Its semantic proposal completed with 14 entities and one relationship, but graph placement was rejected by application validation and remains failed for operator review; the paid model call was not retried. Two older Azure extraction jobs remain `extract_inflight` and were not repeated because their billing outcome is ambiguous.
+
 ## Investigation validation recovery — 2026-10-26
 
 Plan rejection now retains a safe structured diagnostic containing request ID, selected provider, stage, validation code, capability name, expected and actual argument names, and attempt number. Discovered MCP schemas remain authoritative. A rejected plan receives one bounded correction with exact schema feedback; authenticated identity questions that still fail correction use the existing owner-scoped `get_authenticated_profile` capability with its exact zero-argument schema rather than failing or inventing identity. Other invalid plans remain rejected.

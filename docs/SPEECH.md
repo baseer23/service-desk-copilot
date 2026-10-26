@@ -118,6 +118,10 @@ The read-only time, calculation, weather, mapping, currency and holiday capabili
 
 The chat transcript and URL knowledge-ingestion changes do not modify Speech transport, SDK lifecycle, transcript ownership, continuous recognition or usage accounting. The Voice workspace remained accessible in a browser check; no microphone access, recognition session or live Azure Speech validation was performed.
 
+### 2026-10-26 document-ingestion activation
+
+The local persistence, URL ingestion and document graph activation does not modify Speech transport, SDK lifecycle, continuous recognition, transcript ownership or usage accounting. Voice readiness was reported by the running service; no microphone or live Azure Speech recognition request was performed.
+
 ### 2026-10-26 investigation validation recovery
 
 Planner diagnostics, personal-memory lookup, evidence-reference recovery and failed-chat composer restoration do not modify Speech transport, SDK lifecycle, transcript ownership, continuous recognition or usage accounting. No microphone or live Azure Speech check was performed.

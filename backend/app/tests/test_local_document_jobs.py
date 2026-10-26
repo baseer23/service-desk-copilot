@@ -9,6 +9,7 @@ from pydantic import SecretStr
 from backend.app.core.principal import Principal, principal_scope
 from backend.app.services.azure_document_formats import word_segments
 from backend.app.services.document_repository import DocumentRepository
+from backend.app.services.local_documents import LocalDocumentRepository
 from backend.app.services.local_backup import RecordMigration, digest, snapshot_sqlite
 from backend.app.store.local_records import LocalRecords
 from backend.app.store.records import ManagedStoreError
@@ -29,6 +30,35 @@ class Blobs:
 
     def get(self, identifier, artifact):
         return self.items[identifier, artifact]
+
+
+def test_enabling_semantic_ingestion_queues_previously_disabled_linked_document(settings):
+    class Records:
+        def __init__(self):
+            self.row = {"payload": {}}
+            self.written = None
+
+        def read(self, *_args):
+            return self.row
+
+        def write(self, _kind, _identifier, payload, **_kwargs):
+            self.written = payload
+            return {"payload": payload}
+
+    repository = object.__new__(LocalDocumentRepository)
+    repository.settings = settings.model_copy(update={"semantic_graph_ingestion_enabled": True})
+    repository.records = Records()
+    result = repository._set_graph_status(
+        "document-id",
+        {
+            "status": "ready", "phase": "complete", "chunks": 2,
+            "graph_link_status": "linked", "semantic_graph_status": "disabled",
+        },
+        "ready",
+    )
+    assert result["local_index_ready"] is True
+    assert result["graph_link_status"] == "linked"
+    assert result["semantic_graph_status"] == "pending"
 
 
 def test_snapshot_includes_committed_wal_and_never_changes_source(tmp_path):

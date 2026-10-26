@@ -472,6 +472,11 @@ class LocalDocumentRepository(DocumentRepository):
 
     def _set_graph_status(self, identifier, state, status, graph_counts=None):
         row = self.records.read("document", identifier)
+        semantic_status = state.get("semantic_graph_status", "pending")
+        if self.settings.semantic_graph_ingestion_enabled and semantic_status == "disabled":
+            # Enabling semantic ingestion after a document was structurally linked
+            # must make the existing durable job eligible for the background worker.
+            semantic_status = "pending"
         updated = {
             **state,
             "status": status,
@@ -479,7 +484,7 @@ class LocalDocumentRepository(DocumentRepository):
             "local_index_ready": bool(state.get("chunks")),
             "graph_link_status": "linked" if status == "ready" else "pending",
             "semantic_graph_status": (
-                state.get("semantic_graph_status", "pending")
+                semantic_status
                 if status == "ready" and self.settings.semantic_graph_ingestion_enabled
                 else state.get("semantic_graph_status", "disabled")
             ),

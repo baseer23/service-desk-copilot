@@ -202,3 +202,9 @@ The live service reported local MCP/private stores ready and URL ingestion enabl
 One bounded live Groq request reproduced the failure at the `plan` node: classification completed as knowledge/general, no MCP capability executed, and application validation rejected both the corrected and final plan. This rules out tool execution, MCP mutation and evidence-reference validation for the reported incident. Because the earlier error boundary erased the validator detail, the exact historical argument names cannot be reconstructed without another paid request and are not claimed.
 
 Disposable deterministic checks now cover an empty authenticated profile returning a concise unknown-name answer, a confirmed fictional name returning through the existing semantic-memory/profile path, stable general knowledge using zero tools, a schema-compliant MCP retrieval, invalid profile arguments corrected to the discovered zero-argument contract, and invented evidence IDs corrected once then downgraded safely. All focused checks passed. The live request was not repeated after implementation; provider-specific production answer wording remains unclaimed.
+
+## Live semantic document activation — 2026-10-26
+
+The enabled semantic worker successfully produced and persisted a source-grounded proposal for an existing authorized URL document. A read-only worker-identity check resolved every referenced logical object ID from tenant-scoped Chroma, ruling out missing evidence, owner scope and local-vector connectivity. Conservative graph-placement validation rejected the subsequent model result before semantic entity writes, so semantic placement remains a live blocker. The successful paid calls were not automatically retried.
+
+The focused activation regression and existing plain-text automatic-ingestion check passed (2 tests). Python compilation and whitespace validation also passed. No full suite, new Azure extraction, workspace reset or destructive operation was run.
