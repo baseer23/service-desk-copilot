@@ -29,13 +29,19 @@ interface DocumentStatus {
   semantic_graph_status?: string
   semantic_graph_retryable?: boolean
   error?: string
+  processing_error_code?: string
+  processing_error_reason?: string
+  failed_stage?: string
   graph_last_error?: string
 }
 
 function processingSummary(document: DocumentStatus): { text: string; terminal: boolean } {
   const title = document.title ? `${document.title}\n` : ''
   if (document.status === 'error' || document.status === 'failed') {
-    return { text: `${title}Processing failed: ${document.error ?? 'See server diagnostics.'}`, terminal: true }
+    const reason = document.processing_error_reason ?? document.error ?? 'See server diagnostics.'
+    const stage = document.failed_stage ? ` (${document.failed_stage.replace(/_/g, ' ')})` : ''
+    const code = document.processing_error_code ? ` [${document.processing_error_code}]` : ''
+    return { text: `${title}Processing failed${stage}: ${reason}${code}`, terminal: true }
   }
   if (!document.local_index_ready) {
     const stages: Record<string, string> = {
@@ -315,10 +321,10 @@ export default function KnowledgePanel({
         <Switch label="Local + Neo4j Hybrid" checked disabled
           onChange={() => undefined} />
         <p className="muted knowledge-switch-note">
-          {autoGraph
-            ? 'Automatic ingestion is enabled: every file upload uses Azure Document Intelligence and writes reference-only nodes and links to Neo4j. Extraction previews do not save the original locally, but their graph references persist. Azure processing may incur charges. '
-            : readiness?.azure_document_intelligence_available === false
-              ? 'Azure Document Intelligence is unavailable; local document processing remains available. '
+          {readiness?.azure_document_intelligence_available === false
+            ? `${readiness.azure_document_intelligence_blocker ?? 'Azure Document Intelligence is unavailable; local document processing remains available.'} `
+            : autoGraph
+              ? 'Automatic ingestion is enabled: every file upload uses Azure Document Intelligence and writes reference-only nodes and links to Neo4j. Extraction previews do not save the original locally, but their graph references persist. Azure processing may incur charges. '
               : 'Azure processing runs only when you upload a document. '}
           {readiness?.neo4j_read_available === false
             ? 'Neo4j read is unavailable. '

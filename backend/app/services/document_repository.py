@@ -2,12 +2,43 @@
 
 import hashlib
 import json
+import logging
+import traceback
 from pathlib import Path
 
 from backend.app.adapters.embeddings import get_embedding_provider
 from backend.app.core.config import Settings
 from backend.app.services.chunking import split_text, split_structured
 from backend.app.store.records import ManagedStoreError
+
+logger = logging.getLogger(__name__)
+
+
+def _failed_stage(phase: str | None) -> str:
+    return {
+        "extract": "azure_extraction",
+        "extract_inflight": "azure_extraction",
+        "structure": "structuring",
+        "embed": "embedding",
+        "embedding_inflight": "embedding",
+        "index": "local_indexing",
+        "link": "neo4j_structural_linking",
+    }.get(str(phase), "document_processing")
+
+
+def _safe_error(exc: Exception, phase: str | None) -> tuple[str, str, str, str]:
+    stage = _failed_stage(phase)
+    code = str(getattr(exc, "code", None) or "DOCUMENT_PROCESSING_FAILED")[:120]
+    reason = str(
+        getattr(exc, "reason", None)
+        or f"Document processing failed during {stage.replace('_', ' ')}."
+    )[:500]
+    source_type = str(getattr(exc, "source_exception_type", None) or type(exc).__name__)[:160]
+    safe_trace = str(getattr(exc, "safe_traceback", None) or " <- ".join(
+        f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}"
+        for frame in traceback.extract_tb(exc.__traceback__)[-8:]
+    ))[:2000]
+    return code, reason, source_type, safe_trace
 
 
 class DocumentRepository:
@@ -183,7 +214,11 @@ class DocumentRepository:
             status="queued", phase="extract", document_processing=document_processing,
             extraction_history=history, reprocess_generation=state.get("reprocess_generation", 0) + 1,
         )
-        state.pop("extraction_artifact", None)
+        for key in (
+            "extraction_artifact", "processing_error_code", "processing_error_reason",
+            "processing_error_type", "failed_stage",
+        ):
+            state.pop(key, None)
         self.records.write("document", identifier, state, previous=row, fields={"status": "queued"})
         return state
 
@@ -521,16 +556,32 @@ class DocumentRepository:
                 extraction_method=result.get("method", "unknown"),
                 tables=len(result["tables"]),
             )
+            for key in (
+                "processing_error_code", "processing_error_reason",
+                "processing_error_type", "failed_stage",
+            ):
+                state.pop(key, None)
             self.records.write(
                 "document", identifier, state, previous=row, fields={"status": state["status"]}
             )
             self.records.write("indexed_hash", identifier, {"chunks": len(chunks)})
             return state
-        except Exception:
+        except Exception as exc:
             # Preserve the in-flight phase when completion/accounting is ambiguous.
             failed = {**row["payload"], "status": "error"}
             if failed.get("phase") == "embedding_inflight":
                 failed["phase"] = "embed"
+            code, reason, source_type, safe_trace = _safe_error(exc, failed.get("phase"))
+            failed.update(
+                processing_error_code=code,
+                processing_error_reason=reason,
+                processing_error_type=source_type,
+                failed_stage=_failed_stage(failed.get("phase")),
+            )
+            logger.error(
+                "Document processing failed document_id=%s stage=%s type=%s code=%s traceback=%s",
+                identifier, failed["failed_stage"], source_type, code, safe_trace,
+            )
             self.records.write(
                 "document",
                 identifier,

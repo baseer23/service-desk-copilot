@@ -101,3 +101,26 @@ test('polls persisted document status through semantic readiness', async () => {
   expect(await screen.findByText(/Knowledge ready/)).toBeInTheDocument()
   expect(fetch.mock.calls.some(([path]) => path === '/documents/doc-1/status')).toBe(true)
 })
+
+test('shows the persisted safe processing failure and stage', async () => {
+  const fetch = vi.fn(async (path: string) => {
+    if (path === '/documents/upload') return Response.json({ id: 'doc-failed', status: 'queued', chunks: 0 })
+    if (path === '/documents/doc-failed/status') return Response.json({
+      id: 'doc-failed', title: 'Failed.pdf', status: 'error', phase: 'extract_inflight',
+      processing_error_code: 'AZURE_DOCUMENT_AUTHORIZATION_FAILED',
+      processing_error_reason: 'Azure Document Intelligence rejected the configured identity.',
+      failed_stage: 'azure_extraction',
+    })
+    return Response.json([])
+  })
+  vi.stubGlobal('fetch', fetch)
+  render(<KnowledgePanel readiness={{ managed_documents: true, semantic_ingestion_ready: true } as ReadinessReport} />)
+  const user = userEvent.setup()
+  await user.upload(
+    screen.getByLabelText('PDF document'),
+    new File(['content'], 'failed.pdf', { type: 'application/pdf' }),
+  )
+  await user.click(screen.getByRole('button', { name: 'Add to knowledge' }))
+  expect(await screen.findByText(/rejected the configured identity/)).toBeInTheDocument()
+  expect(screen.getByText(/azure extraction/)).toBeInTheDocument()
+})

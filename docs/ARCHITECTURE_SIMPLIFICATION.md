@@ -267,6 +267,14 @@ Saved-document classification now accepts the structured intent result for uploa
 
 Focused offline checks passed for worker recovery/wakeup/backoff, local document job transitions, logical graph-to-Chroma reference hydration, conservative semantic placement, graph repository writes, saved-knowledge routing, the five Knowledge Panel scenarios and the production frontend build. No Azure extraction, paid reasoning request or live Neo4j write was executed; those remain the live boundary.
 
+## Live document failure recovery — 2026-10-27
+
+The live `NSNP 200.pdf` failure was an `AttributeError` in `AzureDocumentExtractor._regions`: the installed Azure SDK returned a flat numeric polygon while the serializer expected point objects. Azure had completed analysis, but the local exception occurred before the first immutable batch was saved. The serializer now accepts numeric, mapping and point-object polygon forms. Processing failures persist a safe stage, code, reason and source exception type, while logs include document ID and stack-frame-only traceback without SDK response bodies or document text.
+
+Azure readiness now uses an authenticated read-only resource-info request; Neo4j writer readiness distinguishes missing settings, connectivity, authorization and schema/transaction validation. Reprocess signals the event-driven worker, resumable semantic states are eligible after restart, successful recovery clears stale failure fields, and the UI renders the persisted safe reason.
+
+One focused polygon regression passed. One live operator-reviewed recovery completed: 14 Azure-extracted pages in seven immutable batches, 25 Chroma chunks, four tables, 412 structural graph nodes, 485 structural relationships and a linked semantic result with 14 entities/mentions and zero source-supported semantic relationships. Both Azure and Neo4j live readiness probes passed.
+
 ## Investigation validation recovery — 2026-10-26
 
 Plan rejection now retains a safe structured diagnostic containing request ID, selected provider, stage, validation code, capability name, expected and actual argument names, and attempt number. Discovered MCP schemas remain authoritative. A rejected plan receives one bounded correction with exact schema feedback; authenticated identity questions that still fail correction use the existing owner-scoped `get_authenticated_profile` capability with its exact zero-argument schema rather than failing or inventing identity. Other invalid plans remain rejected.

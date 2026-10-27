@@ -33,6 +33,8 @@ export interface ReadinessReport {
   structured_ingestion_blocker?: string | null
   hybrid_policy_enabled?: boolean
   azure_document_intelligence_available?: boolean
+  azure_document_intelligence_blocker?: string | null
+  azure_document_intelligence_code?: string | null
   neo4j_read_available?: boolean
   voice_validation_scope?: 'not_checked' | 'configuration' | 'transport'
 }

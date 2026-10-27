@@ -1,25 +1,36 @@
 """Local originals, text extraction, Chroma retrieval and transactional jobs."""
 
 import hashlib
+import logging
+import traceback
+from pathlib import Path
 
 from backend.app.services.document_repository import DocumentRepository
 from backend.app.services.capabilities import knowledge_stores
 from backend.app.store.local_knowledge import LocalDocuments
 from backend.app.store.local_records import LocalRecords
 
+logger = logging.getLogger(__name__)
+
 
 def graph_writer_readiness(settings):
     """Verify the separately authorized ingestion writer and required schema."""
-    configured = (
-        settings.neo4j_ingestion_enabled
-        and settings.neo4j_uri
-        and settings.neo4j_ingestion_user
-        and settings.neo4j_ingestion_password.get_secret_value()
-    )
-    if not configured:
+    missing = []
+    if not settings.neo4j_ingestion_enabled:
+        missing.append("NEO4J_INGESTION_ENABLED=true")
+    if not settings.neo4j_uri:
+        missing.append("NEO4J_URI")
+    if not settings.neo4j_database:
+        missing.append("NEO4J_DATABASE")
+    if not settings.neo4j_ingestion_user:
+        missing.append("NEO4J_INGESTION_USER")
+    if not settings.neo4j_ingestion_password.get_secret_value():
+        missing.append("NEO4J_INGESTION_PASSWORD")
+    if missing:
         return {
             "available": False,
-            "blocker": "Configure an authorized Neo4j ingestion connection to enable linking.",
+            "code": "NEO4J_WRITER_CONFIGURATION_MISSING",
+            "blocker": "Required Neo4j writer setting(s): " + ", ".join(missing),
         }
     from neo4j import GraphDatabase
     from backend.app.store.graph_repo import GraphRepository
@@ -48,11 +59,34 @@ def graph_writer_readiness(settings):
                 ).consume()
             finally:
                 transaction.rollback()
-        return {"available": True, "blocker": None}
-    except Exception:
+        return {"available": True, "code": None, "blocker": None}
+    except Exception as exc:
+        kind = type(exc).__name__
+        code = (
+            "NEO4J_WRITER_AUTHORIZATION_FAILED"
+            if kind in {"AuthError", "ClientError"}
+            else "NEO4J_WRITER_UNREACHABLE"
+            if kind in {"ServiceUnavailable", "SessionExpired"}
+            else "NEO4J_WRITER_VALIDATION_FAILED"
+        )
+        safe_trace = " <- ".join(
+            f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}"
+            for frame in traceback.extract_tb(exc.__traceback__)[-8:]
+        )
+        logger.warning(
+            "Neo4j writer readiness failed database=%s type=%s code=%s traceback=%s",
+            settings.neo4j_database, kind, code, safe_trace,
+        )
         return {
             "available": False,
-            "blocker": "Neo4j ingestion credentials could not create reference metadata.",
+            "code": code,
+            "blocker": (
+                "Neo4j writer authentication or permissions failed."
+                if code == "NEO4J_WRITER_AUTHORIZATION_FAILED"
+                else "Neo4j writer connectivity check failed."
+                if code == "NEO4J_WRITER_UNREACHABLE"
+                else "Neo4j writer schema or transaction validation failed."
+            ),
         }
     finally:
         if driver:

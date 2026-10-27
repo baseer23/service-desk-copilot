@@ -215,6 +215,12 @@ Focused offline retrieval and graph checks passed 16 scenarios covering stable l
 
 Worker/job checks passed 22 focused scenarios across immediate wakeup, startup recovery, bounded unchanged-job handling, deferred structural retries and durable semantic handoff. Five Knowledge Panel checks and the production frontend build passed, including persisted status polling through structural and semantic completion. No live provider, Azure Document Intelligence request or Aura mutation was made, so live extraction quality and production semantic placement remain unverified.
 
+## NSNP live recovery — 2026-10-27
+
+After correcting Azure bounding-region serialization, the preserved NSNP job resumed through extraction, local indexing, structural linking and semantic understanding. The semantic provider produced 14 grounded entities/mentions and no supported relationship claim; zero relationships is retained rather than inventing an edge. Persisted status is `ready`/`complete`, with both graph statuses `linked` and no stale processing error.
+
+The focused SDK-shape regression passed. The live run exercised Azure Document Intelligence, local SentenceTransformers/Chroma, the dedicated Neo4j writer and the configured Groq provider once through the recovered pipeline. No unrelated document was reset or reindexed by this repair.
+
 ## Mandatory saved-knowledge graph participation — 2026-10-26
 
 The LangGraph knowledge subgraph now records explicit saved-knowledge scope in durable state and executes a dedicated retrieval node. It runs local `search_knowledge` and an application-authored tenant-scoped Neo4j read concurrently, preferring the official read-only MCP tool when authorized. Empty graph matches remain valid observations; unavailable graph access is emitted as a failed activity and does not falsely claim graph evidence or suppress local Chroma results. Ordinary general questions and public-web requests do not enter this mandatory path.

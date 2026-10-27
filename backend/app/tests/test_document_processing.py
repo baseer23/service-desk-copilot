@@ -4,7 +4,7 @@ from io import BytesIO
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.core.credentials import AccessToken
 from azure.core.pipeline.transport import HttpResponse, HttpTransport
-from backend.app.services.document_processing import AzureDocumentExtractor
+from backend.app.services.document_processing import AzureDocumentExtractor, _regions
 from backend.app.store.local_records import LocalRecords
 
 
@@ -54,6 +54,20 @@ class Transport(HttpTransport):
     def send(self, request, **kwargs):
         self.requests.append(request)
         return self.callback(request)
+
+
+def test_regions_accept_current_sdk_flat_numeric_polygons():
+    region = type("Region", (), {
+        "page_number": 2,
+        "polygon": [1.0, 2.0, 3.5, 4.5, 5.0, 6.0, 7.0, 8.0],
+    })()
+    assert _regions([region], offset=3) == [{
+        "page": 5,
+        "polygon": [
+            {"x": 1.0, "y": 2.0}, {"x": 3.5, "y": 4.5},
+            {"x": 5.0, "y": 6.0}, {"x": 7.0, "y": 8.0},
+        ],
+    }]
 
 
 def test_real_document_sdk_sends_binary_stream_and_polls_layout_tables(settings):

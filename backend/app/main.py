@@ -147,8 +147,10 @@ def create_app(settings: Settings | None = None):
                 provider = None
             await mcp.start()
             from backend.app.services.local_documents import graph_writer_readiness
+            from backend.app.services.document_processing import azure_document_readiness
 
             app.state.graph_writer = await asyncio.to_thread(graph_writer_readiness, s)
+            app.state.azure_document = await asyncio.to_thread(azure_document_readiness, s)
             from backend.app.core.principal import Principal, principal_scope
 
             system_tenant = (
@@ -374,8 +376,10 @@ def create_app(settings: Settings | None = None):
             "url_ingestion_blocker": report.url_ingestion_blocker,
             "managed_documents": s.uses_record_store,
             "azure_document_intelligence_available": bool(
-                s.uses_record_store and s.azure_document_endpoint
+                s.uses_record_store and app.state.azure_document["available"]
             ),
+            "azure_document_intelligence_blocker": app.state.azure_document["blocker"],
+            "azure_document_intelligence_code": app.state.azure_document["code"],
             "neo4j_read_available": bool(
                 app.state.mcp.integration_status.get("neo4j") == "connected"
                 and {"neo4j__get-schema", "neo4j__read-cypher"}.issubset(
@@ -464,6 +468,8 @@ def create_app(settings: Settings | None = None):
                 "Automatic ingestion requires a persistent local document store"
                 + (" and Azure DI endpoint." if requires_azure else "."),
             )
+        if requires_azure and not app.state.azure_document["available"]:
+            raise HTTPException(503, app.state.azure_document["blocker"])
         # Revalidate the writer BEFORE starting a potentially billable extraction.
         from backend.app.services.local_documents import graph_writer_readiness
 
@@ -590,7 +596,7 @@ def create_app(settings: Settings | None = None):
 
     @app.post("/documents/{document_id}/reprocess")
     async def reprocess_local_document(document_id: str):
-        return (
+        result = (
             await app.state.agent.harness.invoke(
                 "reprocess_document",
                 {
@@ -600,6 +606,9 @@ def create_app(settings: Settings | None = None):
                 },
             )
         )["result"]
+        if s.uses_record_store:
+            app.state.ingestion_wakeup.set()
+        return result
 
     @app.post("/documents/{document_id}/enrich-graph")
     async def enrich_local_document_graph(document_id: str):

@@ -1,6 +1,7 @@
 """Recover durable document work; never auto-repeat ambiguous paid requests."""
 
 import asyncio
+import logging
 import time
 from contextlib import asynccontextmanager
 
@@ -9,6 +10,7 @@ from backend.app.core.principal import Principal, current_principal, principal_s
 MAX_GRAPH_RETRIES = 5
 MAX_IMMEDIATE_PASSES = 100
 _document_locks: dict[tuple[str, str], asyncio.Lock] = {}
+logger = logging.getLogger(__name__)
 
 
 def _lock_tenant(settings) -> str:
@@ -59,7 +61,9 @@ async def process_document_pass(settings, harness, *, timestamp=None):
             and document.get("local_index_ready")
             and document.get("graph_link_status") == "linked"
             and (
-                document.get("semantic_graph_status", "pending") in {"pending", "placing"}
+                document.get("semantic_graph_status", "pending") in {
+                    "pending", "understanding", "discovering", "placing",
+                }
                 or (
                     document.get("semantic_graph_status") == "failed"
                     and document.get("semantic_graph_retryable") is True
@@ -134,9 +138,13 @@ async def document_worker(settings, harness, wakeup: asyncio.Event):
                             next_tenant_retry if next_retry_at is None
                             else min(next_retry_at, next_tenant_retry)
                         )
-                except (RuntimeError, ValueError):
+                except (RuntimeError, ValueError) as exc:
                     # Durable state records retryability. Await a fresh signal instead
                     # of spinning on an unchanged failing job.
+                    logger.error(
+                        "Document worker pass failed tenant=%s type=%s",
+                        tenant, type(exc).__name__,
+                    )
                     continue
         if wakeup.is_set():
             continue

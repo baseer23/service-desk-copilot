@@ -19,6 +19,12 @@ class DocumentSemanticGraphService:
         if not row:
             raise ValueError("Document not found")
         state = {**row["payload"], "semantic_graph_status": status, **extra}
+        if status != "failed" and state.get("local_index_ready"):
+            for key in (
+                "processing_error_code", "processing_error_reason",
+                "processing_error_type", "failed_stage",
+            ):
+                state.pop(key, None)
         self.records.write("document", document_id, state, previous=row, fields={"status": state["status"]})
         return state
 

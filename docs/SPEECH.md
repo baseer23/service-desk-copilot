@@ -133,3 +133,7 @@ Planner diagnostics, personal-memory lookup, evidence-reference recovery and fai
 ### 2026-10-27 document GraphRAG repair
 
 The event-driven document worker, GraphRAG routing and Knowledge status polling do not modify Speech transport, SDK lifecycle, transcript ownership, continuous recognition or usage accounting. No Speech test, microphone session or live Azure Speech request was performed.
+
+### 2026-10-27 live document failure recovery
+
+Azure document readiness, bounding-region serialization, durable document errors and NSNP recovery do not modify Speech transport, continuous recognition, transcript ownership or usage accounting. No Speech test or Azure Speech request was performed.

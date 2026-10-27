@@ -2,6 +2,8 @@
 
 import base64
 import hashlib
+import logging
+import traceback
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -9,6 +11,88 @@ from typing import Any
 from backend.app.core.config import Settings
 from backend.app.core.azure_identity import azure_credential
 from backend.app.store.records import ManagedStoreError
+
+logger = logging.getLogger(__name__)
+
+
+class DocumentProcessingFailure(ManagedStoreError):
+    """Sanitized external-processing failure safe for durable document state."""
+
+    def __init__(self, code: str, reason: str, source_exception_type: str, safe_traceback: str):
+        super().__init__(reason)
+        self.code = code
+        self.reason = reason
+        self.source_exception_type = source_exception_type
+        self.safe_traceback = safe_traceback
+
+
+def _safe_traceback(exc: Exception) -> str:
+    return " <- ".join(
+        f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}"
+        for frame in traceback.extract_tb(exc.__traceback__)[-8:]
+    )
+
+
+def _azure_failure(exc: Exception) -> DocumentProcessingFailure:
+    kind = type(exc).__name__
+    status = getattr(exc, "status_code", None)
+    if kind in {"ClientAuthenticationError", "CredentialUnavailableError"}:
+        code, reason = "AZURE_DOCUMENT_AUTHENTICATION_FAILED", "Azure Document Intelligence authentication failed."
+    elif status in {401, 403}:
+        code, reason = "AZURE_DOCUMENT_AUTHORIZATION_FAILED", "Azure Document Intelligence rejected the configured identity."
+    elif status == 429:
+        code, reason = "AZURE_DOCUMENT_CAPACITY", "Azure Document Intelligence is temporarily at capacity."
+    elif kind in {"ServiceRequestError", "ServiceResponseError"}:
+        code, reason = "AZURE_DOCUMENT_UNREACHABLE", "Azure Document Intelligence could not be reached."
+    elif status == 400:
+        code, reason = "AZURE_DOCUMENT_REJECTED", "Azure Document Intelligence rejected this document."
+    else:
+        code, reason = "AZURE_DOCUMENT_PROCESSING_FAILED", "Azure Document Intelligence could not process this document."
+    return DocumentProcessingFailure(code, reason, kind, _safe_traceback(exc))
+
+
+def azure_document_readiness(settings: Settings) -> dict[str, object]:
+    """Perform a read-only authenticated resource probe without analyzing content."""
+    if not settings.azure_document_endpoint:
+        return {
+            "available": False,
+            "code": "AZURE_DOCUMENT_ENDPOINT_MISSING",
+            "blocker": "AZURE_DOCUMENT_ENDPOINT is required.",
+        }
+    client = credential = None
+    try:
+        from azure.ai.documentintelligence import DocumentIntelligenceClient
+        from azure.core.rest import HttpRequest
+
+        credential = azure_credential(settings)
+        client = DocumentIntelligenceClient(
+            settings.azure_document_endpoint,
+            credential,
+            api_version=settings.azure_document_api_version,
+            retry_total=0,
+            connection_timeout=5,
+            read_timeout=10,
+        )
+        endpoint = settings.azure_document_endpoint.rstrip("/")
+        response = client.send_request(HttpRequest(
+            "GET",
+            f"{endpoint}/documentintelligence/info?api-version={settings.azure_document_api_version}",
+        ))
+        if response.status_code >= 400:
+            response.raise_for_status()
+        return {"available": True, "code": None, "blocker": None}
+    except Exception as exc:
+        failure = _azure_failure(exc)
+        logger.warning(
+            "Azure Document Intelligence readiness failed type=%s code=%s traceback=%s",
+            failure.source_exception_type, failure.code, failure.safe_traceback,
+        )
+        return {"available": False, "code": failure.code, "blocker": failure.reason}
+    finally:
+        if client:
+            client.close()
+        if credential:
+            credential.close()
 
 
 class AzureDocumentExtractor:
@@ -183,8 +267,13 @@ class AzureDocumentExtractor:
                     figures.append(record)
                 if not result.pages and result.content:
                     pages.append({"page": offset + 1, "text": result.content})
-            except Exception:  # noqa: BLE001 - Sanitize SDK/auth failures without disclosing response bodies.
-                raise ManagedStoreError("Document text and layout could not be processed") from None
+            except Exception as exc:  # noqa: BLE001 - persist only sanitized diagnostics.
+                failure = _azure_failure(exc)
+                logger.error(
+                    "Azure document extraction failed type=%s code=%s traceback=%s",
+                    failure.source_exception_type, failure.code, failure.safe_traceback,
+                )
+                raise failure from None
         if not any(page["text"].strip() for page in pages):
             raise ValueError("The document contains no readable text")
         return {
@@ -331,12 +420,25 @@ def _compressed_page_image(page, byte_limit):
 
 
 def _regions(regions, offset=0):
+    def polygon_points(polygon):
+        values = list(polygon or [])
+        if values and all(isinstance(value, (int, float)) for value in values):
+            return [
+                {"x": float(values[index]), "y": float(values[index + 1])}
+                for index in range(0, len(values) - 1, 2)
+            ]
+        points = []
+        for point in values:
+            if isinstance(point, dict) and "x" in point and "y" in point:
+                points.append({"x": float(point["x"]), "y": float(point["y"])})
+            elif hasattr(point, "x") and hasattr(point, "y"):
+                points.append({"x": float(point.x), "y": float(point.y)})
+        return points
+
     return [
         {
             "page": region.page_number + offset,
-            "polygon": [
-                {"x": point.x, "y": point.y} for point in getattr(region, "polygon", None) or []
-            ],
+            "polygon": polygon_points(getattr(region, "polygon", None)),
         }
         for region in regions
     ]
