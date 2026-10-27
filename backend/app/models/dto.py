@@ -108,6 +108,8 @@ class RequestResult(BaseModel):
     final_answer: str | None = None
     chat_messages: list[dict[str, str]] = Field(default_factory=list)
     research_iteration: int = 0
+    explicit_saved_knowledge: bool = False
+    executed_tool_calls: list[str] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
