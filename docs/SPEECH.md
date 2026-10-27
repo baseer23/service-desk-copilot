@@ -122,6 +122,10 @@ The chat transcript and URL knowledge-ingestion changes do not modify Speech tra
 
 The local persistence, URL ingestion and document graph activation does not modify Speech transport, SDK lifecycle, continuous recognition, transcript ownership or usage accounting. Voice readiness was reported by the running service; no microphone or live Azure Speech recognition request was performed.
 
+### 2026-10-26 complete integration recovery
+
+Saved-knowledge graph routing, durable document-worker recovery, conservative semantic placement and investigation-detail rendering do not modify Speech transport, SDK lifecycle, transcript ownership, continuous recognition or usage accounting. The complete frontend suite retained Voice coverage; no microphone or live Azure Speech request was performed.
+
 ### 2026-10-26 investigation validation recovery
 
 Planner diagnostics, personal-memory lookup, evidence-reference recovery and failed-chat composer restoration do not modify Speech transport, SDK lifecycle, transcript ownership, continuous recognition or usage accounting. No microphone or live Azure Speech check was performed.

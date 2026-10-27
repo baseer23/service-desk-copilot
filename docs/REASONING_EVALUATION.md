@@ -208,3 +208,9 @@ Disposable deterministic checks now cover an empty authenticated profile returni
 The enabled semantic worker successfully produced and persisted a source-grounded proposal for an existing authorized URL document. A read-only worker-identity check resolved every referenced logical object ID from tenant-scoped Chroma, ruling out missing evidence, owner scope and local-vector connectivity. Conservative graph-placement validation rejected the subsequent model result before semantic entity writes, so semantic placement remains a live blocker. The successful paid calls were not automatically retried.
 
 The focused activation regression and existing plain-text automatic-ingestion check passed (2 tests). Python compilation and whitespace validation also passed. No full suite, new Azure extraction, workspace reset or destructive operation was run.
+
+## Mandatory saved-knowledge graph participation — 2026-10-26
+
+The LangGraph knowledge subgraph now records explicit saved-knowledge scope in durable state and executes a dedicated retrieval node. It runs local `search_knowledge` and an application-authored tenant-scoped Neo4j read concurrently, preferring the official read-only MCP tool when authorized. Empty graph matches remain valid observations; unavailable graph access is emitted as a failed activity and does not falsely claim graph evidence or suppress local Chroma results. Ordinary general questions and public-web requests do not enter this mandatory path.
+
+Offline coverage verifies classifier override, required local retrieval, official-MCP preference, fallback graph invocation, activity visibility, tenant parameterization and unchanged general routing. Conservative graph placement preserves every proposed entity as created, reused or unresolved and prevents unsupported reuse IDs. No paid reasoning evaluation or live semantic regeneration was run.

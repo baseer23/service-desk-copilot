@@ -2,7 +2,7 @@
 
 import hashlib
 
-from backend.app.models.document_graph_models import GraphPlacementPlan
+from backend.app.models.document_graph_models import EntityPlacement, GraphPlacementPlan
 from backend.app.services.graph_discovery import GraphDiscovery
 
 
@@ -26,11 +26,53 @@ class GraphPlacementService:
         context = {
             "policy": "Choose exactly one conservative decision per proposed entity. Reuse only strong identifiers or consistent graph context. Similar spelling alone is insufficient. Use only candidate IDs supplied here.",
             "proposal": proposal.model_dump(), "candidates": discovery,
+            "required_document_id": proposal.document_id,
+            "required_temporary_ids": [item.temporary_id for item in proposal.entities],
+            "allowed_candidate_ids": {
+                temporary_id: [row["id"] for row in value["candidates"]]
+                for temporary_id, value in discovery.items()
+            },
         }
         plan = await self.provider.generate_structured("graph_placement", context, GraphPlacementPlan)
+        plan = self._conservative_plan(proposal, plan, discovery)
         self._validate(proposal, plan, discovery)
         self._proposal, self._discovery = proposal, discovery
         return plan
+
+    @staticmethod
+    def _conservative_plan(proposal, plan, discovery):
+        """Downgrade malformed placement choices without inventing a graph merge."""
+        supplied = {}
+        for placement in plan.placements:
+            if placement.temporary_id not in supplied:
+                supplied[placement.temporary_id] = placement
+        placements = []
+        for entity in proposal.entities:
+            placement = supplied.get(entity.temporary_id)
+            allowed = {
+                row["id"]
+                for row in discovery.get(entity.temporary_id, {}).get("candidates", [])
+            }
+            if placement is None:
+                placement = EntityPlacement(
+                    temporary_id=entity.temporary_id,
+                    decision="UNRESOLVED",
+                    reason="No valid placement decision was returned; retained without merging.",
+                )
+            elif (
+                placement.decision == "REUSE_EXISTING"
+                and placement.existing_entity_id not in allowed
+            ):
+                placement = EntityPlacement(
+                    temporary_id=entity.temporary_id,
+                    decision="UNRESOLVED",
+                    reason="The proposed reuse target was not an authorized candidate.",
+                )
+            placements.append(placement)
+        return GraphPlacementPlan(
+            document_id=proposal.document_id,
+            placements=placements,
+        )
 
     def _validate(self, proposal, plan, discovery):
         proposed = {item.temporary_id for item in proposal.entities}

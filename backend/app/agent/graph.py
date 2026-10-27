@@ -32,6 +32,7 @@ from backend.app.mcp.client import MCPToolError
 from backend.app.models.provider import LLMError
 from backend.app.services.source_policy import permits, quality, rank_sources
 from backend.app.services.web import relevant_excerpt
+from backend.app.services.entities import extract_entities
 
 LABELS = {
     "search_memory": "Memory searched",
@@ -50,6 +51,7 @@ LABELS = {
     "search_knowledge_entities": "Knowledge entities searched",
     "get_knowledge_entity_context": "Entity relationships inspected",
     "get_entity_document_references": "Entity documents located",
+    "neo4j__read-cypher": "Neo4j knowledge graph queried",
     "search_web": "Public sources searched",
     "search_news": "Current news searched",
     "fetch_web_page": "Public page fetched",
@@ -131,16 +133,20 @@ class ServiceDeskAgent:
 
     def _subgraph(self, workflow):
         graph = StateGraph(InvestigationState)
-        graph.add_node("execute_tools", instrument("execute_tools", self.execute_tools))
         if workflow == "knowledge":
+            graph.add_node(
+                "knowledge_retrieval",
+                instrument("knowledge_retrieval", self.retrieve_knowledge),
+            )
             graph.add_node("understand_question", instrument("understand_question", self.understand_question))
             graph.add_node("retrieval_context", instrument("retrieval_context", self.retrieval_context))
             graph.add_node("formulate_retrieval_plan", instrument("plan", self.plan))
             graph.add_edge(START, "understand_question")
             graph.add_edge("understand_question", "retrieval_context")
             graph.add_edge("retrieval_context", "formulate_retrieval_plan")
-            graph.add_edge("formulate_retrieval_plan", "execute_tools")
+            graph.add_edge("formulate_retrieval_plan", "knowledge_retrieval")
         else:
+            graph.add_node("execute_tools", instrument("execute_tools", self.execute_tools))
             for name in (
                 "analyze_ticket",
                 "identify_entities",
@@ -157,7 +163,10 @@ class ServiceDeskAgent:
             graph.add_edge("load_memory", "formulate_investigation_plan")
             graph.add_edge("formulate_investigation_plan", "execute_tools")
         graph.add_node("observe", instrument("observe", self.observe))
-        graph.add_edge("execute_tools", "observe")
+        graph.add_edge(
+            "knowledge_retrieval" if workflow == "knowledge" else "execute_tools",
+            "observe",
+        )
         graph.add_edge("observe", END)
         return graph.compile()
 
@@ -280,9 +289,14 @@ class ServiceDeskAgent:
             if name == "search_knowledge"
             else summary
         )
+        completed_status = (
+            "failed"
+            if isinstance(result, dict) and result.get("status") in {"error", "unavailable"}
+            else "completed"
+        )
         await emit(
             "tool:" + name,
-            "completed",
+            completed_status,
             completed_summary,
             **details,
             result_count=result_count,
@@ -345,6 +359,17 @@ class ServiceDeskAgent:
                     "result": value,
                 }
         elif isinstance(value, dict):
+            if value.get("available") is False:
+                return {
+                    **value,
+                    "tool": value.get("tool") or name,
+                    "source_system": value.get("source_system", "tool_error"),
+                    "timestamp": value.get("timestamp") or now(),
+                    "reliability": 0,
+                    "status": "unavailable",
+                    "error": value.get("reason") or "Graph integration is unavailable",
+                    "items": [],
+                }
             if value.get("status") in {"error", "unavailable"}:
                 return {
                     **value,
@@ -629,6 +654,7 @@ class ServiceDeskAgent:
                 "ticket",
                 "workflow",
                 "intent",
+                "explicit_saved_knowledge",
                 "analysis",
                 "remembered_facts",
                 "personal_memory",
@@ -686,9 +712,11 @@ class ServiceDeskAgent:
             r"|\blatest\s+official\s+(?:requirements|rules|regulations|guidance)\b",
             request_text, flags=re.IGNORECASE,
         ))
-        if explicit_local and intent.workflow == "knowledge" and intent.knowledge_source != "documents":
+        if explicit_local and (
+            intent.workflow != "knowledge" or intent.knowledge_source != "documents"
+        ):
             intent = intent.model_copy(update={
-                "knowledge_source": "documents", "public_topic": "none",
+                "workflow": "knowledge", "knowledge_source": "documents", "public_topic": "none",
                 "justification": (
                     "The user explicitly requested local knowledge. "
                     "Select authorized local evidence before answering."
@@ -725,6 +753,7 @@ class ServiceDeskAgent:
         )
         return {
             "intent": intent.model_dump(), "workflow": intent.workflow,
+            "explicit_saved_knowledge": explicit_local,
             "chat_messages": state.get("chat_messages", []),
         }
 
@@ -837,6 +866,17 @@ class ServiceDeskAgent:
                         "REQUIRED_SOURCE_NOT_SELECTED",
                         "This question needs the selected source scope. Plan a real "
                         "document/web retrieval or request one material clarification."
+                    )
+                if (
+                    state.get("workflow") == "knowledge"
+                    and state.get("explicit_saved_knowledge")
+                    and not plan.clarification_needed
+                    and not any(call.name == "search_knowledge" for call in plan.tool_calls)
+                ):
+                    raise PlanValidationError(
+                        "LOCAL_KNOWLEDGE_RETRIEVAL_REQUIRED",
+                        "An explicit saved-knowledge request requires local Chroma retrieval. "
+                        "Use search_knowledge; graph participation is enforced separately.",
                     )
                 if plan.tool_calls and not plan.additional_evidence_useful:
                     raise PlanValidationError(
@@ -1150,6 +1190,68 @@ class ServiceDeskAgent:
             ),
             "research_rounds": state.get("research_rounds", 0) + int(web_round),
         }
+
+    async def retrieve_knowledge(self, state):
+        """Run required graph participation alongside the validated retrieval plan."""
+        if not state.get("explicit_saved_knowledge"):
+            return await self.execute_tools(state)
+        planned, graph_result = await asyncio.gather(
+            self.execute_tools(state), self._mandatory_saved_knowledge_graph_read(state)
+        )
+        return {
+            **planned,
+            "tool_results": [*planned.get("tool_results", []), graph_result],
+            "executed_tool_calls": list(dict.fromkeys([
+                *planned.get("executed_tool_calls", []),
+                self._tool_signature(graph_result["name"], graph_result["arguments"]),
+            ])),
+        }
+
+    async def _mandatory_saved_knowledge_graph_read(self, state):
+        """Issue one bounded tenant-scoped graph read; never accept model-written Cypher."""
+        from backend.app.core.principal import current_principal
+
+        question = state["ticket"]["summary"]
+        concepts = extract_entities([{"text": question}])
+        if not concepts:
+            concepts = re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]{2,}", question)
+        terms = list(dict.fromkeys(value.casefold()[:120] for value in concepts))[:10]
+        allowed = self.harness.allowed_names("knowledge")
+        name = "neo4j__read-cypher" if "neo4j__read-cypher" in allowed else "search_graph"
+        if name == "neo4j__read-cypher":
+            query = (
+                "MATCH (d:Document) WHERE d.tenant_id = $tenant_id "
+                "AND any(term IN $terms WHERE toLower(coalesce(d.title,'')) CONTAINS term "
+                "OR toLower(coalesce(d.summary,'')) CONTAINS term) "
+                "OPTIONAL MATCH (d)<-[:MENTIONED_IN]-(m:GraphMention) "
+                "OPTIONAL MATCH (m)-[:REFERS_TO]->(e:Entity) "
+                "OPTIONAL MATCH (m)-[:SUPPORTED_BY]->(o) "
+                "RETURN coalesce(d.original_id,d.id) AS document_id,d.title AS title,"
+                "d.summary AS summary,collect(DISTINCT e.name)[0..10] AS entities,"
+                "collect(DISTINCT coalesce(o.original_id,o.id))[0..50] AS object_ids LIMIT 20"
+            )
+            arguments = {
+                "query": query,
+                "params": {
+                    "tenant_id": current_principal(self.settings).tenant_id,
+                    "terms": terms,
+                },
+            }
+        else:
+            arguments = {"entities": terms, "limit": 20}
+        try:
+            output = await self._call(state, name, arguments)
+        except (MCPToolError, ValueError) as exc:
+            output = {
+                "tool": name,
+                "source_system": "tool_error",
+                "timestamp": now(),
+                "reliability": 0,
+                "status": "unavailable",
+                "error": str(exc),
+                "items": [],
+            }
+        return {"name": name, "arguments": arguments, "output": output}
 
     @staticmethod
     def _tool_signature(name, arguments):

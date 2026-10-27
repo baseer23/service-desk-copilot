@@ -275,6 +275,28 @@ class LocalDocumentRepository(DocumentRepository):
             ]
             if page is not None
         })
+        section_titles = {
+            section.get("id"): str(section.get("title") or "").strip()[:120]
+            for section in extracted.get("sections", [])
+            if section.get("id") and str(section.get("title") or "").strip()
+        }
+        document_label = str(title or "Untitled").strip()[:120]
+
+        def reference_description(item):
+            kind, page = item["object_type"], item.get("page")
+            if kind == "Section":
+                return f"{document_label} — section: {str(item.get('text') or '')[:120]}"
+            if kind == "Chunk" and section_titles.get(item.get("section_id")):
+                return (
+                    f"{document_label} — {section_titles[item['section_id']]} — "
+                    f"chunk reference on page {page}"
+                )
+            if kind == "Table":
+                return f"{document_label} — table reference on page {page}"
+            if kind == "Figure" and str(item.get("text") or "").strip():
+                return f"{document_label} — figure: {str(item['text']).strip()[:100]}"
+            return f"{document_label} — {kind.lower()} reference on page {page}"
+
         for page in pages:
             graph.upsert_page(identifier, page, version)
             node_count += 1
@@ -284,9 +306,7 @@ class LocalDocumentRepository(DocumentRepository):
                 identifier,
                 {
                     **item,
-                    "description": (
-                        f"{item['object_type']} reference on page {item.get('page')}"
-                    ),
+                    "description": reference_description(item),
                     "version": version,
                     "source_element_id": (
                         item.get("source_id") or item.get("table_id")
@@ -333,7 +353,10 @@ class LocalDocumentRepository(DocumentRepository):
                     "page": figure.get("page"), "position": figure.get("position"),
                     "source_element_id": str(figure.get("id") or ""),
                     "bounding_regions": figure.get("bounding_regions", []),
-                    "description": f"Figure reference on page {figure.get('page')}",
+                    "description": (
+                        f"{document_label} — figure: "
+                        f"{str(figure.get('caption') or 'reference')[:100]}"
+                    ),
                     "version": version,
                     "content_hash": hashlib.sha256(
                         str(figure.get("caption") or "").encode()
@@ -367,7 +390,12 @@ class LocalDocumentRepository(DocumentRepository):
                     "azure_role": paragraph.get("role"),
                     "span_offset": (paragraph.get("spans") or [{}])[0].get("offset"),
                     "span_length": (paragraph.get("spans") or [{}])[0].get("length"),
-                    "description": f"Paragraph role {paragraph.get('role') or 'body'} on page {paragraph.get('page')}",
+                    "description": (
+                        f"{document_label} — {paragraph.get('role')}: "
+                        f"{str(paragraph.get('text') or '')[:100]}"
+                        if paragraph.get("role") in {"title", "sectionHeading"}
+                        else f"{document_label} — paragraph reference on page {paragraph.get('page')}"
+                    ),
                     "version": version, "content_hash": hashlib.sha256(
                         str(paragraph.get("text") or "").encode()
                     ).hexdigest(),
@@ -398,7 +426,10 @@ class LocalDocumentRepository(DocumentRepository):
                     "span_length": (cell.get("spans") or [{}])[0].get("length"),
                     "table_row": cell.get("row"), "table_column": cell.get("column"),
                     "position": cell.get("row", 0) * 100000 + cell.get("column", 0),
-                    "description": f"Cell row {cell.get('row')} column {cell.get('column')} on page {table.get('page')}",
+                    "description": (
+                        f"{document_label} — table cell row {cell.get('row')} "
+                        f"column {cell.get('column')} on page {table.get('page')}"
+                    ),
                     "version": version,
                     "content_hash": hashlib.sha256(str(cell.get("text") or "").encode()).hexdigest(),
                     "source_provenance": "azure_document_intelligence" if extracted.get("method") == "document_intelligence" else "saved_local_extraction",
@@ -464,13 +495,17 @@ class LocalDocumentRepository(DocumentRepository):
             return self._set_graph_status(
                 identifier, state, "ready", graph_counts=graph_counts
             )
-        except Exception:
-            return self._set_graph_status(identifier, state, "graph_pending")
+        except Exception as exc:
+            return self._set_graph_status(
+                identifier, state, "graph_pending", graph_error=type(exc).__name__
+            )
         finally:
             if driver:
                 driver.close()
 
-    def _set_graph_status(self, identifier, state, status, graph_counts=None):
+    def _set_graph_status(
+        self, identifier, state, status, graph_counts=None, graph_error=None
+    ):
         row = self.records.read("document", identifier)
         semantic_status = state.get("semantic_graph_status", "pending")
         if self.settings.semantic_graph_ingestion_enabled and semantic_status == "disabled":
@@ -494,5 +529,21 @@ class LocalDocumentRepository(DocumentRepository):
                 graph_nodes=graph_counts["nodes"],
                 graph_relationships=graph_counts["relationships"],
             )
+        if status == "graph_pending":
+            import time
+
+            attempts = int(state.get("graph_retry_attempts", 0)) + 1
+            updated.update(
+                graph_retry_attempts=attempts,
+                graph_retry_after=time.time() + min(300, 10 * (2 ** (attempts - 1))),
+                graph_last_error=graph_error or "GraphUnavailable",
+                graph_retry_terminal=attempts >= 5,
+            )
+        else:
+            for key in (
+                "graph_retry_attempts", "graph_retry_after", "graph_last_error",
+                "graph_retry_terminal",
+            ):
+                updated.pop(key, None)
         self.records.write("document", identifier, updated, previous=row, fields={"status": status})
         return updated

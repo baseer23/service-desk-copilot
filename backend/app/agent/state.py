@@ -12,6 +12,7 @@ class InvestigationState(TypedDict, total=False):
     status: str
     workflow: str
     intent: dict[str, Any]
+    explicit_saved_knowledge: bool
     analysis: dict[str, Any]
     plan: dict[str, Any]
     research_questions: list[str]

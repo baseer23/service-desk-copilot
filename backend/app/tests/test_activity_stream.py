@@ -203,7 +203,7 @@ def test_empty_evidence_plan_is_retried_with_validation_feedback(make_client):
     })
 
     assert len(contexts) == 2
-    assert 'requests no tool' in contexts[1]['plan_validation_feedback']
+    assert 'requests no tool' in contexts[1]['plan_validation_feedback']['message']
     assert update['plan']['tool_calls'][0]['name'] == 'search_knowledge'
 
 
@@ -229,6 +229,7 @@ def test_explicit_local_source_scope_overrides_general_classifier(make_client, r
         'ticket': {'summary': request_text}, 'chat_messages': [],
     })
     assert update['intent']['knowledge_source'] == 'documents'
+    assert update['explicit_saved_knowledge'] is True
 
 
 def test_verifier_gap_routes_to_bounded_replanning(make_client):
@@ -266,7 +267,36 @@ def test_from_knowledge_request_executes_local_retrieval(make_client):
     }).json()
 
     assert 'search_knowledge' in calls
+    assert 'search_graph' in calls
     assert any(event.get('tool') == 'search_knowledge' for event in body['events'])
+
+
+def test_saved_knowledge_graph_stage_prefers_official_read_only_mcp(make_client, monkeypatch):
+    client = make_client()
+    agent = client.app.state.agent
+    captured = []
+    monkeypatch.setattr(
+        agent.harness, 'allowed_names',
+        lambda workflow: {'neo4j__read-cypher'} if workflow == 'knowledge' else set(),
+    )
+
+    async def graph_call(state, name, arguments):
+        captured.append((name, arguments))
+        return {
+            'tool': name, 'status': 'ok', 'items': [],
+            'source_system': 'mcp:neo4j', 'reliability': 0.8,
+        }
+
+    monkeypatch.setattr(agent, '_call', graph_call)
+    result = client.portal.call(agent._mandatory_saved_knowledge_graph_read, {
+        'case_id': 'graph-stage', 'persist_case': False,
+        'ticket': {'summary': 'From knowledge, summarize the uploaded VPN guide.'},
+    })
+    name, arguments = captured[0]
+    assert name == 'neo4j__read-cypher'
+    assert '$tenant_id' in arguments['query'] and '$terms' in arguments['query']
+    assert arguments['params']['tenant_id'] == 'local-demo'
+    assert result['output']['source_system'] == 'mcp:neo4j'
 
 
 def test_tool_completion_streams_concise_observations(make_client):
