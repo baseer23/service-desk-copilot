@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import { post, request } from './api'
 import { type ReadinessReport } from './readiness'
@@ -14,6 +14,66 @@ interface Match {
     source?: string
     extraction_method?: string
     table_count?: number
+  }
+}
+
+interface DocumentStatus {
+  id: string
+  title?: string
+  status?: string
+  phase?: string
+  extraction_method?: string
+  local_index_ready?: boolean
+  graph_link_status?: string
+  graph_retry_terminal?: boolean
+  semantic_graph_status?: string
+  semantic_graph_retryable?: boolean
+  error?: string
+  graph_last_error?: string
+}
+
+function processingSummary(document: DocumentStatus): { text: string; terminal: boolean } {
+  const title = document.title ? `${document.title}\n` : ''
+  if (document.status === 'error' || document.status === 'failed') {
+    return { text: `${title}Processing failed: ${document.error ?? 'See server diagnostics.'}`, terminal: true }
+  }
+  if (!document.local_index_ready) {
+    const stages: Record<string, string> = {
+      queued: 'Queued', waiting: 'Queued', extracting: 'Azure extraction: Processing',
+      structuring: 'Structuring', embedding: 'Embedding',
+    }
+    return { text: `${title}${stages[document.status ?? ''] ?? 'Saved'}`, terminal: false }
+  }
+  const local = 'Local indexing: Completed'
+  if (document.graph_link_status !== 'linked') {
+    const failed = document.status === 'graph_pending' && document.graph_last_error
+    return {
+      text: `${title}${local}\nNeo4j structural graph: ${
+        document.graph_retry_terminal ? 'Failed' : failed ? 'Pending — retry scheduled' : 'Linking'
+      }`,
+      terminal: document.graph_retry_terminal === true,
+    }
+  }
+  const semantic = document.semantic_graph_status ?? 'pending'
+  if (semantic === 'linked') {
+    return { text: `${title}${local}\nNeo4j structural graph: Linked\nSemantic understanding: Completed\nKnowledge ready`, terminal: true }
+  }
+  if (semantic === 'partial') {
+    return { text: `${title}${local}\nNeo4j structural graph: Linked\nSemantic understanding: Partial`, terminal: true }
+  }
+  if (semantic === 'disabled') {
+    return { text: `${title}${local}\nNeo4j structural graph: Linked\nSemantic understanding: Disabled`, terminal: true }
+  }
+  if (semantic === 'failed' && !document.semantic_graph_retryable) {
+    return { text: `${title}${local}\nNeo4j structural graph: Linked\nSemantic understanding: Failed`, terminal: true }
+  }
+  const semanticStages: Record<string, string> = {
+    pending: 'Queued', understanding: 'Processing', discovering: 'Entity discovery',
+    placing: 'Entity placement', failed: 'Retry scheduled',
+  }
+  return {
+    text: `${title}${local}\nNeo4j structural graph: Linked\nSemantic understanding: ${semanticStages[semantic] ?? 'Processing'}`,
+    terminal: false,
   }
 }
 
@@ -78,12 +138,39 @@ export default function KnowledgePanel({
   const [dragging, setDragging] = useState(false)
   const [azureDi, setAzureDi] = useState(true)
   const [neo4jRead, setNeo4jRead] = useState(true)
+  const [activeDocumentId, setActiveDocumentId] = useState<string | null>(null)
   const picker = useRef<HTMLInputElement>(null)
   const autoGraph = readiness?.automatic_graph_ingestion_enabled === true
   const indexingBlocked = readiness?.semantic_ingestion_ready === false
   const urlDisabledByConfiguration = readiness?.url_ingestion_enabled === false
   const urlReadinessUnavailable = readiness === null
   const urlBlocked = urlDisabledByConfiguration || urlReadinessUnavailable
+
+  useEffect(() => {
+    if (!activeDocumentId) return
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const poll = async () => {
+      try {
+        const status = await request<DocumentStatus>(`/documents/${activeDocumentId}/status`)
+        if (cancelled) return
+        const summary = processingSummary(status)
+        setMessage(summary.text)
+        if (summary.terminal) setActiveDocumentId(null)
+        else timer = setTimeout(() => void poll(), 750)
+      } catch (caught) {
+        if (!cancelled) {
+          setError((caught as Error).message)
+          setActiveDocumentId(null)
+        }
+      }
+    }
+    void poll()
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+    }
+  }, [activeDocumentId])
 
   function chooseFile(selected: File | undefined) {
     if (!selected) return
@@ -146,6 +233,9 @@ export default function KnowledgePanel({
         semantic_graph_status?: string
         failed_pages?: number
       }>(path, options)
+      if (result.id && (path === '/documents/upload' || path === '/documents/paste')) {
+        setActiveDocumentId(result.id)
+      }
       if (kind === 'index' && !readiness?.managed_documents && path === '/documents/upload' && result.id) {
         result = await request(`/documents/${result.id}/index`, post())
       }
@@ -171,7 +261,7 @@ export default function KnowledgePanel({
         setMessage(
           result.status === 'graph_pending'
             ? 'Local indexing is ready, but Neo4j linking is pending. Configure the authorized ingestion connection and retry linking.'
-            : `${stage[result.status] ?? 'Processing'} → Ready`,
+            : `${stage[result.status] ?? 'Processing'}`,
         )
       } else if (kind === 'save') {
         setMessage(

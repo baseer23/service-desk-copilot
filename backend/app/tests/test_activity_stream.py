@@ -232,6 +232,27 @@ def test_explicit_local_source_scope_overrides_general_classifier(make_client, r
     assert update['explicit_saved_knowledge'] is True
 
 
+def test_structured_document_intent_marks_title_question_as_saved_knowledge(make_client):
+    client = make_client()
+    agent = client.app.state.agent
+
+    async def classified(stage, context, schema):
+        return RequestIntent(
+            workflow='knowledge', knowledge_source='documents',
+            goal='Answer from the uploaded document',
+            justification='The title identifies a saved document',
+        )
+
+    agent.provider.generate_structured = classified
+    update = client.portal.call(agent.classify_intent, {
+        'case_id': 'document-title-scope', 'persist_case': False,
+        'ticket': {'summary': 'What does NSNP 200 say about eligibility?'},
+        'chat_messages': [],
+    })
+    assert update['explicit_saved_knowledge'] is True
+    assert update['intent']['knowledge_source'] == 'documents'
+
+
 def test_verifier_gap_routes_to_bounded_replanning(make_client):
     agent = make_client({'MAX_INVESTIGATION_CYCLES': '2'}).app.state.agent
     state = {

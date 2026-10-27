@@ -209,6 +209,12 @@ The enabled semantic worker successfully produced and persisted a source-grounde
 
 The focused activation regression and existing plain-text automatic-ingestion check passed (2 tests). Python compilation and whitespace validation also passed. No full suite, new Azure extraction, workspace reset or destructive operation was run.
 
+## Document GraphRAG repair evaluation — 2026-10-27
+
+Focused offline retrieval and graph checks passed 16 scenarios covering stable logical object IDs, structural references, Chroma hydration, stale/unavailable graph fallback, evidence-bound placement and graph writer effects. Saved-document routing checks confirmed structured document intent and mandatory graph participation; planned local searches cannot remain keyword-only and use `HYBRID` graph-first retrieval.
+
+Worker/job checks passed 22 focused scenarios across immediate wakeup, startup recovery, bounded unchanged-job handling, deferred structural retries and durable semantic handoff. Five Knowledge Panel checks and the production frontend build passed, including persisted status polling through structural and semantic completion. No live provider, Azure Document Intelligence request or Aura mutation was made, so live extraction quality and production semantic placement remain unverified.
+
 ## Mandatory saved-knowledge graph participation — 2026-10-26
 
 The LangGraph knowledge subgraph now records explicit saved-knowledge scope in durable state and executes a dedicated retrieval node. It runs local `search_knowledge` and an application-authored tenant-scoped Neo4j read concurrently, preferring the official read-only MCP tool when authorized. Empty graph matches remain valid observations; unavailable graph access is emitted as a failed activity and does not falsely claim graph evidence or suppress local Chroma results. Ordinary general questions and public-web requests do not enter this mandatory path.

@@ -707,6 +707,12 @@ class ServiceDeskAgent:
             r"|\baccording\s+to\s+(?:(?:my|our|the)\s+)?(?:uploaded|saved|local)\s+(?:pdf|document|file|newspaper)\b)",
             request_text, flags=re.IGNORECASE,
         ))
+        # Structured classification is authoritative for natural requests such
+        # as a document title or a follow-up about an uploaded PDF. Regexes only
+        # enforce source scope when the model misses an explicit phrase.
+        explicit_local = explicit_local or (
+            intent.workflow == "knowledge" and intent.knowledge_source == "documents"
+        )
         explicit_public = bool(re.search(
             r"\b(?:search|check|look\s+up)\s+(?:online|the\s+(?:web|internet))\b"
             r"|\blatest\s+official\s+(?:requirements|rules|regulations|guidance)\b",
@@ -846,6 +852,10 @@ class ServiceDeskAgent:
         context = self.context(state, True)
         for attempt in range(2):
             plan = await self.provider.generate_structured("plan", context, InvestigationPlan)
+            if state.get("explicit_saved_knowledge"):
+                for call in plan.tool_calls:
+                    if call.name == "search_knowledge":
+                        call.arguments = {**call.arguments, "mode": "HYBRID"}
             try:
                 self.harness.validate_plan(plan, state["workflow"])
                 if not plan.tool_calls and plan.additional_evidence_useful and not plan.clarification_needed:

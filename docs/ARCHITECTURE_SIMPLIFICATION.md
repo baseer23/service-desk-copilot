@@ -259,6 +259,14 @@ The document worker now resumes local indexing, idempotent structural linking an
 
 Verification used temporary offline stores and mocked providers: 97 document, URL, graph, MCP-security and LangGraph tests passed; all 57 frontend tests and the production frontend build passed. The official Neo4j MCP adapter also passed a bounded read-only live discovery/schema/`RETURN 1`/node-count check. No Azure Document Intelligence request, LLM request, graph write, document reprocessing, workspace reset or destructive operation was performed.
 
+## Event-driven document pipeline repair — 2026-10-27
+
+Durable document ingestion now uses one application-lifetime event instead of a fixed ten-second scan. Upload and paste routes signal only after the original and metadata are saved; startup still recovers eligible jobs, each signal drains successive indexing, structural-link and semantic stages, and persisted graph deadlines wake the worker without repeating Azure extraction. Worker and manual indexing share a tenant/document-scoped in-process lock. This protects the supported single-process profile; a multi-process deployment would still require a distributed lease or job coordinator.
+
+Saved-document classification now accepts the structured intent result for uploaded PDFs, titles and follow-ups. Its local retrieval is forced through the existing graph-first `HYBRID` path, with local Chroma fallback and no graph metadata promoted to factual evidence. Semantic failures are automatically resumable only when the selected provider explicitly marks them recoverable; model-call budget exhaustion is terminal `partial` and ambiguous graph/model operations are not retried.
+
+Focused offline checks passed for worker recovery/wakeup/backoff, local document job transitions, logical graph-to-Chroma reference hydration, conservative semantic placement, graph repository writes, saved-knowledge routing, the five Knowledge Panel scenarios and the production frontend build. No Azure extraction, paid reasoning request or live Neo4j write was executed; those remain the live boundary.
+
 ## Investigation validation recovery — 2026-10-26
 
 Plan rejection now retains a safe structured diagnostic containing request ID, selected provider, stage, validation code, capability name, expected and actual argument names, and attempt number. Discovered MCP schemas remain authoritative. A rejected plan receives one bounded correction with exact schema feedback; authenticated identity questions that still fail correction use the existing owner-scoped `get_authenticated_profile` capability with its exact zero-argument schema rather than failing or inventing identity. Other invalid plans remain rejected.

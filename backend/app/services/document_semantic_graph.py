@@ -2,6 +2,7 @@
 
 import json
 
+from backend.app.models.provider import LLMError
 from backend.app.services.document_graph_understanding import DocumentGraphUnderstanding
 from backend.app.services.graph_placement import GraphPlacementService
 from backend.app.services.graph_discovery import GraphDiscovery
@@ -31,7 +32,12 @@ class DocumentSemanticGraphService:
             extracted = json.loads(self.repository.blobs.get(document_id, state.get("extraction_artifact", "extraction.json")))
             understanding = DocumentGraphUnderstanding(self.settings, self.provider, self.records)
             proposal, partial = await understanding.understand_document(document_id, extracted, state)
-            if partial: return self._status(document_id, "partial", semantic_graph_summary=proposal.summary[:4000])
+            if partial:
+                return self._status(
+                    document_id, "partial", semantic_graph_summary=proposal.summary[:4000],
+                    semantic_graph_retryable=False,
+                    semantic_graph_reason="Configured model-call budget was exhausted",
+                )
             self._status(document_id, "discovering", semantic_graph_summary=proposal.summary[:4000])
             key = understanding.job_key(document_id, state)
             job_row = self.records.read("document_semantic_graph_job", key); job = dict(job_row["payload"])
@@ -51,11 +57,19 @@ class DocumentSemanticGraphService:
             result = placement.apply_placement(plan, proposal)
             self.graph.update_document_semantics(document_id, document_type=proposal.document_type, summary=proposal.summary, status="linked")
             final = self._status(document_id, "linked", semantic_graph_result=result,
+                                 semantic_graph_retryable=False, semantic_graph_reason=None,
                                  document_type=proposal.document_type, semantic_graph_summary=proposal.summary[:4000])
             job_row = self.records.read("document_semantic_graph_job", key); job = dict(job_row["payload"])
             job["status"] = "linked"; job["result"] = result
             self.records.write("document_semantic_graph_job", key, job, previous=job_row)
             return final
         except Exception as exc:
-            self._status(document_id, "failed", semantic_graph_reason=type(exc).__name__)
+            # Only provider failures explicitly declared recoverable are safe to
+            # resume automatically. Graph mutations and ambiguous model failures
+            # remain terminal until an operator reviews them.
+            retryable = isinstance(exc, LLMError) and exc.recoverable
+            self._status(
+                document_id, "failed", semantic_graph_reason=type(exc).__name__,
+                semantic_graph_retryable=retryable,
+            )
             raise

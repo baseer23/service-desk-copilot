@@ -129,3 +129,7 @@ Saved-knowledge graph routing, durable document-worker recovery, conservative se
 ### 2026-10-26 investigation validation recovery
 
 Planner diagnostics, personal-memory lookup, evidence-reference recovery and failed-chat composer restoration do not modify Speech transport, SDK lifecycle, transcript ownership, continuous recognition or usage accounting. No microphone or live Azure Speech check was performed.
+
+### 2026-10-27 document GraphRAG repair
+
+The event-driven document worker, GraphRAG routing and Knowledge status polling do not modify Speech transport, SDK lifecycle, transcript ownership, continuous recognition or usage accounting. No Speech test, microphone session or live Azure Speech request was performed.

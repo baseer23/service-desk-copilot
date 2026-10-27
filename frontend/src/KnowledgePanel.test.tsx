@@ -76,5 +76,28 @@ test('hybrid policy is always on and applies to the selected upload', async () =
   const body = calls[0][1].body as FormData
   expect(body.get('document_processing')).toBe('azure_di')
   expect(body.get('ingestion_mode')).toBe('structured_graph')
-  expect(await screen.findByText('Extracting → Ready')).toBeInTheDocument()
+  expect(await screen.findByText('Extracting')).toBeInTheDocument()
+})
+
+test('polls persisted document status through semantic readiness', async () => {
+  const fetch = vi.fn(async (path: string) => {
+    if (path === '/documents/upload') return Response.json({ id: 'doc-1', status: 'queued', chunks: 0 })
+    if (path === '/documents/doc-1/status') {
+      return Response.json({
+        id: 'doc-1', title: 'Relationships.pdf', status: 'ready', local_index_ready: true,
+        graph_link_status: 'linked', semantic_graph_status: 'linked',
+      })
+    }
+    return Response.json([])
+  })
+  vi.stubGlobal('fetch', fetch)
+  render(<KnowledgePanel readiness={{ managed_documents: true, semantic_ingestion_ready: true } as ReadinessReport} />)
+  const user = userEvent.setup()
+  await user.upload(
+    screen.getByLabelText('PDF document'),
+    new File(['content'], 'relationships.pdf', { type: 'application/pdf' }),
+  )
+  await user.click(screen.getByRole('button', { name: 'Add to knowledge' }))
+  expect(await screen.findByText(/Knowledge ready/)).toBeInTheDocument()
+  expect(fetch.mock.calls.some(([path]) => path === '/documents/doc-1/status')).toBe(true)
 })
