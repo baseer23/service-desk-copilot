@@ -334,7 +334,7 @@ export default function KnowledgePanel({
               ? 'Automatic ingestion is enabled: every file upload uses Azure Document Intelligence and writes reference-only nodes and links to Neo4j. Extraction previews do not save the original locally, but their graph references persist. Azure processing may incur charges. '
               : 'Azure processing runs only when you upload a document. '}
           {readiness?.neo4j_read_available === false
-            ? 'Neo4j read is unavailable. '
+            ? `${readiness.neo4j_read_blocker ?? 'Neo4j read is unavailable.'} `
             : 'Neo4j access is read-only. '}
           {readiness?.structured_ingestion_available === true
             ? 'Hybrid policy is always ON: saved content is indexed locally and linked to Neo4j.'

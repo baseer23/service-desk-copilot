@@ -47,7 +47,7 @@ class GraphFirstRetrieval:
         try:
             references = lookup(
                 [*plan.entities, *plan.concepts],
-                plan.limit,
+                max(plan.limit * 10, 100),
                 document_ids=plan.document_ids,
                 object_types=plan.object_types,
                 relationships=plan.relationship_types,

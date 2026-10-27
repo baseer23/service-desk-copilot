@@ -36,6 +36,7 @@ export interface ReadinessReport {
   azure_document_intelligence_blocker?: string | null
   azure_document_intelligence_code?: string | null
   neo4j_read_available?: boolean
+  neo4j_read_blocker?: string | null
   voice_validation_scope?: 'not_checked' | 'configuration' | 'transport'
 }
 export function reasoningBlocker(report: ReadinessReport | null): string | null {

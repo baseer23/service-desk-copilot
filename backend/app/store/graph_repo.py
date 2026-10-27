@@ -233,15 +233,19 @@ class GraphRepository:
                 "MATCH path=(seed)-[*0..2]-(n) "
                 "WHERE n.tenant_id=$tenant AND any(label IN labels(n) WHERE label IN $object_types) "
                 "AND all(r IN relationships(path) WHERE type(r) IN $relationships) "
-                "RETURN DISTINCT coalesce(n.original_id,n.id) AS object_id, labels(n)[0] AS object_type, "
-                "n.document_id AS document_id, n.page AS page, n.description AS description "
+                "WITH DISTINCT n,d, reduce(score=0, term IN $terms | score + "
+                "CASE WHEN toLower(coalesce(n.description,'')) CONTAINS term THEN 2 ELSE 0 END + "
+                "CASE WHEN toLower(coalesce(d.title,'')) CONTAINS term THEN 1 ELSE 0 END) AS relevance "
+                "RETURN coalesce(n.original_id,n.id) AS object_id, labels(n)[0] AS object_type, "
+                "coalesce(n.document_id,d.original_id) AS document_id, n.page AS page, "
+                "n.description AS description ORDER BY relevance DESC, n.page ASC "
                 "LIMIT $limit",
                 tenant=self.tenant(),
                 terms=terms,
                 document_ids=list(document_ids or []),
                 object_types=selected_types,
                 relationships=selected_relationships,
-                limit=min(max(limit, 1), 20),
+                limit=min(max(limit, 1), 200),
             )
             return [dict(record) for record in result]
 

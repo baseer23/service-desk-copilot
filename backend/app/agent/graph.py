@@ -1241,9 +1241,15 @@ class ServiceDeskAgent:
         planned, graph_result = await asyncio.gather(
             self.execute_tools(state), self._mandatory_saved_knowledge_graph_read(state)
         )
+        graph_outputs = [graph_result]
+        if graph_result.get("hydrated_output"):
+            graph_outputs.append({
+                "name": "search_knowledge",
+                "output": graph_result["hydrated_output"],
+            })
         return {
             **planned,
-            "tool_results": [*planned.get("tool_results", []), graph_result],
+            "tool_results": [*planned.get("tool_results", []), *graph_outputs],
             "executed_tool_calls": list(dict.fromkeys([
                 *planned.get("executed_tool_calls", []),
                 self._tool_signature(graph_result["name"], graph_result["arguments"]),
@@ -1270,12 +1276,19 @@ class ServiceDeskAgent:
                 "MATCH (d:Document) WHERE d.tenant_id = $tenant_id "
                 "AND any(term IN $terms WHERE toLower(coalesce(d.title,'')) CONTAINS term "
                 "OR toLower(coalesce(d.summary,'')) CONTAINS term) "
+                "OPTIONAL MATCH (d)-[:HAS_PAGE]->(p:Page) "
+                "OPTIONAL MATCH (p)-[:HAS_CHUNK|HAS_TABLE|HAS_PARAGRAPH|HAS_FIGURE|HAS_TABLECELL]->(o) "
                 "OPTIONAL MATCH (d)<-[:MENTIONED_IN]-(m:GraphMention) "
                 "OPTIONAL MATCH (m)-[:REFERS_TO]->(e:Entity) "
-                "OPTIONAL MATCH (m)-[:SUPPORTED_BY]->(o) "
+                "OPTIONAL MATCH (m)-[:SUPPORTED_BY]->(mo) "
+                "OPTIONAL MATCH (d)<-[:DOCUMENTED_IN]-(c:GraphClaim) "
+                "OPTIONAL MATCH (c)-[:SUPPORTED_BY]->(co) "
                 "RETURN coalesce(d.original_id,d.id) AS document_id,d.title AS title,"
                 "d.summary AS summary,collect(DISTINCT e.name)[0..10] AS entities,"
-                "collect(DISTINCT coalesce(o.original_id,o.id))[0..50] AS object_ids LIMIT 20"
+                "[value IN (collect(DISTINCT coalesce(o.original_id,o.id)) + "
+                "collect(DISTINCT coalesce(mo.original_id,mo.id)) + "
+                "collect(DISTINCT coalesce(co.original_id,co.id))) WHERE value IS NOT NULL][0..500] "
+                "AS object_ids LIMIT 20"
             )
             arguments = {
                 "query": query,
@@ -1298,7 +1311,42 @@ class ServiceDeskAgent:
                 "error": str(exc),
                 "items": [],
             }
-        return {"name": name, "arguments": arguments, "output": output}
+        hydrated_output = None
+        if name == "neo4j__read-cypher" and output.get("status") == "ok":
+            object_ids = list(dict.fromkeys(
+                str(object_id)
+                for row in output.get("items", [])
+                for object_id in row.get("object_ids", [])
+                if object_id
+            ))[:500]
+            if object_ids:
+                from backend.app.services.local_documents import LocalDocumentRepository
+
+                repository = LocalDocumentRepository(self.settings)
+                query_embedding = repository.embeddings.embed_texts([question])[0]
+                hydrated = await asyncio.to_thread(
+                    repository.search_store.resolve_object_ids,
+                    object_ids,
+                    query_embedding,
+                )
+                if hydrated:
+                    for item in hydrated:
+                        item["graph_enrichment"] = "available"
+                        item["match_type"] = item.get("match_type", "graph_reference")
+                    hydrated_output = {
+                        "tool": "search_knowledge",
+                        "status": "ok",
+                        "items": hydrated,
+                        "timestamp": now(),
+                        "source_system": "chroma",
+                        "reliability": 0.9,
+                    }
+        return {
+            "name": name,
+            "arguments": arguments,
+            "output": output,
+            "hydrated_output": hydrated_output,
+        }
 
     @staticmethod
     def _tool_signature(name, arguments):
@@ -1677,43 +1725,22 @@ class ServiceDeskAgent:
                             ),
                             reverse=True,
                         )
-                        if value_request and "noc" in state["ticket"]["summary"].casefold():
-                            grounded_code = next((
-                                (match.group(1), item)
-                                for item in present
-                                if (match := re.search(
-                                    r"\bNOC(?:\s+2021)?\s+Code\s+(\d{4,6})\b",
+                        matching = present
+                        if value_request:
+                            matching = [
+                                item for item in present
+                                if sum(
+                                    term in str(item["content"].get("text") or "").casefold()
+                                    for term in clarification_terms
+                                ) >= min(2, len(clarification_terms))
+                                and re.search(
+                                    r"(?:\b\d[\w.-]*\b|:\s*\S+)",
                                     str(item["content"].get("text") or ""),
-                                    re.IGNORECASE,
-                                ))
-                            ), None)
-                            if grounded_code:
-                                code, source = grounded_code
-                                page = source["content"]["metadata"]["page"]
-                                title = source["content"].get("title") or source["content"]["metadata"].get("title") or "the saved document"
-                                decision = decision.model_copy(update={
-                                    "outcome": "answer",
-                                    "answer": f"The NOC code is **{code}** ({title}, page {page}).",
-                                    "evidence_summary": (
-                                        f"Accepted evidence {source['id']} explicitly lists NOC code {code} "
-                                        f"on page {page}."
-                                    ),
-                                    "enough_information": True,
-                                    "question_for_human": None,
-                                    "human_field": None,
-                                    "question_subject": None,
-                                    "question_reason": None,
-                                    "missing_information": [],
-                                    "requested_tools": [],
-                                    "needs_web_research": False,
-                                    "research_queries": [],
-                                    "confidence": 1.0,
-                                    "uncertainty": [],
-                                })
-                                break
-                        if attempt == 0:
+                                )
+                            ]
+                        if matching and attempt == 0:
                             available_pages = sorted({
-                                item["content"]["metadata"]["page"] for item in present
+                                item["content"]["metadata"]["page"] for item in matching
                             })
                             context["decision_validation_feedback"] = {
                                 "message": (
@@ -1733,13 +1760,14 @@ class ServiceDeskAgent:
                                             state["ticket"]["summary"], 1600,
                                         ),
                                     }
-                                    for item in present[:3]
+                                    for item in matching[:3]
                                 ],
                             }
                             continue
-                        raise LLMError(
-                            "Reasoning repeatedly requested document evidence that is already present"
-                        )
+                        if matching:
+                            raise LLMError(
+                                "Reasoning repeatedly requested document evidence that is already present"
+                            )
                 break
             except LLMError as exc:
                 if attempt:

@@ -160,6 +160,25 @@ def create_app(settings: Settings | None = None):
                 async with checkpoint_store(s) as saver:
                     app.state.agent = ServiceDeskAgent(s, mcp, provider, saver)
                     await app.state.agent.initialize()
+                    app.state.neo4j_read = {
+                        "available": False,
+                        "blocker": "Neo4j read authorization has not been verified.",
+                    }
+                    if {"neo4j__get-schema", "neo4j__read-cypher"}.issubset(mcp.discovered):
+                        try:
+                            await mcp.call_tool("neo4j__get-schema", {})
+                            probe = await mcp.call_tool(
+                                "neo4j__read-cypher",
+                                {"query": "RETURN 1 AS authorized_read", "params": {}},
+                            )
+                            if probe.get("status") != "ok" or not probe.get("items"):
+                                raise MCPToolError("Neo4j read probe returned no result")
+                            app.state.neo4j_read = {"available": True, "blocker": None}
+                        except (MCPToolError, MCPConnectionError, ValueError):
+                            app.state.neo4j_read = {
+                                "available": False,
+                                "blocker": "Neo4j MCP schema or authorized read verification failed.",
+                            }
                     from backend.app.voice.history import VoiceHistory
                     from backend.app.conversation.sessions import ConversationSessions
                     from backend.app.services.conversation_history import ConversationHistory
@@ -380,12 +399,8 @@ def create_app(settings: Settings | None = None):
             ),
             "azure_document_intelligence_blocker": app.state.azure_document["blocker"],
             "azure_document_intelligence_code": app.state.azure_document["code"],
-            "neo4j_read_available": bool(
-                app.state.mcp.integration_status.get("neo4j") == "connected"
-                and {"neo4j__get-schema", "neo4j__read-cypher"}.issubset(
-                    app.state.mcp.discovered
-                )
-            ),
+            "neo4j_read_available": app.state.neo4j_read["available"],
+            "neo4j_read_blocker": app.state.neo4j_read["blocker"],
             "structured_ingestion_available": bool(
                 s.uses_record_store and app.state.graph_writer["available"]
             ),
