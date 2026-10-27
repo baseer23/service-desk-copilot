@@ -105,15 +105,16 @@ function normalizePublicUrl(value: string): string {
   return parsed.toString()
 }
 
-function Switch({ label, checked, disabled, onChange }: {
+function Switch({ label, checked, disabled, available, onChange }: {
   label: string
   checked: boolean
   disabled: boolean
+  available?: boolean
   onChange: (checked: boolean) => void
 }) {
   return (
-    <label className={`knowledge-switch ${disabled ? 'unavailable' : ''}`}>
-      <span>{label}<small>{disabled ? 'Unavailable' : checked ? 'ON' : 'OFF'}</small></span>
+    <label className={`knowledge-switch ${available === false ? 'unavailable' : ''}`}>
+      <span>{label}<small>{available === false ? 'Unavailable' : available === undefined ? 'Checking' : checked ? 'ON' : 'OFF'}</small></span>
       <input type="checkbox" role="switch" aria-label={label} checked={checked}
         disabled={disabled} onChange={(event) => onChange(event.target.checked)} />
       <i aria-hidden="true" />
@@ -147,6 +148,9 @@ export default function KnowledgePanel({
   const [activeDocumentId, setActiveDocumentId] = useState<string | null>(null)
   const picker = useRef<HTMLInputElement>(null)
   const autoGraph = readiness?.automatic_graph_ingestion_enabled === true
+  const azureAvailable = readiness?.azure_document_intelligence_available
+  const neo4jReadAvailable = readiness?.neo4j_read_available
+  const hybridAvailable = readiness?.structured_ingestion_available
   const indexingBlocked = readiness?.semantic_ingestion_ready === false
   const urlDisabledByConfiguration = readiness?.url_ingestion_enabled === false
   const urlReadinessUnavailable = readiness === null
@@ -312,13 +316,16 @@ export default function KnowledgePanel({
     <section className="card knowledge-card">
       <h2>Documents and knowledge</h2>
       <div className="knowledge-switches" aria-label="Knowledge processing options">
-        <Switch label="Azure Document Intelligence" checked={autoGraph || azureDi}
-          disabled={autoGraph || busy || readiness?.azure_document_intelligence_available === false}
+        <Switch label="Azure Document Intelligence" checked={azureAvailable === true && (autoGraph || azureDi)}
+          available={azureAvailable}
+          disabled={autoGraph || busy || azureAvailable !== true}
           onChange={setAzureDi} />
-        <Switch label="Neo4j Read" checked={neo4jRead}
-          disabled={busy || readiness?.neo4j_read_available === false}
+        <Switch label="Neo4j Read" checked={neo4jReadAvailable === true && neo4jRead}
+          available={neo4jReadAvailable}
+          disabled={busy || neo4jReadAvailable !== true}
           onChange={setNeo4jRead} />
-        <Switch label="Local + Neo4j Hybrid" checked disabled
+        <Switch label="Local + Neo4j Hybrid" checked={hybridAvailable === true}
+          available={hybridAvailable} disabled
           onChange={() => undefined} />
         <p className="muted knowledge-switch-note">
           {readiness?.azure_document_intelligence_available === false

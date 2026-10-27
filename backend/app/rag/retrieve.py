@@ -68,10 +68,17 @@ class Retriever:
             self.graph_repo, self.vector_store, self.embedding_provider
         ).search(question, top_k, graph_plan)
         if structured:
-            supplement = self.vector_search(question, top_k)
+            if hasattr(self.vector_store, "hybrid"):
+                embedding = self.embedding_provider.embed_texts([question])[0]
+                supplement = self.vector_store.hybrid(question, embedding, top_k)
+            else:
+                supplement = self.vector_search(question, top_k)
             seen = set()
             combined = []
-            for row in structured + supplement:
+            # Graph title/entity matches can be broad and reference-only. Keep
+            # locally ranked passage relevance first so an arbitrary bounded
+            # graph-reference order cannot displace the answer-bearing passage.
+            for row in supplement + structured:
                 if row["id"] not in seen:
                     combined.append(row)
                     seen.add(row["id"])

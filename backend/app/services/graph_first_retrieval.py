@@ -1,5 +1,7 @@
 """Bounded graph-reference planning and tenant-safe local hydration."""
 
+import re
+
 from backend.app.agent.models import GraphLookupPlan
 from backend.app.services.entities import extract_entities
 
@@ -12,7 +14,12 @@ class GraphFirstRetrieval:
 
     def plan(self, question: str) -> GraphLookupPlan:
         entities = extract_entities([{"text": question}])[:10]
-        concepts = list(dict.fromkeys([*entities, *question.split()]))[:10]
+        tokens = question.split()
+        identifier_variants = [
+            re.sub(r"(?<=\D)(?=\d)", " ", token)
+            for token in tokens if re.search(r"[A-Za-z]\d", token)
+        ]
+        concepts = list(dict.fromkeys([*entities, *identifier_variants, *tokens]))[:10]
         return GraphLookupPlan(
             entities=entities,
             concepts=concepts,

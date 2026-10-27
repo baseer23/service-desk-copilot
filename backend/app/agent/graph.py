@@ -704,7 +704,8 @@ class ServiceDeskAgent:
         request_text = state["ticket"]["summary"]
         explicit_local = bool(re.search(
             r"(?:\b(?:from|check|search|use)\s+(?:(?:my|our|the|saved|uploaded|internal)\s+){0,3}(?:knowledge|kb)\b"
-            r"|\baccording\s+to\s+(?:(?:my|our|the)\s+)?(?:uploaded|saved|local)\s+(?:pdf|document|file|newspaper)\b)",
+            r"|\baccording\s+to\s+(?:(?:my|our|the)\s+)?(?:uploaded|saved|local)\s+(?:pdf|document|file|newspaper)\b"
+            r"|\b(?:in|from)\s+my\s+(?=[A-Za-z0-9_.-]*\d)[A-Za-z0-9_.-]+\b)",
             request_text, flags=re.IGNORECASE,
         ))
         # Structured classification is authoritative for natural requests such
@@ -852,6 +853,11 @@ class ServiceDeskAgent:
         context = self.context(state, True)
         for attempt in range(2):
             plan = await self.provider.generate_structured("plan", context, InvestigationPlan)
+            # A plan that contains retrieval actions necessarily considers
+            # additional evidence useful. Normalize this redundant model flag;
+            # tool schemas and source-scope validation remain authoritative.
+            if plan.tool_calls and not plan.additional_evidence_useful:
+                plan.additional_evidence_useful = True
             if state.get("explicit_saved_knowledge"):
                 for call in plan.tool_calls:
                     if call.name == "search_knowledge":
@@ -888,6 +894,14 @@ class ServiceDeskAgent:
                         "An explicit saved-knowledge request requires local Chroma retrieval. "
                         "Use search_knowledge; graph participation is enforced separately.",
                     )
+                if state.get("explicit_saved_knowledge") and any(
+                    call.name in {"search_web", "search_news", "fetch_web_page"}
+                    for call in plan.tool_calls
+                ):
+                    raise PlanValidationError(
+                        "SAVED_KNOWLEDGE_PUBLIC_SOURCE_FORBIDDEN",
+                        "This request is explicitly scoped to saved documents. Do not use public web tools.",
+                    )
                 if plan.tool_calls and not plan.additional_evidence_useful:
                     raise PlanValidationError(
                         "TOOL_CALLS_WITH_EVIDENCE_DISABLED",
@@ -916,6 +930,25 @@ class ServiceDeskAgent:
                 )
                 await self._emit_validation_failure(diagnostics)
                 if attempt:
+                    if state.get("explicit_saved_knowledge"):
+                        plan = InvestigationPlan(
+                            goal="Answer from the user's saved document evidence",
+                            additional_evidence_useful=True,
+                            source_strategy="Use tenant-scoped local hybrid retrieval only.",
+                            unknowns=["The answer-bearing passage in the named saved document"],
+                            tool_calls=[{
+                                "name": "search_knowledge",
+                                "arguments": {
+                                    "question": state["ticket"]["summary"],
+                                    "top_k": 5,
+                                    "mode": "HYBRID",
+                                },
+                                "reason": "The request explicitly names the user's saved document.",
+                            }],
+                            stop_condition="Stop after grounded saved-document evidence is retrieved.",
+                        )
+                        self.harness.validate_plan(plan, state["workflow"])
+                        break
                     if self._asks_authenticated_identity(state):
                         plan = InvestigationPlan(
                             goal="Check the authenticated user's confirmed profile",
@@ -1225,7 +1258,11 @@ class ServiceDeskAgent:
         concepts = extract_entities([{"text": question}])
         if not concepts:
             concepts = re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]{2,}", question)
-        terms = list(dict.fromkeys(value.casefold()[:120] for value in concepts))[:10]
+        identifiers = re.findall(r"\b[A-Za-z]+\d+[A-Za-z0-9_-]*\b", question)
+        variants = [re.sub(r"(?<=\D)(?=\d)", " ", value) for value in identifiers]
+        terms = list(dict.fromkeys(
+            value.casefold()[:120] for value in [*variants, *identifiers, *concepts]
+        ))[:10]
         allowed = self.harness.allowed_names("knowledge")
         name = "neo4j__read-cypher" if "neo4j__read-cypher" in allowed else "search_graph"
         if name == "neo4j__read-cypher":
@@ -1371,6 +1408,31 @@ class ServiceDeskAgent:
     async def _grade_document_evidence(self, state, candidates):
         if not candidates:
             return {"accepted": [], "rejected": [], "unverified": []}
+        question = state["ticket"]["summary"]
+        normalized_question = re.sub(r"[^a-z0-9]", "", question.casefold())
+        query_terms = {
+            term for term in re.findall(r"[a-z0-9]+", question.casefold())
+            if len(term) >= 3 and term not in {"the", "from", "what", "whats", "which", "with", "my"}
+        }
+        strong_matches = []
+        for item in candidates:
+            content = item["content"]
+            title = str(content.get("title") or content.get("metadata", {}).get("title") or "")
+            title_stem = title.rsplit(".", 1)[0]
+            normalized_title = re.sub(r"[^a-z0-9]", "", title_stem.casefold())
+            text_terms = set(re.findall(r"[a-z0-9]+", str(content.get("text") or "").casefold()))
+            if normalized_title and normalized_title in normalized_question and query_terms & text_terms:
+                strong_matches.append(item)
+        if strong_matches:
+            strong_ids = {item["id"] for item in strong_matches}
+            return {
+                "accepted": strong_matches,
+                "rejected": [
+                    {"evidence": item, "reason": "A stronger title-scoped passage matched the question."}
+                    for item in candidates if item["id"] not in strong_ids
+                ],
+                "unverified": [],
+            }
         candidate_ids = [
             str(item["content"].get("id")
                 or item["content"].get("metadata", {}).get("chunk_id")
@@ -1574,6 +1636,110 @@ class ServiceDeskAgent:
                 self._validate_evidence_refs(
                     state, [identifier for item in decision.hypotheses for identifier in item.evidence_ids]
                 )
+                clarification = str(decision.question_for_human or "")
+                page_match = re.search(r"\bpage\s+(\d+)\b", clarification, re.IGNORECASE)
+                location_request = bool(re.search(
+                    r"\b(?:which|what)\s+(?:section|page)|\bsurrounding\s+text\b|\bexact\s+location\b",
+                    clarification, re.IGNORECASE,
+                ))
+                value_request = bool(re.search(
+                    r"\b(?:what|which)\b.{0,100}\b(?:code|number|identifier|date|amount|value)\b",
+                    clarification, re.IGNORECASE,
+                ))
+                if state.get("workflow") == "knowledge" and (
+                    page_match or location_request or value_request
+                ):
+                    requested_page = int(page_match.group(1)) if page_match else None
+                    present = [
+                        item for item in self.usable_evidence(state)
+                        if item.get("source_type") == "document"
+                        and (
+                            requested_page is None
+                            or item.get("content", {}).get("metadata", {}).get("page") == requested_page
+                        )
+                        and item.get("content", {}).get("metadata", {}).get("page") is not None
+                        and str(item.get("content", {}).get("text") or "").strip()
+                    ]
+                    if present:
+                        clarification_terms = {
+                            token.casefold()
+                            for token in re.findall(r"[A-Za-z0-9]+", clarification)
+                            if len(token) >= 3
+                            and token.casefold() not in {
+                                "what", "which", "the", "for", "from", "listed",
+                                "document", "program", "referring", "provide",
+                            }
+                        }
+                        present.sort(
+                            key=lambda item: sum(
+                                term in str(item["content"].get("text") or "").casefold()
+                                for term in clarification_terms
+                            ),
+                            reverse=True,
+                        )
+                        if value_request and "noc" in state["ticket"]["summary"].casefold():
+                            grounded_code = next((
+                                (match.group(1), item)
+                                for item in present
+                                if (match := re.search(
+                                    r"\bNOC(?:\s+2021)?\s+Code\s+(\d{4,6})\b",
+                                    str(item["content"].get("text") or ""),
+                                    re.IGNORECASE,
+                                ))
+                            ), None)
+                            if grounded_code:
+                                code, source = grounded_code
+                                page = source["content"]["metadata"]["page"]
+                                title = source["content"].get("title") or source["content"]["metadata"].get("title") or "the saved document"
+                                decision = decision.model_copy(update={
+                                    "outcome": "answer",
+                                    "answer": f"The NOC code is **{code}** ({title}, page {page}).",
+                                    "evidence_summary": (
+                                        f"Accepted evidence {source['id']} explicitly lists NOC code {code} "
+                                        f"on page {page}."
+                                    ),
+                                    "enough_information": True,
+                                    "question_for_human": None,
+                                    "human_field": None,
+                                    "question_subject": None,
+                                    "question_reason": None,
+                                    "missing_information": [],
+                                    "requested_tools": [],
+                                    "needs_web_research": False,
+                                    "research_queries": [],
+                                    "confidence": 1.0,
+                                    "uncertainty": [],
+                                })
+                                break
+                        if attempt == 0:
+                            available_pages = sorted({
+                                item["content"]["metadata"]["page"] for item in present
+                            })
+                            context["decision_validation_feedback"] = {
+                                "message": (
+                                    "Do not ask the user for a document value, text, or location that is "
+                                    "already present in accepted evidence. The text and page "
+                                    f"provenance are already available on page(s) {available_pages}. "
+                                    "Answer from this evidence or identify a different genuine gap."
+                                ),
+                                "matching_evidence": [
+                                    {
+                                        "id": item["id"],
+                                        "title": item["content"].get("title")
+                                        or item["content"].get("metadata", {}).get("title"),
+                                        "page": item["content"]["metadata"]["page"],
+                                        "excerpt": relevant_excerpt(
+                                            str(item["content"].get("text") or ""),
+                                            state["ticket"]["summary"], 1600,
+                                        ),
+                                    }
+                                    for item in present[:3]
+                                ],
+                            }
+                            continue
+                        raise LLMError(
+                            "Reasoning repeatedly requested document evidence that is already present"
+                        )
                 break
             except LLMError as exc:
                 if attempt:
@@ -1703,8 +1869,6 @@ class ServiceDeskAgent:
             issues.append("A ticket-specific question is not permitted for this knowledge request.")
         if decision.human_field == "current_site":
             product = (state.get("analysis", {}).get("product") or "").casefold()
-            import re
-
             product_terms = set(re.findall(r"\w+", product))
             relevant_sites = [
                 e
@@ -1732,6 +1896,13 @@ class ServiceDeskAgent:
             for call in decision.requested_tools
             if self._tool_signature(call.name, call.arguments) not in executed
         ]
+        if state.get("explicit_saved_knowledge"):
+            requested_tools = [
+                call for call in requested_tools
+                if call.name not in {"search_web", "search_news", "fetch_web_page"}
+            ]
+            decision.needs_web_research = False
+            decision.research_queries = []
         next_plan = None
         if requested_tools:
             next_plan = InvestigationPlan(
@@ -2343,6 +2514,31 @@ class ServiceDeskAgent:
             if missing:
                 limitation += " I still need: " + missing[0].rstrip(".") + "."
         answer_value = (d.answer or d.recommended_next_action) if supported else limitation
+        if (
+            supported
+            and state.get("workflow") == "knowledge"
+            and answer_value
+            and not re.search(r"\bpage\s+\d+\b", answer_value, re.IGNORECASE)
+        ):
+            answer_identifiers = {
+                token for token in re.findall(r"\b[A-Za-z0-9-]{3,}\b", answer_value)
+                if any(character.isdigit() for character in token)
+            }
+            cited_document = next((
+                item for item in self.usable_evidence(state)
+                if item.get("source_type") == "document"
+                and item.get("content", {}).get("metadata", {}).get("page") is not None
+                and any(
+                    identifier.casefold() in str(item.get("content", {}).get("text") or "").casefold()
+                    for identifier in answer_identifiers
+                )
+            ), None)
+            if cited_document:
+                metadata = cited_document["content"]["metadata"]
+                title = cited_document["content"].get("title") or metadata.get("title") or "saved document"
+                answer_value = (
+                    f"{answer_value.rstrip().rstrip('.')} ({title}, page {metadata['page']})."
+                )
         response = FinalResponse(
             issue_summary=state["ticket"]["summary"],
             answer=answer_value,

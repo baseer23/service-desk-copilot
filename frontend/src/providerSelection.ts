@@ -2,13 +2,13 @@ export type ReasoningProvider = 'groq' | 'azure_openai'
 
 export const providerStorageKey = 'deskmate.reasoning-provider'
 export const providerChangedEvent = 'deskmate-provider-changed'
-let memorySelection: ReasoningProvider = 'groq'
+let memorySelection: ReasoningProvider = 'azure_openai'
 
 export function getSelectedProvider(): ReasoningProvider {
   try {
     const saved = localStorage.getItem(providerStorageKey)
     if (saved === 'groq' || saved === 'azure_openai') return saved
-    return 'groq'
+    return 'azure_openai'
   } catch {
     return memorySelection
   }
