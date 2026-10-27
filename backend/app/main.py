@@ -178,8 +178,12 @@ def create_app(settings: Settings | None = None):
                     if s.uses_record_store:
                         from backend.app.services.document_worker import document_worker
 
+                        app.state.ingestion_wakeup = asyncio.Event()
                         ingestion_task = asyncio.create_task(
-                            document_worker(s, app.state.agent.harness)
+                            document_worker(
+                                s, app.state.agent.harness, app.state.ingestion_wakeup
+                            ),
+                            name="document-worker",
                         )
                         app.state.ingestion_task = ingestion_task
                     yield
@@ -329,8 +333,11 @@ def create_app(settings: Settings | None = None):
                 if s.uses_record_store:
                     from backend.app.services.document_worker import document_worker
 
+                    app.state.ingestion_wakeup.clear()
                     app.state.ingestion_task = asyncio.create_task(
-                        document_worker(s, app.state.agent.harness),
+                        document_worker(
+                            s, app.state.agent.harness, app.state.ingestion_wakeup
+                        ),
                         name="document-worker-after-reset",
                     )
             return result
@@ -433,11 +440,14 @@ def create_app(settings: Settings | None = None):
     @app.post("/ingest/pdf", response_model=IngestPdfResponse)
     async def ingest_pdf(file: UploadFile = File(...), title: str | None = Form(None)):
         uploaded = await document_upload(file, title, "save_staged_document")
-        processed = (
-            await app.state.agent.harness.invoke(
-                "index_document", {"document_id": uploaded["id"]}
-            )
-        )["result"]
+        from backend.app.services.document_worker import document_processing_lock
+
+        async with document_processing_lock(current_principal(s).tenant_id, uploaded["id"]):
+            processed = (
+                await app.state.agent.harness.invoke(
+                    "index_document", {"document_id": uploaded["id"]}
+                )
+            )["result"]
         pages = processed.get("pages", uploaded.get("pages", 1))
         return {
             "pages": pages, "chunks": processed["chunks"],
@@ -528,14 +538,17 @@ def create_app(settings: Settings | None = None):
             raise HTTPException(400, "document_processing must be local or azure_di")
         if s.auto_document_graph_ingestion:
             ingestion_mode, document_processing = "structured_graph", "azure_di"
-        return await document_upload(
+        result = await document_upload(
             file, title, "save_document", ingestion_mode, document_processing
         )
+        if s.uses_record_store and result.get("id"):
+            app.state.ingestion_wakeup.set()
+        return result
 
     @app.post("/documents/paste")
     async def save_pasted_document(body: IngestPasteRequest):
         await require_auto_graph_writer(requires_azure=False)
-        return (
+        result = (
             await app.state.agent.harness.invoke(
                 "save_document",
                 {
@@ -547,6 +560,9 @@ def create_app(settings: Settings | None = None):
                 },
             )
         )["result"]
+        if s.uses_record_store and result.get("id"):
+            app.state.ingestion_wakeup.set()
+        return result
 
     @app.get("/documents")
     async def list_local_documents():
@@ -563,9 +579,14 @@ def create_app(settings: Settings | None = None):
                     "message": report.semantic_ingestion_blocker,
                 },
             )
-        return (
-            await app.state.agent.harness.invoke("index_document", {"document_id": document_id})
-        )["result"]
+        from backend.app.services.document_worker import document_processing_lock
+
+        async with document_processing_lock(current_principal(s).tenant_id, document_id):
+            return (
+                await app.state.agent.harness.invoke(
+                    "index_document", {"document_id": document_id}
+                )
+            )["result"]
 
     @app.post("/documents/{document_id}/reprocess")
     async def reprocess_local_document(document_id: str):
