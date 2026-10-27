@@ -686,6 +686,12 @@ h1, h2, h3 { font-family: inherit; }
 .technical-activity li { margin: 10px 0; font-size: 11px; }
 .technical-activity li > * { display: block; margin-top: 3px; }
 .technical-activity small { color: #7b887e; }
+.activity-view-tabs { display: flex; gap: 6px; margin: 16px 0 10px; }
+.activity-view-tabs button { width: auto; padding: 7px 10px; border: 1px solid #dce5df; border-radius: 8px; background: #f7f9f7; color: #506c5a; font-size: 12px; }
+.activity-view-tabs button[aria-selected="true"] { background: #e7f0ea; border-color: #aac5b2; color: #294b3b; }
+.investigation-activity, ol.technical-activity { margin: 0; padding-left: 20px; max-height: 260px; overflow: auto; }
+.investigation-activity > li, ol.technical-activity > li { margin: 10px 0; font-size: 11px; }
+ol.technical-activity li > * { display: block; margin-top: 3px; }
 .modal-backdrop { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; padding: 20px; background: #10251fb8; }
 .reset-modal { width: min(520px, 100%); background: white; border-radius: 18px; padding: 28px; box-shadow: 0 22px 70px #07130f55; }
 .reset-modal h2 { margin-top: 0; }
