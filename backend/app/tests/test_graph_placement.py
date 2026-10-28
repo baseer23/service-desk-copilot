@@ -9,7 +9,7 @@ from backend.app.services.graph_placement import GraphPlacementService
 
 
 @pytest.mark.asyncio
-async def test_invalid_or_missing_placement_is_conservatively_unresolved():
+async def test_invalid_or_missing_placement_becomes_unmerged_document_entity():
     proposal = DocumentGraphProposal(
         document_id="doc-1",
         entities=[
@@ -49,5 +49,6 @@ async def test_invalid_or_missing_placement_is_conservatively_unresolved():
     )
     assert plan.document_id == "doc-1"
     assert [item.temporary_id for item in plan.placements] == ["entity-1", "entity-2"]
-    assert all(item.decision == "UNRESOLVED" for item in plan.placements)
+    # Downgraded to a document-scoped CREATE_NEW entity: never a merge or reuse.
+    assert all(item.decision == "CREATE_NEW" for item in plan.placements)
     assert all(item.existing_entity_id is None for item in plan.placements)

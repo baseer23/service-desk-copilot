@@ -64,6 +64,9 @@ function processingSummary(document: DocumentStatus): { text: string; terminal: 
   if (semantic === 'linked') {
     return { text: `${title}${local}\nNeo4j structural graph: Linked\nSemantic understanding: Completed\nKnowledge ready`, terminal: true }
   }
+  if (semantic === 'linked_no_relationships') {
+    return { text: `${title}${local}\nNeo4j structural graph: Linked\nSemantic understanding: Completed (entities only, no relationships)\nKnowledge ready`, terminal: true }
+  }
   if (semantic === 'partial') {
     return { text: `${title}${local}\nNeo4j structural graph: Linked\nSemantic understanding: Partial`, terminal: true }
   }
@@ -260,6 +263,8 @@ export default function KnowledgePanel({
         const graph = result.graph_link_status === 'linked'
           ? result.semantic_graph_status === 'linked'
             ? ' Neo4j semantic linking is complete.'
+            : result.semantic_graph_status === 'linked_no_relationships'
+            ? ' Neo4j semantic linking found entities but no relationships.'
             : ' Neo4j references are linked; semantic enrichment is pending.'
           : ' Local knowledge is ready; Neo4j linking remains pending.'
         setMessage(indexed + failed + graph)
