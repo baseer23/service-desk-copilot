@@ -8,11 +8,23 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
+from azure.core.pipeline.policies import RetryPolicy
+
 from backend.app.core.config import Settings
 from backend.app.core.azure_identity import azure_credential
 from backend.app.store.records import ManagedStoreError
 
 logger = logging.getLogger(__name__)
+
+
+class ThrottleOnlyRetryPolicy(RetryPolicy):
+    """Retry only HTTP 429 (rejected before analysis/billing), honouring Retry-After up to 60s."""
+
+    def is_retry(self, settings, response):
+        if response.http_response.status_code != 429 or settings["total"] <= 0:
+            return False
+        wait = self.get_retry_after(response)
+        return wait is None or wait <= 60
 
 
 class DocumentProcessingFailure(ManagedStoreError):
@@ -107,7 +119,10 @@ class AzureDocumentExtractor:
                 settings.azure_document_endpoint,
                 self.credential,
                 api_version=settings.azure_document_api_version,
-                retry_total=0,
+                retry_policy=ThrottleOnlyRetryPolicy(
+                    retry_total=4, retry_status=4, retry_connect=0, retry_read=0,
+                    retry_backoff_factor=2, retry_backoff_max=60,
+                ),
                 connection_timeout=5,
                 read_timeout=15,
             )
