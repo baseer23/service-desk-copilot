@@ -166,6 +166,14 @@ class DocumentRepository:
         """Upgrade local duplicates once, preserving ambiguous paid-operation guards."""
         if ingestion_mode != "structured_graph" or document_processing != "azure_di":
             return previous
+        if (
+            previous.get("status") == "error"
+            and previous.get("processing_error_code") == "AZURE_DOCUMENT_CAPACITY"
+        ):
+            # Throttled extraction: resume from saved batches; finished pages are not re-sent.
+            return self.reprocess(
+                identifier, document_processing="azure_di", operator_reviewed_inflight=True
+            )
         if previous.get("document_processing") != "azure_di":
             updated = self.reprocess(identifier, document_processing="azure_di")
             row = self.records.read("document", identifier)
