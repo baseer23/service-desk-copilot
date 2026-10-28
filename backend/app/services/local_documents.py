@@ -4,6 +4,7 @@ import hashlib
 import logging
 import traceback
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from backend.app.services.document_repository import DocumentRepository
 from backend.app.services.capabilities import knowledge_stores
@@ -279,7 +280,9 @@ class LocalDocumentRepository(DocumentRepository):
             "source_persisted": False,
         }
 
-    def _publish_reference_objects(self, graph, identifier, title, extracted, *, temporary=False, version=1):
+    def _publish_reference_objects(
+        self, graph, identifier, title, extracted, *, temporary=False, version=1, provenance=None,
+    ):
         """Project Azure layout-derived, source-grounded structure into Aura.
 
         All text/values remain outside Neo4j. Links represent actual hierarchy,
@@ -299,10 +302,14 @@ class LocalDocumentRepository(DocumentRepository):
         if len(objects) + len(paragraphs) + len(cells) > 5000:
             raise ValueError("Document contains too many graph reference objects")
         node_count, relationship_count = 1, 0
+        provenance = provenance or {}
         graph.upsert_document(
             identifier, str(title or "Untitled")[:160],
             "unsaved_azure_layout_references" if temporary else "structured_local_document",
             version=version, content_hash=identifier,
+            source_type=provenance.get("source_type"),
+            source_url=provenance.get("source_url"),
+            canonical_url=provenance.get("canonical_url"),
         )
         pages = sorted({
             int(page)
@@ -480,7 +487,18 @@ class LocalDocumentRepository(DocumentRepository):
             for table_id in table_objects.get(table.get("id"), []):
                 graph.link_reference_objects(table_id, cell_id, "HAS_CELL")
                 relationship_count += 1
-        return {"nodes": node_count, "relationships": relationship_count}
+        counts = {"nodes": node_count, "relationships": relationship_count}
+        canonical_url = provenance.get("canonical_url")
+        if provenance.get("source_type") == "url" and canonical_url:
+            # Website membership and page links are reported apart from this
+            # document's own structural node/relationship counts.
+            parts = urlsplit(canonical_url)
+            links = graph.link_website_document(
+                identifier, f"{parts.scheme}://{parts.netloc}", canonical_url,
+                extracted.get("metadata", {}).get("links", []),
+            )
+            counts["website_links"] = links
+        return counts
 
     def _link_structured(self, identifier, state):
         """Publish reference-only structure with explicitly separate writer credentials."""
@@ -530,6 +548,9 @@ class LocalDocumentRepository(DocumentRepository):
             graph_counts = self._publish_reference_objects(
                 graph, identifier, state.get("title"), extraction,
                 temporary=False, version=state.get("version", 1),
+                provenance={
+                    key: state.get(key) for key in ("source_type", "source_url", "canonical_url")
+                },
             )
             return self._set_graph_status(
                 identifier, state, "ready", graph_counts=graph_counts

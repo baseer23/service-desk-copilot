@@ -199,3 +199,28 @@ def test_saved_page_extraction_has_sections_paragraphs_and_tables(site, workspac
     assert extraction["tables"][0]["cells"][3]["text"] == "$20"
     assert extraction["metadata"]["links"] == [ORIGIN]
     assert state["local_index_ready"] is True
+
+
+def test_graph_gets_website_documents_links_and_url_provenance(site, workspace):
+    from backend.app.store.graph_repo import InMemoryGraphRepository
+
+    _crawl_and_index(workspace)
+    graph = InMemoryGraphRepository()
+    by_url = {}
+    for document in workspace.repository.list_documents():
+        state = workspace.repository.get(document["id"])
+        extraction = json.loads(workspace.repository.blobs.get(document["id"], state["extraction_artifact"]))
+        counts = workspace.repository._publish_reference_objects(
+            graph, document["id"], state["title"], extraction, version=state["version"],
+            provenance={key: state[key] for key in ("source_type", "source_url", "canonical_url")},
+        )
+        assert set(counts) == {"nodes", "relationships", "website_links"}
+        by_url[state["canonical_url"]] = document["id"]
+    assert graph.websites[ORIGIN] == set(by_url.values())
+    a, b, home = by_url[ORIGIN + "/same-a"], by_url[ORIGIN + "/same-b"], by_url[ORIGIN]
+    assert graph.documents[a]["source_type"] == "url"
+    assert graph.documents[a]["source_url"] == graph.documents[a]["canonical_url"] == ORIGIN + "/same-a"
+    # Pages link each other whichever was published first.
+    assert {(a, b), (b, a), (home, a), (by_url[ORIGIN + "/fees"], home)} <= graph.document_links
+    # Links to pages that were never saved (robots, too large) create nothing.
+    assert all(target in by_url.values() for _, target in graph.document_links)
