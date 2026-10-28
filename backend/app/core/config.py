@@ -121,9 +121,12 @@ class Settings(BaseSettings):
     max_web_page_fetches: int = Field(default=4, ge=0, le=10)
     max_investigation_cycles: int = Field(default=8, ge=1, le=20)
     allow_url_ingest: bool = True
-    url_max_depth: int = Field(default=1, ge=0, le=3)
-    url_max_pages: int = Field(default=5, ge=1, le=10)
-    url_max_total_chars: int = Field(default=20000, ge=1000)
+    url_max_depth: int = Field(default=5, ge=0, le=10)
+    url_max_pages: int = Field(default=200, ge=1, le=2000)
+    # Per-page cap (larger pages are skipped as too large) and an overall
+    # safety cap across the whole crawl.
+    url_max_page_chars: int = Field(default=200_000, ge=1000)
+    url_max_total_chars: int = Field(default=20_000_000, ge=1000)
     url_rate_limit_sec: float = Field(default=1, ge=0)
     web_max_bytes: int = Field(default=2_000_000, ge=1024)
     model_config = SettingsConfigDict(

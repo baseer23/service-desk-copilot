@@ -4,6 +4,8 @@ import asyncio
 import base64
 import inspect
 import logging
+import time
+import uuid
 from datetime import datetime, timezone
 from functools import lru_cache, wraps
 from typing import Any, Literal
@@ -16,6 +18,10 @@ from mcp.server.fastmcp import Context, FastMCP
 
 server = FastMCP("deskmate")
 fixtures = FixtureRepository()
+
+
+# One bounded crawl step stays well inside the MCP request timeout.
+CRAWL_STEP_SECONDS = 20
 
 
 class URLIngestError(ValueError):
@@ -41,7 +47,7 @@ def capability(source_system, reliability=0.9):
                 if (
                     (settings.deployment_mode == "production" or not settings.test_mode)
                     and fn.__name__ in {
-                        "search_web", "search_news", "fetch_web_page", "ingest_url",
+                        "search_web", "search_news", "fetch_web_page", "ingest_url", "advance_url_crawl",
                         "get_weather", "geocode_location", "search_places", "get_route",
                         "convert_currency", "get_holidays",
                     }
@@ -811,8 +817,8 @@ def get_document_original(document_id: str):
 
 @capability("chroma")
 def ingest_url(url: str, max_depth: int | None = None, max_pages: int | None = None):
-    """Safely crawl bounded public pages and ingest extracted documents with URL provenance."""
-    from backend.app.services.url_crawler import CrawlLimits, UrlCrawler
+    """Start a durable background crawl of a public website; returns its job ID at once."""
+    from backend.app.services.web import validate_public_url
 
     s = get_settings()
     if not s.allow_url_ingest or not s.enable_public_web_tools:
@@ -827,83 +833,158 @@ def ingest_url(url: str, max_depth: int | None = None, max_pages: int | None = N
         )
     depth = s.url_max_depth if max_depth is None else max_depth
     pages = s.url_max_pages if max_pages is None else max_pages
-    if not 0 <= depth <= 3 or not 1 <= pages <= 10:
+    if not 0 <= depth <= 10 or not 1 <= pages <= 2000:
         raise ValueError("Invalid crawl limits")
     try:
-        result = UrlCrawler(s).crawl(
-            url, CrawlLimits(depth, pages, s.url_max_total_chars, s.url_rate_limit_sec)
-        )
-    except Exception as exc:
-        if hasattr(exc, "code"):
-            raise
-        logging.getLogger(__name__).warning(
-            "URL crawl failed safely (%s)", type(exc).__name__
-        )
-        if isinstance(exc, ValueError):
-            raise URLIngestError("URL_BLOCKED", str(exc), 400) from exc
-        raise URLIngestError(
-            "WEBSITE_UNAVAILABLE",
-            "The website could not be retrieved. Check its address or availability.",
-            502,
-        ) from exc
-    totals = {"chunks": 0, "entities": 0, "vector_count": 0, "ms": 0}
-    repository = documents()
-    document_ids = []
-    states = []
-    failed_pages = 0
-    duplicates = []
-    retrieved_at = datetime.now(timezone.utc).isoformat()
-    for page in result.pages:
-        try:
-            uploaded = repository.upload(
-                page.content.encode("utf-8"),
-                page.title,
-                "text/plain",
-                "structured_graph",
-                "local",
-                source_type="url",
-                source_url=page.url,
-                canonical_url=page.canonical_url or page.url,
-                retrieved_at=retrieved_at,
-            )
-            state = repository.process(uploaded["id"])
-            document_ids.append(uploaded["id"])
-            states.append(state)
-            duplicates.append(bool(uploaded.get("duplicate")))
-            totals["chunks"] += int(state.get("chunks", 0))
-            totals["vector_count"] += int(state.get("chunks", 0))
-        except Exception as exc:
-            logging.getLogger(__name__).warning(
-                "URL page indexing failed safely (%s)", type(exc).__name__
-            )
-            failed_pages += 1
-    if not states:
-        raise URLIngestError(
-            "VECTOR_INDEX_FAILED",
-            "The website was retrieved, but local knowledge indexing failed.",
-            502,
-        )
-    local_ready = all(state.get("local_index_ready") for state in states)
-    graph_link_status = (
-        "linked" if all(state.get("graph_link_status") == "linked" for state in states)
-        else "pending"
-    )
-    semantic_statuses = {state.get("semantic_graph_status", "pending") for state in states}
-    semantic_graph_status = semantic_statuses.pop() if len(semantic_statuses) == 1 else "pending"
-    status = "partial" if failed_pages else "ready" if graph_link_status == "linked" else "graph_pending"
-    return {
-        **totals,
-        "pages": len(states),
-        "failed_pages": failed_pages,
-        "skipped_urls": result.skipped_urls,
-        "document_ids": document_ids,
-        "duplicate": bool(duplicates) and all(duplicates),
-        "content_hash": document_ids[0] if len(document_ids) == 1 else None,
-        "local_index_ready": local_ready,
-        "graph_link_status": graph_link_status,
-        "semantic_graph_status": semantic_graph_status,
-        "status": status,
+        validate_public_url(url)
+    except ValueError as exc:
+        raise URLIngestError("URL_BLOCKED", str(exc), 400) from exc
+    job_id = uuid.uuid4().hex
+    now = datetime.now(timezone.utc).isoformat()
+    job = {
+        "job_id": job_id, "url": url, "status": "queued",
+        "max_depth": depth, "max_pages": pages,
+        "created_at": now, "updated_at": now,
+        "pages_saved": 0, "pages_duplicate": 0, "document_ids": [], "url_documents": {},
+        "save_failures": [], "crawl_state": None, "error_code": None, "error_message": None,
     }
+    documents().records.write(
+        "url_crawl_job", job_id, job, create_only=True, fields={"status": "queued"}
+    )
+    return _crawl_job_summary(job)
+
+
+def _crawl_job_summary(job, documents_by_id=None):
+    """Public job progress without the resumable crawl internals."""
+    state = job.get("crawl_state") or {}
+    skipped = [*state.get("skipped", []), *job.get("save_failures", [])]
+    reasons = {}
+    for item in skipped:
+        reasons[item["reason"]] = reasons.get(item["reason"], 0) + 1
+    found = set(state.get("seen_urls", [])) | {item[0] for item in state.get("queue", [])}
+    summary = {
+        key: job.get(key)
+        for key in (
+            "job_id", "url", "status", "max_depth", "max_pages", "created_at", "updated_at",
+            "pages_saved", "pages_duplicate", "document_ids", "error_code", "error_message",
+        )
+    }
+    summary.update(
+        pages_found=len(found), pages_skipped=len(skipped), skipped_reasons=reasons,
+        skipped=skipped[-50:], sitemap_seeds=state.get("sitemap_seeds", 0),
+    )
+    if documents_by_id is not None:
+        rows = [documents_by_id[item] for item in job.get("document_ids", []) if item in documents_by_id]
+        summary.update(
+            pages_indexed=sum(bool(row.get("local_index_ready")) for row in rows),
+            pages_linked=sum(row.get("graph_link_status") == "linked" for row in rows),
+            pages_failed=sum(row.get("status") == "error" for row in rows),
+        )
+    return summary
+
+
+@capability("public_web")
+def advance_url_crawl(job_id: str):
+    """Application-controlled: crawl the next bounded batch of a website job and save pages."""
+    from backend.app.services.url_crawler import CrawlError, CrawlLimits, UrlCrawler
+
+    s = get_settings()
+    repository = documents()
+    row = repository.records.read("url_crawl_job", job_id)
+    if not row:
+        raise ValueError("Crawl job not found")
+    job = dict(row["payload"])
+    if job["status"] not in {"queued", "running"}:
+        return {**_crawl_job_summary(job), "saved_now": 0}
+
+    def persist(status=None):
+        nonlocal row
+        job["status"] = status or job["status"]
+        job["updated_at"] = datetime.now(timezone.utc).isoformat()
+        row = repository.records.write(
+            "url_crawl_job", job_id, job, previous=row, fields={"status": job["status"]}
+        )
+
+    crawler = UrlCrawler(s)
+    if job["crawl_state"] is None:
+        limits = CrawlLimits(
+            job["max_depth"], job["max_pages"], s.url_max_total_chars,
+            s.url_rate_limit_sec, s.url_max_page_chars,
+        )
+        try:
+            job["crawl_state"] = crawler.start(job["url"], limits)
+        except CrawlError as exc:
+            job.update(error_code=exc.code, error_message=str(exc))
+            persist("failed")
+            return {**_crawl_job_summary(job), "saved_now": 0}
+        persist("running")
+    state = job["crawl_state"]
+    saved_now = 0
+    deadline = time.monotonic() + CRAWL_STEP_SECONDS
+    while not state["done"]:
+        # Each step saves at least one page, then stops at its time budget.
+        pages = crawler.advance(state, max_pages=1)
+        for page in pages:
+            try:
+                saved = repository.upload(
+                    page.html.encode("utf-8"), page.title, "text/html",
+                    "structured_graph", "local", source_type="url",
+                    source_url=page.url, canonical_url=page.canonical_url or page.url,
+                    retrieved_at=datetime.now(timezone.utc).isoformat(),
+                )
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "URL page save failed safely (%s)", type(exc).__name__
+                )
+                job["save_failures"].append({"url": page.url, "reason": "save_failed"})
+                continue
+            job["url_documents"][page.canonical_url or page.url] = saved["id"]
+            if saved["id"] not in job["document_ids"]:
+                job["document_ids"].append(saved["id"])
+            if saved.get("duplicate"):
+                job["pages_duplicate"] += 1
+            else:
+                job["pages_saved"] += 1
+                saved_now += 1
+        # Persist after every page so a restart resumes without refetching it.
+        persist()
+        if not pages or time.monotonic() >= deadline:
+            break
+    if state["done"]:
+        if job["document_ids"]:
+            persist("complete")
+        else:
+            error = UrlCrawler.empty_error(state)
+            job.update(error_code=error.code, error_message=str(error))
+            persist("failed")
+    return {**_crawl_job_summary(job), "saved_now": saved_now}
+
+
+@capability("sqlite_memory", 1)
+def list_url_crawl_jobs():
+    """Application-controlled: crawl jobs that still have work to do."""
+    records = documents().records
+    rows = [
+        *records.query("url_crawl_job", fields={"status": "queued"}, limit=100),
+        *records.query("url_crawl_job", fields={"status": "running"}, limit=100),
+    ]
+    return [{"job_id": row["payload"]["job_id"], "status": row["payload"]["status"]} for row in rows]
+
+
+@capability("sqlite_memory", 1)
+def get_url_crawl_job(job_id: str):
+    """Crawl job progress including how many saved pages are indexed and linked."""
+    repository = documents()
+    row = repository.records.read("url_crawl_job", job_id)
+    if not row:
+        raise ValueError("Crawl job not found")
+    documents_by_id = {item["id"]: item for item in repository.list_documents()}
+    for document_id in row["payload"].get("document_ids", []):
+        if document_id not in documents_by_id:
+            stored = repository.records.read("document", document_id)
+            if stored:
+                documents_by_id[document_id] = stored["payload"]
+    return _crawl_job_summary(row["payload"], documents_by_id)
 
 
 @capability("sqlite_memory", 1)

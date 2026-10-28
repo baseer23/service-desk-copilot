@@ -112,7 +112,14 @@ class DocumentRepository:
             "ingestion_mode": ingestion_mode,
             "document_processing": document_processing,
         }
-        family = hashlib.sha256((title or identifier).strip().casefold().encode()).hexdigest()
+        # A web page's identity is its canonical URL: same-titled pages stay
+        # separate documents, and re-crawling one URL adds a new version of it.
+        family_key = (
+            "url:" + (canonical_url or source_url)
+            if source_type == "url" and (canonical_url or source_url)
+            else (title or identifier).strip().casefold()
+        )
+        family = hashlib.sha256(family_key.encode()).hexdigest()
         with self.records.locked("document_family", family) as history:
             versions = history.setdefault("versions", [])
             payload.update(family=family, version=len(versions) + 1, content_hash=identifier)
@@ -327,6 +334,19 @@ class DocumentRepository:
                             "image_understanding": "not_applicable",
                         },
                     }
+                elif state["media_type"] == "text/html":
+                    # Saved web pages are structured locally, never sent to Azure.
+                    from backend.app.services.web import html_extraction
+
+                    original = (
+                        original_path.read_text(encoding="utf-8", errors="replace")
+                        if original_path
+                        else self.blobs.get(identifier, "original").decode("utf-8", "replace")
+                    )
+                    result = html_extraction(
+                        original,
+                        state.get("canonical_url") or state.get("source_url") or "https://localhost/",
+                    )
                 else:
                     state.update(phase="extract_inflight", status="extracting")
                     row = self.records.write("document", identifier, state, previous=row)

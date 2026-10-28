@@ -80,15 +80,19 @@ class GraphRepository:
     def upsert_document(
         self, doc_id: str, title: Optional[str] = None, source: str = "paste",
         *, version: int = 1, content_hash: str | None = None,
+        source_type: str | None = None, source_url: str | None = None,
+        canonical_url: str | None = None,
     ) -> None:
-        """Insert or update a document node and basic metadata."""
+        """Insert or update a document node, its metadata and source provenance."""
 
         def _tx(tx: Transaction) -> None:
             tx.run(
                 "MERGE (d:Document {id: $doc_id}) "
                 "SET d.title = $title, d.source = $source, d.version=$version, "
                 "d.content_hash=$content_hash, d.link_status='linked', "
-                "d.updated_at = timestamp(), d.original_id=$original_id, d.tenant_id=$tenant_id",
+                "d.updated_at = timestamp(), d.original_id=$original_id, d.tenant_id=$tenant_id, "
+                "d.source_type=$source_type, d.source_url=$source_url, "
+                "d.canonical_url=$canonical_url",
                 doc_id=self.scope(doc_id),
                 title=title,
                 source=source,
@@ -96,6 +100,9 @@ class GraphRepository:
                 tenant_id=self.tenant(),
                 version=version,
                 content_hash=content_hash or doc_id,
+                source_type=source_type,
+                source_url=source_url or None,
+                canonical_url=canonical_url or None,
             )
 
         self._execute_write(_tx)
@@ -250,6 +257,45 @@ class GraphRepository:
             return [dict(record) for record in result]
 
         return self._execute_read(_tx) or []
+
+    def link_website_document(self, doc_id: str, origin: str, canonical_url: str, outlinks):
+        """Attach a crawled page to its Website and to linked pages, in one transaction.
+
+        LINKS_TO is written in both directions against Documents already in the
+        graph (matched by canonical_url), so pages can be linked in any order.
+        """
+        outlinks = [str(url) for url in list(dict.fromkeys(outlinks or []))[:500]]
+
+        def _tx(tx: Transaction):
+            tx.run(
+                "MATCH (d:Document {id:$doc}) WHERE d.tenant_id=$tenant "
+                "SET d.outlinks=$outlinks "
+                "MERGE (w:Website {id:$website}) ON CREATE SET w.created_at=timestamp() "
+                "SET w.origin=$origin, w.original_id=$origin, w.tenant_id=$tenant "
+                "MERGE (w)-[:HAS_DOCUMENT]->(d)",
+                doc=self.scope(doc_id), tenant=self.tenant(), outlinks=outlinks,
+                website=self.scope("website:" + origin), origin=origin,
+            )
+            outbound = tx.run(
+                "MATCH (d:Document {id:$doc}) WHERE d.tenant_id=$tenant "
+                "UNWIND $outlinks AS url "
+                "MATCH (t:Document {canonical_url:url}) WHERE t.tenant_id=$tenant AND t <> d "
+                "MERGE (d)-[:LINKS_TO]->(t) RETURN count(*) AS written",
+                doc=self.scope(doc_id), tenant=self.tenant(), outlinks=outlinks,
+            ).single()
+            inbound = tx.run(
+                "MATCH (d:Document {id:$doc}) WHERE d.tenant_id=$tenant "
+                "MATCH (s:Document) WHERE s.tenant_id=$tenant AND s <> d "
+                "AND $canonical IN coalesce(s.outlinks, []) "
+                "MERGE (s)-[:LINKS_TO]->(d) RETURN count(*) AS written",
+                doc=self.scope(doc_id), tenant=self.tenant(), canonical=canonical_url,
+            ).single()
+            return {
+                "outbound": outbound["written"] if outbound else 0,
+                "inbound": inbound["written"] if inbound else 0,
+            }
+
+        return self._execute_write(_tx) or {"outbound": 0, "inbound": 0}
 
     def link_reference_objects(self, source_id: str, target_id: str, relationship: str):
         allowed = {
@@ -772,6 +818,9 @@ class UnavailableGraphRepository:
     def upsert_document(self, *args, **kwargs):
         pass
 
+    def link_website_document(self, *args, **kwargs):
+        return {"outbound": 0, "inbound": 0}
+
     def upsert_chunk(self, *args, **kwargs):
         pass
 
@@ -842,6 +891,8 @@ class InMemoryGraphRepository:
         self.semantic_facts: MutableMapping[str, Dict[str, Any]] = {}
         self.knowledge_relationships: list[dict] = []
         self.document_mentions: list[dict] = []
+        self.websites: MutableMapping[str, set] = {}
+        self.document_links: set[tuple[str, str]] = set()
 
     def ensure_constraints(self) -> None:  # pragma: no cover - no-op for in-memory variant
         """In-memory store has no constraints to create."""
@@ -850,6 +901,7 @@ class InMemoryGraphRepository:
         deleted = sum(map(len, (self.documents, self.chunks, self.entity_links, self.references, self.semantic_facts)))
         self.documents.clear(); self.chunks.clear(); self.entity_links.clear(); self.references.clear(); self.semantic_facts.clear()
         self.knowledge_relationships.clear(); self.document_mentions.clear()
+        self.websites.clear(); self.document_links.clear()
         return {"status": "cleared", "deleted": deleted, "remaining": 0}
 
     def upsert_document(
@@ -857,7 +909,23 @@ class InMemoryGraphRepository:
     ) -> None:
         """Store document metadata in-memory."""
 
-        self.documents[doc_id] = {"title": title, "source": source}
+        self.documents[doc_id] = {
+            "title": title, "source": source,
+            **{key: metadata.get(key) for key in ("source_type", "source_url", "canonical_url")},
+        }
+
+    def link_website_document(self, doc_id, origin, canonical_url, outlinks):
+        self.websites.setdefault(origin, set()).add(doc_id)
+        self.documents.setdefault(doc_id, {})["outlinks"] = list(outlinks or [])
+        before = len(self.document_links)
+        for other_id, other in self.documents.items():
+            if other_id == doc_id:
+                continue
+            if other.get("canonical_url") in (outlinks or []):
+                self.document_links.add((doc_id, other_id))
+            if canonical_url in (other.get("outlinks") or []):
+                self.document_links.add((other_id, doc_id))
+        return {"outbound": len(self.document_links) - before, "inbound": 0}
 
     def upsert_page(self, doc_id: str, page: int, version: int = 1) -> None:
         """Pages are implicit in the lightweight test repository."""

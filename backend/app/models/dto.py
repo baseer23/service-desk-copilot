@@ -44,8 +44,33 @@ class IngestPdfResponse(IngestPasteResponse):
 
 class IngestUrlRequest(BaseModel):
     url: str
-    max_depth: int | None = Field(default=None, ge=0, le=3)
-    max_pages: int | None = Field(default=None, ge=1, le=10)
+    max_depth: int | None = Field(default=None, ge=0, le=10)
+    max_pages: int | None = Field(default=None, ge=1, le=2000)
+
+
+class IngestUrlJobResponse(BaseModel):
+    """A website crawl job: progress grows as the background crawler saves pages."""
+
+    job_id: str
+    url: str
+    status: Literal["queued", "running", "complete", "failed"]
+    max_depth: int
+    max_pages: int
+    created_at: str | None = None
+    updated_at: str | None = None
+    pages_found: int = 0
+    pages_saved: int = 0
+    pages_duplicate: int = 0
+    pages_skipped: int = 0
+    skipped_reasons: dict[str, int] = Field(default_factory=dict)
+    skipped: list[dict[str, str]] = Field(default_factory=list)
+    sitemap_seeds: int = 0
+    document_ids: list[str] = Field(default_factory=list)
+    pages_indexed: int | None = None
+    pages_linked: int | None = None
+    pages_failed: int | None = None
+    error_code: str | None = None
+    error_message: str | None = None
 
 
 class IngestUrlResponse(IngestPasteResponse):
