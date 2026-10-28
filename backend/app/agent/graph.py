@@ -2894,17 +2894,22 @@ class ServiceDeskAgent:
                 if not item or item.get("source_type") != "document":
                     continue
                 metadata = item.get("content", {}).get("metadata", {})
+                title = item["content"].get("title") or metadata.get("title") or "saved document"
+                web_page = metadata.get("canonical_url") or metadata.get("url")
+                if metadata.get("source_type") == "url" and web_page:
+                    # A web page has no page numbers; cite its title and address.
+                    locations.setdefault(f"{title} — {web_page}", [])
+                    continue
                 if metadata.get("page") is None:
                     continue
-                title = item["content"].get("title") or metadata.get("title") or "saved document"
                 pages = locations.setdefault(title, [])
                 if metadata["page"] not in pages:
                     pages.append(metadata["page"])
             if locations:
                 citation = "; ".join(
-                    f"{title}, page{'s' if len(pages) > 1 else ''} "
+                    label if not pages else f"{label}, page{'s' if len(pages) > 1 else ''} "
                     + ", ".join(str(page) for page in pages[:5])
-                    for title, pages in list(locations.items())[:3]
+                    for label, pages in list(locations.items())[:3]
                 )
                 answer_value = f"{answer_value.rstrip().rstrip('.')} ({citation})."
         response = FinalResponse(

@@ -224,3 +224,39 @@ def test_graph_gets_website_documents_links_and_url_provenance(site, workspace):
     assert {(a, b), (b, a), (home, a), (by_url[ORIGIN + "/fees"], home)} <= graph.document_links
     # Links to pages that were never saved (robots, too large) create nothing.
     assert all(target in by_url.values() for _, target in graph.document_links)
+
+
+def test_chat_cites_web_page_title_and_url_not_page_number(make_client):
+    client = make_client()
+    agent = client.app.state.agent
+    url = ORIGIN + "/fees"
+    evidence = {
+        "id": "web-fees", "source_system": "chroma", "source_type": "document",
+        "tool": "search_knowledge", "timestamp": "2026-10-28T00:00:00Z",
+        "observed_at": "2026-10-28T00:00:00Z", "source": "/documents/x/download", "url": url,
+        "reliability": 0.9, "content": {
+            "title": "Fees", "text": "Annual mooring fees are $20.",
+            "metadata": {"source_type": "url", "url": url, "canonical_url": url, "page": 1},
+        },
+    }
+    answer = "The annual mooring permit costs $20."
+    state = {
+        "case_id": "web-citation", "persist_case": False, "workflow": "knowledge",
+        "ticket": {"summary": "How much is the mooring permit?"}, "research_iteration": 1,
+        "evidence": [evidence], "confirmed_facts": [], "contradictions": [],
+        "decision": {
+            "outcome": "answer", "evidence_summary": "The fees page lists it.",
+            "hypotheses": [{"claim": answer, "evidence_ids": ["web-fees"], "status": "supported"}],
+            "enough_information": True, "answer": answer, "confidence": 0.9,
+        },
+        "verification": {
+            "supported_claims": [answer], "evidence_ids": ["web-fees"], "confidence": 0.9,
+            "should_continue_research": False, "justification": "Supported.",
+        },
+    }
+    agent._request_events["web-citation"] = []
+    result = client.portal.call(agent.finalize, state)
+    final = result["final_answer"]
+    assert final == f"The annual mooring permit costs $20 (Fees — {url})."
+    assert "page" not in final
+    assert url in result["final_response"]["sources"]
