@@ -60,9 +60,13 @@ def offline_test() -> None:
     )
     parent = {"PATH": "/bin", "UNRELATED": "excluded"}
     child = build_neo4j_stdio_env(settings, parent)
-    assert child["NEO4J_MCP_READ_ONLY"] == "true"
-    assert child["NEO4J_MCP_TELEMETRY"] == "false"
-    assert "UNRELATED" not in child and "NEO4J_MCP_PASSWORD" not in parent
+    assert child["NEO4J_READ_ONLY"] == "true"
+    assert child["NEO4J_TELEMETRY"] == "false"
+    assert child["NEO4J_URI"] == settings.neo4j_uri
+    assert child["NEO4J_USERNAME"] == settings.neo4j_user
+    assert child["NEO4J_DATABASE"] == settings.neo4j_database
+    assert "UNRELATED" not in child and "NEO4J_PASSWORD" not in parent
+    assert not any(key.startswith("NEO4J_MCP_") for key in child)
     print("offline adapter verification: ok")
 
 
@@ -123,7 +127,7 @@ async def live_test() -> None:
             "neo4j__read-cypher",
             {"query": "MATCH (n) RETURN count(n) AS node_count", "params": {}},
         )
-        if not _contains_ok(one):
+        if one["status"] != "ok" or not one["items"] or one["items"][0].get("ok") != 1:
             raise MCPToolError("The read-only verification query did not return ok=1")
         print("server connected: yes")
         print("tools discovered: " + ", ".join(sorted(expected)))

@@ -655,6 +655,8 @@ class ServiceDeskAgent:
                 "workflow",
                 "intent",
                 "explicit_saved_knowledge",
+                "resolved_document_ids",
+                "document_alias_matches",
                 "analysis",
                 "remembered_facts",
                 "personal_memory",
@@ -702,6 +704,12 @@ class ServiceDeskAgent:
         # Enforce explicit user-specified source scope, not keyword-based
         # topic routing. The planner still chooses relevant local tools.
         request_text = state["ticket"]["summary"]
+        inventory_result = await self.harness.invoke("list_documents", {})
+        inventory = inventory_result.get("result") or inventory_result.get("items") or []
+        alias_matches = self._document_alias_matches(request_text, inventory)
+        resolved_document_ids = (
+            [alias_matches[0]["id"]] if len(alias_matches) == 1 else []
+        )
         explicit_local = bool(re.search(
             r"(?:\b(?:from|check|search|use)\s+(?:(?:my|our|the|saved|uploaded|internal)\s+){0,3}(?:knowledge|kb)\b"
             r"|\baccording\s+to\s+(?:(?:my|our|the)\s+)?(?:uploaded|saved|local)\s+(?:pdf|document|file|newspaper)\b"
@@ -713,7 +721,7 @@ class ServiceDeskAgent:
         # enforce source scope when the model misses an explicit phrase.
         explicit_local = explicit_local or (
             intent.workflow == "knowledge" and intent.knowledge_source == "documents"
-        )
+        ) or bool(alias_matches)
         explicit_public = bool(re.search(
             r"\b(?:search|check|look\s+up)\s+(?:online|the\s+(?:web|internet))\b"
             r"|\blatest\s+official\s+(?:requirements|rules|regulations|guidance)\b",
@@ -761,8 +769,24 @@ class ServiceDeskAgent:
         return {
             "intent": intent.model_dump(), "workflow": intent.workflow,
             "explicit_saved_knowledge": explicit_local,
+            "resolved_document_ids": resolved_document_ids,
+            "document_alias_matches": alias_matches,
+            "document_inventory": inventory,
             "chat_messages": state.get("chat_messages", []),
         }
+
+    @staticmethod
+    def _document_alias_matches(question, inventory):
+        normalized_question = re.sub(r"[^a-z0-9]", "", question.casefold())
+        matches = []
+        for document in inventory if isinstance(inventory, list) else []:
+            identifier = str(document.get("id") or "")
+            title = str(document.get("title") or "")
+            stem = title.rsplit(".", 1)[0]
+            alias = re.sub(r"[^a-z0-9]", "", stem.casefold())
+            if identifier and len(alias) >= 4 and alias in normalized_question:
+                matches.append({"id": identifier, "title": title, "alias": alias})
+        return matches
 
     def intent_route(self, state):
         intent = state["intent"]
@@ -815,7 +839,19 @@ class ServiceDeskAgent:
         result = await self.harness.invoke(
             "list_available_context", {"question": state["ticket"]["summary"]}
         )
-        return {"available_context": result["result"]}
+        inventory_result = await self.harness.invoke("list_documents", {})
+        inventory = inventory_result.get("result") or inventory_result.get("items") or []
+        matches = self._document_alias_matches(state["ticket"]["summary"], inventory)
+        resolved = [matches[0]["id"]] if len(matches) == 1 else []
+        available = dict(result["result"])
+        available["saved_document_matches"] = matches
+        return {
+            "available_context": available,
+            "explicit_saved_knowledge": state.get("explicit_saved_knowledge") or bool(matches),
+            "resolved_document_ids": resolved,
+            "document_alias_matches": matches,
+            "document_inventory": inventory,
+        }
 
     async def analyze_ticket(self, state):
         analysis = await self.provider.generate_structured(
@@ -850,6 +886,25 @@ class ServiceDeskAgent:
             await self.harness.initialize()
             await emit("discover_tools", "completed", "MCP tool schemas validated",
                        tool_count=len(self.harness.tools))
+        alias_matches = state.get("document_alias_matches", [])
+        if len(alias_matches) > 1:
+            choices = ", ".join(match["title"] for match in alias_matches[:5])
+            plan = InvestigationPlan(
+                goal="Resolve the saved document before retrieval",
+                additional_evidence_useful=False,
+                source_strategy="Use only the tenant-owned saved-document inventory.",
+                clarification_needed=True,
+                clarification_question=f"Which saved document did you mean: {choices}?",
+                clarification_reason="More than one tenant-owned filename matches the supplied alias.",
+                stop_condition="Stop after the user identifies one saved document.",
+            )
+            await self.note(state, "plan", f"Plan: {plan.goal}.", "application")
+            return {
+                "plan": plan.model_dump(),
+                "research_questions": [],
+                "plan_executed": False,
+                "tools_discovered": True,
+            }
         context = self.context(state, True)
         for attempt in range(2):
             plan = await self.provider.generate_structured("plan", context, InvestigationPlan)
@@ -861,7 +916,14 @@ class ServiceDeskAgent:
             if state.get("explicit_saved_knowledge"):
                 for call in plan.tool_calls:
                     if call.name == "search_knowledge":
-                        call.arguments = {**call.arguments, "mode": "HYBRID"}
+                        graph_plan = dict(call.arguments.get("graph_plan") or {})
+                        graph_plan["document_ids"] = list(state.get("resolved_document_ids", []))
+                        call.arguments = {
+                            **call.arguments,
+                            "question": state["ticket"]["summary"],
+                            "mode": "HYBRID",
+                            "graph_plan": graph_plan,
+                        }
             try:
                 self.harness.validate_plan(plan, state["workflow"])
                 if not plan.tool_calls and plan.additional_evidence_useful and not plan.clarification_needed:
@@ -942,6 +1004,11 @@ class ServiceDeskAgent:
                                     "question": state["ticket"]["summary"],
                                     "top_k": 5,
                                     "mode": "HYBRID",
+                                    "graph_plan": {
+                                        "document_ids": list(
+                                            state.get("resolved_document_ids", [])
+                                        ),
+                                    },
                                 },
                                 "reason": "The request explicitly names the user's saved document.",
                             }],

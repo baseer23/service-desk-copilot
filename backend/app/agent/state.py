@@ -13,6 +13,9 @@ class InvestigationState(TypedDict, total=False):
     workflow: str
     intent: dict[str, Any]
     explicit_saved_knowledge: bool
+    resolved_document_ids: list[str]
+    document_alias_matches: list[dict[str, Any]]
+    document_inventory: list[dict[str, Any]]
     analysis: dict[str, Any]
     plan: dict[str, Any]
     research_questions: list[str]

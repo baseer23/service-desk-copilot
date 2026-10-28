@@ -34,12 +34,12 @@ def build_neo4j_stdio_env(settings, parent_env: Mapping[str, str]) -> dict[str, 
     child = {key: value for key, value in parent_env.items() if key in _PASSTHROUGH}
     child.update(
         {
-            "NEO4J_MCP_URI": uri,
-            "NEO4J_MCP_USERNAME": username,
-            "NEO4J_MCP_PASSWORD": password,
-            "NEO4J_MCP_DATABASE": database,
-            "NEO4J_MCP_READ_ONLY": "true",
-            "NEO4J_MCP_TELEMETRY": "false",
+            "NEO4J_URI": uri,
+            "NEO4J_USERNAME": username,
+            "NEO4J_PASSWORD": password,
+            "NEO4J_DATABASE": database,
+            "NEO4J_READ_ONLY": "true",
+            "NEO4J_TELEMETRY": "false",
         }
     )
     return child
