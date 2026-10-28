@@ -35,6 +35,51 @@ interface DocumentStatus {
   graph_last_error?: string
 }
 
+interface CrawlJob {
+  job_id: string
+  url: string
+  status: 'queued' | 'running' | 'complete' | 'failed'
+  pages_found?: number
+  pages_saved?: number
+  pages_duplicate?: number
+  pages_skipped?: number
+  skipped_reasons?: Record<string, number>
+  document_ids?: string[]
+  pages_indexed?: number | null
+  pages_linked?: number | null
+  pages_failed?: number | null
+  error_message?: string | null
+}
+
+const SKIP_REASONS: Record<string, string> = {
+  robots_disallowed: 'blocked by robots.txt', not_html: 'not HTML', rate_limited: 'rate limited',
+  too_large: 'too large', fetch_failed: 'unreachable', depth_limit: 'beyond crawl depth',
+  duplicate_content: 'duplicate content', off_origin: 'on another site', empty: 'no readable text',
+  overall_limit: 'crawl size limit reached', save_failed: 'could not be saved',
+}
+
+export function crawlSummary(job: CrawlJob): { text: string; terminal: boolean } {
+  const state = { queued: 'Queued', running: 'Crawling', complete: 'Crawl complete', failed: 'Crawl failed' }[job.status]
+  const saved = (job.document_ids ?? []).length
+  const lines = [
+    `Website: ${job.url}`,
+    `${state} — pages found ${job.pages_found ?? 0}, saved ${job.pages_saved ?? 0}` +
+      `${job.pages_duplicate ? ` (+${job.pages_duplicate} already saved)` : ''}, skipped ${job.pages_skipped ?? 0}`,
+  ]
+  if (job.pages_indexed != null) {
+    lines.push(`Indexed ${job.pages_indexed} of ${saved} · Neo4j linked ${job.pages_linked ?? 0} of ${saved}` +
+      `${job.pages_failed ? ` · ${job.pages_failed} failed` : ''}`)
+  }
+  const reasons = Object.entries(job.skipped_reasons ?? {})
+  if (reasons.length) {
+    lines.push('Skipped: ' + reasons.map(([reason, count]) =>
+      `${count} ${SKIP_REASONS[reason] ?? reason.replace(/^http_/, 'HTTP ').replace(/_/g, ' ')}`).join(', '))
+  }
+  if (job.status === 'failed' && job.error_message) lines.push(job.error_message)
+  const indexingDone = job.pages_indexed != null && (job.pages_indexed + (job.pages_failed ?? 0)) >= saved
+  return { text: lines.join('\n'), terminal: job.status === 'failed' || (job.status === 'complete' && indexingDone) }
+}
+
 function processingSummary(document: DocumentStatus): { text: string; terminal: boolean } {
   const title = document.title ? `${document.title}\n` : ''
   if (document.status === 'error' || document.status === 'failed') {
@@ -149,6 +194,7 @@ export default function KnowledgePanel({
   const [azureDi, setAzureDi] = useState(true)
   const [neo4jRead, setNeo4jRead] = useState(true)
   const [activeDocumentId, setActiveDocumentId] = useState<string | null>(null)
+  const [crawlJobId, setCrawlJobId] = useState<string | null>(null)
   const picker = useRef<HTMLInputElement>(null)
   const autoGraph = readiness?.automatic_graph_ingestion_enabled === true
   const azureAvailable = readiness?.azure_document_intelligence_available
@@ -184,6 +230,32 @@ export default function KnowledgePanel({
       if (timer) clearTimeout(timer)
     }
   }, [activeDocumentId])
+
+  useEffect(() => {
+    if (!crawlJobId) return
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const poll = async () => {
+      try {
+        const job = await request<CrawlJob>(`/ingest/url/${crawlJobId}/status`)
+        if (cancelled) return
+        const summary = crawlSummary(job)
+        setMessage(summary.text)
+        if (summary.terminal) setCrawlJobId(null)
+        else timer = setTimeout(() => void poll(), 1500)
+      } catch (caught) {
+        if (!cancelled) {
+          setError((caught as Error).message)
+          setCrawlJobId(null)
+        }
+      }
+    }
+    void poll()
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+    }
+  }, [crawlJobId])
 
   function chooseFile(selected: File | undefined) {
     if (!selected) return
@@ -245,7 +317,7 @@ export default function KnowledgePanel({
         graph_link_status?: 'linked' | 'pending' | 'not_configured'
         semantic_graph_status?: string
         failed_pages?: number
-      }>(path, options)
+      } & Partial<Omit<CrawlJob, 'status'>>>(path, options)
       if (result.id && (path === '/documents/upload' || path === '/documents/paste')) {
         setActiveDocumentId(result.id)
       }
@@ -257,17 +329,10 @@ export default function KnowledgePanel({
         setMessage(autoGraph
           ? `${result.method === 'document_intelligence' ? 'Azure Document Intelligence' : 'Local text fallback'} extracted ${result.pages} page(s). Neo4j linked ${result.graph_nodes ?? 0} nodes and ${result.graph_relationships ?? 0} relationships; the original and extracted text were not saved in DeskMate.`
           : `Text preview is ready (${result.pages} page(s)).`)
-      } else if (mode === 'url' && result.local_index_ready) {
-        const indexed = `${result.pages ?? 0} public page(s) were added to local knowledge.`
-        const failed = result.failed_pages ? ` ${result.failed_pages} page(s) could not be indexed.` : ''
-        const graph = result.graph_link_status === 'linked'
-          ? result.semantic_graph_status === 'linked'
-            ? ' Neo4j semantic linking is complete.'
-            : result.semantic_graph_status === 'linked_no_relationships'
-            ? ' Neo4j semantic linking found entities but no relationships.'
-            : ' Neo4j references are linked; semantic enrichment is pending.'
-          : ' Local knowledge is ready; Neo4j linking remains pending.'
-        setMessage(indexed + failed + graph)
+      } else if (mode === 'url' && result.job_id) {
+        // The crawl continues in the background; progress is polled below.
+        setMessage(crawlSummary(result as unknown as CrawlJob).text)
+        setCrawlJobId(result.job_id)
       } else if (result.status && result.status !== 'ready') {
         const stage: Record<string, string> = {
           queued: 'Extracting', extracting: 'Extracting', structuring: 'Structuring',
@@ -446,7 +511,7 @@ export default function KnowledgePanel({
         {mode === 'url' && readiness?.url_ingestion_enabled === true && !busy && (
           <p className="muted">Web page uploads are enabled. Public URL security and robots.txt rules still apply.</p>
         )}
-        {mode === 'url' && busy && <p className="muted">Crawling and indexing a bounded set of public pages…</p>}
+        {mode === 'url' && busy && <p className="muted">Starting the website crawl…</p>}
         {mode !== 'url' && (
           <button
             type="button"
