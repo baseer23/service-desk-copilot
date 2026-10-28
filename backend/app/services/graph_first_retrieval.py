@@ -44,6 +44,13 @@ class GraphFirstRetrieval:
         if not getattr(self.graph_repo, "available", True) or lookup is None:
             return [], "unavailable"
         plan = GraphLookupPlan.model_validate(graph_plan) if graph_plan else self.plan(question)
+        if not plan.entities and not plan.concepts:
+            # A plan that only scopes document_ids still needs lookup terms;
+            # the graph query matches nothing without them.
+            derived = self.plan(question)
+            plan = plan.model_copy(
+                update={"entities": derived.entities, "concepts": derived.concepts}
+            )
         try:
             references = lookup(
                 [*plan.entities, *plan.concepts],

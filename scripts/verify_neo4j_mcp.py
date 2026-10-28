@@ -60,13 +60,12 @@ def offline_test() -> None:
     )
     parent = {"PATH": "/bin", "UNRELATED": "excluded"}
     child = build_neo4j_stdio_env(settings, parent)
-    assert child["NEO4J_READ_ONLY"] == "true"
-    assert child["NEO4J_TELEMETRY"] == "false"
-    assert child["NEO4J_URI"] == settings.neo4j_uri
-    assert child["NEO4J_USERNAME"] == settings.neo4j_user
-    assert child["NEO4J_DATABASE"] == settings.neo4j_database
-    assert "UNRELATED" not in child and "NEO4J_PASSWORD" not in parent
-    assert not any(key.startswith("NEO4J_MCP_") for key in child)
+    assert child["NEO4J_MCP_READ_ONLY"] == "true"
+    assert child["NEO4J_MCP_TELEMETRY"] == "false"
+    assert child["NEO4J_MCP_URI"] == settings.neo4j_uri
+    assert child["NEO4J_MCP_USERNAME"] == settings.neo4j_user
+    assert child["NEO4J_MCP_DATABASE"] == settings.neo4j_database
+    assert "UNRELATED" not in child and "NEO4J_MCP_PASSWORD" not in parent
     print("offline adapter verification: ok")
 
 
