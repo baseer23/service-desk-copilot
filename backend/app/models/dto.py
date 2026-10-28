@@ -44,8 +44,8 @@ class IngestPdfResponse(IngestPasteResponse):
 
 class IngestUrlRequest(BaseModel):
     url: str
-    max_depth: int | None = Field(default=None, ge=0, le=3)
-    max_pages: int | None = Field(default=None, ge=1, le=10)
+    max_depth: int | None = Field(default=None, ge=0, le=10)
+    max_pages: int | None = Field(default=None, ge=1, le=2000)
 
 
 class IngestUrlResponse(IngestPasteResponse):

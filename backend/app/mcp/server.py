@@ -827,11 +827,13 @@ def ingest_url(url: str, max_depth: int | None = None, max_pages: int | None = N
         )
     depth = s.url_max_depth if max_depth is None else max_depth
     pages = s.url_max_pages if max_pages is None else max_pages
-    if not 0 <= depth <= 3 or not 1 <= pages <= 10:
+    if not 0 <= depth <= 10 or not 1 <= pages <= 2000:
         raise ValueError("Invalid crawl limits")
     try:
         result = UrlCrawler(s).crawl(
-            url, CrawlLimits(depth, pages, s.url_max_total_chars, s.url_rate_limit_sec)
+            url, CrawlLimits(
+                depth, pages, s.url_max_total_chars, s.url_rate_limit_sec, s.url_max_page_chars
+            )
         )
     except Exception as exc:
         if hasattr(exc, "code"):

@@ -30,6 +30,7 @@ class CrawlLimits:
     max_pages: int
     max_total_chars: int
     rate_limit_sec: float
+    max_page_chars: int = 200_000
 
 
 @dataclass
@@ -48,7 +49,13 @@ class CrawlResult:
 
     pages: List[CrawledPage] = field(default_factory=list)
     skipped_urls: List[str] = field(default_factory=list)
+    skipped: List[dict] = field(default_factory=list)
     pages_visited: int = 0
+
+    def skip(self, url: str, reason: str) -> None:
+        """Record a skipped URL with a user-facing reason code."""
+        self.skipped_urls.append(url)
+        self.skipped.append({"url": url, "reason": reason})
 
 
 class CrawlError(ValueError):
@@ -103,27 +110,27 @@ class UrlCrawler:
             seen_urls.add(current_url)
 
             if depth > limits.max_depth:
-                result.skipped_urls.append(current_url)
+                result.skip(current_url, "depth_limit")
                 continue
 
             if not self._can_fetch(robot_parser, current_url):
                 robots_blocked = robots_blocked or depth == 0
-                result.skipped_urls.append(current_url)
+                result.skip(current_url, "robots_disallowed")
                 continue
 
             last_fetch = self._respect_rate_limit(last_fetch, limits.rate_limit_sec)
-            response = self._safe_get(current_url)
+            response, failure = self._fetch(current_url)
             if response is None and depth == 0 and current_url == self._normalize_url(root_url):
                 alias = self._www_alias_url(current_url)
                 if alias:
-                    response = self._safe_get(alias)
+                    response, failure = self._fetch(alias)
             if response is None:
-                result.skipped_urls.append(current_url)
+                result.skip(current_url, failure)
                 continue
 
             content_type = response.headers.get("Content-Type", "").lower()
             if "text/html" not in content_type:
-                result.skipped_urls.append(current_url)
+                result.skip(current_url, "not_html")
                 continue
             retrieved_html = True
 
@@ -136,7 +143,7 @@ class UrlCrawler:
                 # crawl origin; all subsequent traversal remains same-origin.
                 parsed_root = parsed_page
             elif parsed_page.scheme != parsed_root.scheme or parsed_page.netloc != parsed_root.netloc:
-                result.skipped_urls.append(page_url)
+                result.skip(page_url, "off_origin")
                 continue
 
             soup = BeautifulSoup(html, "html.parser")
@@ -146,14 +153,20 @@ class UrlCrawler:
 
             text, title = self._extract_text_and_title(soup, canonical_url)
             if not text:
+                result.skip(page_url, "empty")
+                continue
+            if len(text) > limits.max_page_chars:
+                result.skip(page_url, "too_large")
                 continue
 
             text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
             if text_hash in seen_hashes:
+                result.skip(page_url, "duplicate_content")
                 continue
             seen_hashes.add(text_hash)
 
             if total_chars + len(text) > limits.max_total_chars:
+                result.skip(page_url, "overall_limit")
                 break
 
             result.pages.append(
@@ -196,6 +209,7 @@ class UrlCrawler:
             max_pages=max(1, self._settings.url_max_pages),
             max_total_chars=self._settings.url_max_total_chars,
             rate_limit_sec=self._settings.url_rate_limit_sec,
+            max_page_chars=self._settings.url_max_page_chars,
         )
 
     def _load_robots(self, parsed_root: ParseResult) -> RobotFileParser:
@@ -246,13 +260,21 @@ class UrlCrawler:
     def _safe_get(self, url: str) -> Optional[requests.Response]:
         """Perform a GET request handling exceptions and non-200 codes."""
 
+        return self._fetch(url)[0]
+
+    def _fetch(self, url: str) -> Tuple[Optional[requests.Response], str]:
+        """GET a page; on failure return (None, reason) without raising."""
+
         try:
             response = fetch_response(url, self._session, self._settings.web_max_bytes)
-            if response.status_code != 200:
-                return None
-            return response
-        except Exception:
-            return None
+        except Exception as exc:
+            reason = "too_large" if "size limit" in str(exc).lower() else "fetch_failed"
+            return None, reason
+        if response.status_code == 429:
+            return None, "rate_limited"
+        if response.status_code != 200:
+            return None, f"http_{response.status_code}"
+        return response, ""
 
     def _normalize_url(self, url: str) -> str:
         """Return a normalised URL suitable for deduplication."""
