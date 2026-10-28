@@ -109,6 +109,8 @@ class RequestResult(BaseModel):
     chat_messages: list[dict[str, str]] = Field(default_factory=list)
     research_iteration: int = 0
     explicit_saved_knowledge: bool = False
+    # available | empty | stale | unavailable | error; None when no graph read ran.
+    graph_status: str | None = None
     executed_tool_calls: list[str] = Field(default_factory=list)
 
     @model_validator(mode="before")

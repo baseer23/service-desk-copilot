@@ -28,11 +28,25 @@ from backend.app.agent.models import (
 from backend.app.agent.scope import SCOPE_MESSAGE
 from backend.app.agent.state import InvestigationState
 from backend.app.agent.tools import AgentToolHarness, PlanValidationError
-from backend.app.mcp.client import MCPToolError
+from backend.app.mcp.client import MCPConnectionError, MCPToolError
 from backend.app.models.provider import LLMError
 from backend.app.services.source_policy import permits, quality, rank_sources
 from backend.app.services.web import relevant_excerpt
 from backend.app.services.entities import extract_entities
+
+DOCUMENT_EXTENSION = re.compile(r"\.(?:pdf|docx?|txt|md|html?|pptx?|xlsx?|csv|rtf)$", re.IGNORECASE)
+# GraphLookupPlan.document_ids accepts at most ten saved documents.
+MAX_DOCUMENT_CHOICES = 10
+OPENING_QUOTES = "\u201c\u2018"
+CLOSING_QUOTES = "\u201d\u2019"
+MAX_GRAPH_OBJECT_REFERENCES = 500
+GRAPH_STATUS_SUMMARIES = {
+    "available": "Graph references resolved to local document passages",
+    "empty": "Graph returned no references for this request",
+    "stale": "Graph references had no matching local passages",
+    "unavailable": "Graph is not connected; local retrieval continues",
+    "error": "Graph read failed; local retrieval continues",
+}
 
 LABELS = {
     "search_memory": "Memory searched",
@@ -104,7 +118,10 @@ class ServiceDeskAgent:
             "remember",
             "finalize",
         ):
-            builder.add_node(name, instrument(name, getattr(self, name)))
+            function = (
+                self.execute_planned_tools if name == "execute_tools" else getattr(self, name)
+            )
+            builder.add_node(name, instrument(name, function))
         builder.add_node("reject_scope", instrument("reject_scope", self.reject_scope))
         builder.add_edge("reject_scope", END)
         builder.add_node("knowledge_subgraph", self.knowledge_subgraph)
@@ -657,6 +674,7 @@ class ServiceDeskAgent:
                 "explicit_saved_knowledge",
                 "resolved_document_ids",
                 "document_alias_matches",
+                "graph_status",
                 "analysis",
                 "remembered_facts",
                 "personal_memory",
@@ -704,12 +722,6 @@ class ServiceDeskAgent:
         # Enforce explicit user-specified source scope, not keyword-based
         # topic routing. The planner still chooses relevant local tools.
         request_text = state["ticket"]["summary"]
-        inventory_result = await self.harness.invoke("list_documents", {})
-        inventory = inventory_result.get("result") or inventory_result.get("items") or []
-        alias_matches = self._document_alias_matches(request_text, inventory)
-        resolved_document_ids = (
-            [alias_matches[0]["id"]] if len(alias_matches) == 1 else []
-        )
         explicit_local = bool(re.search(
             r"(?:\b(?:from|check|search|use)\s+(?:(?:my|our|the|saved|uploaded|internal)\s+){0,3}(?:knowledge|kb)\b"
             r"|\baccording\s+to\s+(?:(?:my|our|the)\s+)?(?:uploaded|saved|local)\s+(?:pdf|document|file|newspaper)\b"
@@ -721,7 +733,7 @@ class ServiceDeskAgent:
         # enforce source scope when the model misses an explicit phrase.
         explicit_local = explicit_local or (
             intent.workflow == "knowledge" and intent.knowledge_source == "documents"
-        ) or bool(alias_matches)
+        )
         explicit_public = bool(re.search(
             r"\b(?:search|check|look\s+up)\s+(?:online|the\s+(?:web|internet))\b"
             r"|\blatest\s+official\s+(?:requirements|rules|regulations|guidance)\b",
@@ -769,24 +781,115 @@ class ServiceDeskAgent:
         return {
             "intent": intent.model_dump(), "workflow": intent.workflow,
             "explicit_saved_knowledge": explicit_local,
-            "resolved_document_ids": resolved_document_ids,
-            "document_alias_matches": alias_matches,
-            "document_inventory": inventory,
             "chat_messages": state.get("chat_messages", []),
         }
 
     @staticmethod
-    def _document_alias_matches(question, inventory):
-        normalized_question = re.sub(r"[^a-z0-9]", "", question.casefold())
-        matches = []
+    def _title_tokens(title):
+        stem = DOCUMENT_EXTENSION.sub("", str(title or "").strip())
+        return re.findall(r"[a-z0-9]+", stem.casefold())
+
+    @staticmethod
+    def _contains_token_sequence(tokens, alias):
+        """True when consecutive whole tokens join to exactly ``alias``."""
+        for start in range(len(tokens)):
+            joined = ""
+            for token in tokens[start:]:
+                joined += token
+                if joined == alias:
+                    return True
+                if not alias.startswith(joined):
+                    break
+        return False
+
+    @classmethod
+    def _document_alias_matches(cls, question, inventory, *, require_distinctive=True):
+        """Resolve saved-document titles named in ``question`` to unique document IDs.
+
+        The full normalized title stem must appear on token boundaries, so
+        "nsnp200", "nsnp 200" and "NSNP-200" all name "NSNP 200.pdf" while
+        "latest" never names "test.pdf". A single plain word ("network.pdf")
+        is too common to imply a document unless the question refers to it as
+        a file. Versions of one document family resolve to the newest version.
+        """
+        text = str(question or "").casefold()
+        tokens = re.findall(r"[a-z0-9]+", text)
+        best = {}
         for document in inventory if isinstance(inventory, list) else []:
+            if not isinstance(document, dict):
+                continue
             identifier = str(document.get("id") or "")
             title = str(document.get("title") or "")
-            stem = title.rsplit(".", 1)[0]
-            alias = re.sub(r"[^a-z0-9]", "", stem.casefold())
-            if identifier and len(alias) >= 4 and alias in normalized_question:
-                matches.append({"id": identifier, "title": title, "alias": alias})
-        return matches
+            title_tokens = cls._title_tokens(title)
+            alias = "".join(title_tokens)
+            if not identifier or len(alias) < 3 or not cls._contains_token_sequence(tokens, alias):
+                continue
+            distinctive = len(title_tokens) > 1 or any(c.isdigit() for c in alias)
+            if require_distinctive and not distinctive and not re.search(
+                rf"(?<![a-z0-9]){re.escape(alias)}\.[a-z0-9]{{2,5}}\b"
+                rf"|[\"'{OPENING_QUOTES}]{re.escape(alias)}[\"'{CLOSING_QUOTES}]"
+                rf"|(?<![a-z0-9]){re.escape(alias)}\s+(?:pdf|docx?|document|file)\b",
+                text,
+            ):
+                continue
+            try:
+                version = int(document.get("version") or 1)
+            except (TypeError, ValueError):
+                version = 1
+            candidate = {"id": identifier, "title": title, "alias": alias, "version": version}
+            key = str(document.get("family") or identifier)
+            if key not in best or version > best[key]["version"]:
+                best[key] = candidate
+        return list(best.values())
+
+    @staticmethod
+    def _document_choice_question(matches):
+        titles = [match["title"] for match in matches]
+        choices = [
+            f"{number}) {match['title']}"
+            + (f" [{match['id'][:8]}]" if titles.count(match["title"]) > 1 else "")
+            for number, match in enumerate(matches[:MAX_DOCUMENT_CHOICES], 1)
+        ]
+        return "Which saved document did you mean: " + "; ".join(choices) + "?"
+
+    @classmethod
+    def _choose_document(cls, answer, matches):
+        """Pick one candidate from a clarification answer, or None if still ambiguous."""
+        matches = matches[:MAX_DOCUMENT_CHOICES]
+        tokens = re.findall(r"[a-z0-9]+", str(answer or "").casefold())
+        named = cls._document_alias_matches(answer, matches, require_distinctive=False)
+        if named:
+            longest = max(len(match["alias"]) for match in named)
+            named = [match for match in named if len(match["alias"]) == longest]
+            if len(named) == 1:
+                return next(match for match in matches if match["id"] == named[0]["id"])
+        title_tokens = [set(cls._title_tokens(match["title"])) for match in matches]
+        distinguishing = [
+            match for match, own in zip(matches, title_tokens, strict=True)
+            if any(
+                token in own and sum(token in other for other in title_tokens) == 1
+                for token in tokens
+            )
+        ]
+        if len(distinguishing) == 1:
+            return distinguishing[0]
+        by_id = [
+            match for match in matches
+            if any(len(token) >= 6 and match["id"].casefold().startswith(token) for token in tokens)
+        ]
+        if len(by_id) == 1:
+            return by_id[0]
+        ordinals = {
+            "first": 1, "1st": 1, "second": 2, "2nd": 2, "third": 3, "3rd": 3,
+            "fourth": 4, "4th": 4, "fifth": 5, "5th": 5,
+        }
+        positions = {ordinals[token] for token in tokens if token in ordinals}
+        if len(tokens) <= 3:
+            positions |= {int(token) for token in tokens if token.isdigit()}
+        positions = {position for position in positions if 1 <= position <= len(matches)}
+        if len(positions) == 1:
+            return matches[positions.pop() - 1]
+        return None
 
     def intent_route(self, state):
         intent = state["intent"]
@@ -808,8 +911,61 @@ class ServiceDeskAgent:
             "pending_question": None,
         }
 
+    async def _load_saved_documents(self, state):
+        """Read tenant document metadata once per request, after scope acceptance.
+
+        A listing failure leaves alias resolution disabled; it never fails the
+        request, and retrieval context is then discovered as before. Values
+        from an earlier request on the same thread are always replaced.
+        """
+        unresolved = {
+            "available_context": None,
+            "document_alias_matches": [],
+            "resolved_document_ids": [],
+            "graph_status": None,
+        }
+        try:
+            result = await self.harness.invoke(
+                "list_available_context", {"question": state["ticket"]["summary"]}
+            )
+        except (MCPToolError, MCPConnectionError, ValueError):
+            return unresolved
+        context = result.get("result") if isinstance(result, dict) else None
+        if not isinstance(context, dict) or result.get("status") != "ok":
+            return unresolved
+        context = dict(context)
+        inventory = context.pop("document_inventory", None) or []
+        matches = self._document_alias_matches(state["ticket"]["summary"], inventory)
+        return {
+            **unresolved,
+            "available_context": context,
+            "document_alias_matches": matches,
+            "resolved_document_ids": [matches[0]["id"]] if len(matches) == 1 else [],
+        }
+
     async def understand_request(self, state):
-        update = {"status": "investigating"}
+        update = {"status": "investigating", **await self._load_saved_documents(state)}
+        if update.get("document_alias_matches"):
+            # A request naming a saved document is answered from that document.
+            intent = dict(state["intent"])
+            if (
+                intent.get("workflow") != "knowledge"
+                or intent.get("knowledge_source") != "documents"
+            ):
+                intent.update(
+                    workflow="knowledge", knowledge_source="documents", public_topic="none",
+                    justification=(
+                        "The request names a saved document. "
+                        "Select authorized local evidence before answering."
+                    ),
+                )
+                await emit(
+                    "source_scope", "completed",
+                    "Source scope constrained to the user's saved knowledge",
+                    rationale="The request names a saved document in this workspace.",
+                )
+            update.update(intent=intent, workflow="knowledge", explicit_saved_knowledge=True)
+            state = {**state, **update}
         if state.get("route_request") and state["workflow"] == "service_desk":
             evidence = [{**row, "case_id": state["case_id"]} for row in state.get("evidence", [])]
             state = {**state, "persist_case": True, "evidence": evidence}
@@ -836,21 +992,22 @@ class ServiceDeskAgent:
         return {"analysis": {"symptoms": state["ticket"]["summary"], "entities": []}}
 
     async def retrieval_context(self, state):
-        result = await self.harness.invoke(
-            "list_available_context", {"question": state["ticket"]["summary"]}
-        )
-        inventory_result = await self.harness.invoke("list_documents", {})
-        inventory = inventory_result.get("result") or inventory_result.get("items") or []
-        matches = self._document_alias_matches(state["ticket"]["summary"], inventory)
-        resolved = [matches[0]["id"]] if len(matches) == 1 else []
-        available = dict(result["result"])
-        available["saved_document_matches"] = matches
+        # understand_request already discovered context for this request.
+        available = state.get("available_context")
+        if not isinstance(available, dict):
+            result = await self.harness.invoke(
+                "list_available_context", {"question": state["ticket"]["summary"]}
+            )
+            available = dict(result["result"])
+            available.pop("document_inventory", None)
+        matches = state.get("document_alias_matches", [])
         return {
-            "available_context": available,
-            "explicit_saved_knowledge": state.get("explicit_saved_knowledge") or bool(matches),
-            "resolved_document_ids": resolved,
-            "document_alias_matches": matches,
-            "document_inventory": inventory,
+            "available_context": {
+                **available,
+                "saved_document_matches": [
+                    {"id": match["id"], "title": match["title"]} for match in matches
+                ],
+            },
         }
 
     async def analyze_ticket(self, state):
@@ -887,24 +1044,47 @@ class ServiceDeskAgent:
             await emit("discover_tools", "completed", "MCP tool schemas validated",
                        tool_count=len(self.harness.tools))
         alias_matches = state.get("document_alias_matches", [])
-        if len(alias_matches) > 1:
-            choices = ", ".join(match["title"] for match in alias_matches[:5])
-            plan = InvestigationPlan(
-                goal="Resolve the saved document before retrieval",
-                additional_evidence_useful=False,
-                source_strategy="Use only the tenant-owned saved-document inventory.",
-                clarification_needed=True,
-                clarification_question=f"Which saved document did you mean: {choices}?",
-                clarification_reason="More than one tenant-owned filename matches the supplied alias.",
-                stop_condition="Stop after the user identifies one saved document.",
-            )
-            await self.note(state, "plan", f"Plan: {plan.goal}.", "application")
-            return {
-                "plan": plan.model_dump(),
-                "research_questions": [],
-                "plan_executed": False,
-                "tools_discovered": True,
+        resolution = {}
+        if len(alias_matches) > 1 and not state.get("resolved_document_ids"):
+            question = self._document_choice_question(alias_matches)
+            answers = [
+                item.get("answer") for item in state.get("human_answers", [])
+                if str(item.get("question") or "").strip().casefold() == question.casefold()
+            ]
+            if not answers:
+                plan = InvestigationPlan(
+                    goal="Resolve the saved document before retrieval",
+                    additional_evidence_useful=False,
+                    source_strategy="Use only the tenant-owned saved-document inventory.",
+                    clarification_needed=True,
+                    clarification_question=question,
+                    clarification_reason=(
+                        "More than one tenant-owned filename matches the supplied alias."
+                    ),
+                    stop_condition="Stop after the user identifies one saved document.",
+                )
+                await self.note(state, "plan", f"Plan: {plan.goal}.", "application")
+                return {
+                    "plan": plan.model_dump(),
+                    "research_questions": [],
+                    "plan_executed": False,
+                    "tools_discovered": True,
+                }
+            # The question is asked once. An answer that still names no single
+            # candidate scopes retrieval to all candidates instead of re-asking.
+            chosen = self._choose_document(answers[-1], alias_matches)
+            selected = [chosen] if chosen else alias_matches[:MAX_DOCUMENT_CHOICES]
+            resolution = {
+                "document_alias_matches": selected,
+                "resolved_document_ids": [match["id"] for match in selected],
             }
+            state = {**state, **resolution}
+            await emit(
+                "document_resolution", "completed",
+                f"Saved document selected: {chosen['title']}" if chosen
+                else "Answer matched no single document; searching all candidates",
+                document_count=len(selected),
+            )
         context = self.context(state, True)
         for attempt in range(2):
             plan = await self.provider.generate_structured("plan", context, InvestigationPlan)
@@ -1100,6 +1280,7 @@ class ServiceDeskAgent:
             additional_evidence_useful=plan.additional_evidence_useful,
         )
         return {
+            **resolution,
             "plan": plan.model_dump(),
             "research_questions": plan.unknowns,
             "plan_executed": False,
@@ -1301,12 +1482,32 @@ class ServiceDeskAgent:
             "research_rounds": state.get("research_rounds", 0) + int(web_round),
         }
 
+    async def execute_planned_tools(self, state):
+        """Replanned knowledge retrieval stays graph-first like the knowledge subgraph."""
+        if state.get("workflow") == "knowledge":
+            return await self.retrieve_knowledge(state)
+        return await self.execute_tools(state)
+
     async def retrieve_knowledge(self, state):
-        """Run required graph participation alongside the validated retrieval plan."""
+        """Graph-first saved-document retrieval: graph references, then local search.
+
+        The Neo4j read and local hydration complete before the planned local
+        search runs as a supplement or fallback; graph evidence is listed first.
+        """
         if not state.get("explicit_saved_knowledge"):
             return await self.execute_tools(state)
-        planned, graph_result = await asyncio.gather(
-            self.execute_tools(state), self._mandatory_saved_knowledge_graph_read(state)
+        graph_result = await self._mandatory_saved_knowledge_graph_read(state)
+        planned = await self.execute_tools(state)
+        if graph_result is None:
+            # The identical graph read already ran for this request.
+            return planned
+        status = graph_result["graph_status"]
+        await emit(
+            "graph_retrieval",
+            "completed" if status in {"available", "empty"} else "failed",
+            GRAPH_STATUS_SUMMARIES[status],
+            graph_status=status,
+            hydrated_count=len((graph_result.get("hydrated_output") or {}).get("items", [])),
         )
         graph_outputs = [graph_result]
         if graph_result.get("hydrated_output"):
@@ -1316,7 +1517,8 @@ class ServiceDeskAgent:
             })
         return {
             **planned,
-            "tool_results": [*planned.get("tool_results", []), *graph_outputs],
+            "graph_status": status,
+            "tool_results": [*graph_outputs, *planned.get("tool_results", [])],
             "executed_tool_calls": list(dict.fromkeys([
                 *planned.get("executed_tool_calls", []),
                 self._tool_signature(graph_result["name"], graph_result["arguments"]),
@@ -1324,7 +1526,13 @@ class ServiceDeskAgent:
         }
 
     async def _mandatory_saved_knowledge_graph_read(self, state):
-        """Issue one bounded tenant-scoped graph read; never accept model-written Cypher."""
+        """Issue one bounded tenant-scoped graph read; never accept model-written Cypher.
+
+        Returns None when this exact read already ran for the request. The
+        result's graph_status is available, empty, stale (references without
+        local passages), unavailable (no graph connection) or error. An MCP
+        failure is always an error, never an empty graph.
+        """
         from backend.app.core.principal import current_principal
 
         question = state["ticket"]["summary"]
@@ -1336,36 +1544,47 @@ class ServiceDeskAgent:
         terms = list(dict.fromkeys(
             value.casefold()[:120] for value in [*variants, *identifiers, *concepts]
         ))[:10]
+        document_ids = list(state.get("resolved_document_ids", []))[:MAX_DOCUMENT_CHOICES]
         allowed = self.harness.allowed_names("knowledge")
         name = "neo4j__read-cypher" if "neo4j__read-cypher" in allowed else "search_graph"
         if name == "neo4j__read-cypher":
+            # A resolved document scopes the read by ID; only unresolved requests
+            # fall back to title/summary terms. Pattern comprehensions collect
+            # each branch independently, so branches never multiply rows.
             query = (
                 "MATCH (d:Document) WHERE d.tenant_id = $tenant_id "
-                "AND any(term IN $terms WHERE toLower(coalesce(d.title,'')) CONTAINS term "
-                "OR toLower(coalesce(d.summary,'')) CONTAINS term) "
-                "OPTIONAL MATCH (d)-[:HAS_PAGE]->(p:Page) "
-                "OPTIONAL MATCH (p)-[:HAS_CHUNK|HAS_TABLE|HAS_PARAGRAPH|HAS_FIGURE|HAS_TABLECELL]->(o) "
-                "OPTIONAL MATCH (d)<-[:MENTIONED_IN]-(m:GraphMention) "
-                "OPTIONAL MATCH (m)-[:REFERS_TO]->(e:Entity) "
-                "OPTIONAL MATCH (m)-[:SUPPORTED_BY]->(mo) "
-                "OPTIONAL MATCH (d)<-[:DOCUMENTED_IN]-(c:GraphClaim) "
-                "OPTIONAL MATCH (c)-[:SUPPORTED_BY]->(co) "
-                "RETURN coalesce(d.original_id,d.id) AS document_id,d.title AS title,"
-                "d.summary AS summary,collect(DISTINCT e.name)[0..10] AS entities,"
-                "[value IN (collect(DISTINCT coalesce(o.original_id,o.id)) + "
-                "collect(DISTINCT coalesce(mo.original_id,mo.id)) + "
-                "collect(DISTINCT coalesce(co.original_id,co.id))) WHERE value IS NOT NULL][0..500] "
-                "AS object_ids LIMIT 20"
+                "AND ((size($document_ids) > 0 AND coalesce(d.original_id, d.id) IN $document_ids) "
+                "OR (size($document_ids) = 0 AND any(term IN $terms "
+                "WHERE toLower(coalesce(d.title, '')) CONTAINS term "
+                "OR toLower(coalesce(d.summary, '')) CONTAINS term))) "
+                "WITH d ORDER BY coalesce(d.original_id, d.id) LIMIT 20 "
+                "RETURN coalesce(d.original_id, d.id) AS document_id, d.title AS title, "
+                "d.summary AS summary, "
+                "[(d)<-[:MENTIONED_IN]-(m:GraphMention)-[:REFERS_TO]->(e:Entity) "
+                "WHERE m.tenant_id = $tenant_id | e.name][..50] AS entities, "
+                "[(d)<-[:MENTIONED_IN]-(m:GraphMention)-[:SUPPORTED_BY]->(o) "
+                "WHERE m.tenant_id = $tenant_id | coalesce(o.original_id, o.id)][..500] "
+                "AS mention_object_ids, "
+                "[(d)<-[:DOCUMENTED_IN]-(c:GraphClaim)-[:SUPPORTED_BY]->(o) "
+                "WHERE c.tenant_id = $tenant_id | coalesce(o.original_id, o.id)][..500] "
+                "AS claim_object_ids, "
+                "[(d)-[:HAS_PAGE]->(p:Page)-[:HAS_CHUNK|HAS_TABLE|HAS_FIGURE|HAS_SECTION"
+                "|HAS_PARAGRAPH|HAS_TABLECELL]->(o) WHERE p.tenant_id = $tenant_id "
+                "| {object_id: coalesce(o.original_id, o.id), page: p.page}][..2000] "
+                "AS page_objects"
             )
             arguments = {
                 "query": query,
                 "params": {
                     "tenant_id": current_principal(self.settings).tenant_id,
                     "terms": terms,
+                    "document_ids": document_ids,
                 },
             }
         else:
             arguments = {"entities": terms, "limit": 20}
+        if self._tool_signature(name, arguments) in state.get("executed_tool_calls", []):
+            return None
         try:
             output = await self._call(state, name, arguments)
         except (MCPToolError, ValueError) as exc:
@@ -1374,29 +1593,45 @@ class ServiceDeskAgent:
                 "source_system": "tool_error",
                 "timestamp": now(),
                 "reliability": 0,
-                "status": "unavailable",
+                "status": "error",
                 "error": str(exc),
                 "items": [],
             }
+        if output.get("status") == "error":
+            graph_status = "error"
+        elif output.get("status") != "ok":
+            graph_status = "unavailable"
+        else:
+            graph_status = "available" if output.get("items") else "empty"
         hydrated_output = None
         if name == "neo4j__read-cypher" and output.get("status") == "ok":
-            object_ids = list(dict.fromkeys(
-                str(object_id)
-                for row in output.get("items", [])
-                for object_id in row.get("object_ids", [])
-                if object_id
-            ))[:500]
+            rows = [row for row in output.get("items", []) if isinstance(row, dict)]
+            object_ids = self._graph_object_ids(rows)
+            # Reference lists are hydration inputs, not evidence for the model.
+            summaries = [
+                {
+                    "document_id": row.get("document_id"),
+                    "title": row.get("title"),
+                    "summary": row.get("summary"),
+                    "entities": list(dict.fromkeys(
+                        str(value) for value in row.get("entities") or [] if value
+                    ))[:10],
+                    "referenced_objects": len(self._graph_object_ids([row])),
+                }
+                for row in rows
+            ]
+            output = {**output, "items": summaries, "result": summaries}
+            graph_status = "empty"
             if object_ids:
-                from backend.app.services.local_documents import LocalDocumentRepository
-
-                repository = LocalDocumentRepository(self.settings)
-                query_embedding = repository.embeddings.embed_texts([question])[0]
-                hydrated = await asyncio.to_thread(
-                    repository.search_store.resolve_object_ids,
-                    object_ids,
-                    query_embedding,
-                )
-                if hydrated:
+                try:
+                    hydration = await self._call(
+                        state, "resolve_graph_references",
+                        {"question": question, "object_ids": object_ids},
+                    )
+                except (MCPToolError, ValueError) as exc:
+                    hydration = {"status": "error", "error": str(exc), "items": []}
+                if hydration.get("status") == "ok" and hydration.get("items"):
+                    hydrated = [dict(item) for item in hydration["items"] if isinstance(item, dict)]
                     for item in hydrated:
                         item["graph_enrichment"] = "available"
                         item["match_type"] = item.get("match_type", "graph_reference")
@@ -1408,12 +1643,40 @@ class ServiceDeskAgent:
                         "source_system": "chroma",
                         "reliability": 0.9,
                     }
+                    graph_status = "available"
+                elif hydration.get("status") == "ok":
+                    graph_status = "stale"
+                else:
+                    graph_status = "error"
         return {
             "name": name,
             "arguments": arguments,
             "output": output,
             "hydrated_output": hydrated_output,
+            "graph_status": graph_status,
         }
+
+    @staticmethod
+    def _graph_object_ids(rows):
+        """Semantic support first, then page objects in page order; bounded and unique."""
+        semantic, located = [], []
+        for row in rows:
+            semantic += [
+                *(row.get("mention_object_ids") or []),
+                *(row.get("claim_object_ids") or []),
+            ]
+            located += [
+                item for item in row.get("page_objects") or []
+                if isinstance(item, dict) and item.get("object_id")
+            ]
+        located.sort(key=lambda item: (
+            item["page"] if isinstance(item.get("page"), int) else float("inf"),
+            str(item["object_id"]),
+        ))
+        ordered = [*semantic, *(item["object_id"] for item in located)]
+        return list(dict.fromkeys(str(value) for value in ordered if value))[
+            :MAX_GRAPH_OBJECT_REFERENCES
+        ]
 
     @staticmethod
     def _tool_signature(name, arguments):
@@ -2615,25 +2878,35 @@ class ServiceDeskAgent:
             and answer_value
             and not re.search(r"\bpage\s+\d+\b", answer_value, re.IGNORECASE)
         ):
-            answer_identifiers = {
-                token for token in re.findall(r"\b[A-Za-z0-9-]{3,}\b", answer_value)
-                if any(character.isdigit() for character in token)
-            }
-            cited_document = next((
-                item for item in self.usable_evidence(state)
-                if item.get("source_type") == "document"
-                and item.get("content", {}).get("metadata", {}).get("page") is not None
-                and any(
-                    identifier.casefold() in str(item.get("content", {}).get("text") or "").casefold()
-                    for identifier in answer_identifiers
+            # Cite only document evidence the model referenced by validated ID;
+            # without such a reference no page citation is added.
+            referenced = list(dict.fromkeys([
+                *(
+                    identifier for item in d.hypotheses if item.status != "rejected"
+                    for identifier in item.evidence_ids
+                ),
+                *v.get("evidence_ids", []),
+            ]))
+            usable = {item["id"]: item for item in self.usable_evidence(state)}
+            locations = {}
+            for identifier in referenced:
+                item = usable.get(identifier)
+                if not item or item.get("source_type") != "document":
+                    continue
+                metadata = item.get("content", {}).get("metadata", {})
+                if metadata.get("page") is None:
+                    continue
+                title = item["content"].get("title") or metadata.get("title") or "saved document"
+                pages = locations.setdefault(title, [])
+                if metadata["page"] not in pages:
+                    pages.append(metadata["page"])
+            if locations:
+                citation = "; ".join(
+                    f"{title}, page{'s' if len(pages) > 1 else ''} "
+                    + ", ".join(str(page) for page in pages[:5])
+                    for title, pages in list(locations.items())[:3]
                 )
-            ), None)
-            if cited_document:
-                metadata = cited_document["content"]["metadata"]
-                title = cited_document["content"].get("title") or metadata.get("title") or "saved document"
-                answer_value = (
-                    f"{answer_value.rstrip().rstrip('.')} ({title}, page {metadata['page']})."
-                )
+                answer_value = f"{answer_value.rstrip().rstrip('.')} ({citation})."
         response = FinalResponse(
             issue_summary=state["ticket"]["summary"],
             answer=answer_value,
