@@ -11,15 +11,19 @@ from backend.app.services.web import (
 )
 import time
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Deque, Iterable, List, Optional, Set, Tuple
+from dataclasses import asdict, dataclass, field
+from typing import Iterable, List, Optional, Set, Tuple
 from urllib.parse import ParseResult, urljoin, urlparse, urlunsplit
 from urllib.robotparser import RobotFileParser
 
+import defusedxml.ElementTree as DefusedET
 import requests
 from bs4 import BeautifulSoup
 
 from backend.app.core.config import Settings
+
+MAX_SITEMAP_FETCHES = 5
+MAX_SITEMAP_DEPTH = 2
 
 
 @dataclass
@@ -41,6 +45,8 @@ class CrawledPage:
     title: str
     content: str
     canonical_url: str = ""
+    html: str = ""
+    links: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -81,6 +87,23 @@ class UrlCrawler:
     def crawl(self, root_url: str, overrides: Optional[CrawlLimits] = None) -> CrawlResult:
         """Crawl the supplied root URL and return extracted content."""
 
+        state = self.start(root_url, overrides)
+        result = CrawlResult()
+        while not state["done"]:
+            result.pages.extend(self.advance(state))
+        result.skipped = list(state["skipped"])
+        result.skipped_urls = [item["url"] for item in state["skipped"]]
+        result.pages_visited = len(result.pages)
+        if not result.pages:
+            raise self.empty_error(state)
+        return result
+
+    def start(self, root_url: str, overrides: Optional[CrawlLimits] = None) -> dict:
+        """Validate the root, load robots and sitemaps, and return resumable state.
+
+        The state is plain JSON so a crawl job can persist it between steps.
+        """
+
         try:
             validate_public_url(root_url)
         except ValueError as exc:
@@ -92,58 +115,95 @@ class UrlCrawler:
             raise CrawlError("URL_BLOCKED", "URL must include a hostname.", 400)
 
         limits = overrides or self._default_limits()
-        robot_parser = self._load_robots(parsed_root)
+        robots_lines = self._load_robots_lines(parsed_root)
+        root = self._normalize_url(root_url)
+        state = {
+            "root_url": root,
+            "origin": [parsed_root.scheme, parsed_root.netloc],
+            "limits": asdict(limits),
+            "robots_lines": robots_lines,
+            "queue": [[root, 0]],
+            "seen_urls": [],
+            "seen_hashes": [],
+            "total_chars": 0,
+            "pages_accepted": 0,
+            "skipped": [],
+            "robots_blocked": False,
+            "retrieved_html": False,
+            "last_fetch_at": 0.0,
+            "sitemap_seeds": 0,
+            "done": False,
+        }
+        if limits.max_depth >= 1:
+            seeds = self._sitemap_seeds(state)
+            state["queue"].extend([url, 1] for url in seeds)
+            state["sitemap_seeds"] = len(seeds)
+        return state
 
-        queue: Deque[Tuple[str, int]] = deque([(self._normalize_url(root_url), 0)])
-        seen_urls: Set[str] = set()
-        seen_hashes: Set[str] = set()
-        total_chars = 0
-        result = CrawlResult()
-        robots_blocked = False
-        retrieved_html = False
-        last_fetch = 0.0
+    def advance(
+        self, state: dict, max_pages: int | None = None, deadline: float | None = None
+    ) -> List[CrawledPage]:
+        """Crawl at most ``max_pages`` pages (or until ``deadline``) from saved state."""
 
-        while queue and len(result.pages) < limits.max_pages:
+        limits = CrawlLimits(**state["limits"])
+        robot_parser = self._parse_robots(state["robots_lines"])
+        parsed_root = urlparse(urlunsplit((*state["origin"], "/", "", "")))
+        queue = deque(tuple(item) for item in state["queue"])
+        seen_urls = set(state["seen_urls"])
+        seen_hashes = set(state["seen_hashes"])
+        pages: List[CrawledPage] = []
+
+        def skip(url, reason):
+            state["skipped"].append({"url": url, "reason": reason})
+
+        while queue and state["pages_accepted"] < limits.max_pages:
+            if max_pages is not None and len(pages) >= max_pages:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                break
             current_url, depth = queue.popleft()
             if current_url in seen_urls:
                 continue
             seen_urls.add(current_url)
 
             if depth > limits.max_depth:
-                result.skip(current_url, "depth_limit")
+                skip(current_url, "depth_limit")
                 continue
 
             if not self._can_fetch(robot_parser, current_url):
-                robots_blocked = robots_blocked or depth == 0
-                result.skip(current_url, "robots_disallowed")
+                state["robots_blocked"] = state["robots_blocked"] or depth == 0
+                skip(current_url, "robots_disallowed")
                 continue
 
-            last_fetch = self._respect_rate_limit(last_fetch, limits.rate_limit_sec)
+            state["last_fetch_at"] = self._respect_wall_rate_limit(
+                state["last_fetch_at"], limits.rate_limit_sec
+            )
             response, failure = self._fetch(current_url)
-            if response is None and depth == 0 and current_url == self._normalize_url(root_url):
+            if response is None and depth == 0 and current_url == state["root_url"]:
                 alias = self._www_alias_url(current_url)
                 if alias:
                     response, failure = self._fetch(alias)
             if response is None:
-                result.skip(current_url, failure)
+                skip(current_url, failure)
                 continue
 
             content_type = response.headers.get("Content-Type", "").lower()
             if "text/html" not in content_type:
-                result.skip(current_url, "not_html")
+                skip(current_url, "not_html")
                 continue
-            retrieved_html = True
+            state["retrieved_html"] = True
 
             html = response.text
             page_url = self._normalize_url(response.url or current_url)
             parsed_page = urlparse(page_url)
-            if not result.pages and self._is_www_redirect_alias(parsed_root, parsed_page):
+            if not state["pages_accepted"] and self._is_www_redirect_alias(parsed_root, parsed_page):
                 # fetch_response validated every redirect target before requesting it.
                 # Adopt only the common apex <-> www canonical transition as the
                 # crawl origin; all subsequent traversal remains same-origin.
                 parsed_root = parsed_page
+                state["origin"] = [parsed_page.scheme, parsed_page.netloc]
             elif parsed_page.scheme != parsed_root.scheme or parsed_page.netloc != parsed_root.netloc:
-                result.skip(page_url, "off_origin")
+                skip(page_url, "off_origin")
                 continue
 
             soup = BeautifulSoup(html, "html.parser")
@@ -153,53 +213,119 @@ class UrlCrawler:
 
             text, title = self._extract_text_and_title(soup, canonical_url)
             if not text:
-                result.skip(page_url, "empty")
+                skip(page_url, "empty")
                 continue
             if len(text) > limits.max_page_chars:
-                result.skip(page_url, "too_large")
+                skip(page_url, "too_large")
                 continue
 
             text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
             if text_hash in seen_hashes:
-                result.skip(page_url, "duplicate_content")
+                skip(page_url, "duplicate_content")
                 continue
+
+            if state["total_chars"] + len(text) > limits.max_total_chars:
+                skip(page_url, "overall_limit")
+                queue.clear()
+                break
             seen_hashes.add(text_hash)
 
-            if total_chars + len(text) > limits.max_total_chars:
-                result.skip(page_url, "overall_limit")
-                break
-
-            result.pages.append(
+            links = sorted(self._extract_same_origin_links(soup, canonical_url, parsed_root))
+            pages.append(
                 CrawledPage(
                     url=page_url,
                     canonical_url=canonical_url,
                     title=title or canonical_url,
                     content=text,
+                    html=html,
+                    links=[link for link in links if link != canonical_url],
                 )
             )
-            total_chars += len(text)
-            result.pages_visited += 1
+            state["total_chars"] += len(text)
+            state["pages_accepted"] += 1
             seen_urls.add(canonical_url)
 
-            if depth < limits.max_depth and len(result.pages) < limits.max_pages:
-                links = self._extract_same_origin_links(soup, canonical_url, parsed_root)
+            if depth < limits.max_depth and state["pages_accepted"] < limits.max_pages:
                 for link in links:
                     if link not in seen_urls:
                         queue.append((link, depth + 1))
 
-        if not result.pages:
-            if robots_blocked:
-                raise CrawlError(
-                    "ROBOTS_DISALLOWED", "The website does not allow this page to be indexed.", 403
-                )
-            if retrieved_html:
-                raise CrawlError("CRAWL_EMPTY", "The website returned no readable page content.")
-            raise CrawlError(
-                "WEBSITE_UNAVAILABLE",
-                "The website could not be retrieved. Check its address or availability.",
-                502,
+        state["queue"] = [list(item) for item in queue]
+        state["seen_urls"] = sorted(seen_urls)
+        state["seen_hashes"] = sorted(seen_hashes)
+        state["done"] = not queue or state["pages_accepted"] >= limits.max_pages
+        return pages
+
+    @staticmethod
+    def empty_error(state: dict) -> "CrawlError":
+        """The error a crawl that saved no page reports."""
+
+        if state["robots_blocked"]:
+            return CrawlError(
+                "ROBOTS_DISALLOWED", "The website does not allow this page to be indexed.", 403
             )
-        return result
+        if state["retrieved_html"]:
+            return CrawlError("CRAWL_EMPTY", "The website returned no readable page content.")
+        return CrawlError(
+            "WEBSITE_UNAVAILABLE",
+            "The website could not be retrieved. Check its address or availability.",
+            502,
+        )
+
+    def _sitemap_seeds(self, state: dict) -> List[str]:
+        """Same-origin, robots-allowed URLs from robots "Sitemap:" lines and /sitemap.xml."""
+
+        limits = CrawlLimits(**state["limits"])
+        robot_parser = self._parse_robots(state["robots_lines"])
+        scheme, netloc = state["origin"]
+        pending = list(robot_parser.site_maps() or [])
+        default = urlunsplit((scheme, netloc, "/sitemap.xml", "", ""))
+        if default not in pending:
+            pending.append(default)
+        pending = [(url, 0) for url in pending]
+        fetched, seeds, visited = 0, [], set()
+        while pending and fetched < MAX_SITEMAP_FETCHES and len(seeds) < limits.max_pages:
+            sitemap_url, level = pending.pop(0)
+            parsed = urlparse(sitemap_url)
+            if (parsed.scheme, parsed.netloc) != (scheme, netloc) or sitemap_url in visited:
+                continue
+            visited.add(sitemap_url)
+            state["last_fetch_at"] = self._respect_wall_rate_limit(
+                state["last_fetch_at"], limits.rate_limit_sec
+            )
+            fetched += 1
+            response, _ = self._fetch(sitemap_url)
+            if response is None:
+                continue
+            try:
+                root = DefusedET.fromstring(response.content)
+            except Exception:  # malformed, gzip or forbidden XML constructs
+                continue
+            kind = root.tag.rsplit("}", 1)[-1]
+            for element in root:
+                location = next(
+                    (child.text for child in element if child.tag.rsplit("}", 1)[-1] == "loc"),
+                    None,
+                )
+                if not location:
+                    continue
+                location = location.strip()
+                if kind == "sitemapindex":
+                    if level < MAX_SITEMAP_DEPTH:
+                        pending.append((location, level + 1))
+                    continue
+                url = self._normalize_url(location)
+                parsed_url = urlparse(url)
+                if (
+                    (parsed_url.scheme, parsed_url.netloc) == (scheme, netloc)
+                    and url != state["root_url"]
+                    and url not in seeds
+                    and self._can_fetch(robot_parser, url)
+                ):
+                    seeds.append(url)
+                    if len(seeds) >= limits.max_pages:
+                        break
+        return seeds
 
     def _default_limits(self) -> CrawlLimits:
         """Construct CrawlLimits using application settings."""
@@ -215,8 +341,20 @@ class UrlCrawler:
     def _load_robots(self, parsed_root: ParseResult) -> RobotFileParser:
         """Load and parse robots.txt for the target origin."""
 
-        robots_url = urlunsplit((parsed_root.scheme, parsed_root.netloc, "/robots.txt", "", ""))
+        return self._parse_robots(self._load_robots_lines(parsed_root))
+
+    @staticmethod
+    def _parse_robots(lines: List[str]) -> RobotFileParser:
         parser = RobotFileParser()
+        parser.parse(lines)
+        parser.modified()
+        return parser
+
+    def _load_robots_lines(self, parsed_root: ParseResult) -> List[str]:
+        """Fetch robots.txt lines for the origin; an unavailable file allows all."""
+
+        robots_url = urlunsplit((parsed_root.scheme, parsed_root.netloc, "/robots.txt", "", ""))
+        lines: List[str] = []
         # Keep robots-response cookies isolated. Some CDNs issue a host-scoped
         # bot-management cookie for robots.txt that causes a subsequent HTML
         # request in the same session to be rejected even though both requests
@@ -225,18 +363,15 @@ class UrlCrawler:
         robots_session.headers.update(self._session.headers)
         try:
             response = fetch_response(robots_url, robots_session, self._settings.web_max_bytes)
-            if response.status_code >= 400:
-                parser.parse([])
-            else:
-                parser.parse(response.text.splitlines())
+            if response.status_code < 400:
+                lines = response.text.splitlines()
         except Exception:
-            parser.parse([])
+            lines = []
         finally:
             close = getattr(robots_session, "close", None)
             if callable(close):
                 close()
-        parser.modified()
-        return parser
+        return lines
 
     def _can_fetch(self, parser: RobotFileParser, url: str) -> bool:
         """Return True when the crawler is permitted to fetch the given URL."""
@@ -256,6 +391,16 @@ class UrlCrawler:
         if wait > 0:
             time.sleep(wait)
         return time.monotonic()
+
+    @staticmethod
+    def _respect_wall_rate_limit(last_fetch_at: float, rate_limit_sec: float) -> float:
+        """Rate-limit with wall-clock time so the interval survives saved state."""
+
+        if rate_limit_sec > 0:
+            wait = (last_fetch_at + rate_limit_sec) - time.time()
+            if wait > 0:
+                time.sleep(wait)
+        return time.time()
 
     def _safe_get(self, url: str) -> Optional[requests.Response]:
         """Perform a GET request handling exceptions and non-200 codes."""
