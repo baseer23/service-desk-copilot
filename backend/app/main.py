@@ -33,8 +33,8 @@ from backend.app.models.dto import (
     IngestPasteRequest,
     IngestPasteResponse,
     IngestPdfResponse,
+    IngestUrlJobResponse,
     IngestUrlRequest,
-    IngestUrlResponse,
     MemorySaveRequest,
 )
 from backend.app.models.provider import LLMError
@@ -137,7 +137,7 @@ def create_app(settings: Settings | None = None):
         mcp = MultiMCPClient(s, builtin=DeskMateMCPClient(s))
         app.state.settings, app.state.mcp = s, mcp
         provider = None
-        ingestion_task = None
+        ingestion_task = crawl_task = None
         try:
             try:
                 provider = get_provider(s)
@@ -207,15 +207,24 @@ def create_app(settings: Settings | None = None):
                             name="document-worker",
                         )
                         app.state.ingestion_task = ingestion_task
+                        from backend.app.services.url_crawl_worker import url_crawl_worker
+
+                        app.state.url_crawl_wakeup = asyncio.Event()
+                        crawl_task = asyncio.create_task(
+                            url_crawl_worker(
+                                s, app.state.agent.harness, app.state.url_crawl_wakeup,
+                                app.state.ingestion_wakeup,
+                            ),
+                            name="url-crawl-worker",
+                        )
                     yield
         finally:
             active_ingestion = getattr(app.state, "ingestion_task", ingestion_task)
-            for task in {ingestion_task, active_ingestion} - {None}:
+            background = {ingestion_task, active_ingestion, crawl_task} - {None}
+            for task in background:
                 task.cancel()
-            if ingestion_task or active_ingestion:
-                await asyncio.gather(
-                    *({ingestion_task, active_ingestion} - {None}), return_exceptions=True
-                )
+            if background:
+                await asyncio.gather(*background, return_exceptions=True)
             await app.state.speech.close()
             await mcp.close()
             if provider and hasattr(provider, "aclose"):
@@ -716,7 +725,7 @@ def create_app(settings: Settings | None = None):
         )
         return {"mode": "keyword", "generated_answer": False, "items": result["items"]}
 
-    @app.post("/ingest/url", response_model=IngestUrlResponse)
+    @app.post("/ingest/url", response_model=IngestUrlJobResponse)
     async def ingest_url(body: IngestUrlRequest):
         if not s.allow_url_ingest or not s.enable_public_web_tools:
             raise HTTPException(403, {
@@ -749,8 +758,20 @@ def create_app(settings: Settings | None = None):
         if outcome.get("status") != "ok" or not isinstance(outcome.get("result"), dict):
             raise HTTPException(502, {
                 "code": "VECTOR_INDEX_FAILED",
-                "message": "The website was retrieved, but local knowledge indexing failed.",
+                "message": "The website crawl could not be started.",
             })
+        # The crawl runs in the background; poll /ingest/url/{job_id}/status.
+        app.state.url_crawl_wakeup.set()
+        return outcome["result"]
+
+    @app.get("/ingest/url/{job_id}/status", response_model=IngestUrlJobResponse)
+    async def ingest_url_status(job_id: str):
+        try:
+            outcome = await app.state.agent.harness.invoke("get_url_crawl_job", {"job_id": job_id})
+        except MCPToolError as exc:
+            raise HTTPException(404, {"code": "CRAWL_JOB_NOT_FOUND", "message": str(exc)}) from exc
+        if outcome.get("status") != "ok" or not isinstance(outcome.get("result"), dict):
+            raise HTTPException(404, {"code": "CRAWL_JOB_NOT_FOUND", "message": "Crawl job not found"})
         return outcome["result"]
 
     async def load(case_id):

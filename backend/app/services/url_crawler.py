@@ -413,8 +413,14 @@ class UrlCrawler:
         try:
             response = fetch_response(url, self._session, self._settings.web_max_bytes)
         except Exception as exc:
-            reason = "too_large" if "size limit" in str(exc).lower() else "fetch_failed"
-            return None, reason
+            # fetch_response raises for HTTP errors, so the status lives on the error.
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status is not None:
+                response = exc.response
+            elif "size limit" in str(exc).lower():
+                return None, "too_large"
+            else:
+                return None, "fetch_failed"
         if response.status_code == 429:
             return None, "rate_limited"
         if response.status_code != 200:
