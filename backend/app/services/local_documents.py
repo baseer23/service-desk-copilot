@@ -98,6 +98,9 @@ class LocalDocumentExtractor:
         self.settings, self.records = settings, records
 
     def extract(self, data, media_type, enhanced=False, force_azure=False):
+        if media_type == "text/html":
+            # HTML is structured locally; it must never fall through to Azure.
+            raise ValueError("Saved web pages are structured during local indexing")
         if media_type in {"text/plain", "text/markdown"}:
             text = data.decode("utf-8-sig")
             if not text.strip():
@@ -145,6 +148,8 @@ class LocalDocumentExtractor:
                 extractor.credential.close()
 
     def extract_path(self, path, media_type, enhanced=False, force_azure=False, **callbacks):
+        if media_type == "text/html":
+            raise ValueError("Saved web pages are structured during local indexing")
         if media_type in {"text/plain", "text/markdown"}:
             return self.extract(path.read_bytes(), media_type, enhanced, force_azure=False)
         if media_type == "application/pdf" and not force_azure:

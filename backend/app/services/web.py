@@ -148,6 +148,93 @@ def extract_html(html, url):
     }, soup
 
 
+MAX_PAGE_LINKS = 500
+HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+
+
+def same_origin_links(html, url):
+    """Normalized same-origin links on a page (navigation included), self excluded."""
+    base = urlsplit(url)
+    links = []
+    for anchor in BeautifulSoup(html, "html.parser").find_all("a", href=True):
+        target = normalize_url(urljoin(url, anchor["href"].strip()))
+        parsed = urlsplit(target)
+        if (
+            (parsed.scheme, parsed.netloc) == (base.scheme, base.netloc)
+            and target != normalize_url(url)
+            and target not in links
+        ):
+            links.append(target)
+            if len(links) >= MAX_PAGE_LINKS:
+                break
+    return links
+
+
+def html_extraction(html, url):
+    """Extract one HTML page in the layout shape Azure Document Intelligence produces.
+
+    Headings become title/sectionHeading paragraphs, paragraphs, list items and
+    preformatted blocks become body paragraphs, and tables keep their cells, so
+    split_structured and the graph publisher build the same Section, Paragraph,
+    Table, TableCell and Chunk objects they build for PDFs. Everything is page 1.
+    """
+    from backend.app.services.document_processing import _sections
+
+    links = same_origin_links(html, url)
+    page, soup = extract_html(html, url)
+    article = soup.find("article") or soup.find("main") or soup.body or soup
+    paragraphs, tables, seen_title = [], [], False
+    for block in article.find_all([*HEADING_TAGS, "p", "li", "pre", "table"]):
+        if block.find_parent(["p", "li", "pre", "table"]):
+            continue
+        if block.name == "table":
+            cells = [
+                {
+                    "row": row_index, "column": column_index,
+                    "kind": "columnHeader" if cell.name == "th" else "content",
+                    "text": cell.get_text(" ", strip=True), "spans": [],
+                }
+                for row_index, row in enumerate(block.find_all("tr"))
+                for column_index, cell in enumerate(row.find_all(["th", "td"], recursive=False))
+            ]
+            if any(cell["text"] for cell in cells):
+                tables.append({
+                    "id": f"table-1-{len(tables)}", "page": 1,
+                    "row_count": 1 + max(cell["row"] for cell in cells),
+                    "column_count": 1 + max(cell["column"] for cell in cells),
+                    "cells": cells,
+                })
+            continue
+        text = block.get_text(" ", strip=True)
+        if not text:
+            continue
+        role = None
+        if block.name in HEADING_TAGS:
+            role = "sectionHeading" if seen_title or block.name != "h1" else "title"
+            seen_title = seen_title or block.name == "h1"
+        position = len(paragraphs)
+        paragraphs.append({
+            "id": f"paragraph-1-{position}", "page": 1, "text": text,
+            "role": role, "spans": [], "position": position,
+        })
+    if not page["text"] and not tables:
+        raise ValueError("The document contains no readable text")
+    return {
+        "pages": [{"page": 1, "text": page["text"], "markdown": page["text"], "spans": []}],
+        "paragraphs": paragraphs,
+        "sections": _sections(paragraphs),
+        "tables": tables,
+        "figures": [],
+        "method": "html_structure",
+        "metadata": {
+            "format": "text/html", "page_count": 1, "table_count": len(tables),
+            "classification": "web_page", "classification_method": "html_structure",
+            "structured": True, "image_understanding": "not_applicable",
+            "title": page["title"], "canonical_url": page["url"], "links": links,
+        },
+    }
+
+
 def fetch_page(url, session=None, max_bytes=2_000_000):
     response = fetch_response(url, session, max_bytes)
     if "text/html" not in response.headers.get("Content-Type", "").lower():

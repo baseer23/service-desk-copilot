@@ -334,6 +334,19 @@ class DocumentRepository:
                             "image_understanding": "not_applicable",
                         },
                     }
+                elif state["media_type"] == "text/html":
+                    # Saved web pages are structured locally, never sent to Azure.
+                    from backend.app.services.web import html_extraction
+
+                    original = (
+                        original_path.read_text(encoding="utf-8", errors="replace")
+                        if original_path
+                        else self.blobs.get(identifier, "original").decode("utf-8", "replace")
+                    )
+                    result = html_extraction(
+                        original,
+                        state.get("canonical_url") or state.get("source_url") or "https://localhost/",
+                    )
                 else:
                     state.update(phase="extract_inflight", status="extracting")
                     row = self.records.write("document", identifier, state, previous=row)
