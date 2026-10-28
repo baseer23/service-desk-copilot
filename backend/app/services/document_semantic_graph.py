@@ -8,6 +8,9 @@ from backend.app.services.graph_placement import GraphPlacementService
 from backend.app.services.graph_discovery import GraphDiscovery
 from backend.app.models.document_graph_models import GraphPlacementPlan
 
+# Terminal success states; "linked_no_relationships" means entities only.
+SEMANTIC_LINKED_STATUSES = {"linked", "linked_no_relationships"}
+
 
 class DocumentSemanticGraphService:
     def __init__(self, settings, repository, records, provider, graph, vector_store):
@@ -31,7 +34,7 @@ class DocumentSemanticGraphService:
     async def enrich(self, document_id):
         try:
             state = self.repository.get(document_id)
-            if state.get("semantic_graph_status") == "linked": return state
+            if state.get("semantic_graph_status") in SEMANTIC_LINKED_STATUSES: return state
             if not state.get("local_index_ready") or state.get("graph_link_status") != "linked":
                 return self._status(document_id, "pending", semantic_graph_reason="Local index or structural graph is not ready")
             self._status(document_id, "understanding")
@@ -61,12 +64,14 @@ class DocumentSemanticGraphService:
                 self.records.write("document_semantic_graph_job", key, job, previous=job_row)
             self._status(document_id, "placing")
             result = placement.apply_placement(plan, proposal)
-            self.graph.update_document_semantics(document_id, document_type=proposal.document_type, summary=proposal.summary, status="linked")
-            final = self._status(document_id, "linked", semantic_graph_result=result,
+            # Entities without any written relationship are not a full semantic link.
+            linked_status = "linked" if result.get("relationships_written", 0) else "linked_no_relationships"
+            self.graph.update_document_semantics(document_id, document_type=proposal.document_type, summary=proposal.summary, status=linked_status)
+            final = self._status(document_id, linked_status, semantic_graph_result=result,
                                  semantic_graph_retryable=False, semantic_graph_reason=None,
                                  document_type=proposal.document_type, semantic_graph_summary=proposal.summary[:4000])
             job_row = self.records.read("document_semantic_graph_job", key); job = dict(job_row["payload"])
-            job["status"] = "linked"; job["result"] = result
+            job["status"] = linked_status; job["result"] = result
             self.records.write("document_semantic_graph_job", key, job, previous=job_row)
             return final
         except Exception as exc:

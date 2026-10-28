@@ -516,51 +516,66 @@ class GraphRepository:
         return {"upserted": len(entities)}
 
     def upsert_knowledge_relationships(self, relationships):
+        """Write claims; the count is rows actually matched, never proposals."""
+        written = 0
         for item in relationships:
             evidence = list(dict.fromkeys(item.get("evidence_object_ids", [])))[:50]
             claim_id = "claim_" + hashlib.sha256(json.dumps({
                 "s": item["source_id"], "p": item["predicate"], "o": item["target_id"],
                 "d": item["document_id"], "e": evidence}, sort_keys=True).encode()).hexdigest()[:32]
             def write_scoped(tx, item=item, evidence=evidence, claim_id=claim_id):
-                tx.run("MATCH (a:Entity {id:$source}),(b:Entity {id:$target}),(d:Document {id:$document}) "
+                result = tx.run("MATCH (a:Entity {id:$source}),(b:Entity {id:$target}),(d:Document {id:$document}) "
                        "WHERE a.tenant_id=$tenant AND b.tenant_id=$tenant AND d.tenant_id=$tenant "
                        "MERGE (a)-[r:RELATED_TO {predicate:$predicate}]->(b) ON CREATE SET r.created_at=timestamp() SET r.updated_at=timestamp() "
                        "MERGE (c:GraphClaim {id:$claim}) SET c.original_id=$claim_original,c.tenant_id=$tenant,c.predicate=$predicate,"
                        "c.confidence=$confidence,c.is_explicit=$explicit,c.description=$description,c.observed_at=$observed_at,c.status='documented' "
-                       "MERGE (c)-[:SUBJECT]->(a) MERGE (c)-[:OBJECT]->(b) MERGE (c)-[:DOCUMENTED_IN]->(d)",
+                       "MERGE (c)-[:SUBJECT]->(a) MERGE (c)-[:OBJECT]->(b) MERGE (c)-[:DOCUMENTED_IN]->(d) "
+                       "RETURN count(c) AS written",
                        source=self.scope(item["source_id"]), target=self.scope(item["target_id"]), document=self.scope(item["document_id"]),
                        tenant=self.tenant(), predicate=item["predicate"][:64], claim=self.scope(claim_id), claim_original=claim_id,
                        confidence=float(item.get("confidence", 0)), explicit=bool(item.get("is_explicit", True)),
                        description=str(item.get("description", ""))[:1200], observed_at=item.get("observed_at"))
+                record = result.single()
                 if evidence:
                     tx.run("MATCH (c:GraphClaim {id:$claim}) UNWIND $evidence AS oid "
                            "MATCH (o {id:oid}) WHERE c.tenant_id=$tenant AND o.tenant_id=$tenant "
                            "MERGE (c)-[:SUPPORTED_BY]->(o)", claim=self.scope(claim_id),
                            evidence=[self.scope(v) for v in evidence], tenant=self.tenant())
-            self._execute_write(write_scoped)
-        return {"upserted": len(relationships)}
+                return record["written"] if record else 0
+            written += self._execute_write(write_scoped) or 0
+        return {"upserted": written, "proposed": len(relationships)}
 
     def link_document_mentions(self, document_id, mentions):
+        """Link mentions; counts are rows actually matched, never proposals."""
+        linked = resolved = 0
         for item in mentions:
             mention_id = "mention_" + hashlib.sha256(f"{document_id}:{item['mention_id']}".encode()).hexdigest()[:32]
             def write(tx, item=item, mention_id=mention_id):
-                tx.run("MATCH (d:Document {id:$document}) WHERE d.tenant_id=$tenant "
+                result = tx.run("MATCH (d:Document {id:$document}) WHERE d.tenant_id=$tenant "
                        "MERGE (m:GraphMention {id:$mention}) SET m.original_id=$mention_original,m.tenant_id=$tenant,"
-                       "m.name=$name,m.kind=$kind,m.status=$status MERGE (m)-[:MENTIONED_IN]->(d)",
+                       "m.name=$name,m.kind=$kind,m.status=$status MERGE (m)-[:MENTIONED_IN]->(d) "
+                       "RETURN count(m) AS linked",
                        document=self.scope(document_id), tenant=self.tenant(), mention=self.scope(mention_id),
                        mention_original=mention_id, name=item["name"][:240], kind=item["kind"][:100], status=item["status"])
+                record = result.single()
                 evidence = item.get("evidence_object_ids", [])[:50]
                 if evidence:
                     tx.run("MATCH (m:GraphMention {id:$mention}) UNWIND $evidence AS oid "
                            "MATCH (o {id:oid}) WHERE m.tenant_id=$tenant AND o.tenant_id=$tenant "
                            "MERGE (m)-[:SUPPORTED_BY]->(o)", mention=self.scope(mention_id),
                            evidence=[self.scope(v) for v in evidence], tenant=self.tenant())
+                refers = 0
                 if item.get("entity_id"):
-                    tx.run("MATCH (m:GraphMention {id:$mention}),(e:Entity {id:$entity}) "
-                           "WHERE m.tenant_id=$tenant AND e.tenant_id=$tenant MERGE (m)-[:REFERS_TO]->(e)",
-                           mention=self.scope(mention_id), entity=self.scope(item["entity_id"]), tenant=self.tenant())
-            self._execute_write(write)
-        return {"linked": len(mentions)}
+                    refers_record = tx.run("MATCH (m:GraphMention {id:$mention}),(e:Entity {id:$entity}) "
+                           "WHERE m.tenant_id=$tenant AND e.tenant_id=$tenant MERGE (m)-[:REFERS_TO]->(e) "
+                           "RETURN count(e) AS resolved",
+                           mention=self.scope(mention_id), entity=self.scope(item["entity_id"]), tenant=self.tenant()).single()
+                    refers = refers_record["resolved"] if refers_record else 0
+                return (record["linked"] if record else 0), refers
+            counts = self._execute_write(write) or (0, 0)
+            linked += counts[0]
+            resolved += counts[1]
+        return {"linked": linked, "resolved": resolved, "proposed": len(mentions)}
 
     def upsert_semantic_memory(self, batch) -> None:
         """Idempotently publish validated, owner-scoped facts and provenance."""

@@ -41,7 +41,12 @@ class GraphPlacementService:
 
     @staticmethod
     def _conservative_plan(proposal, plan, discovery):
-        """Downgrade malformed placement choices without inventing a graph merge."""
+        """Downgrade malformed placement choices without inventing a graph merge.
+
+        A missing or unauthorized choice becomes a document-scoped CREATE_NEW
+        entity (see apply_placement), so its relationships are kept and nothing
+        merges across documents. The reason records the downgrade.
+        """
         supplied = {}
         for placement in plan.placements:
             if placement.temporary_id not in supplied:
@@ -56,7 +61,7 @@ class GraphPlacementService:
             if placement is None:
                 placement = EntityPlacement(
                     temporary_id=entity.temporary_id,
-                    decision="UNRESOLVED",
+                    decision="CREATE_NEW",
                     reason="No valid placement decision was returned; retained without merging.",
                 )
             elif (
@@ -65,7 +70,7 @@ class GraphPlacementService:
             ):
                 placement = EntityPlacement(
                     temporary_id=entity.temporary_id,
-                    decision="UNRESOLVED",
+                    decision="CREATE_NEW",
                     reason="The proposed reuse target was not an authorized candidate.",
                 )
             placements.append(placement)
@@ -118,7 +123,12 @@ class GraphPlacementService:
                 continue
             relationships.append({**relation.model_dump(), "source_id": source, "target_id": target,
                                   "document_id": proposal.document_id})
-        self.graph.upsert_knowledge_relationships(relationships)
-        self.graph.link_document_mentions(proposal.document_id, mentions)
+        # Report what the writer actually wrote, not what was proposed.
+        written = (self.graph.upsert_knowledge_relationships(relationships) or {}).get("upserted", 0)
+        linked = self.graph.link_document_mentions(proposal.document_id, mentions) or {}
         return {"entities_created": len(writes), "mentions": len(mentions),
-                "relationships": len(relationships), "unresolved": sum(not v for v in mapping.values())}
+                "mentions_linked": linked.get("linked", 0),
+                "relationships": written, "relationships_written": written,
+                "relationships_proposed": len(proposal.relationships),
+                "relationships_dropped": len(proposal.relationships) - written,
+                "unresolved": sum(not v for v in mapping.values())}

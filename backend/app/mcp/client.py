@@ -12,10 +12,17 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+import httpx
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
+from mcp.shared.exceptions import McpError
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
+# Ingestion stages that legitimately outlast the session's default read timeout.
+LONG_RUNNING_TOOLS = {
+    "enrich_document_graph", "enrich_document_semantic_graph",
+    "index_document", "reprocess_document",
+}
 
 
 class MCPToolError(RuntimeError):
@@ -256,7 +263,14 @@ class DeskMateMCPClient:
                                 result = await session.list_tools()
                                 value = [t.model_dump() for t in result.tools]
                             else:
-                                result = await session.call_tool(name, arguments, meta=meta)
+                                result = await session.call_tool(
+                                    name, arguments,
+                                    read_timeout_seconds=(
+                                        timedelta(seconds=900)
+                                        if name in LONG_RUNNING_TOOLS else None
+                                    ),
+                                    meta=meta,
+                                )
                                 if result.isError:
                                     message = " ".join(
                                         getattr(c, "text", "") for c in result.content
@@ -278,6 +292,19 @@ class DeskMateMCPClient:
                         except MCPToolError as exc:
                             if not future.done():
                                 future.set_exception(exc)
+                        except McpError as exc:
+                            # A request-level error leaves the session and server alive,
+                            # so a slow write finishes and records its own final status.
+                            if not future.done():
+                                if exc.error.code == httpx.codes.REQUEST_TIMEOUT:
+                                    future.set_exception(MCPToolError(
+                                        f"MCP tool {name} is still running past its time limit",
+                                        504, "MCP_REQUEST_TIMEOUT",
+                                    ))
+                                else:
+                                    future.set_exception(MCPToolError(
+                                        f"MCP tool {name} failed", 502, "MCP_ERROR",
+                                    ))
                         except Exception:
                             if not future.done():
                                 future.set_exception(
