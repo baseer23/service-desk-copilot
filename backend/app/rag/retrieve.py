@@ -75,10 +75,11 @@ class Retriever:
                 supplement = self.vector_search(question, top_k)
             seen = set()
             combined = []
-            # Graph title/entity matches can be broad and reference-only. Keep
-            # locally ranked passage relevance first so an arbitrary bounded
-            # graph-reference order cannot displace the answer-bearing passage.
-            for row in supplement + structured:
+            # Graph-first: hydrated graph objects are already ranked against the
+            # question, so they lead the local supplement. An exact local
+            # identifier match still comes first because it names the passage.
+            exact = [row for row in supplement if row.get("match_type") == "exact_identifier"]
+            for row in exact + structured + supplement:
                 if row["id"] not in seen:
                     combined.append(row)
                     seen.add(row["id"])

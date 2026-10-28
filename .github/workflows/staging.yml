@@ -50,7 +50,7 @@ jobs:
           npm --prefix frontend ci
           npx --prefix frontend playwright install --with-deps chromium
       - name: Persistent memory and integration tests
-        run: .venv/bin/python -m pytest backend/app/tests -q
+        run: .venv/bin/python -m pytest backend/app/tests -q -m "not live"
       - name: Browser validation
         run: npm --prefix frontend run test:e2e
       - name: Production frontend build

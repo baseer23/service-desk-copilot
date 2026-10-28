@@ -183,6 +183,48 @@ class MultiMCPClient:
             output = await asyncio.wait_for(self.integrations[server].call_tool(original, arguments), 30)
         except (MCPConnectionError, MCPToolError, asyncio.TimeoutError):
             raise MCPToolError("The connected integration is temporarily unavailable") from None
+        if server == "neo4j" and original == "read-cypher":
+            raw = output
+            envelope = output
+            while isinstance(envelope, dict) and any(
+                key in envelope for key in ("result", "results")
+            ):
+                nested = envelope.get("rows")
+                if isinstance(nested, list):
+                    break
+                envelope = envelope.get("result", envelope.get("results"))
+            if isinstance(envelope, dict) and isinstance(envelope.get("rows"), list):
+                rows = envelope["rows"]
+            elif isinstance(envelope, list) and all(isinstance(row, dict) for row in envelope):
+                rows = envelope
+            elif isinstance(envelope, dict) and not any(
+                key in envelope for key in ("columns", "data", "records", "rows")
+            ):
+                rows = [envelope]
+            else:
+                raise MCPToolError(
+                    "Neo4j read-cypher returned an unsupported response envelope",
+                    code="NEO4J_MCP_RESPONSE_SHAPE",
+                )
+            if any(not isinstance(row, dict) for row in rows):
+                raise MCPToolError(
+                    "Neo4j read-cypher rows must be objects",
+                    code="NEO4J_MCP_RESPONSE_SHAPE",
+                )
+            metadata = {
+                key: value for key, value in (raw.items() if isinstance(raw, dict) else [])
+                if key in {"truncated", "has_more", "warnings", "error"}
+            }
+            return {
+                "tool": name,
+                "status": "ok",
+                "items": rows,
+                "result": raw,
+                "metadata": metadata,
+                "timestamp": datetime.now(UTC).isoformat(),
+                "source_system": "mcp:" + server,
+                "reliability": 0.8,
+            }
         values = output if isinstance(output, list) else [output]
         items = [value if isinstance(value, dict) else {"text": str(value)} for value in values]
         return {"tool": name, "status": "ok", "items": items, "result": output,

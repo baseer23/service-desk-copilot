@@ -150,7 +150,8 @@ def run(selection: dict) -> int:
         ])
     if selection["backend"]:
         commands.append([
-            str(ROOT / ".venv/bin/python"), "-m", "pytest", "-q", *selection["backend"],
+            str(ROOT / ".venv/bin/python"), "-m", "pytest", "-q", "-m", "not live",
+            *selection["backend"],
         ])
     if selection["frontend"]:
         commands.append([

@@ -1020,6 +1020,17 @@ def list_available_context(question: str | None = None):
         "local_documents_available": bool(catalog),
         "document_catalog": catalog,
         "document_catalog_bounded": len(catalog) < len(rows) if get_settings().uses_record_store else False,
+        # Complete tenant-owned title inventory for application-side document
+        # resolution; the agent removes it before building model context.
+        "document_inventory": [
+            {
+                "id": row.get("id"),
+                "title": row.get("title"),
+                "family": row.get("family"),
+                "version": row.get("version", 1),
+            }
+            for row in rows
+        ],
         "chroma": vector.ping(),
         "aura_connected": driver is not None,
         **(fixtures.inventory() if get_settings().enable_local_fixtures else {}),
@@ -1027,6 +1038,25 @@ def list_available_context(question: str | None = None):
         "memory": "sqlite_memory",
         "web": "public_web" if get_settings().enable_public_web_tools else "unavailable",
     }
+
+
+@capability("chroma")
+def resolve_graph_references(question: str, object_ids: list[str]):
+    """Application-controlled: hydrate graph object references into local passages.
+
+    Only tenant-owned passages are returned, ranked against ``question``.
+    """
+    if not 1 <= len(object_ids) <= 500:
+        raise ValueError("object_ids must contain between 1 and 500 references")
+    repository = documents()
+    resolve = getattr(getattr(repository, "search_store", None), "resolve_object_ids", None)
+    if resolve is None:
+        return {
+            "available": False,
+            "reason": "Graph-reference hydration requires local document persistence.",
+        }
+    embedding = repository.embeddings.embed_texts([question])[0]
+    return resolve(object_ids, embedding)
 
 
 @capability("local_storage", 1)

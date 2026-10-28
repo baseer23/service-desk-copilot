@@ -7,6 +7,7 @@ import time
 import uuid
 
 import httpx
+import pytest
 from neo4j import GraphDatabase
 
 from backend.app.core.config import Settings
@@ -52,7 +53,16 @@ def _pdf(text: str) -> bytes:
     return output.getvalue()
 
 
+@pytest.mark.live
 def test_document_upload_to_neo4j_to_chat():
+    # Fail closed: this uploads to a running server backed by real stores.
+    if not (
+        os.getenv("DESKMATE_TEST_PROFILE") == "live"
+        and os.getenv("DESKMATE_ALLOW_LIVE_API_TESTS", "").casefold() == "true"
+    ):
+        pytest.skip(
+            "Live only: set DESKMATE_TEST_PROFILE=live and DESKMATE_ALLOW_LIVE_API_TESTS=true"
+        )
     settings = Settings()
     base_url = os.getenv("DESKMATE_E2E_BASE_URL", "http://127.0.0.1:8000")
     run_id = os.getenv("DESKMATE_E2E_RUN_ID") or uuid.uuid4().hex[:12]
