@@ -112,7 +112,14 @@ class DocumentRepository:
             "ingestion_mode": ingestion_mode,
             "document_processing": document_processing,
         }
-        family = hashlib.sha256((title or identifier).strip().casefold().encode()).hexdigest()
+        # A web page's identity is its canonical URL: same-titled pages stay
+        # separate documents, and re-crawling one URL adds a new version of it.
+        family_key = (
+            "url:" + (canonical_url or source_url)
+            if source_type == "url" and (canonical_url or source_url)
+            else (title or identifier).strip().casefold()
+        )
+        family = hashlib.sha256(family_key.encode()).hexdigest()
         with self.records.locked("document_family", family) as history:
             versions = history.setdefault("versions", [])
             payload.update(family=family, version=len(versions) + 1, content_hash=identifier)
