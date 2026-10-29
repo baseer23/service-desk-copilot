@@ -197,8 +197,12 @@ def create_app(settings: Settings | None = None):
                             "aura_connected": False,
                         }
                     if s.uses_record_store:
-                        from backend.app.services.document_worker import document_worker
+                        from backend.app.services.document_worker import (
+                            document_worker,
+                            recover_interrupted_work,
+                        )
 
+                        await recover_interrupted_work(s, app.state.agent.harness)
                         app.state.ingestion_wakeup = asyncio.Event()
                         ingestion_task = asyncio.create_task(
                             document_worker(

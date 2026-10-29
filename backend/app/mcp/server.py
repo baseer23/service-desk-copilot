@@ -720,6 +720,13 @@ def list_documents():
     return documents().list_documents()
 
 
+@capability("local_document")
+def recover_interrupted_documents():
+    """Settle document jobs an earlier application process left mid-operation."""
+    recover = getattr(documents(), "recover_interrupted", None)
+    return recover() if recover else []
+
+
 @capability("chroma")
 def index_document(document_id: str):
     """Explicit operator write: embed a staged document into the configured verified collection."""
