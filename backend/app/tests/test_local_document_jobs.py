@@ -447,7 +447,8 @@ def test_azure_structure_counts_actual_nodes_and_relationships_without_text(sett
     counts = repository._publish_reference_objects(
         graph, "a" * 64, "Structured", extraction, temporary=False
     )
-    assert counts == {"nodes": 7, "relationships": 7}
+    # Includes the paragraph's PART_OF link to the chunk that holds its text.
+    assert counts == {"nodes": 7, "relationships": 8}
     serialized = repr(graph.references)
     assert "Private body" not in serialized and "Private cell" not in serialized
     assert {item["object_type"] for item in graph.references.values()} == {

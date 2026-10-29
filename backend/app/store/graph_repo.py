@@ -29,16 +29,81 @@ T = TypeVar("T")
 ChunkRecord = Dict[str, object]
 
 
-# Reference-only structural labels; their text stays in local storage.
+# Structural labels. Long narrative text stays in local storage (Chroma); short
+# structural meaning (questions, option labels, headers, titles) and, when the
+# content policy allows, exact values are stored as node properties.
 REFERENCE_LABELS = {
     "Chunk", "Table", "Figure", "Section", "Paragraph", "TableCell", "FormField", "SelectionMark",
 }
 REFERENCE_RELATIONSHIPS = {
     "HAS_SECTION", "HAS_CHUNK", "HAS_TABLE", "HAS_FIGURE", "HAS_PARAGRAPH", "HAS_TABLECELL",
     "HAS_CELL", "HAS_FORMFIELD", "HAS_SELECTIONMARK", "REFERENCES_TABLE", "REFERENCES_FIGURE",
-    "MENTIONS", "RELATED_TO",
+    "MENTIONS", "RELATED_TO", "HEADER_OF", "PART_OF",
+}
+# Meaningful properties a structural node may carry, beyond its provenance.
+MEANINGFUL_PROPERTIES = {
+    "question", "question_normalized", "field_type", "field_status", "selected_option",
+    "association_method", "ambiguity_reason", "option_count", "option_label", "selected",
+    "ordinal",
+    "form_field_id", "title", "caption", "level", "page_start", "page_end",
+    "content_references", "row_count", "column_count", "column_headers", "row_headers",
+    "table_id", "row_group", "row_span", "column_span", "kind", "column_header", "row_header",
+    "value", "data_type", "unit", "header_text", "content_policy",
 }
 WRITE_BATCH_ROWS = 500
+# Exact structural lookups. Fixed, parameterised and tenant-scoped; the agent
+# runs them through neo4j-mcp read-cypher and never composes its own Cypher.
+EXACT_FORM_FIELDS_QUERY = (
+    "MATCH (f:FormField) WHERE f.tenant_id = $tenant_id AND f.document_id IN $document_ids "
+    "OPTIONAL MATCH (f)-[:HAS_SELECTIONMARK]->(m:SelectionMark) "
+    "WITH f, m ORDER BY m.ordinal "
+    "WITH f, collect(CASE WHEN m IS NULL THEN NULL ELSE {label: m.option_label, "
+    "selected: m.state_flag = 'selected', confidence: m.confidence, ordinal: m.ordinal} END) "
+    "AS options "
+    "RETURN coalesce(f.original_id, f.id) AS object_id, f.document_id AS document_id, "
+    "f.page AS page, f.question AS question, f.question_normalized AS question_normalized, "
+    "f.field_type AS field_type, f.field_status AS status, f.selected_option AS selected_option, "
+    "f.confidence AS confidence, f.ambiguity_reason AS ambiguity_reason, "
+    "f.association_method AS association_method, options LIMIT 500"
+)
+EXACT_TABLE_CELLS_QUERY = (
+    "MATCH (c:TableCell) WHERE c.tenant_id = $tenant_id AND c.document_id IN $document_ids "
+    "AND c.kind = 'content' "
+    "RETURN coalesce(c.original_id, c.id) AS object_id, c.document_id AS document_id, "
+    "c.page AS page, c.table_id AS table_id, c.table_row AS row, c.table_column AS column, "
+    "c.row_span AS row_span, c.column_span AS column_span, c.column_header AS column_header, "
+    "c.row_header AS row_header, c.value AS value, c.data_type AS data_type, c.unit AS unit "
+    "LIMIT 5000"
+)
+
+
+VERIFIED_CLAIMS = {"observed", "derived", "documented"}
+
+
+def claim_status(item):
+    """A claim's stored status; unlabeled legacy proposals keep 'documented'."""
+    status = item.get("status")
+    return status if status in {"observed", "derived", "ambiguous", "hypothesis"} else "documented"
+
+
+def meaningful_properties(values):
+    """Allowlisted, Neo4j-storable properties (primitives or lists of primitives).
+
+    A None value is kept so ``SET n += map`` removes a property the current
+    content policy no longer allows.
+    """
+    clean = {}
+    for key, value in (values or {}).items():
+        if key not in MEANINGFUL_PROPERTIES:
+            continue
+        if isinstance(value, str):
+            value = value[:1000]
+        elif isinstance(value, list):
+            value = [str(item)[:300] for item in value[:50]]
+        elif value is not None and not isinstance(value, (bool, int, float)):
+            continue
+        clean[key] = value
+    return clean
 
 
 def _batches(rows):
@@ -88,6 +153,9 @@ class GraphRepository:
             "CREATE CONSTRAINT IF NOT EXISTS FOR (c:TableCell) REQUIRE c.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (f:FormField) REQUIRE f.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (m:SelectionMark) REQUIRE m.id IS UNIQUE",
+            "CREATE INDEX IF NOT EXISTS FOR (f:FormField) ON (f.document_id)",
+            "CREATE INDEX IF NOT EXISTS FOR (f:FormField) ON (f.question_normalized)",
+            "CREATE INDEX IF NOT EXISTS FOR (c:TableCell) ON (c.document_id)",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (t:Topic) REQUIRE t.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (f:SemanticFact) REQUIRE f.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (s:ConversationSource) REQUIRE s.id IS UNIQUE",
@@ -100,7 +168,7 @@ class GraphRepository:
         self, doc_id: str, title: Optional[str] = None, source: str = "paste",
         *, version: int = 1, content_hash: str | None = None,
         source_type: str | None = None, source_url: str | None = None,
-        canonical_url: str | None = None,
+        canonical_url: str | None = None, projection: dict | None = None,
     ) -> None:
         """Insert or update a document node, its metadata and source provenance."""
 
@@ -111,7 +179,7 @@ class GraphRepository:
                 "d.content_hash=$content_hash, d.link_status='linked', "
                 "d.updated_at = timestamp(), d.original_id=$original_id, d.tenant_id=$tenant_id, "
                 "d.source_type=$source_type, d.source_url=$source_url, "
-                "d.canonical_url=$canonical_url",
+                "d.canonical_url=$canonical_url, d += $projection",
                 doc_id=self.scope(doc_id),
                 title=title,
                 source=source,
@@ -122,9 +190,30 @@ class GraphRepository:
                 source_type=source_type,
                 source_url=source_url or None,
                 canonical_url=canonical_url or None,
+                projection={
+                    key: value for key, value in (projection or {}).items()
+                    if key in {"projection_version", "content_policy", "extraction_method",
+                               "extraction_artifact"}
+                },
             )
 
         self._execute_write(_tx)
+
+    def exact_form_fields(self, document_ids):
+        """Form fields of the given documents with their options, by index lookup."""
+        def read(tx):
+            return [dict(row) for row in tx.run(
+                EXACT_FORM_FIELDS_QUERY, tenant_id=self.tenant(), document_ids=list(document_ids),
+            )]
+        return self._execute_read(read) or []
+
+    def exact_table_cells(self, document_ids):
+        """Content cells of the given documents' tables with their headers."""
+        def read(tx):
+            return [dict(row) for row in tx.run(
+                EXACT_TABLE_CELLS_QUERY, tenant_id=self.tenant(), document_ids=list(document_ids),
+            )]
+        return self._execute_read(read) or []
 
     def upsert_page(self, doc_id: str, page: int, version: int = 1) -> None:
         """Create a tenant-scoped page anchor without storing private content."""
@@ -207,7 +296,8 @@ class GraphRepository:
                         "n.table_row=row.table_row, n.table_column=row.table_column, "
                         "n.role=row.role, n.state_flag=row.state_flag, "
                         "n.confidence=row.confidence, "
-                        "n.bounding_regions_json=row.bounding_regions_json",
+                        "n.bounding_regions_json=row.bounding_regions_json, "
+                        "n += row.properties",
                         rows=batch,
                     )
                     if label == "SelectionMark":
@@ -250,6 +340,7 @@ class GraphRepository:
             "bounding_regions_json": json.dumps(
                 item.get("bounding_regions", [])[:8], separators=(",", ":")
             )[:4000],
+            "properties": meaningful_properties(item.get("properties")),
         }
 
     def fetch_structured_references(
@@ -650,15 +741,21 @@ class GraphRepository:
             def write_scoped(tx, item=item, evidence=evidence, claim_id=claim_id):
                 result = tx.run("MATCH (a:Entity {id:$source}),(b:Entity {id:$target}),(d:Document {id:$document}) "
                        "WHERE a.tenant_id=$tenant AND b.tenant_id=$tenant AND d.tenant_id=$tenant "
-                       "MERGE (a)-[r:RELATED_TO {predicate:$predicate}]->(b) ON CREATE SET r.created_at=timestamp() SET r.updated_at=timestamp() "
+                       # Only verified claims (observed/derived) become a traversable edge;
+                       # ambiguous and hypothesis claims stay GraphClaims with their status.
+                       "FOREACH (_ IN CASE WHEN $verified THEN [1] ELSE [] END | "
+                       "MERGE (a)-[r:RELATED_TO {predicate:$predicate}]->(b) "
+                       "ON CREATE SET r.created_at=timestamp() "
+                       "SET r.updated_at=timestamp(), r.status=$status) "
                        "MERGE (c:GraphClaim {id:$claim}) SET c.original_id=$claim_original,c.tenant_id=$tenant,c.predicate=$predicate,"
-                       "c.confidence=$confidence,c.is_explicit=$explicit,c.description=$description,c.observed_at=$observed_at,c.status='documented' "
+                       "c.confidence=$confidence,c.is_explicit=$explicit,c.description=$description,c.observed_at=$observed_at,c.status=$status "
                        "MERGE (c)-[:SUBJECT]->(a) MERGE (c)-[:OBJECT]->(b) MERGE (c)-[:DOCUMENTED_IN]->(d) "
                        "RETURN count(c) AS written",
                        source=self.scope(item["source_id"]), target=self.scope(item["target_id"]), document=self.scope(item["document_id"]),
                        tenant=self.tenant(), predicate=item["predicate"][:64], claim=self.scope(claim_id), claim_original=claim_id,
                        confidence=float(item.get("confidence", 0)), explicit=bool(item.get("is_explicit", True)),
-                       description=str(item.get("description", ""))[:1200], observed_at=item.get("observed_at"))
+                       description=str(item.get("description", ""))[:1200], observed_at=item.get("observed_at"),
+                       status=claim_status(item), verified=claim_status(item) in VERIFIED_CLAIMS)
                 record = result.single()
                 if evidence:
                     tx.run("MATCH (c:GraphClaim {id:$claim}) UNWIND $evidence AS oid "
@@ -938,6 +1035,12 @@ class UnavailableGraphRepository:
     def upsert_reference_objects(self, *args, **kwargs):
         pass
 
+    def exact_form_fields(self, document_ids):
+        return []
+
+    def exact_table_cells(self, document_ids):
+        return []
+
     def link_reference_objects_many(self, *args, **kwargs):
         pass
 
@@ -1036,16 +1139,77 @@ class InMemoryGraphRepository:
         }
 
     def upsert_reference_object(self, doc_id: str, item: dict) -> None:
+        current = self.references.get(item["object_id"], {})
+        properties = {
+            **current.get("properties", {}), **meaningful_properties(item.get("properties")),
+        }
         self.references[item["object_id"]] = {
             "object_id": item["object_id"],
             "object_type": item["object_type"],
             "document_id": doc_id,
             "page": item.get("page"),
+            "position": item.get("position"),
+            "source_element_id": item.get("source_element_id"),
+            "table_row": item.get("table_row"),
+            "table_column": item.get("table_column"),
             "description": str(item.get("description") or "")[:160],
             "role": item.get("role"),
             "state_flag": item.get("state_flag"),
             "confidence": item.get("confidence"),
+            # Mirrors SET n += properties: a None value removes the property.
+            "properties": {key: value for key, value in properties.items() if value is not None},
         }
+
+    def exact_form_fields(self, document_ids):
+        """Same rows as EXACT_FORM_FIELDS_QUERY."""
+        rows = []
+        for object_id, item in self.references.items():
+            if item["object_type"] != "FormField" or item["document_id"] not in document_ids:
+                continue
+            props = item["properties"]
+            marks = sorted(
+                (self.references[target] for source, relationship, target in self.reference_links
+                 if source == object_id and relationship == "HAS_SELECTIONMARK"
+                 and target in self.references),
+                key=lambda mark: mark["properties"].get("ordinal", 0),
+            )
+            rows.append({
+                "object_id": object_id, "document_id": item["document_id"], "page": item["page"],
+                "question": props.get("question"),
+                "question_normalized": props.get("question_normalized"),
+                "field_type": props.get("field_type"), "status": props.get("field_status"),
+                "selected_option": props.get("selected_option"),
+                "confidence": item.get("confidence"),
+                "ambiguity_reason": props.get("ambiguity_reason"),
+                "association_method": props.get("association_method"),
+                "options": [
+                    {"label": mark["properties"].get("option_label"),
+                     "selected": mark["state_flag"] == "selected",
+                     "confidence": mark["confidence"],
+                     "ordinal": mark["properties"].get("ordinal")}
+                    for mark in marks
+                ],
+            })
+        return rows
+
+    def exact_table_cells(self, document_ids):
+        """Same rows as EXACT_TABLE_CELLS_QUERY."""
+        rows = []
+        for object_id, item in self.references.items():
+            props = item["properties"]
+            if (item["object_type"] != "TableCell" or item["document_id"] not in document_ids
+                    or props.get("kind") != "content"):
+                continue
+            rows.append({
+                "object_id": object_id, "document_id": item["document_id"], "page": item["page"],
+                "table_id": props.get("table_id"), "row": item["table_row"],
+                "column": item["table_column"], "row_span": props.get("row_span"),
+                "column_span": props.get("column_span"),
+                "column_header": props.get("column_header"),
+                "row_header": props.get("row_header"), "value": props.get("value"),
+                "data_type": props.get("data_type"), "unit": props.get("unit"),
+            })
+        return rows
 
     def fetch_structured_references(
         self,

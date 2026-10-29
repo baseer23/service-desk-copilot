@@ -21,7 +21,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 # Ingestion stages that legitimately outlast the session's default read timeout.
 LONG_RUNNING_TOOLS = {
     "enrich_document_graph", "enrich_document_semantic_graph",
-    "index_document", "reprocess_document",
+    "index_document", "reprocess_document", "upgrade_graph_projection",
 }
 
 

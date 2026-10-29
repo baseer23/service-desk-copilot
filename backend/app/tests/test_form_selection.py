@@ -313,7 +313,9 @@ def test_graph_references_link_fields_and_marks_without_private_values():
         assert "Silver Tern" not in ref["description"]
         assert "selected:" not in ref["description"] and "[x]" not in ref["description"]
     for ref in marks.values():
-        assert ref["description"] == "Mooring application.pdf — selection mark on page 1"
+        # The default content policy keeps option labels (and so the answer) local.
+        assert " — option " in ref["description"] and " of: " in ref["description"]
+        assert "“" not in ref["description"] and "option_label" not in ref["properties"]
 
 
 class ScriptedUnderstanding:
@@ -333,8 +335,9 @@ class ScriptedUnderstanding:
             summary="A mooring application.",
             entities=[
                 {
+                    # Entity names must appear in the objects they cite.
                     "temporary_id": "vessel",
-                    "name": "Silver Tern",
+                    "name": "vessel",
                     "entity_type": "Vessel",
                     "evidence_object_ids": [chunk["object_id"]],
                 },
