@@ -277,40 +277,43 @@ class GraphRepository:
         """Attach a crawled page to its Website and to linked pages, in one transaction.
 
         LINKS_TO is written in both directions against Documents already in the
-        graph (matched by canonical_url), so pages can be linked in any order.
+        graph (matched by canonical_url), so pages can be linked in any order: a
+        link to a page not yet saved is written when that page arrives. Counts
+        are relationships actually created.
         """
         outlinks = [str(url) for url in list(dict.fromkeys(outlinks or []))[:500]]
 
         def _tx(tx: Transaction):
-            tx.run(
+            attached = tx.run(
                 "MATCH (d:Document {id:$doc}) WHERE d.tenant_id=$tenant "
                 "SET d.outlinks=$outlinks "
                 "MERGE (w:Website {id:$website}) ON CREATE SET w.created_at=timestamp() "
                 "SET w.origin=$origin, w.original_id=$origin, w.tenant_id=$tenant "
-                "MERGE (w)-[:HAS_DOCUMENT]->(d)",
+                "MERGE (w)-[:HAS_DOCUMENT]->(d) RETURN count(d) AS attached",
                 doc=self.scope(doc_id), tenant=self.tenant(), outlinks=outlinks,
                 website=self.scope("website:" + origin), origin=origin,
-            )
+            ).single()
+            if not attached or not attached["attached"]:
+                # The page Document is not in the graph yet: nothing was written.
+                return {"outbound": 0, "inbound": 0, "document_found": False}
             outbound = tx.run(
                 "MATCH (d:Document {id:$doc}) WHERE d.tenant_id=$tenant "
                 "UNWIND $outlinks AS url "
                 "MATCH (t:Document {canonical_url:url}) WHERE t.tenant_id=$tenant AND t <> d "
-                "MERGE (d)-[:LINKS_TO]->(t) RETURN count(*) AS written",
+                "MERGE (d)-[:LINKS_TO]->(t)",
                 doc=self.scope(doc_id), tenant=self.tenant(), outlinks=outlinks,
-            ).single()
+            ).consume().counters.relationships_created
             inbound = tx.run(
                 "MATCH (d:Document {id:$doc}) WHERE d.tenant_id=$tenant "
                 "MATCH (s:Document) WHERE s.tenant_id=$tenant AND s <> d "
                 "AND $canonical IN coalesce(s.outlinks, []) "
-                "MERGE (s)-[:LINKS_TO]->(d) RETURN count(*) AS written",
+                "MERGE (s)-[:LINKS_TO]->(d)",
                 doc=self.scope(doc_id), tenant=self.tenant(), canonical=canonical_url,
-            ).single()
-            return {
-                "outbound": outbound["written"] if outbound else 0,
-                "inbound": inbound["written"] if inbound else 0,
-            }
+            ).consume().counters.relationships_created
+            # Counters report relationships actually created, not existing ones re-matched.
+            return {"outbound": outbound, "inbound": inbound, "document_found": True}
 
-        return self._execute_write(_tx) or {"outbound": 0, "inbound": 0}
+        return self._execute_write(_tx) or {"outbound": 0, "inbound": 0, "document_found": False}
 
     def link_reference_objects(self, source_id: str, target_id: str, relationship: str):
         allowed = {
@@ -836,7 +839,7 @@ class UnavailableGraphRepository:
         pass
 
     def link_website_document(self, *args, **kwargs):
-        return {"outbound": 0, "inbound": 0}
+        return {"outbound": 0, "inbound": 0, "document_found": False}
 
     def upsert_chunk(self, *args, **kwargs):
         pass
@@ -933,17 +936,22 @@ class InMemoryGraphRepository:
         }
 
     def link_website_document(self, doc_id, origin, canonical_url, outlinks):
+        if doc_id not in self.documents:
+            # Like the Neo4j MATCH: an absent page Document gets no links.
+            return {"outbound": 0, "inbound": 0, "document_found": False}
         self.websites.setdefault(origin, set()).add(doc_id)
-        self.documents.setdefault(doc_id, {})["outlinks"] = list(outlinks or [])
-        before = len(self.document_links)
-        for other_id, other in self.documents.items():
-            if other_id == doc_id:
-                continue
-            if other.get("canonical_url") in (outlinks or []):
-                self.document_links.add((doc_id, other_id))
-            if canonical_url in (other.get("outlinks") or []):
-                self.document_links.add((other_id, doc_id))
-        return {"outbound": len(self.document_links) - before, "inbound": 0}
+        self.documents[doc_id]["outlinks"] = list(outlinks or [])
+        outbound = {
+            (doc_id, other_id) for other_id, other in self.documents.items()
+            if other_id != doc_id and other.get("canonical_url") in (outlinks or [])
+        }
+        inbound = {
+            (other_id, doc_id) for other_id, other in self.documents.items()
+            if other_id != doc_id and canonical_url in (other.get("outlinks") or [])
+        }
+        outbound, inbound = outbound - self.document_links, inbound - self.document_links
+        self.document_links |= outbound | inbound
+        return {"outbound": len(outbound), "inbound": len(inbound), "document_found": True}
 
     def upsert_page(self, doc_id: str, page: int, version: int = 1) -> None:
         """Pages are implicit in the lightweight test repository."""

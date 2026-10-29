@@ -34,11 +34,20 @@ async def document_processing_lock(tenant_id: str, document_id: str):
             _document_locks.pop(key, None)
 
 
-async def process_document_pass(settings, harness, *, timestamp=None):
-    """Advance at most one durable document job without repeating paid extraction."""
+async def process_document_pass(settings, harness, *, timestamp=None, exclude=(), attempted=None):
+    """Advance at most one durable document job without repeating paid extraction.
+
+    Documents in ``exclude`` are passed over, and the processed document's id is
+    appended to ``attempted``, so a caller can step past a document whose pass
+    changed nothing instead of letting it starve the documents queued after it.
+    """
     current = time.time() if timestamp is None else timestamp
     documents = (await harness.invoke("list_documents", {}))["items"]
     for document in documents:
+        if document.get("id") in exclude:
+            continue
+        if attempted is not None:
+            attempted.append(document.get("id"))
         phase = document.get("phase")
         status = document.get("status")
         if phase in {"extract_inflight", "embedding_inflight"}:
@@ -122,12 +131,18 @@ async def document_worker(settings, harness, wakeup: asyncio.Event):
         for tenant in (settings.auth_allowed_tenants or [settings.voice_tenant_id]):
             with principal_scope(Principal(tenant, "document-worker")):
                 try:
+                    stalled = set()
                     for _ in range(MAX_IMMEDIATE_PASSES):
                         before = await _work_fingerprint(harness)
-                        if await process_document_pass(settings, harness) is None:
+                        attempted = []
+                        if await process_document_pass(
+                            settings, harness, exclude=stalled, attempted=attempted
+                        ) is None:
                             break
                         if await _work_fingerprint(harness) == before:
-                            break
+                            # Set aside a document whose pass changed nothing and
+                            # continue with the rest of the queue.
+                            stalled.add(attempted[-1])
                     else:
                         # Yield between bounded batches while ensuring a large queue
                         # remains immediately runnable without an external signal.

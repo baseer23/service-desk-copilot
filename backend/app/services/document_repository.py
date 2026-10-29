@@ -83,7 +83,16 @@ class DocumentRepository:
             raise ValueError("Choose a nonempty document and a title up to 300 characters")
         if media_type in {"text/plain", "text/markdown"} and not data.decode("utf-8-sig").strip():
             raise ValueError("The document contains no readable text")
-        identifier = hashlib.sha256(data).hexdigest()
+        if media_type == "text/html":
+            from backend.app.services.web import stable_html_fingerprint
+
+            # A re-crawled page whose only change is volatile markup (scripts,
+            # nonces, cache comments) is the same document, not a new version.
+            identifier = hashlib.sha256(
+                b"html-content-v1\n" + stable_html_fingerprint(data.decode("utf-8", "replace"))
+            ).hexdigest()
+        else:
+            identifier = hashlib.sha256(data).hexdigest()
         previous = self.records.read("document", identifier)
         if previous:
             payload = self._upgrade_duplicate(
@@ -341,6 +350,32 @@ class DocumentRepository:
             if state["phase"] == "extract":
                 location = getattr(self.blobs, "location", None)
                 original_path = location(identifier, "original") if location else None
+
+                def load_batch(index):
+                    if not location:
+                        return None
+                    path = location(identifier, f"extraction-batch-{index}.json")
+                    return json.loads(path.read_bytes()) if path.exists() else None
+
+                def save_batch(index, batch):
+                    # Completed paid batches are saved so a resume never re-sends them.
+                    nonlocal row
+                    self.blobs.put(
+                        identifier, f"extraction-batch-{index}.json",
+                        json.dumps(batch).encode(), "application/json",
+                    )
+                    state.update(
+                        completed_batches=index + 1,
+                        pages=sum(
+                            len(load_batch(item).get("pages", []))
+                            for item in range(index + 1)
+                        ),
+                    )
+                    row = self.records.write(
+                        "document", identifier, state, previous=row,
+                        fields={"status": "extracting"},
+                    )
+
                 if state["media_type"] in {"text/plain", "text/markdown"}:
                     original = (
                         original_path.read_text(encoding="utf-8-sig")
@@ -367,8 +402,10 @@ class DocumentRepository:
                         },
                     }
                 elif state["media_type"] == "text/html":
-                    # Saved web pages are structured locally, never sent to Azure.
-                    from backend.app.services.web import html_extraction
+                    # Saved web pages are parsed locally (free). Azure layout
+                    # analysis runs only for pages saved with azure_di, and the
+                    # local parse still supplies links, canonical URL and tables.
+                    from backend.app.services.web import html_extraction, merge_html_analysis
 
                     original = (
                         original_path.read_text(encoding="utf-8", errors="replace")
@@ -379,30 +416,17 @@ class DocumentRepository:
                         original,
                         state.get("canonical_url") or state.get("source_url") or "https://localhost/",
                     )
+                    if state.get("document_processing") == "azure_di":
+                        analysis = load_batch(0)
+                        if analysis is None:
+                            state.update(phase="extract_inflight", status="extracting")
+                            row = self.records.write("document", identifier, state, previous=row)
+                            analysis = self.extractor.analyze_html(original.encode("utf-8"))
+                            save_batch(0, analysis)
+                        result = merge_html_analysis(analysis, result)
                 else:
                     state.update(phase="extract_inflight", status="extracting")
                     row = self.records.write("document", identifier, state, previous=row)
-                    def load_batch(index):
-                        path = self.blobs.location(identifier, f"extraction-batch-{index}.json")
-                        return json.loads(path.read_bytes()) if path.exists() else None
-
-                    def save_batch(index, batch):
-                        nonlocal row
-                        self.blobs.put(
-                            identifier, f"extraction-batch-{index}.json",
-                            json.dumps(batch).encode(), "application/json",
-                        )
-                        state.update(
-                            completed_batches=index + 1,
-                            pages=sum(
-                                len(load_batch(item).get("pages", []))
-                                for item in range(index + 1)
-                            ),
-                        )
-                        row = self.records.write(
-                            "document", identifier, state, previous=row,
-                            fields={"status": "extracting"},
-                        )
                     if original_path and state.get("document_processing") == "azure_di":
                         result = self.extractor.extract_path(
                             original_path, state["media_type"], True, force_azure=True,

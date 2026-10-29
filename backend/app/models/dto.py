@@ -53,7 +53,7 @@ class IngestUrlJobResponse(BaseModel):
 
     job_id: str
     url: str
-    status: Literal["queued", "running", "complete", "failed"]
+    status: Literal["queued", "running", "complete", "failed", "blocked_by_site"]
     max_depth: int
     max_pages: int
     created_at: str | None = None
@@ -66,9 +66,20 @@ class IngestUrlJobResponse(BaseModel):
     skipped: list[dict[str, str]] = Field(default_factory=list)
     sitemap_seeds: int = 0
     document_ids: list[str] = Field(default_factory=list)
+    # Crawl stages, from the crawl state.
+    pages_fetched: int = 0
+    pages_blocked: dict[str, int] = Field(default_factory=dict)
+    blocked_by_site: dict[str, str] | None = None
+    crawl_delay: float = 0.0
+    resume_after: float | None = None
+    azure_analysis: Literal["enabled", "disabled", "not_configured"] = "disabled"
+    # Ingestion stages, from each saved page's document state.
+    pages_azure_analysed: int | None = None
     pages_indexed: int | None = None
     pages_linked: int | None = None
+    pages_semantic: dict[str, int] | None = None
     pages_failed: int | None = None
+    failed_reasons: dict[str, int] | None = None
     error_code: str | None = None
     error_message: str | None = None
 

@@ -110,6 +110,60 @@ def normalize_url(url):
     return urlunsplit((p.scheme.lower(), p.netloc.lower(), p.path or "/", p.query, "")).rstrip("/")
 
 
+def is_www_alias(a, b):
+    """True when two parsed URLs differ only as a site's apex and www host."""
+
+    def host(value):
+        return (value.hostname or "").lower().removeprefix("www.")
+
+    def port(value):
+        return value.port or (443 if value.scheme == "https" else 80)
+
+    return (
+        a.scheme == b.scheme
+        and port(a) == port(b)
+        and host(a) == host(b)
+        and a.hostname != b.hostname
+        and "www." in {(a.hostname or "")[:4].lower(), (b.hostname or "")[:4].lower()}
+    )
+
+
+def same_site_url(url, origin_url):
+    """``url`` on ``origin_url``'s host (apex/www aliases rewritten), else None."""
+    target, origin = urlsplit(url), urlsplit(origin_url)
+    if (target.scheme, target.netloc) == (origin.scheme, origin.netloc):
+        return url
+    if is_www_alias(origin, target):
+        return urlunsplit((origin.scheme, origin.netloc, target.path, target.query, ""))
+    return None
+
+
+VOLATILE_TAGS = ["script", "style", "noscript", "template"]
+VOLATILE_ATTRIBUTES = {"nonce", "integrity", "data-nonce", "data-csrf", "data-cf-beacon"}
+
+
+def stable_html_fingerprint(html):
+    """Bytes identifying a page's content: scripts, styles, comments and nonces removed.
+
+    Re-crawling an unchanged page whose markup carries per-request tokens then
+    resolves to the same document instead of a new version.
+    """
+    from bs4 import Comment
+
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(VOLATILE_TAGS):
+        tag.decompose()
+    for comment in soup.find_all(string=lambda value: isinstance(value, Comment)):
+        comment.extract()
+    for meta in soup.find_all("meta"):
+        if "csrf" in str(meta.get("name", "")).lower():
+            meta.decompose()
+    for tag in soup.find_all(True):
+        for attribute in VOLATILE_ATTRIBUTES & set(tag.attrs):
+            del tag[attribute]
+    return re.sub(r"\s+", " ", str(soup)).strip().encode("utf-8")
+
+
 def extract_html(html, url):
     soup = BeautifulSoup(html, "html.parser")
     title = soup.title.get_text(" ", strip=True) if soup.title else url
@@ -153,17 +207,14 @@ HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
 
 
 def same_origin_links(html, url):
-    """Normalized same-origin links on a page (navigation included), self excluded."""
-    base = urlsplit(url)
+    """Normalized same-site links on a page (navigation included), self excluded.
+
+    Links to the site's apex/www alias are rewritten to the page's own host.
+    """
     links = []
     for anchor in BeautifulSoup(html, "html.parser").find_all("a", href=True):
-        target = normalize_url(urljoin(url, anchor["href"].strip()))
-        parsed = urlsplit(target)
-        if (
-            (parsed.scheme, parsed.netloc) == (base.scheme, base.netloc)
-            and target != normalize_url(url)
-            and target not in links
-        ):
+        target = same_site_url(normalize_url(urljoin(url, anchor["href"].strip())), url)
+        if target and target != normalize_url(url) and target not in links:
             links.append(target)
             if len(links) >= MAX_PAGE_LINKS:
                 break
@@ -232,6 +283,68 @@ def html_extraction(html, url):
             "structured": True, "image_understanding": "not_applicable",
             "title": page["title"], "canonical_url": page["url"], "links": links,
         },
+    }
+
+
+def merge_html_analysis(analysis, local):
+    """Azure layout analysis of a web page in the saved extraction schema.
+
+    Azure supplies paragraphs, roles and tables; the local parse supplies what
+    Azure does not return (links, canonical URL, title). Locally parsed tables
+    are kept when Azure's are missing or disagree, and that choice is recorded.
+    Everything is page 1, as for a locally parsed page.
+    """
+    from backend.app.services.document_processing import _sections
+
+    paragraphs = [
+        {**paragraph, "id": f"paragraph-1-{position}", "page": 1, "position": position,
+         "bounding_regions": []}
+        for position, paragraph in enumerate(analysis.get("paragraphs") or [])
+        if str(paragraph.get("text") or "").strip()
+    ]
+    metadata = dict(local.get("metadata") or {})
+    if not paragraphs:
+        metadata["azure_analysis"] = "empty_result_local_extraction_kept"
+        return {**local, "metadata": metadata}
+
+    def cell_texts(tables):
+        return sorted(
+            re.sub(r"\s+", " ", str(cell.get("text") or "")).strip().casefold()
+            for table in tables for cell in table.get("cells", [])
+            if str(cell.get("text") or "").strip()
+        )
+
+    azure_tables = [
+        {**table, "id": f"table-1-{index}", "page": 1, "bounding_regions": []}
+        for index, table in enumerate(analysis.get("tables") or [])
+    ]
+    local_tables = local.get("tables") or []
+    if not local_tables and not azure_tables:
+        tables, source, note = [], "none", "no_tables"
+    elif not azure_tables:
+        tables, source, note = local_tables, "local", "azure_returned_no_tables"
+    elif cell_texts(azure_tables) != cell_texts(local_tables) or len(azure_tables) != len(
+        local_tables
+    ):
+        tables, source, note = local_tables, "local", "azure_tables_disagree_with_page"
+    else:
+        tables, source, note = azure_tables, "azure", "azure_tables_match_page"
+    text = "\n".join(str(page.get("text") or "") for page in analysis.get("pages") or []).strip()
+    text = text or "\n\n".join(paragraph["text"] for paragraph in paragraphs)
+    metadata.update(
+        classification_method="azure_document_intelligence_layout",
+        azure_analysis="analysed", tables_source=source, tables_note=note,
+        # Document Intelligence bills HTML per 3,000 characters.
+        page_units_estimate=max(1, -(-len(text) // 3000)),
+    )
+    return {
+        "pages": [{"page": 1, "text": text, "markdown": text, "spans": []}],
+        "paragraphs": paragraphs,
+        "sections": _sections(paragraphs),
+        "tables": tables,
+        "figures": [],
+        "method": "document_intelligence",
+        "metadata": metadata,
     }
 
 

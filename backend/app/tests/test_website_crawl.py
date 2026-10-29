@@ -56,6 +56,7 @@ def site_responses():
                  for path, text in pages.items()}
     responses[ORIGIN + "/"] = responses[ORIGIN]
     responses[ORIGIN + "/busy"] = ErrorResponse(ORIGIN + "/busy", "", status_code=429)
+    responses[ORIGIN + "/busy"].headers["Retry-After"] = "0"
     responses[ORIGIN + "/robots.txt"] = FakeResponse(
         ORIGIN + "/robots.txt",
         "User-agent: *\nDisallow: /private\nSitemap: https://site.example/sitemap-index.xml",
@@ -166,8 +167,12 @@ def test_restart_resumes_job_without_refetching_or_duplicates(site, workspace, m
 
     workspace.restart()
     summary = run_job(job_id)
-    pages = [url for url in site.request_log if "sitemap" not in url and "robots" not in url]
-    assert len(pages) == len(set(pages))  # every page fetched exactly once
+    # Every page is fetched exactly once; only the rate-limited page is retried.
+    pages = [
+        url for url in site.request_log
+        if "sitemap" not in url and "robots" not in url and not url.endswith("/busy")
+    ]
+    assert len(pages) == len(set(pages))
     assert summary["pages_duplicate"] == 0
     assert len(workspace.repository.list_documents()) == summary["pages_saved"]
 
