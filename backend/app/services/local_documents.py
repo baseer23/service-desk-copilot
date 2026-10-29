@@ -341,6 +341,10 @@ class LocalDocumentRepository(DocumentRepository):
                 )
             if kind == "Table":
                 return f"{document_label} — table reference on page {page}"
+            if kind == "FormField":
+                # The question is a structural label, like a section title; the
+                # selected answer stays local.
+                return f"{document_label} — form field: {str(item.get('question') or '')[:100]}"
             if kind == "Figure" and str(item.get("text") or "").strip():
                 return f"{document_label} — figure: {str(item['text']).strip()[:100]}"
             return f"{document_label} — {kind.lower()} reference on page {page}"
@@ -364,10 +368,39 @@ class LocalDocumentRepository(DocumentRepository):
                     "content_hash": hashlib.sha256(item["text"].encode()).hexdigest(),
                     "source_provenance": "azure_document_intelligence" if extracted.get("method") == "document_intelligence" else "saved_local_extraction",
                     "link_status": "reference_only_unsaved" if temporary else "linked",
+                    **(
+                        {"role": "form_field", "state_flag": item["field_status"],
+                         "confidence": item.get("field_confidence")}
+                        if item["object_type"] == "FormField" else {}
+                    ),
                 },
             )
             node_count += 1
             relationship_count += 1
+            if item["object_type"] == "FormField":
+                # Page -[:HAS_FORMFIELD]-> FormField -[:HAS_SELECTIONMARK]-> SelectionMark.
+                # A mark keeps only its selected flag and confidence, never its label.
+                for ordinal, mark in enumerate(item.get("marks", [])):
+                    mark_id = "M" + hashlib.sha256(
+                        f"{identifier}:{version}:{item['object_id']}:{mark['mark_id']}".encode()
+                    ).hexdigest()[:24]
+                    graph.upsert_reference_object(identifier, {
+                        "object_id": mark_id, "object_type": "SelectionMark",
+                        "page": item.get("page"), "position": ordinal,
+                        "description": (
+                            f"{document_label} — selection mark on page {item.get('page')}"
+                        ),
+                        "version": version, "source_element_id": mark["mark_id"],
+                        "content_hash": hashlib.sha256(mark["mark_id"].encode()).hexdigest(),
+                        "source_provenance": item.get("association_method"),
+                        "link_status": "reference_only_unsaved" if temporary else "linked",
+                        "role": "option",
+                        "state_flag": "selected" if mark["selected"] else "unselected",
+                        "confidence": mark.get("confidence"),
+                    })
+                    graph.link_reference_objects(item["object_id"], mark_id, "HAS_SELECTIONMARK")
+                    node_count += 1
+                    relationship_count += 1
         section_map = {
             obj.get("source_id"): obj["object_id"]
             for obj in objects if obj["object_type"] == "Section"

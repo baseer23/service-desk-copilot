@@ -1,6 +1,7 @@
 """Resumable local document jobs, immutable artifacts and verified Chroma indexing."""
 
 import hashlib
+from io import BytesIO
 import json
 import logging
 import traceback
@@ -256,6 +257,19 @@ class DocumentRepository:
             and not state.get("chunks")
         ):
             raise ManagedStoreError("This document has an ambiguous in-flight operation")
+        if state.get("media_type") == "application/pdf" and "form_fields" not in extraction:
+            # Fillable-PDF fields are read locally (no Azure call). When there are
+            # any, they join a new extraction generation; the original is kept.
+            fields = self._acroform_fields(identifier)
+            if fields:
+                extraction["form_fields"] = fields
+                encoded = json.dumps(extraction).encode()
+                artifact = "extraction-" + hashlib.sha256(encoded).hexdigest()[:16] + ".json"
+                self.blobs.put(identifier, artifact, encoded, "application/json")
+                state["extraction_history"] = [
+                    *state.get("extraction_history", []), state.get("extraction_artifact")
+                ]
+                state["extraction_artifact"] = artifact
         phase = "structure"
         structured_texts = [
             item["text"]
@@ -290,6 +304,20 @@ class DocumentRepository:
             "document", identifier, state, previous=row, fields={"status": "structuring"}
         )
         return state
+
+    def _acroform_fields(self, identifier):
+        """Fillable-PDF field values, read locally from the immutable original."""
+        from backend.app.services.form_marks import acroform_fields
+
+        location = getattr(self.blobs, "location", None)
+        try:
+            source = location(identifier, "original") if location else BytesIO(
+                self.blobs.get(identifier, "original")
+            )
+            return acroform_fields(source)
+        except Exception:  # noqa: BLE001 - a malformed form never blocks indexing
+            logger.warning("Fillable PDF fields could not be read for a document")
+            return []
 
     def search(self, question: str, top_k: int):
         return self.search_store.search_keywords(question, top_k)
@@ -408,6 +436,8 @@ class DocumentRepository:
                             "application/octet-stream",
                         )
                         figure["image_artifact"] = artifact
+                if state["media_type"] == "application/pdf" and "form_fields" not in result:
+                    result["form_fields"] = self._acroform_fields(identifier)
                 encoded_result = json.dumps(result).encode()
                 extraction_artifact = (
                     "extraction-" + hashlib.sha256(encoded_result).hexdigest()[:16] + ".json"
@@ -458,6 +488,16 @@ class DocumentRepository:
                                 "table_id": item.get("table_id") or "",
                                 "figure_id": item.get("figure_id") or "",
                                 "image_artifact": item.get("image_artifact") or "",
+                                **(
+                                    {
+                                        "form_field_status": item["field_status"],
+                                        "form_field_selected": item.get("selected_option") or "",
+                                        "form_field_question": item["question"][:300],
+                                        "form_association_method": item["association_method"],
+                                        "form_ambiguity_reason": item.get("ambiguity_reason") or "",
+                                    }
+                                    if item["object_type"] == "FormField" else {}
+                                ),
                                 "ingestion_mode": "structured_graph",
                                 "extraction_method": result.get("method", "unknown"),
                                 "document_classification": extraction_metadata.get(

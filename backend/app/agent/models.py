@@ -14,6 +14,10 @@ class RequestIntent(StructuredModel):
     public_topic: Literal["none", "news", "web"] = "none"
     goal: str
     justification: str
+    # The request rewritten as one self-contained question from the conversation
+    # ("is it a no?" -> which document, which field). Used for retrieval only;
+    # the user's own words stay the displayed request.
+    standalone_question: str = Field(default="", max_length=1000)
 
 
 class GeneralAnswer(StructuredModel):
