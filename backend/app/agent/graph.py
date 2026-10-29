@@ -40,6 +40,20 @@ MAX_DOCUMENT_CHOICES = 10
 OPENING_QUOTES = "\u201c\u2018"
 CLOSING_QUOTES = "\u201d\u2019"
 MAX_GRAPH_OBJECT_REFERENCES = 500
+# Graph-scoped passages handed to grading and reasoning per request.
+GRAPH_EVIDENCE_LIMIT = 8
+MAX_GRAPH_RELATIONSHIPS = 20
+# Reciprocal-rank-fusion constant (Cormack et al.); larger flattens rank gaps.
+RRF_K = 60
+FUZZY_TERM_SCORE = 83
+# Same-page passages added after the best-matching pages (graph neighbourhood).
+GRAPH_NEIGHBOUR_PAGES = 2
+GRAPH_NEIGHBOUR_LIMIT = 4
+SEARCH_STOPWORDS = frozenset(
+    "a an and are as at be by can could did do does for from has have how i in is it its my "
+    "of on or our please so tell than that the their them there these this those to was what "
+    "whats when where which who whom why will with would you your".split()
+)
 GRAPH_STATUS_SUMMARIES = {
     "available": "Graph references resolved to local document passages",
     "empty": "Graph returned no references for this request",
@@ -648,7 +662,9 @@ class ServiceDeskAgent:
                 }
             }
             if "text" in body:
-                body["text"] = relevant_excerpt(str(body["text"]), state["ticket"]["summary"], 1600)
+                body["text"] = relevant_excerpt(
+                    self._readable_marks(body["text"]), state["ticket"]["summary"], 1600
+                )
                 body["title"] = meta.get("title") or body.get("title")
                 body["url"] = row.get("url")
             evidence.append(
@@ -935,12 +951,26 @@ class ServiceDeskAgent:
             return unresolved
         context = dict(context)
         inventory = context.pop("document_inventory", None) or []
-        matches = self._document_alias_matches(state["ticket"]["summary"], inventory)
+        intent = state.get("intent") or {}
+        matches, resolved, kind = self._scope_documents(
+            state["ticket"]["summary"], inventory, state.get("conversation_context"),
+            documents_intent=(
+                intent.get("workflow") == "knowledge"
+                and intent.get("knowledge_source") == "documents"
+            ),
+        )
+        if matches and kind != "title":
+            await emit(
+                "document_resolution", "completed",
+                f"Saved document scope from the {kind}: "
+                + ", ".join(str(match["title"]) for match in matches[:3]),
+                document_count=len(matches),
+            )
         return {
             **unresolved,
             "available_context": context,
             "document_alias_matches": matches,
-            "resolved_document_ids": [matches[0]["id"]] if len(matches) == 1 else [],
+            "resolved_document_ids": resolved,
         }
 
     async def understand_request(self, state):
@@ -1510,15 +1540,27 @@ class ServiceDeskAgent:
             hydrated_count=len((graph_result.get("hydrated_output") or {}).get("items", [])),
         )
         graph_outputs = [graph_result]
+        graph_rows = []
         if graph_result.get("hydrated_output"):
+            graph_rows = graph_result["hydrated_output"]["items"]
             graph_outputs.append({
                 "name": "search_knowledge",
                 "output": graph_result["hydrated_output"],
             })
+        # Local search is a supplement: passages the graph path already supplied
+        # are not graded or cited a second time.
+        supplements = []
+        for item in planned.get("tool_results", []):
+            output = item.get("output")
+            if item.get("name") == "search_knowledge" and isinstance(output, dict) and graph_rows:
+                rows = output.get("items") or []
+                unique = self._unique_document_rows([*graph_rows, *rows])[len(graph_rows):]
+                item = {**item, "output": {**output, "items": unique}}
+            supplements.append(item)
         return {
             **planned,
             "graph_status": status,
-            "tool_results": [*graph_outputs, *planned.get("tool_results", [])],
+            "tool_results": [*graph_outputs, *supplements],
             "executed_tool_calls": list(dict.fromkeys([
                 *planned.get("executed_tool_calls", []),
                 self._tool_signature(graph_result["name"], graph_result["arguments"]),
@@ -1568,6 +1610,11 @@ class ServiceDeskAgent:
                 "[(d)<-[:DOCUMENTED_IN]-(c:GraphClaim)-[:SUPPORTED_BY]->(o) "
                 "WHERE c.tenant_id = $tenant_id | coalesce(o.original_id, o.id)][..500] "
                 "AS claim_object_ids, "
+                "[(d)<-[:DOCUMENTED_IN]-(c:GraphClaim)-[:SUBJECT]->(s) "
+                "WHERE c.tenant_id = $tenant_id | {subject: s.name, predicate: c.predicate, "
+                "object: head([(c)-[:OBJECT]->(t) | t.name]), "
+                "evidence_object_ids: [(c)-[:SUPPORTED_BY]->(x) | coalesce(x.original_id, x.id)][..10]}"
+                "][..50] AS claims, "
                 "[(d)-[:HAS_PAGE]->(p:Page)-[:HAS_CHUNK|HAS_TABLE|HAS_FIGURE|HAS_SECTION"
                 "|HAS_PARAGRAPH|HAS_TABLECELL]->(o) WHERE p.tenant_id = $tenant_id "
                 "| {object_id: coalesce(o.original_id, o.id), page: p.page}][..2000] "
@@ -1616,10 +1663,25 @@ class ServiceDeskAgent:
                     "entities": list(dict.fromkeys(
                         str(value) for value in row.get("entities") or [] if value
                     ))[:10],
+                    "relationships": [
+                        {
+                            "subject": claim.get("subject"), "predicate": claim.get("predicate"),
+                            "object": claim.get("object"),
+                            "supporting_object_ids": list(claim.get("evidence_object_ids") or []),
+                        }
+                        for claim in row.get("claims") or [] if isinstance(claim, dict)
+                    ][:MAX_GRAPH_RELATIONSHIPS],
                     "referenced_objects": len(self._graph_object_ids([row])),
                 }
                 for row in rows
             ]
+            # Passages that support semantic mentions or documented claims are
+            # graph evidence in their own right; they are always kept.
+            supporting = {
+                str(value) for row in rows
+                for value in [*(row.get("mention_object_ids") or []), *(row.get("claim_object_ids") or [])]
+                if value
+            }
             output = {**output, "items": summaries, "result": summaries}
             graph_status = "empty"
             if object_ids:
@@ -1631,7 +1693,10 @@ class ServiceDeskAgent:
                 except (MCPToolError, ValueError) as exc:
                     hydration = {"status": "error", "error": str(exc), "items": []}
                 if hydration.get("status") == "ok" and hydration.get("items"):
-                    hydrated = [dict(item) for item in hydration["items"] if isinstance(item, dict)]
+                    hydrated = self._select_graph_evidence(
+                        [dict(item) for item in hydration["items"] if isinstance(item, dict)],
+                        question, GRAPH_EVIDENCE_LIMIT, priority_ids=supporting,
+                    )
                     for item in hydrated:
                         item["graph_enrichment"] = "available"
                         item["match_type"] = item.get("match_type", "graph_reference")
@@ -1655,6 +1720,168 @@ class ServiceDeskAgent:
             "hydrated_output": hydrated_output,
             "graph_status": graph_status,
         }
+
+    @staticmethod
+    def _search_terms(text):
+        return [
+            token for token in re.findall(r"[a-z0-9]+", str(text or "").casefold())
+            if token not in SEARCH_STOPWORDS and (len(token) > 1 or token.isdigit())
+        ]
+
+    @classmethod
+    def _select_graph_evidence(cls, rows, question, limit, priority_ids=()):
+        """Rank graph-scoped passages by fused vector and keyword relevance, then bound them.
+
+        Rows arrive ordered by vector similarity. Keyword relevance is IDF-weighted
+        over the candidates themselves, so words repeated on every page (titles,
+        footers) count for little, and tolerates typos at reduced weight. Reciprocal
+        rank fusion combines both, as hybrid graph retrievers do. The graph's page
+        structure then adds passages on the same page as the best matches, the
+        Document -> Page -> object neighbourhood a field's label and value share.
+        Passages supporting semantic graph claims or mentions are always kept.
+        Section headings are navigation, not evidence: each heading also opens the
+        chunk that follows it, so heading-only rows would only displace content.
+        """
+        import math
+
+        from rapidfuzz import fuzz
+
+        rows = [
+            row for row in rows
+            if isinstance(row, dict) and row.get("metadata", {}).get("object_type") != "Section"
+        ]
+        if not rows:
+            return []
+        query_terms = set(cls._search_terms(question))
+        documents = [set(cls._search_terms(row.get("text"))) for row in rows]
+
+        def presence(term, terms):
+            if term in terms:
+                return 1.0
+            if len(term) >= 4 and not term.isdigit() and any(
+                len(other) >= 4 and fuzz.ratio(term, other) >= FUZZY_TERM_SCORE for other in terms
+            ):
+                return 0.5
+            return 0.0
+
+        matrix = [{term: presence(term, terms) for term in query_terms} for terms in documents]
+        frequency = {term: sum(row[term] > 0 for row in matrix) for term in query_terms}
+        weight = {
+            term: math.log((len(rows) + 1) / (count + 1)) + 1
+            for term, count in frequency.items() if count
+        }
+        lexical = [sum(weight.get(term, 0) * value for term, value in row.items()) for row in matrix]
+        lexical_rank = {
+            index: position for position, index in enumerate(
+                sorted((i for i, score in enumerate(lexical) if score > 0),
+                       key=lambda i: (-lexical[i], i))
+            )
+        }
+        fused = sorted(
+            range(len(rows)),
+            key=lambda i: -(
+                1 / (RRF_K + i + 1)
+                + (1 / (RRF_K + lexical_rank[i] + 1) if i in lexical_rank else 0)
+            ),
+        )
+        priority = {str(value) for value in priority_ids}
+        supported = [i for i in fused if str(rows[i].get("metadata", {}).get("object_id")) in priority]
+        chosen = [*supported[:MAX_GRAPH_RELATIONSHIPS]]
+        for i in fused:
+            if len(chosen) >= limit:
+                break
+            if i not in chosen:
+                chosen.append(i)
+        best_pages = []
+        for i in fused:
+            page = rows[i].get("metadata", {}).get("page")
+            if page is not None and page not in best_pages:
+                best_pages.append(page)
+            if len(best_pages) >= GRAPH_NEIGHBOUR_PAGES:
+                break
+        neighbours = [
+            i for i in fused
+            if i not in chosen and rows[i].get("metadata", {}).get("page") in best_pages
+        ][:GRAPH_NEIGHBOUR_LIMIT]
+        return [rows[i] for i in [*chosen, *neighbours]]
+
+    @staticmethod
+    def _unique_document_rows(rows):
+        """Drop repeats of a passage already returned by an earlier retrieval path."""
+        seen, unique = set(), []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            key = (row.get("metadata", {}).get("doc_id"), row.get("id"))
+            if key[1] is not None and key in seen:
+                continue
+            seen.add(key)
+            unique.append(row)
+        return unique
+
+    @classmethod
+    def _scope_documents(cls, question, inventory, conversation_context=None, documents_intent=False):
+        """Which saved documents a question is about: (matches, resolved_ids, kind).
+
+        A full title always wins. Weaker evidence is used only when the classifier
+        already chose saved documents: first the documents the previous answer
+        cited (a follow-up), then title acronyms named as whole words. Inherited
+        documents are all in scope; several acronym candidates are asked about.
+        """
+        matches = cls._document_alias_matches(question, inventory)
+        if matches or not documents_intent:
+            return matches, ([matches[0]["id"]] if len(matches) == 1 else []), "title"
+        titles = {str(item.get("id")): item.get("title") for item in inventory or []}
+        ids = [item for item in cls._inherited_document_ids(conversation_context) if item in titles]
+        kind = "previous answer"
+        if not ids:
+            ids, _ = cls._resolve_named_documents(question, inventory)
+            kind = "title acronym"
+        matches = [
+            {"id": item, "title": titles.get(item) or item, "alias": "", "version": 1,
+             "matched_by": kind}
+            for item in ids
+        ]
+        resolved = ids if kind == "previous answer" or len(ids) == 1 else []
+        return matches, resolved, (kind if ids else "none")
+
+    @staticmethod
+    def _inherited_document_ids(conversation_context):
+        """Documents the previous answer cited, for a follow-up naming none."""
+        references = (conversation_context or {}).get("document_references") or []
+        return list(dict.fromkeys(
+            str(item["document_id"]) for item in references
+            if isinstance(item, dict) and item.get("document_id")
+        ))[:MAX_DOCUMENT_CHOICES]
+
+    @classmethod
+    def _resolve_named_documents(cls, question, inventory):
+        """Document IDs a question names: full titles first, then title acronyms.
+
+        Returns (ids, kind). An acronym such as "NSNP" in a title only names a
+        document when written as a whole word; several candidates stay several,
+        so the caller asks which one was meant.
+        """
+        matches = cls._document_alias_matches(question, inventory)
+        if matches:
+            return [match["id"] for match in matches], "title"
+        words = set(re.findall(r"[a-z0-9]+", str(question or "").casefold()))
+        named = []
+        for document in inventory if isinstance(inventory, list) else []:
+            title = DOCUMENT_EXTENSION.sub("", str(document.get("title") or ""))
+            acronyms = {
+                token.casefold() for token in re.findall(r"\b[A-Z]{3,}\b", title)
+            }
+            if document.get("id") and acronyms & words:
+                named.append(str(document["id"]))
+        return named[:MAX_DOCUMENT_CHOICES], ("acronym" if named else "none")
+
+    @staticmethod
+    def _readable_marks(text):
+        """Render layout selection marks so the checked option is unambiguous."""
+        return (
+            str(text).replace(":unselected:", "[ ]").replace(":selected:", "[x]")
+        )
 
     @staticmethod
     def _graph_object_ids(rows):
@@ -1719,7 +1946,17 @@ class ServiceDeskAgent:
             }
         failed = result.get("status") in {"error", "unavailable"}
         if failed:
-            rows = [{"error": result.get("error") or "Capability returned no usable response"}]
+            detail = result.get("result") if isinstance(result.get("result"), dict) else {}
+            if result.get("status") == "unavailable":
+                # An unconnected optional integration is reported with its own
+                # reason; it is not a failed evidence source.
+                rows = [{
+                    "error": result.get("error") or detail.get("reason")
+                    or "This integration is not connected.",
+                    "available": False,
+                }]
+            else:
+                rows = [{"error": result.get("error") or "Capability returned no usable response"}]
         items = []
         for row in rows:
             meta = row.get("metadata", {})
@@ -1786,31 +2023,8 @@ class ServiceDeskAgent:
     async def _grade_document_evidence(self, state, candidates):
         if not candidates:
             return {"accepted": [], "rejected": [], "unverified": []}
-        question = state["ticket"]["summary"]
-        normalized_question = re.sub(r"[^a-z0-9]", "", question.casefold())
-        query_terms = {
-            term for term in re.findall(r"[a-z0-9]+", question.casefold())
-            if len(term) >= 3 and term not in {"the", "from", "what", "whats", "which", "with", "my"}
-        }
-        strong_matches = []
-        for item in candidates:
-            content = item["content"]
-            title = str(content.get("title") or content.get("metadata", {}).get("title") or "")
-            title_stem = title.rsplit(".", 1)[0]
-            normalized_title = re.sub(r"[^a-z0-9]", "", title_stem.casefold())
-            text_terms = set(re.findall(r"[a-z0-9]+", str(content.get("text") or "").casefold()))
-            if normalized_title and normalized_title in normalized_question and query_terms & text_terms:
-                strong_matches.append(item)
-        if strong_matches:
-            strong_ids = {item["id"] for item in strong_matches}
-            return {
-                "accepted": strong_matches,
-                "rejected": [
-                    {"evidence": item, "reason": "A stronger title-scoped passage matched the question."}
-                    for item in candidates if item["id"] not in strong_ids
-                ],
-                "unverified": [],
-            }
+        # Every candidate is graded. A title named in the question says which
+        # document to search, not which of its passages answer the question.
         candidate_ids = [
             str(item["content"].get("id")
                 or item["content"].get("metadata", {}).get("chunk_id")
@@ -1831,7 +2045,8 @@ class ServiceDeskAgent:
                 "title": item["content"].get("title")
                 or item["content"].get("metadata", {}).get("title"),
                 "excerpt": relevant_excerpt(
-                    str(item["content"].get("text", "")), state["ticket"]["summary"], 900
+                    self._readable_marks(item["content"].get("text", "")),
+                    state["ticket"]["summary"], 900,
                 ),
             }
             for index, item in enumerate(candidates)
@@ -1926,10 +2141,22 @@ class ServiceDeskAgent:
                 rows = errors + assessment["accepted"]
             converted.extend(rows)
         retrieval_candidates = list(candidate_map.values())[-24:]
+
+        def passage(row):
+            # One stored passage keeps one evidence ID, whichever path found it.
+            if row.get("source_type") != "document":
+                return None
+            content = row.get("content", {})
+            return (row.get("doc_id") or content.get("metadata", {}).get("doc_id"), content.get("id"))
+
+        passages = {passage(row) for row in evidence} - {None}
         for row in converted:
-            if row["id"] not in seen:
+            key = passage(row)
+            if row["id"] not in seen and (key is None or key[1] is None or key not in passages):
                 evidence.append(row)
                 seen.add(row["id"])
+                if key is not None:
+                    passages.add(key)
         contradictions = list(state.get("contradictions", []))
         by_predicate = {}
         trusted_facts = []
@@ -2086,7 +2313,7 @@ class ServiceDeskAgent:
                                         or item["content"].get("metadata", {}).get("title"),
                                         "page": item["content"]["metadata"]["page"],
                                         "excerpt": relevant_excerpt(
-                                            str(item["content"].get("text") or ""),
+                                            self._readable_marks(item["content"].get("text") or ""),
                                             state["ticket"]["summary"], 1600,
                                         ),
                                     }
@@ -2840,6 +3067,7 @@ class ServiceDeskAgent:
         if not supported:
             errors = [
                 e["content"].get("error") for e in state.get("evidence", [])
+                if e["content"].get("available") is not False
                 if e["source_type"] == "tool_error" and e["content"].get("error")
             ]
             observed_tools = {

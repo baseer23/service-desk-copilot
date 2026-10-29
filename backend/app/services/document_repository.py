@@ -9,6 +9,7 @@ from pathlib import Path
 from backend.app.adapters.embeddings import get_embedding_provider
 from backend.app.core.config import Settings
 from backend.app.services.chunking import split_text, split_structured
+from backend.app.services.document_processing import with_heading_sections
 from backend.app.store.records import ManagedStoreError
 
 logger = logging.getLogger(__name__)
@@ -259,7 +260,10 @@ class DocumentRepository:
         structured_texts = [
             item["text"]
             for item in split_structured(
-                identifier, extraction, self.settings.chunk_tokens, state.get("version", 1)
+                identifier,
+                with_heading_sections(extraction),
+                self.settings.chunk_tokens,
+                state.get("version", 1),
             )
         ]
         reusable = getattr(
@@ -431,7 +435,10 @@ class DocumentRepository:
             ordinal = 0
             if state.get("ingestion_mode") == "structured_graph":
                 structured = split_structured(
-                    identifier, result, self.settings.chunk_tokens, state.get("version", 1)
+                    identifier,
+                    with_heading_sections(result),
+                    self.settings.chunk_tokens,
+                    state.get("version", 1),
                 )
                 for ordinal, item in enumerate(structured):
                     chunks.append(

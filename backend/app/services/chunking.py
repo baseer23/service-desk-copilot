@@ -131,7 +131,11 @@ def split_structured(
                     None,
                 )
             candidate = "\n\n".join([*buffer, paragraph.get("text", "")])
-            if buffer and approx_tokens(candidate) > chunk_tokens:
+            # A chunk never spans pages: its page is its citation, so text from
+            # the next page must start a new chunk even mid-section.
+            if buffer and (
+                approx_tokens(candidate) > chunk_tokens or paragraph.get("page") != start_page
+            ):
                 add("Chunk", start_page, start_position, "\n\n".join(buffer), section_id=section_id)
                 buffer = []
             if not buffer:
