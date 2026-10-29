@@ -14,6 +14,9 @@ from backend.app.services.document_processing import with_heading_sections
 from backend.app.store.records import ManagedStoreError
 
 logger = logging.getLogger(__name__)
+RESUMABLE_EXTRACTION_ERRORS = {"AZURE_DOCUMENT_CAPACITY", "AZURE_DOCUMENT_INTERRUPTED"}
+# Statuses written only while a process is actively working on the document.
+ACTIVE_STATUSES = {"extracting", "structuring", "embedding"}
 
 
 def _failed_stage(phase: str | None) -> str:
@@ -186,9 +189,10 @@ class DocumentRepository:
             return previous
         if (
             previous.get("status") == "error"
-            and previous.get("processing_error_code") == "AZURE_DOCUMENT_CAPACITY"
+            and previous.get("processing_error_code") in RESUMABLE_EXTRACTION_ERRORS
         ):
-            # Throttled extraction: resume from saved batches; finished pages are not re-sent.
+            # Throttled or interrupted extraction: resume from saved batches;
+            # finished pages are not re-sent.
             return self.reprocess(
                 identifier, document_processing="azure_di", operator_reviewed_inflight=True
             )
@@ -212,6 +216,47 @@ class DocumentRepository:
 
     def list_documents(self):
         return [row["payload"] for row in self.records.query("document", limit=100)]
+
+    def recover_interrupted(self):
+        """Settle jobs an earlier application process left mid-operation.
+
+        One process owns document work, so at startup nothing is still running
+        them. Local stages resume. An extraction whose last request may already
+        have been billed is reported instead of re-sent; uploading the same file
+        again resumes from the saved batches.
+        """
+        recovered = []
+        for listed in self.records.query("document", limit=10000):
+            if listed["payload"].get("status") not in ACTIVE_STATUSES:
+                continue
+            row = self.records.read("document", listed["payload"]["id"])
+            state = dict(row["payload"])
+            if state.get("status") not in ACTIVE_STATUSES:
+                continue
+            if state.get("phase") == "extract_inflight":
+                saved = int(state.get("completed_batches", 0) or 0)
+                state.update(
+                    status="error",
+                    failed_stage="azure_extraction",
+                    processing_error_code="AZURE_DOCUMENT_INTERRUPTED",
+                    processing_error_type="ApplicationRestart",
+                    processing_error_reason=(
+                        "DeskMate restarted while this document was being extracted"
+                        f" ({saved} batch{'es' if saved != 1 else ''} saved). Upload the"
+                        " same file again to finish; saved pages are not sent again."
+                    ),
+                )
+            else:
+                if state.get("phase") == "embedding_inflight":
+                    state["phase"] = "embed"
+                state["status"] = "queued"
+            self.records.write(
+                "document", state["id"], state, previous=row, fields={"status": state["status"]}
+            )
+            recovered.append({"id": state["id"], "status": state["status"]})
+        if recovered:
+            logger.warning("Recovered %d interrupted document job(s)", len(recovered))
+        return recovered
 
     def get(self, identifier: str):
         row = self.records.read("document", identifier)

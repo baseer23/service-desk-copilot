@@ -123,6 +123,23 @@ async def _work_fingerprint(harness):
     )
 
 
+async def recover_interrupted_work(settings, harness):
+    """At startup, settle jobs a previous process left mid-operation.
+
+    Without this they keep an active status that no worker pass picks up, so
+    the upload looks like it is still processing forever.
+    """
+    for tenant in (settings.auth_allowed_tenants or [settings.voice_tenant_id]):
+        with principal_scope(Principal(tenant, "document-worker")):
+            try:
+                await harness.invoke("recover_interrupted_documents", {})
+            except Exception as exc:  # noqa: BLE001 - recovery never blocks startup
+                logger.error(
+                    "Interrupted document recovery failed tenant=%s type=%s",
+                    tenant, type(exc).__name__,
+                )
+
+
 async def document_worker(settings, harness, wakeup: asyncio.Event):
     """Recover at startup, then drain durable work on signals and retry deadlines."""
     while True:
