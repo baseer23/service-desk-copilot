@@ -38,16 +38,22 @@ interface DocumentStatus {
 interface CrawlJob {
   job_id: string
   url: string
-  status: 'queued' | 'running' | 'complete' | 'failed'
+  status: 'queued' | 'running' | 'complete' | 'failed' | 'blocked_by_site'
   pages_found?: number
+  pages_fetched?: number
   pages_saved?: number
   pages_duplicate?: number
   pages_skipped?: number
   skipped_reasons?: Record<string, number>
+  pages_blocked?: Record<string, number>
   document_ids?: string[]
+  azure_analysis?: 'enabled' | 'disabled' | 'not_configured'
+  pages_azure_analysed?: number | null
   pages_indexed?: number | null
   pages_linked?: number | null
+  pages_semantic?: Record<string, number> | null
   pages_failed?: number | null
+  failed_reasons?: Record<string, number> | null
   error_message?: string | null
 }
 
@@ -56,28 +62,67 @@ const SKIP_REASONS: Record<string, string> = {
   too_large: 'too large', fetch_failed: 'unreachable', depth_limit: 'beyond crawl depth',
   duplicate_content: 'duplicate content', off_origin: 'on another site', empty: 'no readable text',
   overall_limit: 'crawl size limit reached', save_failed: 'could not be saved',
+  bot_challenge: 'bot-protection challenge',
+}
+
+function reasonText(reason: string): string {
+  return SKIP_REASONS[reason] ?? reason.replace(/^http_/, 'HTTP ').replace(/_/g, ' ')
+}
+
+function countList(counts: Record<string, number>): string {
+  return Object.entries(counts).map(([reason, count]) => `${count} ${reasonText(reason)}`).join(', ')
 }
 
 export function crawlSummary(job: CrawlJob): { text: string; terminal: boolean } {
-  const state = { queued: 'Queued', running: 'Crawling', complete: 'Crawl complete', failed: 'Crawl failed' }[job.status]
   const saved = (job.document_ids ?? []).length
+  const settled = job.pages_indexed != null && (job.pages_indexed + (job.pages_failed ?? 0)) >= saved
+  // A finished crawl is not finished ingestion: say which one is still running.
+  const state = {
+    queued: 'Crawl queued',
+    running: 'Crawling',
+    complete: settled ? 'Crawl finished' : 'Crawl finished; ingestion still running',
+    failed: 'Crawl failed',
+    blocked_by_site: 'Crawl stopped: the website refused automated access',
+  }[job.status]
   const lines = [
     `Website: ${job.url}`,
-    `${state} — pages found ${job.pages_found ?? 0}, saved ${job.pages_saved ?? 0}` +
+    `${state} — found ${job.pages_found ?? 0}, fetched ${job.pages_fetched ?? 0}, ` +
+      `saved ${job.pages_saved ?? 0}` +
       `${job.pages_duplicate ? ` (+${job.pages_duplicate} already saved)` : ''}, skipped ${job.pages_skipped ?? 0}`,
   ]
+  const blocked = job.pages_blocked ?? {}
+  if (Object.keys(blocked).length) lines.push(`Blocked by the website: ${countList(blocked)}`)
   if (job.pages_indexed != null) {
-    lines.push(`Indexed ${job.pages_indexed} of ${saved} · Neo4j linked ${job.pages_linked ?? 0} of ${saved}` +
-      `${job.pages_failed ? ` · ${job.pages_failed} failed` : ''}`)
+    const parts = []
+    if (job.azure_analysis === 'enabled') parts.push(`Azure analysed ${job.pages_azure_analysed ?? 0} of ${saved}`)
+    parts.push(`indexed ${job.pages_indexed} of ${saved}`, `Neo4j linked ${job.pages_linked ?? 0} of ${saved}`)
+    const semantic = job.pages_semantic ?? {}
+    const linked = semantic.linked ?? 0
+    const entitiesOnly = semantic.linked_no_relationships ?? 0
+    if (linked || entitiesOnly || semantic.failed || semantic.understanding || semantic.placing) {
+      parts.push(`semantic graph ${linked} of ${saved}` +
+        `${entitiesOnly ? ` (+${entitiesOnly} entities only, no relationships)` : ''}`)
+    } else if ((semantic.disabled ?? 0) === saved && saved) {
+      parts.push('semantic graph off')
+    }
+    if (job.pages_failed) {
+      const reasons = Object.keys(job.failed_reasons ?? {}).length ? ` (${countList(job.failed_reasons ?? {})})` : ''
+      parts.push(`${job.pages_failed} failed${reasons}`)
+    }
+    lines.push(parts.join(' · ').replace(/^./, (first) => first.toUpperCase()))
   }
-  const reasons = Object.entries(job.skipped_reasons ?? {})
-  if (reasons.length) {
-    lines.push('Skipped: ' + reasons.map(([reason, count]) =>
-      `${count} ${SKIP_REASONS[reason] ?? reason.replace(/^http_/, 'HTTP ').replace(/_/g, ' ')}`).join(', '))
+  const skipped = Object.fromEntries(
+    Object.entries(job.skipped_reasons ?? {}).filter(([reason]) => !(reason in blocked)),
+  )
+  if (Object.keys(skipped).length) lines.push('Skipped: ' + countList(skipped))
+  if ((job.status === 'failed' || job.status === 'blocked_by_site') && job.error_message) {
+    lines.push(job.error_message)
   }
-  if (job.status === 'failed' && job.error_message) lines.push(job.error_message)
-  const indexingDone = job.pages_indexed != null && (job.pages_indexed + (job.pages_failed ?? 0)) >= saved
-  return { text: lines.join('\n'), terminal: job.status === 'failed' || (job.status === 'complete' && indexingDone) }
+  const stopped = job.status === 'failed' || job.status === 'blocked_by_site'
+  return {
+    text: lines.join('\n'),
+    terminal: (stopped && (!saved || settled)) || (job.status === 'complete' && settled),
+  }
 }
 
 function processingSummary(document: DocumentStatus): { text: string; terminal: boolean } {

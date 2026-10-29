@@ -169,10 +169,13 @@ class AzureDocumentExtractor:
             try:
                 arguments = {
                     "body": BytesIO(segment),
-                    "content_type": "application/octet-stream",
+                    # Layout v4.0 analyses HTML as text (billed per 3,000 characters).
+                    "content_type": (
+                        "text/html" if media_type == "text/html" else "application/octet-stream"
+                    ),
                     "output_content_format": "markdown",
                 }
-                if enhanced:
+                if enhanced and media_type != "text/html":
                     try:
                         from azure.ai.documentintelligence.models import AnalyzeOutputOption
 

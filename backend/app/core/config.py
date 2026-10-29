@@ -128,6 +128,10 @@ class Settings(BaseSettings):
     url_max_page_chars: int = Field(default=200_000, ge=1000)
     url_max_total_chars: int = Field(default=20_000_000, ge=1000)
     url_rate_limit_sec: float = Field(default=1, ge=0)
+    # Contact URL in the crawler's User-Agent so site owners can reach the operator.
+    url_crawler_contact: str = ""
+    # Paid Azure Document Intelligence layout analysis of saved web pages.
+    url_azure_analysis: bool = False
     web_max_bytes: int = Field(default=2_000_000, ge=1024)
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env", extra="ignore", hide_input_in_errors=True

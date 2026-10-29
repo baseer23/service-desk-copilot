@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 from backend.app.services.web import (
     fetch_response,
+    is_www_alias,
+    same_site_url,
     validate_public_url,
     extract_html,
     normalize_url,
@@ -12,6 +14,7 @@ from backend.app.services.web import (
 import time
 from collections import deque
 from dataclasses import asdict, dataclass, field
+from email.utils import parsedate_to_datetime
 from typing import Iterable, List, Optional, Set, Tuple
 from urllib.parse import ParseResult, urljoin, urlparse, urlunsplit
 from urllib.robotparser import RobotFileParser
@@ -24,6 +27,30 @@ from backend.app.core.config import Settings
 
 MAX_SITEMAP_FETCHES = 5
 MAX_SITEMAP_DEPTH = 2
+USER_AGENT_PRODUCT = "DeskMateBot/1.0"
+ACCEPT = "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8"
+ACCEPT_LANGUAGE = "en-CA,en;q=0.8"
+# Consecutive HTTP 403s after which the site is treated as refusing the crawler.
+MAX_CONSECUTIVE_FORBIDDEN = 3
+DEFAULT_RETRY_AFTER_SEC = 60
+MAX_RETRY_AFTER_SEC = 900
+MAX_RATE_LIMIT_RETRIES = 3
+# Cookies that bot-protection services use to track or clear automated
+# clients. They are never kept or replayed: DeskMate does not bypass them.
+BOT_PROTECTION_COOKIES = (
+    "cf_clearance", "__cf_bm", "_cfuvid", "__cfruid", "datadome", "_abck", "bm_sz",
+    "ak_bmsc", "incap_ses_", "visid_incap_", "reese84",
+)
+CHALLENGE_MARKERS = (
+    "/cdn-cgi/challenge-platform/", "<title>just a moment...</title>",
+    "captcha-delivery.com", "_incapsula_resource",
+)
+
+
+def crawler_user_agent(settings) -> str:
+    """An honest crawler identity with the operator's contact URL when configured."""
+    contact = str(getattr(settings, "url_crawler_contact", "") or "").strip()
+    return f"{USER_AGENT_PRODUCT} (+{contact})" if contact else USER_AGENT_PRODUCT
 
 
 @dataclass
@@ -76,13 +103,20 @@ class CrawlError(ValueError):
 class UrlCrawler:
     """Same-origin crawler that respects robots, limits, and rate controls."""
 
-    USER_AGENT = "ServiceDeskCopilotBot/1.0 (+https://example.com)"
+    USER_AGENT = USER_AGENT_PRODUCT
 
     def __init__(self, settings: Settings, session: Optional[requests.Session] = None) -> None:
         """Store configuration and instantiate an HTTP session if needed."""
         self._settings = settings
+        self.user_agent = crawler_user_agent(settings)
+        # One session per crawl step; requests' own default User-Agent must
+        # not survive, so the identity is set rather than defaulted.
         self._session = session or requests.Session()
-        self._session.headers.setdefault("User-Agent", self.USER_AGENT)
+        self._session.headers.update(
+            {"User-Agent": self.user_agent, "Accept": ACCEPT, "Accept-Language": ACCEPT_LANGUAGE}
+        )
+        self._prefetched: dict = {}
+        self.last_retry_after = DEFAULT_RETRY_AFTER_SEC
 
     def crawl(self, root_url: str, overrides: Optional[CrawlLimits] = None) -> CrawlResult:
         """Crawl the supplied root URL and return extracted content."""
@@ -90,6 +124,9 @@ class UrlCrawler:
         state = self.start(root_url, overrides)
         result = CrawlResult()
         while not state["done"]:
+            wait = state.get("resume_after", 0) - time.time()
+            if wait > 0:
+                time.sleep(wait)
             result.pages.extend(self.advance(state))
         result.skipped = list(state["skipped"])
         result.skipped_urls = [item["url"] for item in state["skipped"]]
@@ -99,9 +136,12 @@ class UrlCrawler:
         return result
 
     def start(self, root_url: str, overrides: Optional[CrawlLimits] = None) -> dict:
-        """Validate the root, load robots and sitemaps, and return resumable state.
+        """Validate the root, resolve its canonical origin, load robots and sitemaps.
 
-        The state is plain JSON so a crawl job can persist it between steps.
+        The root is fetched once here (and handed to the first ``advance``) so an
+        apex <-> www redirect is adopted before robots.txt and sitemaps are read
+        from the canonical origin. The state is plain JSON so a crawl job can
+        persist it between steps.
         """
 
         try:
@@ -115,13 +155,13 @@ class UrlCrawler:
             raise CrawlError("URL_BLOCKED", "URL must include a hostname.", 400)
 
         limits = overrides or self._default_limits()
-        robots_lines = self._load_robots_lines(parsed_root)
         root = self._normalize_url(root_url)
         state = {
             "root_url": root,
             "origin": [parsed_root.scheme, parsed_root.netloc],
             "limits": asdict(limits),
-            "robots_lines": robots_lines,
+            "robots_lines": self._load_robots_lines(parsed_root),
+            "crawl_delay": 0.0,
             "queue": [[root, 0]],
             "seen_urls": [],
             "seen_hashes": [],
@@ -132,13 +172,63 @@ class UrlCrawler:
             "retrieved_html": False,
             "last_fetch_at": 0.0,
             "sitemap_seeds": 0,
+            "consecutive_forbidden": 0,
+            "rate_limit_retries": {},
+            "resume_after": 0.0,
+            "blocked_by_site": None,
             "done": False,
         }
+        self._set_crawl_delay(state)
+        if self._can_fetch(self._parse_robots(state["robots_lines"]), root):
+            self._resolve_canonical_root(state)
         if limits.max_depth >= 1:
             seeds = self._sitemap_seeds(state)
             state["queue"].extend([url, 1] for url in seeds)
             state["sitemap_seeds"] = len(seeds)
         return state
+
+    def _resolve_canonical_root(self, state: dict) -> None:
+        """Fetch the root once and adopt an apex <-> www redirect as the crawl origin."""
+
+        root = state["root_url"]
+        state["last_fetch_at"] = self._respect_wall_rate_limit(
+            state["last_fetch_at"], self._delay(state)
+        )
+        response, failure = self._fetch(root)
+        if response is None and failure not in {"bot_challenge", "rate_limited"}:
+            alias = self._www_alias_url(root)
+            if alias:
+                alias_response, _ = self._fetch(alias)
+                if alias_response is not None:
+                    response, failure = alias_response, ""
+        if response is not None:
+            final = urlparse(self._normalize_url(response.url or root))
+            if self._is_www_redirect_alias(urlparse(root), final):
+                # fetch_response validated every redirect target before requesting it.
+                canonical = self._normalize_url(
+                    urlunsplit((final.scheme, final.netloc, final.path, final.query, ""))
+                )
+                state["origin"] = [final.scheme, final.netloc]
+                state["root_url"] = canonical
+                state["queue"] = [[canonical, 0]]
+                robots = self._load_robots_lines(final)
+                if robots:
+                    state["robots_lines"] = robots
+                    self._set_crawl_delay(state)
+                root = canonical
+        self._prefetched[root] = (response, failure)
+
+    def _set_crawl_delay(self, state: dict) -> None:
+        try:
+            delay = self._parse_robots(state["robots_lines"]).crawl_delay(self.user_agent)
+        except (TypeError, ValueError):  # pragma: no cover - malformed Crawl-delay
+            delay = None
+        state["crawl_delay"] = float(delay or 0)
+
+    @staticmethod
+    def _delay(state: dict) -> float:
+        """The configured rate limit, or robots.txt Crawl-delay when that is longer."""
+        return max(float(state["limits"]["rate_limit_sec"]), float(state.get("crawl_delay") or 0))
 
     def advance(
         self, state: dict, max_pages: int | None = None, deadline: float | None = None
@@ -152,11 +242,18 @@ class UrlCrawler:
         seen_urls = set(state["seen_urls"])
         seen_hashes = set(state["seen_hashes"])
         pages: List[CrawledPage] = []
+        state.setdefault("consecutive_forbidden", 0)
+        state.setdefault("rate_limit_retries", {})
 
         def skip(url, reason):
             state["skipped"].append({"url": url, "reason": reason})
 
-        while queue and state["pages_accepted"] < limits.max_pages:
+        while (
+            queue
+            and state["pages_accepted"] < limits.max_pages
+            and not state.get("blocked_by_site")
+            and state.get("resume_after", 0) <= time.time()
+        ):
             if max_pages is not None and len(pages) >= max_pages:
                 break
             if deadline is not None and time.monotonic() >= deadline:
@@ -175,17 +272,40 @@ class UrlCrawler:
                 skip(current_url, "robots_disallowed")
                 continue
 
-            state["last_fetch_at"] = self._respect_wall_rate_limit(
-                state["last_fetch_at"], limits.rate_limit_sec
-            )
-            response, failure = self._fetch(current_url)
-            if response is None and depth == 0 and current_url == state["root_url"]:
-                alias = self._www_alias_url(current_url)
-                if alias:
-                    response, failure = self._fetch(alias)
+            if current_url in self._prefetched:
+                response, failure = self._prefetched.pop(current_url)
+            else:
+                state["last_fetch_at"] = self._respect_wall_rate_limit(
+                    state["last_fetch_at"], self._delay(state)
+                )
+                response, failure = self._fetch(current_url)
+                if response is None and depth == 0 and current_url == state["root_url"]:
+                    alias = self._www_alias_url(current_url)
+                    if alias and failure not in {"bot_challenge", "rate_limited"}:
+                        response, failure = self._fetch(alias)
             if response is None:
+                if failure == "rate_limited":
+                    retries = state["rate_limit_retries"].get(current_url, 0) + 1
+                    state["rate_limit_retries"][current_url] = retries
+                    if retries <= MAX_RATE_LIMIT_RETRIES:
+                        # Resume this URL after the site's Retry-After instead of skipping it.
+                        seen_urls.discard(current_url)
+                        queue.appendleft((current_url, depth))
+                        state["resume_after"] = time.time() + self.last_retry_after
+                        if self.last_retry_after > 0:
+                            break
+                        continue
                 skip(current_url, failure)
+                if failure == "bot_challenge":
+                    state["blocked_by_site"] = {"reason": "bot_challenge", "url": current_url}
+                    break
+                if failure == "http_403":
+                    state["consecutive_forbidden"] += 1
+                    if state["consecutive_forbidden"] >= MAX_CONSECUTIVE_FORBIDDEN:
+                        state["blocked_by_site"] = {"reason": "http_403", "url": current_url}
+                        break
                 continue
+            state["consecutive_forbidden"] = 0
 
             content_type = response.headers.get("Content-Type", "").lower()
             if "text/html" not in content_type:
@@ -253,13 +373,19 @@ class UrlCrawler:
         state["queue"] = [list(item) for item in queue]
         state["seen_urls"] = sorted(seen_urls)
         state["seen_hashes"] = sorted(seen_hashes)
-        state["done"] = not queue or state["pages_accepted"] >= limits.max_pages
+        state["done"] = (
+            bool(state.get("blocked_by_site"))
+            or not queue
+            or state["pages_accepted"] >= limits.max_pages
+        )
         return pages
 
     @staticmethod
     def empty_error(state: dict) -> "CrawlError":
         """The error a crawl that saved no page reports."""
 
+        if state.get("blocked_by_site"):
+            return CrawlError("BLOCKED_BY_SITE", "The website refused automated access.", 403)
         if state["robots_blocked"]:
             return CrawlError(
                 "ROBOTS_DISALLOWED", "The website does not allow this page to be indexed.", 403
@@ -273,11 +399,16 @@ class UrlCrawler:
         )
 
     def _sitemap_seeds(self, state: dict) -> List[str]:
-        """Same-origin, robots-allowed URLs from robots "Sitemap:" lines and /sitemap.xml."""
+        """Robots-allowed URLs from robots "Sitemap:" lines and /sitemap.xml.
+
+        Sitemaps and their URLs on the site's apex/www alias are rewritten to
+        the canonical origin, so pages are not fetched through redirects.
+        """
 
         limits = CrawlLimits(**state["limits"])
         robot_parser = self._parse_robots(state["robots_lines"])
         scheme, netloc = state["origin"]
+        origin = urlunsplit((scheme, netloc, "/", "", ""))
         pending = list(robot_parser.site_maps() or [])
         default = urlunsplit((scheme, netloc, "/sitemap.xml", "", ""))
         if default not in pending:
@@ -286,12 +417,12 @@ class UrlCrawler:
         fetched, seeds, visited = 0, [], set()
         while pending and fetched < MAX_SITEMAP_FETCHES and len(seeds) < limits.max_pages:
             sitemap_url, level = pending.pop(0)
-            parsed = urlparse(sitemap_url)
-            if (parsed.scheme, parsed.netloc) != (scheme, netloc) or sitemap_url in visited:
+            sitemap_url = same_site_url(sitemap_url, origin)
+            if not sitemap_url or sitemap_url in visited:
                 continue
             visited.add(sitemap_url)
             state["last_fetch_at"] = self._respect_wall_rate_limit(
-                state["last_fetch_at"], limits.rate_limit_sec
+                state["last_fetch_at"], self._delay(state)
             )
             fetched += 1
             response, _ = self._fetch(sitemap_url)
@@ -314,10 +445,9 @@ class UrlCrawler:
                     if level < MAX_SITEMAP_DEPTH:
                         pending.append((location, level + 1))
                     continue
-                url = self._normalize_url(location)
-                parsed_url = urlparse(url)
+                url = same_site_url(self._normalize_url(location), origin)
                 if (
-                    (parsed_url.scheme, parsed_url.netloc) == (scheme, netloc)
+                    url
                     and url != state["root_url"]
                     and url not in seeds
                     and self._can_fetch(robot_parser, url)
@@ -377,7 +507,7 @@ class UrlCrawler:
         """Return True when the crawler is permitted to fetch the given URL."""
 
         try:
-            return parser.can_fetch(self.USER_AGENT, url)
+            return parser.can_fetch(self.user_agent, url)
         except Exception:  # pragma: no cover - defensive
             return True
 
@@ -421,11 +551,59 @@ class UrlCrawler:
                 return None, "too_large"
             else:
                 return None, "fetch_failed"
+        finally:
+            self._drop_bot_protection_cookies()
+        if self._is_challenge(response):
+            return None, "bot_challenge"
         if response.status_code == 429:
+            self.last_retry_after = self._retry_after(response)
             return None, "rate_limited"
         if response.status_code != 200:
             return None, f"http_{response.status_code}"
         return response, ""
+
+    @staticmethod
+    def _header(response, name: str) -> str:
+        headers = getattr(response, "headers", None) or {}
+        return next(
+            (str(value) for key, value in headers.items() if key.lower() == name.lower()), ""
+        )
+
+    def _is_challenge(self, response) -> bool:
+        """A bot-protection challenge page rather than the requested content."""
+
+        if self._header(response, "cf-mitigated").strip().lower() == "challenge":
+            return True
+        if response.status_code not in {403, 429, 503}:
+            return False
+        try:
+            body = (response.text or "")[:20_000].lower()
+        except Exception:  # noqa: BLE001 - a closed error stream has no readable body
+            return False
+        return any(marker in body for marker in CHALLENGE_MARKERS)
+
+    def _retry_after(self, response) -> float:
+        """Seconds the site asked to wait (seconds or HTTP date), bounded."""
+
+        value = self._header(response, "Retry-After").strip()
+        seconds = DEFAULT_RETRY_AFTER_SEC
+        if value:
+            try:
+                seconds = float(value)
+            except ValueError:
+                try:
+                    seconds = parsedate_to_datetime(value).timestamp() - time.time()
+                except (TypeError, ValueError):
+                    seconds = DEFAULT_RETRY_AFTER_SEC
+        return min(max(seconds, 0.0), MAX_RETRY_AFTER_SEC)
+
+    def _drop_bot_protection_cookies(self) -> None:
+        cookies = getattr(self._session, "cookies", None)
+        if cookies is None:
+            return
+        for cookie in list(cookies):
+            if cookie.name.startswith(BOT_PROTECTION_COOKIES):
+                cookies.clear(cookie.domain, cookie.path, cookie.name)
 
     def _normalize_url(self, url: str) -> str:
         """Return a normalised URL suitable for deduplication."""
@@ -443,19 +621,7 @@ class UrlCrawler:
 
     @staticmethod
     def _is_www_redirect_alias(root: ParseResult, destination: ParseResult) -> bool:
-        def host(value: ParseResult) -> str:
-            return (value.hostname or "").lower().removeprefix("www.")
-
-        def port(value: ParseResult) -> int:
-            return value.port or (443 if value.scheme == "https" else 80)
-
-        return (
-            root.scheme == destination.scheme
-            and port(root) == port(destination)
-            and host(root) == host(destination)
-            and root.hostname != destination.hostname
-            and "www." in {(root.hostname or "")[:4].lower(), (destination.hostname or "")[:4].lower()}
-        )
+        return is_www_alias(root, destination)
 
     def _canonical_url(self, soup: BeautifulSoup, fallback_url: str) -> str:
         """Resolve a canonical URL from the page when provided."""
@@ -470,20 +636,17 @@ class UrlCrawler:
     def _extract_same_origin_links(
         self, soup: BeautifulSoup, base_url: str, root: ParseResult
     ) -> Iterable[str]:
-        """Yield same-origin links discovered within the provided soup."""
+        """Same-site links in the soup; apex/www alias links use the crawl origin."""
 
-        parsed_root = root
+        origin = urlunsplit((root.scheme, root.netloc, "/", "", ""))
         collected: Set[str] = set()
         for anchor in soup.find_all("a", href=True):
             href = anchor.get("href", "").strip()
             if not href:
                 continue
-            joined = urljoin(base_url, href)
-            normalized = self._normalize_url(joined)
-            parsed = urlparse(normalized)
-            if parsed.scheme != parsed_root.scheme or parsed.netloc != parsed_root.netloc:
-                continue
-            collected.add(normalized)
+            normalized = same_site_url(self._normalize_url(urljoin(base_url, href)), origin)
+            if normalized:
+                collected.add(normalized)
         return collected
 
 

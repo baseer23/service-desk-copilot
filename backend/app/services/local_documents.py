@@ -148,6 +148,20 @@ class LocalDocumentExtractor:
             if extractor.credential:
                 extractor.credential.close()
 
+    def analyze_html(self, data):
+        """Azure Document Intelligence layout analysis of one saved web page (paid)."""
+        if not self.settings.azure_document_endpoint:
+            raise ValueError("Document processing is not configured for web page analysis")
+        from backend.app.services.document_processing import AzureDocumentExtractor
+
+        extractor = AzureDocumentExtractor(self.settings, self.records)
+        try:
+            return extractor.extract(data, "text/html")
+        finally:
+            extractor.client.close()
+            if extractor.credential:
+                extractor.credential.close()
+
     def extract_path(self, path, media_type, enhanced=False, force_azure=False, **callbacks):
         if media_type == "text/html":
             raise ValueError("Saved web pages are structured during local indexing")

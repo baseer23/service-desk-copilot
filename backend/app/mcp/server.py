@@ -854,13 +854,24 @@ def ingest_url(url: str, max_depth: int | None = None, max_pages: int | None = N
     return _crawl_job_summary(job)
 
 
+# Skip reasons meaning the website itself refused the crawler.
+SITE_REFUSAL_REASONS = {"bot_challenge", "http_401", "http_403", "http_451", "robots_disallowed"}
+
+
 def _crawl_job_summary(job, documents_by_id=None):
-    """Public job progress without the resumable crawl internals."""
+    """Public job progress without the resumable crawl internals.
+
+    Crawl counts come from the crawl state; ingestion counts come from each
+    saved page's own document state, so a finished crawl never reads as
+    finished ingestion.
+    """
     state = job.get("crawl_state") or {}
     skipped = [*state.get("skipped", []), *job.get("save_failures", [])]
-    reasons = {}
+    reasons, blocked = {}, {}
     for item in skipped:
         reasons[item["reason"]] = reasons.get(item["reason"], 0) + 1
+        if item["reason"] in SITE_REFUSAL_REASONS:
+            blocked[item["reason"]] = blocked.get(item["reason"], 0) + 1
     found = set(state.get("seen_urls", [])) | {item[0] for item in state.get("queue", [])}
     summary = {
         key: job.get(key)
@@ -872,15 +883,49 @@ def _crawl_job_summary(job, documents_by_id=None):
     summary.update(
         pages_found=len(found), pages_skipped=len(skipped), skipped_reasons=reasons,
         skipped=skipped[-50:], sitemap_seeds=state.get("sitemap_seeds", 0),
+        pages_fetched=state.get("pages_accepted", 0), pages_blocked=blocked,
+        blocked_by_site=state.get("blocked_by_site"),
+        crawl_delay=state.get("crawl_delay", 0.0), resume_after=state.get("resume_after") or None,
+        azure_analysis=job.get("azure_analysis", "disabled"),
     )
     if documents_by_id is not None:
         rows = [documents_by_id[item] for item in job.get("document_ids", []) if item in documents_by_id]
+        semantic, failures = {}, {}
+        for row in rows:
+            status = row.get("semantic_graph_status") or "pending"
+            semantic[status] = semantic.get(status, 0) + 1
+            if row.get("status") == "error":
+                reason = row.get("processing_error_code") or row.get("failed_stage") or "unknown"
+                failures[reason] = failures.get(reason, 0) + 1
         summary.update(
+            pages_azure_analysed=sum(
+                row.get("extraction_method") == "document_intelligence" for row in rows
+            ),
             pages_indexed=sum(bool(row.get("local_index_ready")) for row in rows),
             pages_linked=sum(row.get("graph_link_status") == "linked" for row in rows),
-            pages_failed=sum(row.get("status") == "error" for row in rows),
+            pages_semantic=semantic,
+            pages_failed=sum(failures.values()),
+            failed_reasons=failures,
         )
     return summary
+
+
+def _blocked_message(state):
+    """Plain-language explanation of a crawl the website refused."""
+    blocked = state.get("blocked_by_site") or {}
+    refused = sum(
+        item["reason"] in {"http_401", "http_403", "http_451"} for item in state.get("skipped", [])
+    )
+    if blocked.get("reason") == "bot_challenge":
+        return (
+            "The website answered with a bot-protection challenge, so the crawl stopped. "
+            "DeskMate doesn't bypass site protections."
+        )
+    return (
+        f"The website refused automated access to {refused} "
+        f"page{'s' if refused != 1 else ''} (HTTP 403), so the crawl stopped. "
+        "DeskMate doesn't bypass site protections."
+    )
 
 
 @capability("public_web")
@@ -906,6 +951,12 @@ def advance_url_crawl(job_id: str):
         )
 
     crawler = UrlCrawler(s)
+    # Paid Azure layout analysis of saved pages only when enabled and configured.
+    processing = "azure_di" if s.url_azure_analysis and s.azure_document_endpoint else "local"
+    job["azure_analysis"] = (
+        "enabled" if processing == "azure_di"
+        else "not_configured" if s.url_azure_analysis else "disabled"
+    )
     if job["crawl_state"] is None:
         limits = CrawlLimits(
             job["max_depth"], job["max_pages"], s.url_max_total_chars,
@@ -928,7 +979,7 @@ def advance_url_crawl(job_id: str):
             try:
                 saved = repository.upload(
                     page.html.encode("utf-8"), page.title, "text/html",
-                    "structured_graph", "local", source_type="url",
+                    "structured_graph", processing, source_type="url",
                     source_url=page.url, canonical_url=page.canonical_url or page.url,
                     retrieved_at=datetime.now(timezone.utc).isoformat(),
                 )
@@ -951,7 +1002,11 @@ def advance_url_crawl(job_id: str):
         if not pages or time.monotonic() >= deadline:
             break
     if state["done"]:
-        if job["document_ids"]:
+        if state.get("blocked_by_site"):
+            # Stop instead of retrying; every page saved so far is kept.
+            job.update(error_code="BLOCKED_BY_SITE", error_message=_blocked_message(state))
+            persist("blocked_by_site")
+        elif job["document_ids"]:
             persist("complete")
         else:
             error = UrlCrawler.empty_error(state)
