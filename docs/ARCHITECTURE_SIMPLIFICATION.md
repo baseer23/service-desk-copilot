@@ -319,3 +319,14 @@ Executed checks:
 - **Offline tests:** 4 new recovery tests, including one that a resumed PDF sends only its unsaved pages, and a batching test that publishes a document in 4 write transactions with labelled link matches. The full offline suite has the same 11 pre-existing failures (`test_ingest_url`, `test_scope_source_policy` and `test_service_desk_scenarios`, confirmed on dev without these changes).
 - **Live recovery:** on restart, the stuck NSNP 200 job became `AZURE_DOCUMENT_INTERRUPTED` with 6 batches saved. One re-upload sent only batch 6 (pages 13–14, one free-tier request) and the document reached `ready`.
 - **Live link timing:** re-linking it through `/documents/{id}/enrich-graph` (no Azure, saved vectors reused) took about 6 s instead of 3 min 11 s. A read-only Aura check found all 547 reference nodes plus the Document: 30 FormField, 87 SelectionMark, 87 HAS_SELECTIONMARK, 275 HAS_PARAGRAPH. Both new constraints exist.
+
+## Probabilistic knowledge-graph experiment (dev_exp) — 2026-10-29
+
+An isolated experiment compares dev's semantic graph pipeline (A) with probabilistic reasoning plus deterministic validation, written through the Python driver (B) or through a separate write-enabled neo4j-mcp connection (C). It is not wired into the application. The conversational agent's neo4j-mcp stays read-only. See [PROBABILISTIC_KG_EXPERIMENT.md](PROBABILISTIC_KG_EXPERIMENT.md).
+
+Executed checks:
+- **Offline tests:** 10 new tests. They cover an end-to-end A/B/C comparison on six invented documents with recorded model output, the validator's guarantees, the template allowlist, read-only and production-URI refusal, and retrieval bounds.
+- **Transport:** C ran over real MCP stdio to a stand-in for neo4j-mcp.
+- **Full offline suite:** the same 11 pre-existing failures as dev.
+
+No Azure, Groq or Neo4j Aura request was made. Remaining live blockers: real model proposals, real Cypher on Neo4j, and the real neo4j-mcp `write-cypher` against an isolated database.

@@ -28,6 +28,7 @@ TOKEN_LIMITS = {
     "evaluate_sources": 350,
     "document_graph_extract": 1500,
     "graph_placement": 1200,
+    "probabilistic_graph_extract": 4000,
 }
 
 
