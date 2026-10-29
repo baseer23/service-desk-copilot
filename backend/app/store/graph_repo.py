@@ -33,6 +33,18 @@ ChunkRecord = Dict[str, object]
 REFERENCE_LABELS = {
     "Chunk", "Table", "Figure", "Section", "Paragraph", "TableCell", "FormField", "SelectionMark",
 }
+REFERENCE_RELATIONSHIPS = {
+    "HAS_SECTION", "HAS_CHUNK", "HAS_TABLE", "HAS_FIGURE", "HAS_PARAGRAPH", "HAS_TABLECELL",
+    "HAS_CELL", "HAS_FORMFIELD", "HAS_SELECTIONMARK", "REFERENCES_TABLE", "REFERENCES_FIGURE",
+    "MENTIONS", "RELATED_TO",
+}
+WRITE_BATCH_ROWS = 500
+
+
+def _batches(rows):
+    for start in range(0, len(rows), WRITE_BATCH_ROWS):
+        yield rows[start:start + WRITE_BATCH_ROWS]
+
 
 class GraphRepository:
     """Persistence adapter for document, chunk, and entity metadata in Neo4j."""
@@ -74,6 +86,8 @@ class GraphRepository:
             "CREATE CONSTRAINT IF NOT EXISTS FOR (p:Page) REQUIRE p.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (p:Paragraph) REQUIRE p.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (c:TableCell) REQUIRE c.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (f:FormField) REQUIRE f.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (m:SelectionMark) REQUIRE m.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (t:Topic) REQUIRE t.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (f:SemanticFact) REQUIRE f.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (s:ConversationSource) REQUIRE s.id IS UNIQUE",
@@ -114,18 +128,29 @@ class GraphRepository:
 
     def upsert_page(self, doc_id: str, page: int, version: int = 1) -> None:
         """Create a tenant-scoped page anchor without storing private content."""
-        page_id = f"{doc_id}:page:{page}"
+        self.upsert_pages(doc_id, [page], version)
+
+    def upsert_pages(self, doc_id: str, pages, version: int = 1) -> None:
+        """Create many page anchors in one transaction (one round trip per batch)."""
+        rows = [
+            {"page_id": self.scope(f"{doc_id}:page:{page}"),
+             "original_id": f"{doc_id}:page:{page}", "page": page}
+            for page in pages
+        ]
+        if not rows:
+            return
 
         def _tx(tx: Transaction) -> None:
-            tx.run(
-                "MATCH (d:Document {id:$doc_id}) MERGE (p:Page {id:$page_id}) "
-                "SET p.original_id=$original_id, p.document_id=$original_doc_id, "
-                "p.page=$page, p.version=$version, p.tenant_id=$tenant "
-                "MERGE (d)-[:HAS_PAGE]->(p)",
-                doc_id=self.scope(doc_id), page_id=self.scope(page_id),
-                original_id=page_id, original_doc_id=doc_id, page=page,
-                version=version, tenant=self.tenant(),
-            )
+            for batch in _batches(rows):
+                tx.run(
+                    "MATCH (d:Document {id:$doc_id}) UNWIND $rows AS row "
+                    "MERGE (p:Page {id:row.page_id}) "
+                    "SET p.original_id=row.original_id, p.document_id=$original_doc_id, "
+                    "p.page=row.page, p.version=$version, p.tenant_id=$tenant "
+                    "MERGE (d)-[:HAS_PAGE]->(p)",
+                    rows=batch, doc_id=self.scope(doc_id), original_doc_id=doc_id,
+                    version=version, tenant=self.tenant(),
+                )
 
         self._execute_write(_tx)
 
@@ -150,61 +175,82 @@ class GraphRepository:
 
     def upsert_reference_object(self, doc_id: str, item: dict) -> None:
         """Persist bounded reference metadata only; actual content remains local."""
-        label = item.get("object_type", "Chunk")
-        if label not in REFERENCE_LABELS:
-            raise ValueError("Unsupported graph object type")
-        description = re.sub(r"\s+", " ", str(item.get("description") or "")).strip()[:160]
+        self.upsert_reference_objects(doc_id, [item])
+
+    def upsert_reference_objects(self, doc_id: str, items) -> None:
+        """Persist many reference objects with one UNWIND per label and batch.
+
+        A per-object transaction costs several Aura round trips, which made
+        linking a large form take minutes.
+        """
+        grouped: dict[str, list[dict]] = {}
+        for item in items:
+            label = item.get("object_type", "Chunk")
+            if label not in REFERENCE_LABELS:
+                raise ValueError("Unsupported graph object type")
+            grouped.setdefault(label, []).append(self._reference_row(doc_id, item))
+        if not grouped:
+            return
 
         def _tx(tx: Transaction) -> None:
-            tx.run(
-                f"MERGE (n:{label} {{id: $id}}) "
-                "SET n.original_id=$original_id, n.document_id=$document_id, "
-                "n.page=$page, n.ordinal=$ordinal, n.description=$description, "
-                "n.document_hash=$document_hash, n.content_hash=$content_hash, "
-                "n.version=$version, n.source_provenance=$source_provenance, "
-                "n.link_status=$link_status, n.tenant_id=$tenant_id, "
-                "n.source_element_id=$source_element_id, n.azure_role=$azure_role, "
-                "n.span_offset=$span_offset, n.span_length=$span_length, "
-                "n.table_row=$table_row, n.table_column=$table_column, "
-                "n.role=$role, n.state_flag=$state_flag, n.confidence=$confidence, "
-                "n.bounding_regions_json=$bounding_regions_json",
-                id=self.scope(item["object_id"]),
-                original_id=item["object_id"],
-                document_id=doc_id,
-                page=item.get("page"),
-                ordinal=item.get("position"),
-                description=description,
-                document_hash=doc_id,
-                tenant_id=self.tenant(),
-                content_hash=item.get("content_hash"),
-                version=item.get("version", 1),
-                source_provenance=item.get("source_provenance"),
-                link_status=item.get("link_status", "linked"),
-                source_element_id=item.get("source_element_id"),
-                azure_role=item.get("azure_role"),
-                span_offset=item.get("span_offset"),
-                span_length=item.get("span_length"),
-                table_row=item.get("table_row"),
-                table_column=item.get("table_column"),
-                # Form references carry a role, a state flag and a confidence,
-                # never the question's answer text.
-                role=item.get("role"),
-                state_flag=item.get("state_flag"),
-                confidence=item.get("confidence"),
-                bounding_regions_json=json.dumps(
-                    item.get("bounding_regions", [])[:8], separators=(",", ":")
-                )[:4000],
-            )
-            if label == "SelectionMark":
-                return  # reached through its FormField, not directly from the Page
-            tx.run(
-                f"MATCH (p:Page {{id:$page_id}}), (n:{label} {{id:$id}}) "
-                f"MERGE (p)-[:HAS_{label.upper()}]->(n)",
-                page_id=self.scope(f"{doc_id}:page:{item.get('page')}"),
-                id=self.scope(item["object_id"]),
-            )
+            for label, rows in grouped.items():
+                for batch in _batches(rows):
+                    tx.run(
+                        f"UNWIND $rows AS row MERGE (n:{label} {{id: row.id}}) "
+                        "SET n.original_id=row.original_id, n.document_id=row.document_id, "
+                        "n.page=row.page, n.ordinal=row.ordinal, n.description=row.description, "
+                        "n.document_hash=row.document_hash, n.content_hash=row.content_hash, "
+                        "n.version=row.version, n.source_provenance=row.source_provenance, "
+                        "n.link_status=row.link_status, n.tenant_id=row.tenant_id, "
+                        "n.source_element_id=row.source_element_id, n.azure_role=row.azure_role, "
+                        "n.span_offset=row.span_offset, n.span_length=row.span_length, "
+                        "n.table_row=row.table_row, n.table_column=row.table_column, "
+                        "n.role=row.role, n.state_flag=row.state_flag, "
+                        "n.confidence=row.confidence, "
+                        "n.bounding_regions_json=row.bounding_regions_json",
+                        rows=batch,
+                    )
+                    if label == "SelectionMark":
+                        continue  # reached through its FormField, not directly from the Page
+                    tx.run(
+                        f"UNWIND $rows AS row MATCH (p:Page {{id:row.page_id}}) "
+                        f"MATCH (n:{label} {{id:row.id}}) MERGE (p)-[:HAS_{label.upper()}]->(n)",
+                        rows=batch,
+                    )
 
         self._execute_write(_tx)
+
+    def _reference_row(self, doc_id: str, item: dict) -> dict:
+        description = re.sub(r"\s+", " ", str(item.get("description") or "")).strip()[:160]
+        return {
+            "id": self.scope(item["object_id"]),
+            "page_id": self.scope(f"{doc_id}:page:{item.get('page')}"),
+            "original_id": item["object_id"],
+            "document_id": doc_id,
+            "page": item.get("page"),
+            "ordinal": item.get("position"),
+            "description": description,
+            "document_hash": doc_id,
+            "tenant_id": self.tenant(),
+            "content_hash": item.get("content_hash"),
+            "version": item.get("version", 1),
+            "source_provenance": item.get("source_provenance"),
+            "link_status": item.get("link_status", "linked"),
+            "source_element_id": item.get("source_element_id"),
+            "azure_role": item.get("azure_role"),
+            "span_offset": item.get("span_offset"),
+            "span_length": item.get("span_length"),
+            "table_row": item.get("table_row"),
+            "table_column": item.get("table_column"),
+            # Form references carry a role, a state flag and a confidence,
+            # never the question's answer text.
+            "role": item.get("role"),
+            "state_flag": item.get("state_flag"),
+            "confidence": item.get("confidence"),
+            "bounding_regions_json": json.dumps(
+                item.get("bounding_regions", [])[:8], separators=(",", ":")
+            )[:4000],
+        }
 
     def fetch_structured_references(
         self,
@@ -315,33 +361,45 @@ class GraphRepository:
 
         return self._execute_write(_tx) or {"outbound": 0, "inbound": 0, "document_found": False}
 
-    def link_reference_objects(self, source_id: str, target_id: str, relationship: str):
-        allowed = {
-            "HAS_SECTION",
-            "HAS_CHUNK",
-            "HAS_TABLE",
-            "HAS_FIGURE",
-            "HAS_PARAGRAPH",
-            "HAS_TABLECELL",
-            "HAS_CELL",
-            "HAS_FORMFIELD",
-            "HAS_SELECTIONMARK",
-            "REFERENCES_TABLE",
-            "REFERENCES_FIGURE",
-            "MENTIONS",
-            "RELATED_TO",
-        }
-        if relationship not in allowed:
-            raise ValueError("Unsupported structured relationship")
+    def link_reference_objects(
+        self, source_id: str, target_id: str, relationship: str,
+        source_label: str | None = None, target_label: str | None = None,
+    ):
+        self.link_reference_objects_many(
+            [(source_id, target_id, relationship, source_label, target_label)]
+        )
+
+    def link_reference_objects_many(self, links) -> None:
+        """Link reference objects in batches of (source, target, relationship[, labels]).
+
+        Known labels let the match use the per-label id constraints instead
+        of scanning every node in the database for each link.
+        """
+        grouped: dict[tuple, list[dict]] = {}
+        for source_id, target_id, relationship, *labels in links:
+            source_label, target_label = [*labels, None, None][:2]
+            if relationship not in REFERENCE_RELATIONSHIPS:
+                raise ValueError("Unsupported structured relationship")
+            if {source_label, target_label} - REFERENCE_LABELS - {None}:
+                raise ValueError("Unsupported graph object type")
+            grouped.setdefault((relationship, source_label, target_label), []).append(
+                {"source": self.scope(source_id), "target": self.scope(target_id)}
+            )
+        if not grouped:
+            return
 
         def _tx(tx: Transaction):
-            tx.run(
-                "MATCH (a {id:$source}), (b {id:$target}) "
-                f"WHERE a.tenant_id=$tenant AND b.tenant_id=$tenant MERGE (a)-[:{relationship}]->(b)",
-                source=self.scope(source_id),
-                target=self.scope(target_id),
-                tenant=self.tenant(),
-            )
+            for (relationship, source_label, target_label), rows in grouped.items():
+                source = f":{source_label}" if source_label else ""
+                target = f":{target_label}" if target_label else ""
+                for batch in _batches(rows):
+                    tx.run(
+                        f"UNWIND $rows AS row MATCH (a{source} {{id:row.source}}) "
+                        f"MATCH (b{target} {{id:row.target}}) "
+                        "WHERE a.tenant_id=$tenant AND b.tenant_id=$tenant "
+                        f"MERGE (a)-[:{relationship}]->(b)",
+                        rows=batch, tenant=self.tenant(),
+                    )
 
         self._execute_write(_tx)
 
@@ -874,6 +932,15 @@ class UnavailableGraphRepository:
     def link_reference_objects(self, *args, **kwargs):
         pass
 
+    def upsert_pages(self, *args, **kwargs):
+        pass
+
+    def upsert_reference_objects(self, *args, **kwargs):
+        pass
+
+    def link_reference_objects_many(self, *args, **kwargs):
+        pass
+
     def search_relationships(self, entities, limit=12):
         return []
 
@@ -1006,10 +1073,21 @@ class InMemoryGraphRepository:
             and (not object_types or item["object_type"] in object_types)
         ][: min(max(limit, 1), 20)]
 
-    def link_reference_objects(self, source_id: str, target_id: str, relationship: str):
+    def link_reference_objects(self, source_id: str, target_id: str, relationship: str, *labels):
         if source_id not in self.references or target_id not in self.references:
             raise ValueError("Unknown reference object")
         self.reference_links.add((source_id, relationship, target_id))
+
+    def upsert_pages(self, doc_id: str, pages, version: int = 1) -> None:
+        """Pages are implicit in the lightweight test repository."""
+
+    def upsert_reference_objects(self, doc_id: str, items) -> None:
+        for item in items:
+            self.upsert_reference_object(doc_id, item)
+
+    def link_reference_objects_many(self, links) -> None:
+        for source_id, target_id, relationship, *_labels in links:
+            self.link_reference_objects(source_id, target_id, relationship)
 
     def link_doc_chunk(self, doc_id: str, chunk_id: str) -> None:  # pragma: no cover - no-op
         """Document/chunk relationships are implicit in the in-memory structure."""
