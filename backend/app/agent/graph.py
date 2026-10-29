@@ -1739,12 +1739,17 @@ class ServiceDeskAgent:
         structure then adds passages on the same page as the best matches, the
         Document -> Page -> object neighbourhood a field's label and value share.
         Passages supporting semantic graph claims or mentions are always kept.
+        Section headings are navigation, not evidence: each heading also opens the
+        chunk that follows it, so heading-only rows would only displace content.
         """
         import math
 
         from rapidfuzz import fuzz
 
-        rows = [row for row in rows if isinstance(row, dict)]
+        rows = [
+            row for row in rows
+            if isinstance(row, dict) and row.get("metadata", {}).get("object_type") != "Section"
+        ]
         if not rows:
             return []
         query_terms = set(cls._search_terms(question))

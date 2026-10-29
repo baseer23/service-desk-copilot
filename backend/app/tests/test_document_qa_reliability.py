@@ -73,6 +73,22 @@ def test_chunks_never_span_pages_so_their_page_is_a_correct_citation():
     assert berth["page"] == 2 and "Silver Tern" not in berth["text"]
 
 
+def test_saved_extraction_without_sections_regains_them_from_headings():
+    from backend.app.services.document_processing import with_heading_sections
+
+    assert FORM["sections"] == []
+    restored = with_heading_sections(FORM)
+    assert [s["title"] for s in restored["sections"]] == [
+        "Section A - Applicant",
+        "Section B - Fees",
+    ]
+    objects = split_structured("d" * 64, restored, 512)
+    sections = {o["source_id"]: o for o in objects if o["object_type"] == "Section"}
+    fee = next(o for o in objects if o["object_type"] == "Chunk" and "$1,240" in o["text"])
+    assert sections[fee["section_id"]]["text"] == "Section B - Fees"
+    assert FORM["sections"] == []  # the saved artifact itself is never modified
+
+
 def test_form_check_boxes_are_readable_to_the_model():
     text = "1. Is the vessel insured? :unselected: Yes :selected: No"
     assert ServiceDeskAgent._readable_marks(text) == "1. Is the vessel insured? [ ] Yes [x] No"
@@ -98,6 +114,14 @@ def test_graph_evidence_fuses_keywords_tolerates_typos_and_adds_page_neighbours(
     assert ids[0] == "fee"  # typo-tolerant keyword relevance outranks vector order
     assert "fee-table" in ids  # same-page neighbour from the graph's page structure
     assert len(selected) <= 4 + 4
+
+
+def test_heading_only_section_rows_never_take_evidence_slots():
+    heading = row("sec", "Section B - Fees", 3)
+    heading["metadata"]["object_type"] = "Section"
+    rows = [heading, row("fee", "Section B - Fees\n\nAnnual mooring fee: $1,240", 3)]
+    selected = ServiceDeskAgent._select_graph_evidence(rows, "What are the fees?", 1)
+    assert [item["id"] for item in selected] == ["fee"]
 
 
 def test_passages_supporting_graph_claims_are_always_kept():

@@ -405,6 +405,13 @@ def _sections(paragraphs):
     return sections
 
 
+def with_heading_sections(extraction):
+    """Derive sections a saved extraction's heading paragraphs define but it lacks."""
+    if extraction.get("sections") or not extraction.get("paragraphs"):
+        return extraction
+    return {**extraction, "sections": _sections(extraction["paragraphs"])}
+
+
 def _offset_batch(batch, offset, batch_index):
     for collection in ("pages", "paragraphs", "tables", "figures"):
         for ordinal, item in enumerate(batch.get(collection, [])):

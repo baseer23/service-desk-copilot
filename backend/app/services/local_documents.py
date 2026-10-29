@@ -289,7 +289,9 @@ class LocalDocumentRepository(DocumentRepository):
         page membership or table-cell containment, not invented semantic facts.
         """
         from backend.app.services.chunking import split_structured
+        from backend.app.services.document_processing import with_heading_sections
 
+        extracted = with_heading_sections(extracted)
         objects = split_structured(
             identifier, extracted, self.settings.chunk_tokens, version
         )

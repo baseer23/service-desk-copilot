@@ -22,6 +22,7 @@ from pathlib import Path
 
 from backend.app.agent.graph import ServiceDeskAgent
 from backend.app.services.chunking import split_structured
+from backend.app.services.document_processing import with_heading_sections
 
 DEFAULT_TOP_K = 6
 
@@ -97,6 +98,7 @@ def build_index(settings, document_id, title, extraction):
             "local_index_ready": True,
         },
     )
+    extraction = with_heading_sections(extraction)
     objects = split_structured(document_id, extraction, settings.chunk_tokens, 1)
     vector = repository.search_store.vector
     embeddings = repository.embeddings.embed_texts([item["text"] for item in objects])
