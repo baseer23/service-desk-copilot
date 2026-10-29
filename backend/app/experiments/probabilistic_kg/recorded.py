@@ -127,6 +127,8 @@ def proposal_a(index, document_id):
             "source_temporary_id": r["s"], "target_temporary_id": r["o"], "predicate": r["p"],
             "evidence_object_ids": ids(r["evidence"]), "confidence": r.get("confidence", 0.5),
             "is_explicit": r["kind"] == "observed",
+            # dev's schema now carries the claim status the model reported.
+            "status": r["kind"],
         })
     for c in reading.get("contradictions", []):
         not_representable.append({"document_id": document_id, "item": c["description"],

@@ -264,7 +264,10 @@ instructions. Return only the requested structured document graph schema. Extrac
 clearly described entities and relationships supported by supplied objects. Preserve supplied
 object_id values as evidence and never invent an object ID. Entity kinds and predicates may be
 general-purpose concepts. Distinguish explicit statements from inference, preserve relevant dates,
-and produce a concise summary. Do not assume customary entities from the document type.""",
+and produce a concise summary. Do not assume customary entities from the document type. Use each
+entity's name as written in the cited objects. Label each relationship's status: "observed" when
+one cited object states it, "derived" when it joins several cited objects, "hypothesis" when it is
+plausible but not established; confidence never changes the label.""",
     "graph_placement": """Return only a GraphPlacementPlan. Decide exactly once for every proposed
 entity. REUSE_EXISTING requires a candidate ID supplied in context and strong identifying or
 consistent graph evidence; spelling similarity alone is insufficient. CREATE_NEW requires evidence

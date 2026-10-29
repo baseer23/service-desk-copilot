@@ -31,9 +31,9 @@ from backend.app.agent.state import InvestigationState
 from backend.app.agent.tools import AgentToolHarness, PlanValidationError
 from backend.app.mcp.client import MCPConnectionError, MCPToolError
 from backend.app.models.provider import LLMError
+from backend.app.services.entities import extract_entities
 from backend.app.services.source_policy import permits, quality, rank_sources
 from backend.app.services.web import relevant_excerpt
-from backend.app.services.entities import extract_entities
 
 DOCUMENT_EXTENSION = re.compile(r"\.(?:pdf|docx?|txt|md|html?|pptx?|xlsx?|csv|rtf)$", re.IGNORECASE)
 # GraphLookupPlan.document_ids accepts at most ten saved documents.
@@ -1534,6 +1534,23 @@ class ServiceDeskAgent:
         """
         if not state.get("explicit_saved_knowledge"):
             return await self.execute_tools(state)
+        exact = await self._exact_structured_lookup(state)
+        if exact is not None:
+            # An exact form or table question is answered by indexed graph
+            # lookup; no broad graph read and no semantic search are needed.
+            await emit(
+                "graph_retrieval", "completed",
+                "Answered from an exact structured lookup in the knowledge graph",
+                graph_status="available", hydrated_count=len(exact["output"]["items"]),
+            )
+            return {
+                "graph_status": "available",
+                "tool_results": [exact],
+                "plan_executed": True,
+                "executed_tool_calls": list(dict.fromkeys([
+                    *state.get("executed_tool_calls", []), *exact["signatures"],
+                ])),
+            }
         graph_result = await self._mandatory_saved_knowledge_graph_read(state)
         planned = await self.execute_tools(state)
         if graph_result is None:
@@ -1574,6 +1591,170 @@ class ServiceDeskAgent:
                 self._tool_signature(graph_result["name"], graph_result["arguments"]),
             ])),
         }
+
+    async def _exact_structured_lookup(self, state):
+        """Answer an exact form-field or table-cell question by indexed graph lookup.
+
+        Runs the fixed EXACT_* queries through neo4j-mcp read-cypher for the
+        resolved documents. A matching field or cell is returned as evidence
+        directly when the graph holds its verified value (content policy
+        structured_values); otherwise that one element is resolved by ID from
+        the local index or saved extraction. Returns None when the question is
+        not an exact structural question or nothing matches, so the normal
+        graph-first retrieval runs instead.
+        """
+        from rapidfuzz import fuzz, utils
+
+        from backend.app.core.principal import current_principal
+        from backend.app.services.graph_projection import normalize_question
+        from backend.app.store.graph_repo import EXACT_FORM_FIELDS_QUERY, EXACT_TABLE_CELLS_QUERY
+
+        document_ids = list(state.get("resolved_document_ids", []))[:MAX_DOCUMENT_CHOICES]
+        if not document_ids or "neo4j__read-cypher" not in self.harness.allowed_names("knowledge"):
+            return None
+        question = self._retrieval_question(state)
+        titles = {match.get("id"): match.get("title")
+                  for match in state.get("document_alias_matches", [])}
+        params = {"tenant_id": current_principal(self.settings).tenant_id,
+                  "document_ids": document_ids}
+        signatures = []
+
+        async def read(query):
+            arguments = {"query": query, "params": params}
+            signatures.append(self._tool_signature("neo4j__read-cypher", arguments))
+            try:
+                output = await self._call(state, "neo4j__read-cypher", arguments)
+            except (MCPToolError, ValueError):
+                return []
+            if output.get("status") != "ok":
+                return []
+            return [row for row in output.get("items", []) if isinstance(row, dict)]
+
+        def exact(item, source_system):
+            return {
+                "name": "search_knowledge",
+                "arguments": {"question": question, "mode": "EXACT"},
+                "signatures": signatures,
+                "output": {
+                    "tool": "search_knowledge", "status": "ok", "items": [item],
+                    "timestamp": now(), "source_system": source_system, "reliability": 0.95,
+                },
+            }
+
+        fields = sorted(
+            (
+                (fuzz.token_set_ratio(normalize_question(row["question"]), question,
+                                      processor=utils.default_process), row)
+                for row in await read(EXACT_FORM_FIELDS_QUERY) if row.get("question")
+            ),
+            key=lambda pair: -pair[0],
+        )
+        if fields and fields[0][0] >= FORM_FIELD_MATCH:
+            row = fields[0][1]
+            options = [o for o in row.get("options") or [] if isinstance(o, dict)]
+            metadata = {
+                "doc_id": row.get("document_id"), "title": titles.get(row.get("document_id")),
+                "page": row.get("page"), "object_id": row.get("object_id"),
+                "object_type": "FormField", "ingestion_mode": "structured_graph",
+                "form_field_question": row.get("question"),
+                "form_field_status": row.get("status"),
+                "form_field_selected": row.get("selected_option"),
+                "form_ambiguity_reason": row.get("ambiguity_reason"),
+                "form_association_method": row.get("association_method"),
+                "match_type": "exact_graph_lookup",
+            }
+            verified = row.get("status") != "answered" or (
+                row.get("selected_option") and all(o.get("label") for o in options)
+            )
+            if verified:
+                text = " ".join([str(row["question"]), *(
+                    f"[{'x' if o.get('selected') else ' '}] {o['label']}" for o in options
+                    if o.get("label")
+                )])
+                return exact({"id": f"graph-{row.get('object_id')}", "text": text,
+                              "metadata": metadata, "score": 1.0, "storage": "neo4j",
+                              "match_type": "exact_graph_lookup"}, "neo4j_aura")
+            # The graph does not hold this field's value (content policy): resolve
+            # exactly this element by ID, never by similarity search.
+            try:
+                hydrated = await self._call(
+                    state, "resolve_graph_references",
+                    {"question": question, "object_ids": [row["object_id"]]},
+                )
+            except (MCPToolError, ValueError):
+                return None  # normal graph-first retrieval still runs
+            signatures.append(self._tool_signature(
+                "resolve_graph_references", {"question": question, "object_ids": [row["object_id"]]}
+            ))
+            rows = [r for r in hydrated.get("items", []) if isinstance(r, dict)]
+            if rows:
+                item = {**rows[0], "match_type": "exact_graph_lookup"}
+                item["metadata"] = {**item.get("metadata", {}), "match_type": "exact_graph_lookup"}
+                return exact(item, "chroma")
+
+        def leaves(header):
+            return [part.split(" / ")[-1].strip() for part in str(header or "").split(" | ")
+                    if part.strip()]
+
+        def named(header):
+            return any(
+                fuzz.partial_ratio(leaf.casefold(), question.casefold()) >= FORM_FIELD_MATCH
+                for leaf in leaves(header) if len(leaf) >= 3
+            )
+
+        cells = [
+            cell for cell in await read(EXACT_TABLE_CELLS_QUERY)
+            if cell.get("object_id") and cell.get("table_id") is not None
+            and cell.get("row") is not None
+        ]
+        column_hits = [cell for cell in cells if named(cell.get("column_header"))]
+        if not column_hits and any(cell.get("column_header") is None for cell in cells):
+            # The content policy keeps table text local: the graph says which
+            # tables exist, the saved extraction says what they hold.
+            column_hits = [cell for cell in cells if cell.get("column_header") is None]
+        if not column_hits:
+            return None
+        matches = [cell for cell in column_hits
+                   if cell.get("row_header") and cell.get("value") is not None
+                   and named(cell.get("row_header"))]
+        source_system = "neo4j_aura"
+        if not matches:
+            # Values are not in the graph (content policy): read exactly these
+            # tables' cells from the saved extraction.
+            tables = {}
+            for cell in column_hits:
+                tables.setdefault(cell["document_id"], set()).add(cell.get("table_id"))
+            local = []
+            for document_id, table_ids in tables.items():
+                arguments = {"document_id": document_id, "table_ids": sorted(map(str, table_ids))}
+                signatures.append(self._tool_signature("resolve_table_cells", arguments))
+                try:
+                    result = await self._call(state, "resolve_table_cells", arguments)
+                except (MCPToolError, ValueError):
+                    return None  # normal graph-first retrieval still runs
+                local.extend(r for r in result.get("items", []) if isinstance(r, dict))
+            matches = [cell for cell in local
+                       if named(cell.get("column_header")) and named(cell.get("row_header"))]
+            source_system = "local_document"
+        if len(matches) != 1:
+            return None
+        cell = matches[0]
+        text = (f"{cell.get('row_header')} | {cell.get('column_header')}: {cell.get('value')}"
+                + (f" ({cell['unit']})" if cell.get("unit") else ""))
+        return exact({
+            "id": f"graph-{cell.get('object_id')}", "text": text, "score": 1.0,
+            "storage": "neo4j" if source_system == "neo4j_aura" else "extraction",
+            "match_type": "exact_graph_lookup",
+            "metadata": {
+                "doc_id": cell.get("document_id"), "title": titles.get(cell.get("document_id")),
+                "page": cell.get("page"), "object_id": cell.get("object_id"),
+                "object_type": "TableCell", "ingestion_mode": "structured_graph",
+                "table_id": cell.get("table_id"), "table_row": cell.get("row"),
+                "table_column": cell.get("column"), "row_header": cell.get("row_header"),
+                "column_header": cell.get("column_header"), "cell_value": cell.get("value"),
+                "unit": cell.get("unit"), "match_type": "exact_graph_lookup",
+            },
+        }, source_system)
 
     async def _mandatory_saved_knowledge_graph_read(self, state):
         """Issue one bounded tenant-scoped graph read; never accept model-written Cypher.
@@ -1616,10 +1797,13 @@ class ServiceDeskAgent:
                 "WHERE m.tenant_id = $tenant_id | coalesce(o.original_id, o.id)][..500] "
                 "AS mention_object_ids, "
                 "[(d)<-[:DOCUMENTED_IN]-(c:GraphClaim)-[:SUPPORTED_BY]->(o) "
-                "WHERE c.tenant_id = $tenant_id | coalesce(o.original_id, o.id)][..500] "
+                "WHERE c.tenant_id = $tenant_id AND coalesce(c.status, 'documented') "
+                "IN ['observed', 'derived', 'documented'] | coalesce(o.original_id, o.id)][..500] "
                 "AS claim_object_ids, "
                 "[(d)<-[:DOCUMENTED_IN]-(c:GraphClaim)-[:SUBJECT]->(s) "
-                "WHERE c.tenant_id = $tenant_id | {subject: s.name, predicate: c.predicate, "
+                "WHERE c.tenant_id = $tenant_id AND coalesce(c.status, 'documented') "
+                "IN ['observed', 'derived', 'documented'] | "
+                "{subject: s.name, predicate: c.predicate, "
                 "object: head([(c)-[:OBJECT]->(t) | t.name]), "
                 "evidence_object_ids: [(c)-[:SUPPORTED_BY]->(x) | coalesce(x.original_id, x.id)][..10]}"
                 "][..50] AS claims, "
@@ -2057,6 +2241,12 @@ class ServiceDeskAgent:
     async def _grade_document_evidence(self, state, candidates):
         if not candidates:
             return {"accepted": [], "rejected": [], "unverified": []}
+        if all(
+            (item.get("content") or {}).get("metadata", {}).get("match_type")
+            == "exact_graph_lookup" for item in candidates
+        ):
+            # Indexed structural lookups matched the question deterministically.
+            return {"accepted": list(candidates), "rejected": [], "unverified": []}
         # Every candidate is graded. A title named in the question says which
         # document to search, not which of its passages answer the question.
         candidate_ids = [
@@ -2438,6 +2628,7 @@ class ServiceDeskAgent:
             decision.confidence = 0
         if state.get("workflow") == "knowledge":
             self._enforce_form_selection(state, decision)
+            self._enforce_table_cell(state, decision)
         summary = state["ticket"]["summary"].casefold()
         terse_diagnostic_request = (
             len(summary.split()) <= 8
@@ -2660,6 +2851,33 @@ class ServiceDeskAgent:
             f"from the document: {why}."
         )
         decision.hypotheses, decision.confidence = [], 0
+        decision.question_for_human = decision.human_field = None
+        decision.needs_web_research = False
+
+    def _enforce_table_cell(self, state, decision):
+        """State an exactly matched table cell's value and headers as the answer."""
+        cells = [
+            item for item in self.usable_evidence(state)
+            if (item.get("content") or {}).get("metadata", {}).get("object_type") == "TableCell"
+            and item["content"]["metadata"].get("match_type") == "exact_graph_lookup"
+        ]
+        if not cells:
+            return
+        item = cells[0]
+        metadata = item["content"]["metadata"]
+        value = str(metadata.get("cell_value") or "")
+        if decision.outcome == "answer" and value and value in str(decision.answer or ""):
+            return
+        unit = f" {metadata['unit']}" if metadata.get("unit") else ""
+        decision.answer = (
+            f"The table on page {metadata.get('page')} lists {value}{unit} for "
+            f"“{metadata.get('row_header')}” under “{metadata.get('column_header')}”."
+        )
+        decision.outcome, decision.enough_information = "answer", True
+        decision.hypotheses = [Hypothesis(
+            claim=decision.answer, evidence_ids=[item["id"]], confidence=0.9, status="supported",
+        )]
+        decision.confidence = max(decision.confidence, 0.8)
         decision.question_for_human = decision.human_field = None
         decision.needs_web_research = False
 

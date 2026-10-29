@@ -646,6 +646,14 @@ def create_app(settings: Settings | None = None):
             )
         )["result"]
 
+    @app.post("/documents/upgrade-graph-projection")
+    async def upgrade_graph_projection(document_id: str | None = None):
+        """Operator action: rebuild structural graph meaning from saved extractions."""
+        arguments = {"document_id": document_id} if document_id else {}
+        return (
+            await app.state.agent.harness.invoke("upgrade_graph_projection", arguments)
+        )["result"]
+
     @app.get("/documents/{document_id}/status")
     async def document_status(document_id: str):
         return (await app.state.agent.harness.invoke("get_document", {"document_id": document_id}))[

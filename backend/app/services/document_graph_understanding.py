@@ -5,6 +5,7 @@ import re
 
 from backend.app.models.document_graph_models import DocumentGraphProposal
 from backend.app.services.chunking import split_structured
+from backend.app.services.grounding import mentions, weaker
 
 
 class DocumentGraphUnderstanding:
@@ -23,6 +24,9 @@ class DocumentGraphUnderstanding:
             document_metadata.get("version", 1),
         )
         allowed_ids = {item["object_id"] for item in objects}
+        # Cited text, for grounding checks; it is never sent anywhere.
+        self.object_text = {item["object_id"]: str(item.get("text") or "") for item in objects}
+        self.rejected_proposals = []
         # Verified form fields are the only source of a field's value.
         self.form_fields = {
             item["object_id"]: item for item in objects if item["object_type"] == "FormField"
@@ -71,6 +75,10 @@ class DocumentGraphUnderstanding:
             job["rejected_form_values"] = (
                 job.get("rejected_form_values", 0) + self.rejected_form_values
             )
+            job["rejected_proposals"] = [
+                *job.get("rejected_proposals", []), *self.rejected_proposals
+            ][-200:]
+            self.rejected_proposals = []
             job["sections"].append(data.model_dump())
             job["cursor"] += 1; job["calls"] += 1
             row = self.records.write("document_semantic_graph_job", key, job, previous=row)
@@ -95,6 +103,10 @@ class DocumentGraphUnderstanding:
             job["rejected_form_values"] = (
                 job.get("rejected_form_values", 0) + self.rejected_form_values
             )
+            job["rejected_proposals"] = [
+                *job.get("rejected_proposals", []), *self.rejected_proposals
+            ][-200:]
+            self.rejected_proposals = []
             job["proposal"] = proposal.model_dump(); job["status"] = "understood"
             self.records.write("document_semantic_graph_job", key, job, previous=row)
             return proposal, False
@@ -107,6 +119,18 @@ class DocumentGraphUnderstanding:
         for item in data["entities"]:
             item["evidence_object_ids"] = [v for v in item["evidence_object_ids"] if v in allowed_ids]
         data["entities"] = [item for item in data["entities"] if item["evidence_object_ids"]]
+        texts = getattr(self, "object_text", {})
+        if texts:
+            # An entity must be named in at least one object it cites.
+            grounded = []
+            for item in data["entities"]:
+                names = [item["name"], *item.get("aliases", [])]
+                cited = item["evidence_object_ids"]
+                if any(mentions(texts.get(value, ""), names) for value in cited):
+                    grounded.append(item)
+                else:
+                    self._record_rejection(item, "entity_not_named_in_cited_evidence")
+            data["entities"] = grounded
         entity_ids = {item["temporary_id"] for item in data["entities"]}
         for item in data["relationships"]:
             item["evidence_object_ids"] = [v for v in item["evidence_object_ids"] if v in allowed_ids]
@@ -118,8 +142,53 @@ class DocumentGraphUnderstanding:
             item for item in data["relationships"] if self._grounded_form_value(item, names)
         ]
         self.rejected_form_values = len(data["relationships"]) - len(grounded)
+        for item in data["relationships"]:
+            if item not in grounded:
+                self._record_rejection(item, "contradicts_extracted_form_selection")
+        aliases = {
+            entity["temporary_id"]: [entity["name"], *entity.get("aliases", [])]
+            for entity in data["entities"]
+        }
+        for item in grounded:
+            item["status"] = self._claim_status(item, aliases, texts)
         data["relationships"] = grounded
         return DocumentGraphProposal.model_validate(data)
+
+    def _claim_status(self, relationship, aliases, texts):
+        """The strongest status the cited objects support, never above the proposal's."""
+        proposed = relationship.get("status") or (
+            "observed" if relationship.get("is_explicit", True) else "derived"
+        )
+        if not texts:
+            return proposed
+        fields = getattr(self, "form_fields", {})
+        cited = relationship["evidence_object_ids"]
+        if any(fields.get(value, {}).get("field_status") == "ambiguous" for value in cited):
+            return weaker(proposed, "ambiguous")
+        source = aliases.get(relationship["source_temporary_id"], [])
+        target = aliases.get(relationship["target_temporary_id"], [])
+
+        def subject_named(value):
+            # A form field answers a question about its subject (the applicant).
+            return value in fields or mentions(texts.get(value, ""), source)
+
+        def object_named(value):
+            return mentions(texts.get(value, ""), target)
+
+        if any(subject_named(value) and object_named(value) for value in cited):
+            return proposed
+        if any(map(subject_named, cited)) and any(map(object_named, cited)):
+            return weaker(proposed, "derived")
+        return weaker(proposed, "hypothesis")
+
+    def _record_rejection(self, item, reason):
+        if not hasattr(self, "rejected_proposals"):
+            self.rejected_proposals = []
+        self.rejected_proposals.append({
+            "reason": reason,
+            "name": item.get("name") or item.get("predicate"),
+            "evidence_object_ids": list(item.get("evidence_object_ids", []))[:10],
+        })
 
     @staticmethod
     def _field_context(item):

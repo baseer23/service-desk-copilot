@@ -721,6 +721,24 @@ def list_documents():
 
 
 @capability("local_document")
+def resolve_table_cells(document_id: str, table_ids: list[str]):
+    """Application-controlled: exact table cells with headers from the saved extraction."""
+    cells = getattr(documents(), "table_cells", None)
+    if cells is None:
+        raise ValueError("Exact table cells require the local document store")
+    return {"items": cells(document_id, table_ids[:20]), "status": "ok"}
+
+
+@capability("local_document")
+def upgrade_graph_projection(document_id: str | None = None):
+    """Operator action: re-project saved extractions into the structural graph (no Azure)."""
+    upgrade = getattr(documents(), "upgrade_graph_projection", None)
+    if upgrade is None:
+        raise ValueError("Graph projection upgrade requires the local document store")
+    return upgrade(document_id)
+
+
+@capability("local_document")
 def recover_interrupted_documents():
     """Settle document jobs an earlier application process left mid-operation."""
     recover = getattr(documents(), "recover_interrupted", None)

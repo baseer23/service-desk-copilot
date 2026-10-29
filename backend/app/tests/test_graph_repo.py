@@ -101,7 +101,9 @@ def test_document_publication_batches_writes_and_matches_links_by_label():
     queries = [query for batch in writes for query, _ in batch]
     assert sum(len(params.get("rows", [])) for batch in writes for _, params in batch) > 60
     links = [query for query in queries if "MERGE (a)-[:" in query]
-    assert links and all("MATCH (a:Section" in query for query in links)
+    assert links and all(
+        "MATCH (a:Section" in query or "MATCH (a:Paragraph" in query for query in links
+    )
     assert counts["nodes"] > 60
 
 

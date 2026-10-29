@@ -122,6 +122,9 @@ async def run_baseline(index):
                               "aliases": value.get("aliases", [])}
     seen = set()
     for row in graph.knowledge_relationships:
+        if row.get("status") not in (None, "observed", "derived", "documented"):
+            # Stored as a GraphClaim with its status but no RELATED_TO edge.
+            continue
         identity = (row["source_id"], row["predicate"], row["target_id"], row["document_id"],
                     tuple(row.get("evidence_object_ids", [])))
         if identity in seen:  # GraphRepository MERGEs claims by this identity

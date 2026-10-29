@@ -243,3 +243,22 @@ On this dataset and recorded reading, yes: B/C is the hybrid. It combines probab
 1. **Live model run:** real Groq or Azure OpenAI proposals for these six fixtures and NSNP 200's saved extraction, scored against the same answer key. This is paid, bounded to about 7–10 calls.
 2. **Real Cypher and real neo4j-mcp:** run B and C against a local Neo4j in Docker, isolated from Aura. The Docker daemon is not running on this machine and no Neo4j image is present.
 3. **An isolated Aura database** with separate `DESKMATE_EXP_NEO4J_*` credentials, if Aura-specific behaviour matters.
+
+## Update: the baseline after folding claim statuses into dev's pipeline
+
+The meaningful-graph change put entity grounding and observed/derived/hypothesis claim statuses into the existing `DocumentGraphUnderstanding` and graph writer. Re-running this evaluation with Approach A on that code (same recorded reading, with the model's status now passed through):
+
+| | A before | A after | B |
+|---|---|---|---|
+| Relationship precision | 0.80 | 0.94 | 0.94 |
+| Unsupported facts | 4 | 1 | 1 |
+| Agentic multi-hop | 3/6 | 4/6 | 6/6 |
+| Contradictions detected | 0 | 0 | 1 |
+| Element-exact citations | 0.06 | 0.06 | 1.00 |
+| Duplicate entities | 1 | 1 | 0 |
+
+What still separates B:
+- cross-document derivations (M3);
+- contradiction detection (M4);
+- element-level evidence;
+- identity resolution that enriches reused entities.

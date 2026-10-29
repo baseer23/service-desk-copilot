@@ -24,8 +24,6 @@ from __future__ import annotations
 import hashlib
 import re
 
-from rapidfuzz import fuzz
-
 from backend.app.experiments.probabilistic_kg.models import (
     EXISTING_PREFIX,
     ProbabilisticGraphProposal,
@@ -35,7 +33,7 @@ from backend.app.experiments.probabilistic_kg.models import (
     ValidatedEntity,
     ValidatedGraph,
 )
-from backend.app.services.form_marks import readable_marks
+from backend.app.services.grounding import mentions, normalize
 
 # Predicates whose subject can hold only one value at a time. A second value
 # from different evidence is a contradiction to surface, not a fact to choose.
@@ -46,26 +44,6 @@ SINGLE_VALUED_PREDICATES = {
 }
 # Without a grounded identifier, these names are not unique across documents.
 DOCUMENT_SCOPED_TYPES = {"person", "date", "amount", "duration", "value"}
-FUZZY_MENTION = 92
-
-
-def normalize(text: str) -> str:
-    text = readable_marks(str(text or "")).casefold()
-    text = re.sub(r"[^\w\s$%./-]+", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def mentions(text: str, names) -> bool:
-    haystack = normalize(text)
-    for name in names:
-        needle = normalize(name)
-        if not needle:
-            continue
-        if re.search(r"(?<!\w)" + re.escape(needle) + r"(?!\w)", haystack):
-            return True
-        if len(needle) >= 6 and fuzz.partial_ratio(needle, haystack) >= FUZZY_MENTION:
-            return True
-    return False
 
 
 def entity_key(entity_type: str, name: str, identifiers: dict, document_id: str) -> str:

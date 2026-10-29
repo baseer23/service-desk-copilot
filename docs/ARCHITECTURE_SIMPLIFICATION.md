@@ -330,3 +330,63 @@ Executed checks:
 - **Full offline suite:** the same 11 pre-existing failures as dev.
 
 No Azure, Groq or Neo4j Aura request was made. Remaining live blockers: real model proposals, real Cypher on Neo4j, and the real neo4j-mcp `write-cypher` against an isolated database.
+
+## Meaningful structural graph (dev_exp) — 2026-10-29
+
+**What was wrong.** The structural writer works:
+- `_link_structured` writes through the Python Neo4j driver with the separate ingestion login, in batched `UNWIND` transactions.
+- The official neo4j-mcp stays read-only.
+- NSNP 200's 548 nodes were confirmed in Aura by a read-only count.
+
+What it wrote was mostly location, not meaning:
+- **Form fields:** the question lived only inside `description`. There was no field type, selected option, ambiguity reason or association method.
+- **Selection marks:** a state with no option label.
+- **Tables:** "table reference on page N". There was no shape and no headers.
+- **Cells:** coordinates and a hash. There was no text, kind, span, header link or data type.
+- **Sections:** no page range or content count.
+
+Two problems were in the extraction itself:
+- **Cell kinds:** every saved extraction stored the SDK enum's text (`DocumentTableCellKind.COLUMN_HEADER`) instead of `columnHeader`, so header cells were invisible.
+- **Captions:** table captions were never saved.
+
+**Semantic enrichment** runs automatically after structural linking only when `SEMANTIC_GRAPH_INGESTION_ENABLED=true`. `.env` sets it, but the app was started this session with the override `false`. Structural linking never depends on it: a semantic failure sets only `semantic_graph_status`.
+
+**What changed:**
+- **Projection** (`graph_projection.py`, `_publish_reference_objects`):
+  - **FormField:** question, `question_normalized`, `field_type`, `field_status`, `ambiguity_reason`, `association_method`, `option_count`, and `selected_option` (answered fields only).
+  - **SelectionMark:** `ordinal`, `selected`, `form_field_id`, and the `option_label` Azure associated with that mark.
+  - **Table:** shape, `table_id`, `row_group`, caption, column/row headers.
+  - **TableCell:** kind, row/column spans, column/row header (merged cells included), value, data type and unit (from the value or the header's "(CAD)").
+  - **Section:** title, `page_start`/`page_end`, `content_references`.
+  - **Figure:** caption.
+  - **New links:** `(header cell)-[:HEADER_OF]->(cell)`, `(Section)-[:HAS_TABLE|HAS_FORMFIELD]->`, `(Paragraph)-[:PART_OF]->(Chunk)`.
+  - **Document node:** projection version, content policy and extraction method.
+  - Descriptions now state what a node is.
+- **Content policy** (`GRAPH_CONTENT_POLICY`):
+  - `references` is the default and matches the previous privacy boundary. Selected options, option labels and all table text, headers included, stay local and are explicitly cleared from Neo4j. Azure marked NSNP's filled-in address row as a header row, so header text is not safe to treat as a label.
+  - `structured_values` stores those values and must be authorized for Aura.
+- **Retrieval:** `_exact_structured_lookup` runs the fixed `EXACT_FORM_FIELDS_QUERY` / `EXACT_TABLE_CELLS_QUERY` through neo4j-mcp `read-cypher`. Both are indexed on `document_id`.
+  - A matching field or cell is answered from the graph, or from that one element resolved by ID: `resolve_graph_references` for fields, `resolve_table_cells` against the saved extraction for tables.
+  - It never runs a similarity search, and it does not grade with a model.
+  - Anything unmatched falls back to the existing graph-first path.
+- **Semantic layer** (the existing `DocumentGraphUnderstanding`, not a new system):
+  - Relationships carry `status`: observed, derived, ambiguous or hypothesis, never raised by validation.
+  - Entities must be named in the objects they cite.
+  - Rejected proposals are kept in the job record.
+  - Only observed and derived claims get `RELATED_TO`, and the agent's graph read returns only those.
+- **Migration:** `upgrade_graph_projection` (MCP tool and `POST /documents/upgrade-graph-projection`) re-projects saved extractions in place. It reuses the same stable node IDs, makes no Azure call, does not re-embed, deletes nothing, and skips documents already current.
+
+Executed checks:
+- **Offline end-to-end test** (`test_meaningful_graph.py`), under both policies: Azure DI fixture → `LocalDocumentRepository` → graph → `read-cypher` harness → answer.
+  - Covers a Yes, a No, an ambiguous check-box, a table and a long section passage.
+  - Asserts no similarity search for exact answers, and that the Cypher rows carry the policy's values.
+- **Related suites:** 91 passed. The full offline suite run before the last fixes showed the 11 pre-existing failures plus 3 that are now fixed.
+- **NSNP 200, projected locally from its saved extraction** (no Aura write, no Azure):
+  - 30 form fields: 21 answered, 9 explicitly ambiguous.
+  - "Is the applicant currently working for you?" → page 6, `answered`, selected **Yes**. The Yes mark is ordinal 0, confidence 0.991, associated by text position, and No is unselected.
+  - 47 of 57 table cells regained their column headers once kinds were normalised.
+
+Not done, and needs approval:
+- running the upgrade against Aura, under the chosen content policy;
+- semantic enrichment (paid model calls);
+- real-Neo4j execution of the new Cypher. The writes and lookups were exercised against the in-memory graph and captured driver rows, not a Neo4j server.

@@ -236,7 +236,11 @@ class AzureDocumentExtractor:
                             "column": cell.column_index,
                             "row_span": getattr(cell, "row_span", 1) or 1,
                             "column_span": getattr(cell, "column_span", 1) or 1,
-                            "kind": str(getattr(cell, "kind", "content") or "content"),
+                            # The enum's value ("columnHeader"), not its Python name.
+                            "kind": str(
+                                getattr(getattr(cell, "kind", None), "value", None)
+                                or getattr(cell, "kind", None) or "content"
+                            ),
                             "text": cell.content,
                             "spans": [
                                 {"offset": span.offset, "length": span.length}
@@ -257,6 +261,9 @@ class AzureDocumentExtractor:
                             "page": table_page,
                             "row_count": getattr(table, "row_count", 0),
                             "column_count": getattr(table, "column_count", 0),
+                            "caption": getattr(
+                                getattr(table, "caption", None), "content", None
+                            ),
                             "cells": cells,
                             "bounding_regions": _regions(table.bounding_regions or [], offset),
                         }

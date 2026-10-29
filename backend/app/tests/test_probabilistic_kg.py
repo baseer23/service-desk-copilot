@@ -47,20 +47,26 @@ def results():
 
 def test_end_to_end_comparison_reports_measured_differences(results):
     a, b, c = (results["approaches"][key] for key in "ABC")
-    # Same recorded reading: validation removes unsupported facts that A keeps.
-    assert b["graph"]["hallucinated_facts"] < a["graph"]["hallucinated_facts"]
-    assert b["graph"]["relationship_precision"] > a["graph"]["relationship_precision"]
-    # ...at a cost: one true fact with a wrong citation is held as a hypothesis.
+    # A runs dev_exp's production pipeline, which now grounds entities and keeps
+    # claim statuses, so it matches B on unsupported facts for the same reading.
+    assert b["graph"]["hallucinated_facts"] <= a["graph"]["hallucinated_facts"]
+    # What still differs: conflicts, element-exact citations, cross-document links.
+    assert b["graph"]["contradictions_detected"] > a["graph"]["contradictions_detected"]
+    assert b["graph"]["attribution_strict"] > a["graph"]["attribution_strict"]
+    assert b["graph"]["duplicate_entities"] < a["graph"]["duplicate_entities"]
+    # B's strictness costs one true fact whose citation was wrong.
     assert b["graph"]["true_facts_held_as_hypotheses"] == 1
     # Exact form and table answers are deterministic and identical everywhere.
     for approach in (a, b, c):
         assert all(row["correct"] and row["evidence_correct"]
                    for row in approach["retrieval"]["exact"])
     agentic = {row["id"]: row for row in b["retrieval"]["multi_hop"]["agentic"]}
-    assert agentic["M4"]["answer"] == "CONFLICT"          # conflicting effective dates
-    assert agentic["M6"]["answer"] == "NOT_ESTABLISHED"   # a hypothesis is not a fact
     baseline = {row["id"]: row for row in a["retrieval"]["multi_hop"]["agentic"]}
-    assert baseline["M6"]["answer"] == "YES"  # dev stores the speculation as a fact
+    assert agentic["M4"]["answer"] == "CONFLICT"          # conflicting effective dates
+    assert baseline["M4"]["answer"] != "CONFLICT"
+    assert agentic["M3"]["correct"] and not baseline["M3"]["correct"]  # cross-document
+    for approach in (agentic, baseline):
+        assert approach["M6"]["answer"] == "NOT_ESTABLISHED"  # a hypothesis is not a fact
     # C wrote exactly what B wrote; only the transport differs.
     transport = results["transport"]
     assert transport["identical_graphs"]

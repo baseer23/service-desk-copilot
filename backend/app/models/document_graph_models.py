@@ -38,6 +38,11 @@ class ProposedRelationship(BaseModel):
     evidence_object_ids: list[str] = Field(default_factory=list, max_length=50)
     confidence: float = Field(default=0.0, ge=0, le=1)
     is_explicit: bool = True
+    # observed: one cited object states it; derived: it joins cited objects;
+    # ambiguous: cites an ambiguous form field; hypothesis: plausible, not
+    # established. Validation may lower this, never raise it. None means the
+    # model gave no label: observed when is_explicit, otherwise derived.
+    status: Literal["observed", "derived", "ambiguous", "hypothesis"] | None = None
     observed_at: str | None = Field(default=None, max_length=80)
 
     @field_validator("predicate")
