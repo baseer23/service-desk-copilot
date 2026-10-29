@@ -46,8 +46,12 @@ summaries use knowledge_source=documents. General how-to questions, including ho
 a printer, use knowledge/general unless the user reports an actual failure requiring investigation.
 Operational failures, MFA problems, printer failures,
 VPN and outages use service_desk. A person's resume is a document, not
-an investigation. Return RequestIntent with the user's goal and concise
-justification.""",
+an investigation. Also return standalone_question: the current request rewritten as one
+self-contained question using the conversation, naming the document and the exact field, item or
+subject a follow-up refers to (for example 'is it a no?' after a question about a form's
+employment-status question becomes 'In <document>, is the answer to "<that question>" No?'). Never
+add facts or answers. If the request is already self-contained, repeat it. Return RequestIntent
+with the user's goal and concise justification.""",
     "analyze_ticket": """Extract EVERY explicitly supplied identifier from ticket.summary:
 person, company, device, product, error and affected scope. '<person>
 from <company>' supplies both identifiers. Distinguish shared multi-user

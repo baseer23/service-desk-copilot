@@ -6,11 +6,13 @@ import logging
 import traceback
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from azure.core.pipeline.policies import RetryPolicy
 
 from backend.app.core.config import Settings
+from backend.app.services.form_marks import readable_marks
 from backend.app.core.azure_identity import azure_credential
 from backend.app.store.records import ManagedStoreError
 
@@ -182,20 +184,28 @@ class AzureDocumentExtractor:
                 poller = self.client.begin_analyze_document("prebuilt-layout", **arguments)
                 result = poller.result(timeout=600)
                 for page in result.pages or []:
-                    text = "\n".join(line.content for line in page.lines or [])
-                    if not text and result.content:
-                        text = "\n".join(
-                            result.content[span.offset : span.offset + span.length]
-                            for span in page.spans or []
-                        )
+                    page_number = page.page_number + offset
+                    # Azure's own Markdown for the page (tables, headings and ☒/☐
+                    # marks), sliced from the result content by the page's spans.
+                    markdown = "".join(
+                        result.content[span.offset : span.offset + span.length]
+                        for span in page.spans or []
+                    ) if result.content else ""
+                    text = "\n".join(line.content for line in page.lines or []) or markdown
                     pages.append(
                         {
-                            "page": page.page_number + offset,
+                            "page": page_number,
                             "text": text,
-                            "markdown": text,
+                            "markdown": readable_marks(markdown or text),
                             "spans": [
                                 {"offset": span.offset, "length": span.length}
                                 for span in page.spans or []
+                            ],
+                            "selection_marks": [
+                                _selection_mark(mark, page_number, ordinal, offset)
+                                for ordinal, mark in enumerate(
+                                    getattr(page, "selection_marks", None) or []
+                                )
                             ],
                         }
                     )
@@ -405,6 +415,24 @@ def _sections(paragraphs):
     return sections
 
 
+def _selection_mark(mark, page_number, ordinal, offset=0):
+    """A saved selection mark: state, confidence, polygon and span, with a stable ID."""
+    span = getattr(mark, "span", None)
+    return {
+        "id": f"selectionmark-{page_number}-{ordinal}",
+        "page": page_number,
+        "state": str(getattr(mark, "state", "") or "").lower(),
+        "confidence": getattr(mark, "confidence", None),
+        "bounding_regions": _regions(
+            [SimpleNamespace(
+                page_number=page_number - offset, polygon=getattr(mark, "polygon", None)
+            )],
+            offset,
+        ),
+        "span": {"offset": span.offset, "length": span.length} if span else None,
+    }
+
+
 def with_heading_sections(extraction):
     """Derive sections a saved extraction's heading paragraphs define but it lacks."""
     if extraction.get("sections") or not extraction.get("paragraphs"):
@@ -413,6 +441,13 @@ def with_heading_sections(extraction):
 
 
 def _offset_batch(batch, offset, batch_index):
+    for page in batch.get("pages", []):
+        # Marks are numbered per document page, so their IDs stay stable.
+        for ordinal, mark in enumerate(page.get("selection_marks") or []):
+            mark["page"] = mark.get("page", 1) + offset
+            mark["id"] = f"selectionmark-{mark['page']}-{ordinal}"
+            for region in mark.get("bounding_regions", []):
+                region["page"] = region.get("page", 1) + offset
     for collection in ("pages", "paragraphs", "tables", "figures"):
         for ordinal, item in enumerate(batch.get(collection, [])):
             item["page"] = item.get("page", 1) + offset

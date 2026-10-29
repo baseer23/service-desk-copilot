@@ -23,12 +23,14 @@ from pathlib import Path
 from backend.app.agent.graph import ServiceDeskAgent
 from backend.app.services.chunking import split_structured
 from backend.app.services.document_processing import with_heading_sections
+from backend.app.services.form_marks import readable_marks
 
 DEFAULT_TOP_K = 6
 
 
 def _normalized(value: str) -> str:
-    return re.sub(r"[^a-z0-9:|@./]", "", str(value).casefold())
+    # Check boxes compare in their readable [x] / [ ] form, however they were written.
+    return re.sub(r"[^a-z0-9:|@./\[\]]", "", readable_marks(value).casefold())
 
 
 @dataclass

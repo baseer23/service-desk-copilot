@@ -29,6 +29,11 @@ T = TypeVar("T")
 ChunkRecord = Dict[str, object]
 
 
+# Reference-only structural labels; their text stays in local storage.
+REFERENCE_LABELS = {
+    "Chunk", "Table", "Figure", "Section", "Paragraph", "TableCell", "FormField", "SelectionMark",
+}
+
 class GraphRepository:
     """Persistence adapter for document, chunk, and entity metadata in Neo4j."""
 
@@ -146,7 +151,7 @@ class GraphRepository:
     def upsert_reference_object(self, doc_id: str, item: dict) -> None:
         """Persist bounded reference metadata only; actual content remains local."""
         label = item.get("object_type", "Chunk")
-        if label not in {"Chunk", "Table", "Figure", "Section", "Paragraph", "TableCell"}:
+        if label not in REFERENCE_LABELS:
             raise ValueError("Unsupported graph object type")
         description = re.sub(r"\s+", " ", str(item.get("description") or "")).strip()[:160]
 
@@ -161,6 +166,7 @@ class GraphRepository:
                 "n.source_element_id=$source_element_id, n.azure_role=$azure_role, "
                 "n.span_offset=$span_offset, n.span_length=$span_length, "
                 "n.table_row=$table_row, n.table_column=$table_column, "
+                "n.role=$role, n.state_flag=$state_flag, n.confidence=$confidence, "
                 "n.bounding_regions_json=$bounding_regions_json",
                 id=self.scope(item["object_id"]),
                 original_id=item["object_id"],
@@ -180,10 +186,17 @@ class GraphRepository:
                 span_length=item.get("span_length"),
                 table_row=item.get("table_row"),
                 table_column=item.get("table_column"),
+                # Form references carry a role, a state flag and a confidence,
+                # never the question's answer text.
+                role=item.get("role"),
+                state_flag=item.get("state_flag"),
+                confidence=item.get("confidence"),
                 bounding_regions_json=json.dumps(
                     item.get("bounding_regions", [])[:8], separators=(",", ":")
                 )[:4000],
             )
+            if label == "SelectionMark":
+                return  # reached through its FormField, not directly from the Page
             tx.run(
                 f"MATCH (p:Page {{id:$page_id}}), (n:{label} {{id:$id}}) "
                 f"MERGE (p)-[:HAS_{label.upper()}]->(n)",
@@ -213,6 +226,8 @@ class GraphRepository:
             "HAS_PARAGRAPH",
             "HAS_TABLECELL",
             "HAS_CELL",
+            "HAS_FORMFIELD",
+            "HAS_SELECTIONMARK",
             "HAS_OBJECT",
             "REFERENCES_TABLE",
             "REFERENCES_FIGURE",
@@ -226,8 +241,8 @@ class GraphRepository:
         ]
         selected_types = [
             label
-            for label in (object_types or ["Chunk", "Table", "Figure", "Section", "Paragraph", "TableCell"])
-            if label in {"Chunk", "Table", "Figure", "Section", "Paragraph", "TableCell"}
+            for label in (object_types or sorted(REFERENCE_LABELS))
+            if label in REFERENCE_LABELS
         ]
 
         def _tx(tx: Transaction):
@@ -306,6 +321,8 @@ class GraphRepository:
             "HAS_PARAGRAPH",
             "HAS_TABLECELL",
             "HAS_CELL",
+            "HAS_FORMFIELD",
+            "HAS_SELECTIONMARK",
             "REFERENCES_TABLE",
             "REFERENCES_FIGURE",
             "MENTIONS",
@@ -893,6 +910,7 @@ class InMemoryGraphRepository:
         self.document_mentions: list[dict] = []
         self.websites: MutableMapping[str, set] = {}
         self.document_links: set[tuple[str, str]] = set()
+        self.reference_links: set[tuple[str, str, str]] = set()
 
     def ensure_constraints(self) -> None:  # pragma: no cover - no-op for in-memory variant
         """In-memory store has no constraints to create."""
@@ -901,7 +919,7 @@ class InMemoryGraphRepository:
         deleted = sum(map(len, (self.documents, self.chunks, self.entity_links, self.references, self.semantic_facts)))
         self.documents.clear(); self.chunks.clear(); self.entity_links.clear(); self.references.clear(); self.semantic_facts.clear()
         self.knowledge_relationships.clear(); self.document_mentions.clear()
-        self.websites.clear(); self.document_links.clear()
+        self.websites.clear(); self.document_links.clear(); self.reference_links.clear()
         return {"status": "cleared", "deleted": deleted, "remaining": 0}
 
     def upsert_document(
@@ -949,6 +967,9 @@ class InMemoryGraphRepository:
             "document_id": doc_id,
             "page": item.get("page"),
             "description": str(item.get("description") or "")[:160],
+            "role": item.get("role"),
+            "state_flag": item.get("state_flag"),
+            "confidence": item.get("confidence"),
         }
 
     def fetch_structured_references(
@@ -980,6 +1001,7 @@ class InMemoryGraphRepository:
     def link_reference_objects(self, source_id: str, target_id: str, relationship: str):
         if source_id not in self.references or target_id not in self.references:
             raise ValueError("Unknown reference object")
+        self.reference_links.add((source_id, relationship, target_id))
 
     def link_doc_chunk(self, doc_id: str, chunk_id: str) -> None:  # pragma: no cover - no-op
         """Document/chunk relationships are implicit in the in-memory structure."""

@@ -17,6 +17,7 @@ from backend.app.agent.models import (
     EvidenceGradeResult,
     EvidenceItem,
     FinalResponse,
+    Hypothesis,
     InvestigationDecision,
     InvestigationPlan,
     MemoryFact,
@@ -49,6 +50,13 @@ FUZZY_TERM_SCORE = 83
 # Same-page passages added after the best-matching pages (graph neighbourhood).
 GRAPH_NEIGHBOUR_PAGES = 2
 GRAPH_NEIGHBOUR_LIMIT = 4
+# A FormField whose question matches the request this well is the field asked about.
+FORM_FIELD_MATCH = 85
+SELECTION_QUESTION = re.compile(
+    r"\b(?:checked|ticked|check-?box(?:es)?|tick-?box(?:es)?|selected option|which option"
+    r"|marked(?:\s+as)?\s+(?:yes|no)|yes or no|is it (?:a |an )?(?:yes|no)|answer(?:ed)? to)\b",
+    re.IGNORECASE,
+)
 SEARCH_STOPWORDS = frozenset(
     "a an and are as at be by can could did do does for from has have how i in is it its my "
     "of on or our please so tell than that the their them there these this those to was what "
@@ -663,7 +671,7 @@ class ServiceDeskAgent:
             }
             if "text" in body:
                 body["text"] = relevant_excerpt(
-                    self._readable_marks(body["text"]), state["ticket"]["summary"], 1600
+                    self._readable_marks(body["text"]), self._retrieval_question(state), 1600
                 )
                 body["title"] = meta.get("title") or body.get("title")
                 body["url"] = row.get("url")
@@ -953,7 +961,7 @@ class ServiceDeskAgent:
         inventory = context.pop("document_inventory", None) or []
         intent = state.get("intent") or {}
         matches, resolved, kind = self._scope_documents(
-            state["ticket"]["summary"], inventory, state.get("conversation_context"),
+            self._retrieval_question(state), inventory, state.get("conversation_context"),
             documents_intent=(
                 intent.get("workflow") == "knowledge"
                 and intent.get("knowledge_source") == "documents"
@@ -1130,7 +1138,7 @@ class ServiceDeskAgent:
                         graph_plan["document_ids"] = list(state.get("resolved_document_ids", []))
                         call.arguments = {
                             **call.arguments,
-                            "question": state["ticket"]["summary"],
+                            "question": self._retrieval_question(state),
                             "mode": "HYBRID",
                             "graph_plan": graph_plan,
                         }
@@ -1211,7 +1219,7 @@ class ServiceDeskAgent:
                             tool_calls=[{
                                 "name": "search_knowledge",
                                 "arguments": {
-                                    "question": state["ticket"]["summary"],
+                                    "question": self._retrieval_question(state),
                                     "top_k": 5,
                                     "mode": "HYBRID",
                                     "graph_plan": {
@@ -1577,7 +1585,7 @@ class ServiceDeskAgent:
         """
         from backend.app.core.principal import current_principal
 
-        question = state["ticket"]["summary"]
+        question = self._retrieval_question(state)
         concepts = extract_entities([{"text": question}])
         if not concepts:
             concepts = re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]{2,}", question)
@@ -1616,7 +1624,7 @@ class ServiceDeskAgent:
                 "evidence_object_ids: [(c)-[:SUPPORTED_BY]->(x) | coalesce(x.original_id, x.id)][..10]}"
                 "][..50] AS claims, "
                 "[(d)-[:HAS_PAGE]->(p:Page)-[:HAS_CHUNK|HAS_TABLE|HAS_FIGURE|HAS_SECTION"
-                "|HAS_PARAGRAPH|HAS_TABLECELL]->(o) WHERE p.tenant_id = $tenant_id "
+                "|HAS_PARAGRAPH|HAS_TABLECELL|HAS_FORMFIELD]->(o) WHERE p.tenant_id = $tenant_id "
                 "| {object_id: coalesce(o.original_id, o.id), page: p.page}][..2000] "
                 "AS page_objects"
             )
@@ -1741,15 +1749,31 @@ class ServiceDeskAgent:
         Passages supporting semantic graph claims or mentions are always kept.
         Section headings are navigation, not evidence: each heading also opens the
         chunk that follows it, so heading-only rows would only displace content.
+        A FormField repeats its chunk's question and marks; it is added (outside
+        the limit) only when its question matches the one asked.
         """
         import math
 
         from rapidfuzz import fuzz
 
+        rows = [row for row in rows if isinstance(row, dict)]
+
+        def field_score(row):
+            return cls._form_field_score(
+                {"ticket": {"summary": question}},
+                {"content": {"metadata": row.get("metadata", {})}},
+            )
+
+        fields = sorted(
+            (row for row in rows if field_score(row) >= FORM_FIELD_MATCH),
+            key=lambda row: -field_score(row),
+        )
         rows = [
             row for row in rows
-            if isinstance(row, dict) and row.get("metadata", {}).get("object_type") != "Section"
+            if row.get("metadata", {}).get("object_type") not in {"Section", "FormField"}
         ]
+        if not rows:
+            return fields[:2]
         if not rows:
             return []
         query_terms = set(cls._search_terms(question))
@@ -1803,7 +1827,7 @@ class ServiceDeskAgent:
             i for i in fused
             if i not in chosen and rows[i].get("metadata", {}).get("page") in best_pages
         ][:GRAPH_NEIGHBOUR_LIMIT]
-        return [rows[i] for i in [*chosen, *neighbours]]
+        return [*fields[:2], *(rows[i] for i in [*chosen, *neighbours])]
 
     @staticmethod
     def _unique_document_rows(rows):
@@ -1878,10 +1902,20 @@ class ServiceDeskAgent:
 
     @staticmethod
     def _readable_marks(text):
-        """Render layout selection marks so the checked option is unambiguous."""
-        return (
-            str(text).replace(":unselected:", "[ ]").replace(":selected:", "[x]")
-        )
+        """Form check boxes as [x] / [ ], from Azure tokens or ☒ / ☐ alike."""
+        from backend.app.services.form_marks import readable_marks
+
+        return readable_marks(text)
+
+    @staticmethod
+    def _retrieval_question(state):
+        """The self-contained question for retrieval and grading.
+
+        A follow-up such as "is it a no?" is resolved by the classifier from the
+        conversation; the user's own words remain the displayed request.
+        """
+        intent = state.get("intent") or {}
+        return str(intent.get("standalone_question") or "").strip() or state["ticket"]["summary"]
 
     @staticmethod
     def _graph_object_ids(rows):
@@ -2046,7 +2080,7 @@ class ServiceDeskAgent:
                 or item["content"].get("metadata", {}).get("title"),
                 "excerpt": relevant_excerpt(
                     self._readable_marks(item["content"].get("text", "")),
-                    state["ticket"]["summary"], 900,
+                    self._retrieval_question(state), 900,
                 ),
             }
             for index, item in enumerate(candidates)
@@ -2054,7 +2088,7 @@ class ServiceDeskAgent:
         try:
             grade = await self.provider.generate_structured(
                 "grade_evidence",
-                {"question": state["ticket"]["summary"], "candidates": bounded},
+                {"question": self._retrieval_question(state), "candidates": bounded},
                 EvidenceGradeResult,
             )
             actual = set(candidate_ids)
@@ -2069,6 +2103,14 @@ class ServiceDeskAgent:
                 or accepted | rejected != actual
             ):
                 raise ValueError("Evidence grader returned invalid candidate identifiers")
+            # A verified form field for the question asked is the evidence a
+            # selection answer must come from, whatever the grader thought of it.
+            fields = {
+                candidate_id for candidate_id, item in zip(candidate_ids, candidates, strict=True)
+                if self._form_field_score(state, item) >= FORM_FIELD_MATCH
+            }
+            accepted, rejected = accepted | fields, rejected - fields
+            grade.rejected = [item for item in grade.rejected if item.id not in fields]
             await emit(
                 "evidence_grading",
                 "completed",
@@ -2314,7 +2356,7 @@ class ServiceDeskAgent:
                                         "page": item["content"]["metadata"]["page"],
                                         "excerpt": relevant_excerpt(
                                             self._readable_marks(item["content"].get("text") or ""),
-                                            state["ticket"]["summary"], 1600,
+                                            self._retrieval_question(state), 1600,
                                         ),
                                     }
                                     for item in matching[:3]
@@ -2394,6 +2436,8 @@ class ServiceDeskAgent:
             decision.needs_web_research = False
             decision.requested_tools = []
             decision.confidence = 0
+        if state.get("workflow") == "knowledge":
+            self._enforce_form_selection(state, decision)
         summary = state["ticket"]["summary"].casefold()
         terse_diagnostic_request = (
             len(summary.split()) <= 8
@@ -2546,6 +2590,78 @@ class ServiceDeskAgent:
         if next_plan is not None:
             result.update(plan=next_plan.model_dump(), plan_executed=False)
         return result
+
+    @classmethod
+    def _form_field_score(cls, state, item):
+        """How well a FormField item's question matches the request (0 when not a field)."""
+        from rapidfuzz import fuzz, utils
+
+        metadata = (item.get("content") or {}).get("metadata") or {}
+        question = str(metadata.get("form_field_question") or "")
+        if metadata.get("object_type") != "FormField" or not question.strip():
+            return 0
+        normalize = lambda text: re.sub(r"^\W*\d{1,3}[.)]\s*", "", text).casefold()  # noqa: E731
+        return fuzz.token_set_ratio(
+            normalize(question), cls._retrieval_question(state), processor=utils.default_process
+        )
+
+    def _enforce_form_selection(self, state, decision):
+        """Answer which option is selected only from a verified, unambiguous FormField.
+
+        Applies when the request asks about a check-box selection, or when a
+        FormField for the asked question is in evidence. Otherwise the answer
+        says the selection cannot be established and why; it never explains what
+        an option would mean instead of answering.
+        """
+        fields = sorted(
+            (
+                (self._form_field_score(state, item), item)
+                for item in self.usable_evidence(state)
+                if item.get("source_type") == "document"
+            ),
+            key=lambda pair: -pair[0],
+        )
+        relevant = [item for score, item in fields if score >= FORM_FIELD_MATCH]
+        if not relevant and not SELECTION_QUESTION.search(self._retrieval_question(state)):
+            return
+        if relevant:
+            item = relevant[0]
+            metadata = item["content"]["metadata"]
+            question, page = metadata["form_field_question"], metadata.get("page")
+            if metadata.get("form_field_status") == "answered":
+                selected = metadata["form_field_selected"]
+                stated = re.search(
+                    rf"\b{re.escape(selected)}\b", str(decision.answer or ""), re.IGNORECASE
+                )
+                if decision.outcome != "answer" or not stated:
+                    decision.answer = (
+                        f"The form marks “{selected}” for “{question}” (page {page})."
+                    )
+                decision.outcome, decision.enough_information = "answer", True
+                decision.hypotheses = [Hypothesis(
+                    claim=decision.answer, evidence_ids=[item["id"]], confidence=0.9,
+                    status="supported",
+                )]
+                decision.confidence = max(decision.confidence, 0.8)
+                decision.question_for_human = decision.human_field = None
+                decision.needs_web_research = False
+                return
+            why = (
+                "its check boxes are ambiguous ("
+                + str(metadata.get("form_ambiguity_reason") or "uncertain").replace("_", " ")
+                + ")"
+            )
+        else:
+            question = "this question"
+            why = "no check-box selection was extracted for it from the document"
+        decision.outcome, decision.enough_information = "cannot_verify", False
+        decision.answer = (
+            f"I can't establish which option is selected for “{question}” "
+            f"from the document: {why}."
+        )
+        decision.hypotheses, decision.confidence = [], 0
+        decision.question_for_human = decision.human_field = None
+        decision.needs_web_research = False
 
     @staticmethod
     def usable_evidence(state):
