@@ -71,10 +71,20 @@ class _RecordingGraph:
     def upsert_page(self, *args, **kwargs):
         pass
 
+    def upsert_pages(self, *args, **kwargs):
+        pass
+
     def upsert_reference_object(self, doc_id, item):
         self.objects.append({"object_id": item["object_id"], "page": item.get("page")})
 
+    def upsert_reference_objects(self, doc_id, items):
+        for item in items:
+            self.upsert_reference_object(doc_id, item)
+
     def link_reference_objects(self, *args, **kwargs):
+        pass
+
+    def link_reference_objects_many(self, *args, **kwargs):
         pass
 
     def link_website_document(self, *args, **kwargs):

@@ -363,13 +363,13 @@ class LocalDocumentRepository(DocumentRepository):
                 return f"{document_label} — figure: {str(item['text']).strip()[:100]}"
             return f"{document_label} — {kind.lower()} reference on page {page}"
 
-        for page in pages:
-            graph.upsert_page(identifier, page, version)
-            node_count += 1
-            relationship_count += 1
+        # Writes are collected and sent in a few batched transactions at the end:
+        # one Aura round trip per object made large documents take minutes.
+        references, reference_links = [], []
+        node_count += len(pages)
+        relationship_count += len(pages)
         for item in objects:
-            graph.upsert_reference_object(
-                identifier,
+            references.append(
                 {
                     **item,
                     "description": reference_description(item),
@@ -398,7 +398,7 @@ class LocalDocumentRepository(DocumentRepository):
                     mark_id = "M" + hashlib.sha256(
                         f"{identifier}:{version}:{item['object_id']}:{mark['mark_id']}".encode()
                     ).hexdigest()[:24]
-                    graph.upsert_reference_object(identifier, {
+                    references.append({
                         "object_id": mark_id, "object_type": "SelectionMark",
                         "page": item.get("page"), "position": ordinal,
                         "description": (
@@ -412,7 +412,10 @@ class LocalDocumentRepository(DocumentRepository):
                         "state_flag": "selected" if mark["selected"] else "unselected",
                         "confidence": mark.get("confidence"),
                     })
-                    graph.link_reference_objects(item["object_id"], mark_id, "HAS_SELECTIONMARK")
+                    reference_links.append((
+                        item["object_id"], mark_id, "HAS_SELECTIONMARK",
+                        "FormField", "SelectionMark",
+                    ))
                     node_count += 1
                     relationship_count += 1
         section_map = {
@@ -421,14 +424,15 @@ class LocalDocumentRepository(DocumentRepository):
         }
         for obj in objects:
             if obj["object_type"] == "Chunk" and obj.get("section_id") in section_map:
-                graph.link_reference_objects(
-                    section_map[obj["section_id"]], obj["object_id"], "HAS_CHUNK"
-                )
+                reference_links.append((
+                    section_map[obj["section_id"]], obj["object_id"], "HAS_CHUNK",
+                    "Section", "Chunk",
+                ))
                 relationship_count += 1
         for section in extracted.get("sections", []):
             parent, child = section_map.get(section.get("parent_id")), section_map.get(section.get("id"))
             if parent and child and parent != child:
-                graph.link_reference_objects(parent, child, "HAS_SECTION")
+                reference_links.append((parent, child, "HAS_SECTION", "Section", "Section"))
                 relationship_count += 1
         # Azure can identify a figure even when it has no caption. Retain
         # its reference node instead of silently dropping a valid API element.
@@ -441,8 +445,7 @@ class LocalDocumentRepository(DocumentRepository):
             figure_id = "FIG" + hashlib.sha256(
                 f"{identifier}:{version}:{figure.get('id')}:{figure.get('page')}".encode()
             ).hexdigest()[:24]
-            graph.upsert_reference_object(
-                identifier,
+            references.append(
                 {
                     "object_id": figure_id, "object_type": "Figure",
                     "page": figure.get("page"), "position": figure.get("position"),
@@ -475,8 +478,7 @@ class LocalDocumentRepository(DocumentRepository):
             paragraph_id = "PAR" + hashlib.sha256(
                 f"{identifier}:{version}:{source_id}:{paragraph.get('page')}:{paragraph.get('position')}".encode()
             ).hexdigest()[:24]
-            graph.upsert_reference_object(
-                identifier,
+            references.append(
                 {
                     "object_id": paragraph_id, "object_type": "Paragraph",
                     "page": paragraph.get("page"), "position": paragraph.get("position"),
@@ -501,7 +503,9 @@ class LocalDocumentRepository(DocumentRepository):
             node_count += 1
             relationship_count += 1
             if active_section_id:
-                graph.link_reference_objects(active_section_id, paragraph_id, "HAS_PARAGRAPH")
+                reference_links.append((
+                    active_section_id, paragraph_id, "HAS_PARAGRAPH", "Section", "Paragraph",
+                ))
                 relationship_count += 1
         table_objects = {}
         for obj in objects:
@@ -511,8 +515,7 @@ class LocalDocumentRepository(DocumentRepository):
             cell_id = "CELL" + hashlib.sha256(
                 f"{identifier}:{version}:{table.get('id')}:{cell.get('row')}:{cell.get('column')}".encode()
             ).hexdigest()[:24]
-            graph.upsert_reference_object(
-                identifier,
+            references.append(
                 {
                     "object_id": cell_id, "object_type": "TableCell",
                     "page": table.get("page"), "source_element_id": str(table.get("id")),
@@ -534,8 +537,11 @@ class LocalDocumentRepository(DocumentRepository):
             node_count += 1
             relationship_count += 1
             for table_id in table_objects.get(table.get("id"), []):
-                graph.link_reference_objects(table_id, cell_id, "HAS_CELL")
+                reference_links.append((table_id, cell_id, "HAS_CELL", "Table", "TableCell"))
                 relationship_count += 1
+        graph.upsert_pages(identifier, pages, version)
+        graph.upsert_reference_objects(identifier, references)
+        graph.link_reference_objects_many(reference_links)
         counts = {"nodes": node_count, "relationships": relationship_count}
         canonical_url = provenance.get("canonical_url")
         if provenance.get("source_type") == "url" and canonical_url:
