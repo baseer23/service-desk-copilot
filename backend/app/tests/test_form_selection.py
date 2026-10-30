@@ -940,3 +940,18 @@ def test_the_most_similar_passage_survives_fusion_without_sharing_a_word():
         rows, "In Employer form.pdf, which page shows the job title?", 8,
     )
     assert "c-position" in [row["id"] for row in chosen]
+
+
+def test_the_model_context_shows_each_passage_page():
+    from types import SimpleNamespace
+
+    agent = SimpleNamespace(_readable_marks=ServiceDeskAgent._readable_marks,
+                            _retrieval_question=ServiceDeskAgent._retrieval_question,
+                            settings=SimpleNamespace(), harness=SimpleNamespace())
+    passage = chunk_evidence("c-1", "Name of worker: A. Person. Position offered: Technician",
+                             page=1)
+    state = agent_state("which page shows the job title?", "Which page shows the job title?",
+                        [passage])
+    context = ServiceDeskAgent.context(agent, state)
+    content = context["evidence"][0]["content"]
+    assert content["page"] == 1 and content["object_type"] == "Chunk"
