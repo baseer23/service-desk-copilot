@@ -913,3 +913,14 @@ def test_a_rare_exact_term_survives_rank_fusion_even_when_its_embedding_ranks_la
     # A term every candidate shares is not rare and anchors nothing.
     common = ServiceDeskAgent._select_graph_evidence(rows[:30], "what is the postal code?", 8)
     assert len(common) <= 8 + 4
+
+
+def test_the_verifier_does_not_review_previous_answers():
+    conversation = [
+        {"role": "user", "content": "what is the NOC code in my form"},
+        {"role": "assistant", "content": "The NOC code is not listed anywhere in the form."},
+        {"role": "user", "content": "what is the NOC code in my form"},
+    ]
+    kept = ServiceDeskAgent._verification_conversation(conversation)
+    assert [message["role"] for message in kept] == ["user", "user"]
+    assert all("not listed" not in message["content"] for message in kept)
