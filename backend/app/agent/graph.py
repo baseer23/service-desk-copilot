@@ -43,6 +43,7 @@ CLOSING_QUOTES = "\u201d\u2019"
 MAX_GRAPH_OBJECT_REFERENCES = 500
 # Graph-scoped passages handed to grading and reasoning per request.
 GRAPH_EVIDENCE_LIMIT = 8
+GRADE_BATCH = 8  # candidates per evidence-grading call
 MAX_GRAPH_RELATIONSHIPS = 20
 # Reciprocal-rank-fusion constant (Cormack et al.); larger flattens rank gaps.
 RRF_K = 60
@@ -2302,85 +2303,91 @@ class ServiceDeskAgent:
                 f"{len(candidates)} retrieved documents as unverified candidates",
             )
             return {"accepted": [], "rejected": [], "unverified": candidates}
-        bounded = [
-            {
-                "id": candidate_ids[index],
-                "chunk_id": candidate_ids[index],
-                "title": item["content"].get("title")
-                or item["content"].get("metadata", {}).get("title"),
-                "excerpt": relevant_excerpt(
-                    self._readable_marks(item["content"].get("text", "")),
-                    self._retrieval_question(state), 900,
-                ),
-            }
-            for index, item in enumerate(candidates)
-        ]
-        try:
-            grade = await self.provider.generate_structured(
-                "grade_evidence",
-                {"question": self._retrieval_question(state), "candidates": bounded},
-                EvidenceGradeResult,
+        # A form field the question (or the previous answer) points at is the
+        # evidence a selection answer must come from, whatever the grader says.
+        inherited = self._inherited_object_ids(state)
+        fields = {
+            candidate_id for candidate_id, item in zip(candidate_ids, candidates, strict=True)
+            if self._form_field_score(state, item) >= FORM_FIELD_MATCH
+            or (
+                (item.get("content") or {}).get("metadata", {}).get("object_type") == "FormField"
+                and (item.get("content") or {}).get("metadata", {}).get("object_id") in inherited
             )
-            actual = set(candidate_ids)
-            accepted = set(grade.accepted_ids)
-            rejected = {item.id for item in grade.rejected}
-            if (
-                len(grade.accepted_ids) != len(accepted)
-                or len(grade.rejected) != len(rejected)
-                or not accepted <= actual
-                or not rejected <= actual
-                or accepted & rejected
-                or accepted | rejected != actual
-            ):
-                raise ValueError("Evidence grader returned invalid candidate identifiers")
-            # A verified form field for the question asked is the evidence a
-            # selection answer must come from, whatever the grader thought of it.
-            inherited = self._inherited_object_ids(state)
-            fields = {
-                candidate_id for candidate_id, item in zip(candidate_ids, candidates, strict=True)
-                if self._form_field_score(state, item) >= FORM_FIELD_MATCH
-                or (
-                    (item.get("content") or {}).get("metadata", {}).get("object_type")
-                    == "FormField"
-                    and (item.get("content") or {}).get("metadata", {}).get("object_id")
-                    in inherited
+        }
+        question = self._retrieval_question(state)
+
+        async def grade(batch):
+            """Grade one bounded batch; (accepted ids, {rejected id: reason}, failed)."""
+            bounded = [
+                {
+                    "id": candidate_id,
+                    "chunk_id": candidate_id,
+                    "title": item["content"].get("title")
+                    or item["content"].get("metadata", {}).get("title"),
+                    "excerpt": relevant_excerpt(
+                        self._readable_marks(item["content"].get("text", "")), question, 900,
+                    ),
+                }
+                for candidate_id, item in batch
+            ]
+            actual = {candidate_id for candidate_id, _item in batch}
+            try:
+                result = await self.provider.generate_structured(
+                    "grade_evidence", {"question": question, "candidates": bounded},
+                    EvidenceGradeResult,
                 )
-            }
-            accepted, rejected = accepted | fields, rejected - fields
-            grade.rejected = [item for item in grade.rejected if item.id not in fields]
-            await emit(
-                "evidence_grading",
-                "completed",
-                f"Document relevance checked: {len(accepted)} accepted; {len(rejected)} rejected",
-                findings=[f"Rejected {item.id}: {item.reason}" for item in grade.rejected[:6]],
+                accepted = set(result.accepted_ids)
+                rejected = {item.id: item.reason for item in result.rejected}
+                if (
+                    len(result.accepted_ids) != len(accepted)
+                    or len(result.rejected) != len(rejected)
+                    or not accepted <= actual
+                    or not set(rejected) <= actual
+                    or accepted & set(rejected)
+                    or accepted | set(rejected) != actual
+                ):
+                    raise ValueError("Evidence grader returned invalid candidate identifiers")
+                return accepted, rejected, False
+            except Exception as exc:  # noqa: BLE001 - this batch stays unverified
+                logger.warning(
+                    "Evidence grading failed for %d candidates type=%s",
+                    len(batch), type(exc).__name__,
+                )
+                return set(), {}, True
+
+        # Bounded batches graded concurrently: one call over every candidate
+        # can outlast the model timeout and would leave all of them unverified.
+        pairs = list(zip(candidate_ids, candidates, strict=True))
+        batches = [pairs[start:start + GRADE_BATCH] for start in range(0, len(pairs), GRADE_BATCH)]
+        outcomes = await asyncio.gather(*(grade(batch) for batch in batches))
+        accepted, rejected, unverified = set(fields), {}, set()
+        for batch, (batch_accepted, batch_rejected, failed) in zip(batches, outcomes, strict=True):
+            if failed:
+                unverified |= {candidate_id for candidate_id, _item in batch} - fields
+            accepted |= batch_accepted
+            rejected.update(
+                (key, reason) for key, reason in batch_rejected.items() if key not in fields
             )
-            return {
-                "accepted": [
-                    item for candidate_id, item in zip(candidate_ids, candidates)
-                    if candidate_id in accepted
-                ],
-                "rejected": [
-                    {
-                        "evidence": item,
-                        "reason": next(
-                            rejected_item.reason
-                            for rejected_item in grade.rejected
-                            if rejected_item.id == candidate_id
-                        ),
-                    }
-                    for candidate_id, item in zip(candidate_ids, candidates)
-                    if candidate_id in rejected
-                ],
-                "unverified": [],
-            }
-        except Exception:
+        if unverified:
             await emit(
-                "evidence_grading",
-                "failed",
-                "Model grading unavailable; retaining "
-                f"{len(candidates)} retrieved documents as unverified candidates",
+                "evidence_grading", "failed",
+                "Model grading unavailable for some candidates; retaining "
+                f"{len(unverified)} retrieved documents as unverified candidates",
             )
-            return {"accepted": [], "rejected": [], "unverified": candidates}
+        await emit(
+            "evidence_grading",
+            "completed",
+            f"Document relevance checked: {len(accepted)} accepted; {len(rejected)} rejected",
+            findings=[f"Rejected {key}: {reason}" for key, reason in list(rejected.items())[:6]],
+        )
+        return {
+            "accepted": [item for candidate_id, item in pairs if candidate_id in accepted],
+            "rejected": [
+                {"evidence": item, "reason": rejected[candidate_id]}
+                for candidate_id, item in pairs if candidate_id in rejected
+            ],
+            "unverified": [item for candidate_id, item in pairs if candidate_id in unverified],
+        }
 
     async def observe(self, state):
         evidence = list(state.get("evidence", []))

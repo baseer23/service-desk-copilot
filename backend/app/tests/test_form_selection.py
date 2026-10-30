@@ -857,3 +857,41 @@ def test_a_stalled_recovery_finalizes_instead_of_replanning():
     assert ServiceDeskAgent.verification_route(agent, {**state, "recovery_stalled": True}) == (
         "finalize"
     )
+
+
+def test_evidence_is_graded_in_bounded_batches_and_a_failed_batch_keeps_matching_fields():
+    from types import SimpleNamespace
+
+    from backend.app.agent.models import EvidenceGradeResult
+
+    calls = []
+
+    class Grader:
+        async def generate_structured(self, stage, context, schema):
+            ids = [candidate["id"] for candidate in context["candidates"]]
+            calls.append(len(ids))
+            if len(ids) > 8:
+                raise TimeoutError("one oversized call outlasts the model timeout")
+            if "c-14" in ids:
+                raise TimeoutError("this batch times out")
+            return EvidenceGradeResult(accepted_ids=ids[:1], rejected=[
+                {"id": value, "reason": "not relevant"} for value in ids[1:]
+            ])
+
+    agent = SimpleNamespace(
+        provider=Grader(), _form_field_score=ServiceDeskAgent._form_field_score,
+        _retrieval_question=ServiceDeskAgent._retrieval_question,
+        _readable_marks=ServiceDeskAgent._readable_marks,
+        _inherited_object_ids=ServiceDeskAgent._inherited_object_ids,
+    )
+    candidates = [chunk_evidence(f"c-{index}", f"Passage {index}") for index in range(14)]
+    field = field_evidence("c-14", "1. Is the applicant currently working for you?",
+                           "answered", "Yes", page=6)
+    candidates.append(field)
+    state = agent_state("is the applicant currently working for you, yes or no?",
+                        "Is the applicant currently working for you?", candidates)
+    result = asyncio.run(ServiceDeskAgent._grade_document_evidence(agent, state, candidates))
+    assert calls == [8, 7]
+    assert [item["id"] for item in result["accepted"]] == ["c-0", "c-14"]
+    assert {item["id"] for item in result["unverified"]} == {f"c-{index}" for index in range(8, 14)}
+    assert len(result["rejected"]) == 7
