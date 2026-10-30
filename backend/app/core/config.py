@@ -32,6 +32,17 @@ class Settings(BaseSettings):
     # Explicit opt-in: each upload may create a billable Azure DI request and
     # persist structural metadata to the separately authorized Neo4j writer.
     auto_document_graph_ingestion: bool = False
+    semantic_graph_ingestion_enabled: bool = False
+    # What document content the structural graph may hold. "references" keeps
+    # exact values (selected options, option labels, cell values, row headers)
+    # local; "structured_values" also stores them in Neo4j so exact questions
+    # are answered from the graph. Set it only where storing document values in
+    # the configured Neo4j (for example Aura) is authorized.
+    graph_content_policy: Literal["references", "structured_values"] = "references"
+    semantic_graph_max_llm_calls_per_job: int = Field(default=30, ge=1, le=100)
+    semantic_graph_batch_chars: int = Field(default=12000, ge=1000, le=50000)
+    semantic_graph_max_entities_per_document: int = Field(default=100, ge=1, le=500)
+    semantic_graph_max_relationships_per_document: int = Field(default=200, ge=1, le=1000)
     azure_key_vault_url: str = ""
     azure_session_secret_name: str = "deskmate-session-signing-key"
     auth_client_id: str = ""
@@ -116,10 +127,17 @@ class Settings(BaseSettings):
     max_web_page_fetches: int = Field(default=4, ge=0, le=10)
     max_investigation_cycles: int = Field(default=8, ge=1, le=20)
     allow_url_ingest: bool = True
-    url_max_depth: int = Field(default=1, ge=0, le=3)
-    url_max_pages: int = Field(default=5, ge=1, le=10)
-    url_max_total_chars: int = Field(default=20000, ge=1000)
+    url_max_depth: int = Field(default=5, ge=0, le=10)
+    url_max_pages: int = Field(default=200, ge=1, le=2000)
+    # Per-page cap (larger pages are skipped as too large) and an overall
+    # safety cap across the whole crawl.
+    url_max_page_chars: int = Field(default=200_000, ge=1000)
+    url_max_total_chars: int = Field(default=20_000_000, ge=1000)
     url_rate_limit_sec: float = Field(default=1, ge=0)
+    # Contact URL in the crawler's User-Agent so site owners can reach the operator.
+    url_crawler_contact: str = ""
+    # Paid Azure Document Intelligence layout analysis of saved web pages.
+    url_azure_analysis: bool = False
     web_max_bytes: int = Field(default=2_000_000, ge=1024)
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env", extra="ignore", hide_input_in_errors=True

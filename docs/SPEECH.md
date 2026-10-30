@@ -113,3 +113,27 @@ The planning, evidence verification, activity-stream and Investigation Activity 
 ### 2026-10-21 general intelligence experiment
 
 The read-only time, calculation, weather, mapping, currency and holiday capabilities do not modify Voice or Speech code, SDK lifecycle, continuous recognition, transcript ownership or usage accounting. No Speech request or physical microphone check was performed; prior Voice validation and blockers remain unchanged.
+
+### 2026-10-26 chat and URL-ingestion repair
+
+The chat transcript and URL knowledge-ingestion changes do not modify Speech transport, SDK lifecycle, transcript ownership, continuous recognition or usage accounting. The Voice workspace remained accessible in a browser check; no microphone access, recognition session or live Azure Speech validation was performed.
+
+### 2026-10-26 document-ingestion activation
+
+The local persistence, URL ingestion and document graph activation does not modify Speech transport, SDK lifecycle, continuous recognition, transcript ownership or usage accounting. Voice readiness was reported by the running service; no microphone or live Azure Speech recognition request was performed.
+
+### 2026-10-26 complete integration recovery
+
+Saved-knowledge graph routing, durable document-worker recovery, conservative semantic placement and investigation-detail rendering do not modify Speech transport, SDK lifecycle, transcript ownership, continuous recognition or usage accounting. The complete frontend suite retained Voice coverage; no microphone or live Azure Speech request was performed.
+
+### 2026-10-26 investigation validation recovery
+
+Planner diagnostics, personal-memory lookup, evidence-reference recovery and failed-chat composer restoration do not modify Speech transport, SDK lifecycle, transcript ownership, continuous recognition or usage accounting. No microphone or live Azure Speech check was performed.
+
+### 2026-10-27 document GraphRAG repair
+
+The event-driven document worker, GraphRAG routing and Knowledge status polling do not modify Speech transport, SDK lifecycle, transcript ownership, continuous recognition or usage accounting. No Speech test, microphone session or live Azure Speech request was performed.
+
+### 2026-10-27 live document failure recovery
+
+Azure document readiness, bounding-region serialization, durable document errors and NSNP recovery do not modify Speech transport, continuous recognition, transcript ownership or usage accounting. No Speech test or Azure Speech request was performed.

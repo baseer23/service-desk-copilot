@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import { post, request } from './api'
 import { type ReadinessReport } from './readiness'
@@ -17,15 +17,197 @@ interface Match {
   }
 }
 
-function Switch({ label, checked, disabled, onChange }: {
+interface DocumentStatus {
+  id: string
+  title?: string
+  status?: string
+  phase?: string
+  extraction_method?: string
+  local_index_ready?: boolean
+  graph_link_status?: string
+  graph_retry_terminal?: boolean
+  semantic_graph_status?: string
+  semantic_graph_retryable?: boolean
+  error?: string
+  processing_error_code?: string
+  processing_error_reason?: string
+  failed_stage?: string
+  graph_last_error?: string
+}
+
+interface CrawlJob {
+  job_id: string
+  url: string
+  status: 'queued' | 'running' | 'complete' | 'failed' | 'blocked_by_site'
+  pages_found?: number
+  pages_fetched?: number
+  pages_saved?: number
+  pages_duplicate?: number
+  pages_skipped?: number
+  skipped_reasons?: Record<string, number>
+  pages_blocked?: Record<string, number>
+  document_ids?: string[]
+  azure_analysis?: 'enabled' | 'disabled' | 'not_configured'
+  pages_azure_analysed?: number | null
+  pages_indexed?: number | null
+  pages_linked?: number | null
+  pages_semantic?: Record<string, number> | null
+  pages_failed?: number | null
+  failed_reasons?: Record<string, number> | null
+  error_message?: string | null
+}
+
+const SKIP_REASONS: Record<string, string> = {
+  robots_disallowed: 'blocked by robots.txt', not_html: 'not HTML', rate_limited: 'rate limited',
+  too_large: 'too large', fetch_failed: 'unreachable', depth_limit: 'beyond crawl depth',
+  duplicate_content: 'duplicate content', off_origin: 'on another site', empty: 'no readable text',
+  overall_limit: 'crawl size limit reached', save_failed: 'could not be saved',
+  bot_challenge: 'bot-protection challenge',
+}
+
+function reasonText(reason: string): string {
+  return SKIP_REASONS[reason] ?? reason.replace(/^http_/, 'HTTP ').replace(/_/g, ' ')
+}
+
+function countList(counts: Record<string, number>): string {
+  return Object.entries(counts).map(([reason, count]) => `${count} ${reasonText(reason)}`).join(', ')
+}
+
+export function crawlSummary(job: CrawlJob): { text: string; terminal: boolean } {
+  const saved = (job.document_ids ?? []).length
+  const settled = job.pages_indexed != null && (job.pages_indexed + (job.pages_failed ?? 0)) >= saved
+  // A finished crawl is not finished ingestion: say which one is still running.
+  const state = {
+    queued: 'Crawl queued',
+    running: 'Crawling',
+    complete: settled ? 'Crawl finished' : 'Crawl finished; ingestion still running',
+    failed: 'Crawl failed',
+    blocked_by_site: 'Crawl stopped: the website refused automated access',
+  }[job.status]
+  const lines = [
+    `Website: ${job.url}`,
+    `${state} — found ${job.pages_found ?? 0}, fetched ${job.pages_fetched ?? 0}, ` +
+      `saved ${job.pages_saved ?? 0}` +
+      `${job.pages_duplicate ? ` (+${job.pages_duplicate} already saved)` : ''}, skipped ${job.pages_skipped ?? 0}`,
+  ]
+  const blocked = job.pages_blocked ?? {}
+  if (Object.keys(blocked).length) lines.push(`Blocked by the website: ${countList(blocked)}`)
+  if (job.pages_indexed != null) {
+    const parts = []
+    if (job.azure_analysis === 'enabled') parts.push(`Azure analysed ${job.pages_azure_analysed ?? 0} of ${saved}`)
+    parts.push(`indexed ${job.pages_indexed} of ${saved}`, `Neo4j linked ${job.pages_linked ?? 0} of ${saved}`)
+    const semantic = job.pages_semantic ?? {}
+    const linked = semantic.linked ?? 0
+    const entitiesOnly = semantic.linked_no_relationships ?? 0
+    if (linked || entitiesOnly || semantic.failed || semantic.understanding || semantic.placing) {
+      parts.push(`semantic graph ${linked} of ${saved}` +
+        `${entitiesOnly ? ` (+${entitiesOnly} entities only, no relationships)` : ''}`)
+    } else if ((semantic.disabled ?? 0) === saved && saved) {
+      parts.push('semantic graph off')
+    }
+    if (job.pages_failed) {
+      const reasons = Object.keys(job.failed_reasons ?? {}).length ? ` (${countList(job.failed_reasons ?? {})})` : ''
+      parts.push(`${job.pages_failed} failed${reasons}`)
+    }
+    lines.push(parts.join(' · ').replace(/^./, (first) => first.toUpperCase()))
+  }
+  const skipped = Object.fromEntries(
+    Object.entries(job.skipped_reasons ?? {}).filter(([reason]) => !(reason in blocked)),
+  )
+  if (Object.keys(skipped).length) lines.push('Skipped: ' + countList(skipped))
+  if ((job.status === 'failed' || job.status === 'blocked_by_site') && job.error_message) {
+    lines.push(job.error_message)
+  }
+  const stopped = job.status === 'failed' || job.status === 'blocked_by_site'
+  return {
+    text: lines.join('\n'),
+    terminal: (stopped && (!saved || settled)) || (job.status === 'complete' && settled),
+  }
+}
+
+function processingSummary(document: DocumentStatus): { text: string; terminal: boolean } {
+  const title = document.title ? `${document.title}\n` : ''
+  if (document.status === 'error' || document.status === 'failed') {
+    const reason = document.processing_error_reason ?? document.error ?? 'See server diagnostics.'
+    const stage = document.failed_stage ? ` (${document.failed_stage.replace(/_/g, ' ')})` : ''
+    const code = document.processing_error_code ? ` [${document.processing_error_code}]` : ''
+    return { text: `${title}Processing failed${stage}: ${reason}${code}`, terminal: true }
+  }
+  if (!document.local_index_ready) {
+    const stages: Record<string, string> = {
+      queued: 'Queued', waiting: 'Queued', extracting: 'Azure extraction: Processing',
+      structuring: 'Structuring', embedding: 'Embedding',
+    }
+    return { text: `${title}${stages[document.status ?? ''] ?? 'Saved'}`, terminal: false }
+  }
+  const local = 'Local indexing: Completed'
+  if (document.graph_link_status !== 'linked') {
+    const failed = document.status === 'graph_pending' && document.graph_last_error
+    return {
+      text: `${title}${local}\nNeo4j structural graph: ${
+        document.graph_retry_terminal ? 'Failed' : failed ? 'Pending — retry scheduled' : 'Linking'
+      }`,
+      terminal: document.graph_retry_terminal === true,
+    }
+  }
+  const semantic = document.semantic_graph_status ?? 'pending'
+  if (semantic === 'linked') {
+    return { text: `${title}${local}\nNeo4j structural graph: Linked\nSemantic understanding: Completed\nKnowledge ready`, terminal: true }
+  }
+  if (semantic === 'linked_no_relationships') {
+    return { text: `${title}${local}\nNeo4j structural graph: Linked\nSemantic understanding: Completed (entities only, no relationships)\nKnowledge ready`, terminal: true }
+  }
+  if (semantic === 'partial') {
+    return { text: `${title}${local}\nNeo4j structural graph: Linked\nSemantic understanding: Partial`, terminal: true }
+  }
+  if (semantic === 'disabled') {
+    return { text: `${title}${local}\nNeo4j structural graph: Linked\nSemantic understanding: Disabled`, terminal: true }
+  }
+  if (semantic === 'failed' && !document.semantic_graph_retryable) {
+    return { text: `${title}${local}\nNeo4j structural graph: Linked\nSemantic understanding: Failed`, terminal: true }
+  }
+  const semanticStages: Record<string, string> = {
+    pending: 'Queued', understanding: 'Processing', discovering: 'Entity discovery',
+    placing: 'Entity placement', failed: 'Retry scheduled',
+  }
+  return {
+    text: `${title}${local}\nNeo4j structural graph: Linked\nSemantic understanding: ${semanticStages[semantic] ?? 'Processing'}`,
+    terminal: false,
+  }
+}
+
+function normalizePublicUrl(value: string): string {
+  const candidate = value.trim()
+  if (!candidate) throw new Error('Enter a public website address.')
+  const hasScheme = /^[a-z][a-z0-9+.-]*:/i.test(candidate)
+  if (hasScheme && !/^https?:\/\//i.test(candidate)) {
+    throw new Error('Use an HTTP or HTTPS website address.')
+  }
+  if (!hasScheme && !/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?::\d{1,5})?(?:[/?#].*)?$/i.test(candidate)) {
+    throw new Error('Enter a valid public domain, such as ngenuity.ca.')
+  }
+  let parsed: URL
+  try {
+    parsed = new URL(hasScheme ? candidate : `https://${candidate}`)
+  } catch {
+    throw new Error('Enter a valid HTTP or HTTPS website address.')
+  }
+  if (!parsed.hostname || parsed.username || parsed.password) {
+    throw new Error('Enter a public website address without embedded credentials.')
+  }
+  return parsed.toString()
+}
+
+function Switch({ label, checked, disabled, available, onChange }: {
   label: string
   checked: boolean
   disabled: boolean
+  available?: boolean
   onChange: (checked: boolean) => void
 }) {
   return (
-    <label className={`knowledge-switch ${disabled ? 'unavailable' : ''}`}>
-      <span>{label}<small>{disabled ? 'Unavailable' : checked ? 'ON' : 'OFF'}</small></span>
+    <label className={`knowledge-switch ${available === false ? 'unavailable' : ''}`}>
+      <span>{label}<small>{available === false ? 'Unavailable' : available === undefined ? 'Checking' : checked ? 'ON' : 'OFF'}</small></span>
       <input type="checkbox" role="switch" aria-label={label} checked={checked}
         disabled={disabled} onChange={(event) => onChange(event.target.checked)} />
       <i aria-hidden="true" />
@@ -35,8 +217,12 @@ function Switch({ label, checked, disabled, onChange }: {
 
 export default function KnowledgePanel({
   readiness,
+  readinessChecking = false,
+  readinessError = null,
 }: {
   readiness: ReadinessReport | null
+  readinessChecking?: boolean
+  readinessError?: string | null
 }): JSX.Element {
   const [mode, setMode] = useState<'paste' | 'pdf' | 'url'>('paste')
   const [text, setText] = useState('')
@@ -52,10 +238,69 @@ export default function KnowledgePanel({
   const [dragging, setDragging] = useState(false)
   const [azureDi, setAzureDi] = useState(true)
   const [neo4jRead, setNeo4jRead] = useState(true)
+  const [activeDocumentId, setActiveDocumentId] = useState<string | null>(null)
+  const [crawlJobId, setCrawlJobId] = useState<string | null>(null)
   const picker = useRef<HTMLInputElement>(null)
   const autoGraph = readiness?.automatic_graph_ingestion_enabled === true
+  const azureAvailable = readiness?.azure_document_intelligence_available
+  const neo4jReadAvailable = readiness?.neo4j_read_available
+  const hybridAvailable = readiness?.structured_ingestion_available
   const indexingBlocked = readiness?.semantic_ingestion_ready === false
-  const urlBlocked = readiness?.url_ingestion_enabled === false
+  const urlDisabledByConfiguration = readiness?.url_ingestion_enabled === false
+  const urlReadinessUnavailable = readiness === null
+  const urlBlocked = urlDisabledByConfiguration || urlReadinessUnavailable
+
+  useEffect(() => {
+    if (!activeDocumentId) return
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const poll = async () => {
+      try {
+        const status = await request<DocumentStatus>(`/documents/${activeDocumentId}/status`)
+        if (cancelled) return
+        const summary = processingSummary(status)
+        setMessage(summary.text)
+        if (summary.terminal) setActiveDocumentId(null)
+        else timer = setTimeout(() => void poll(), 750)
+      } catch (caught) {
+        if (!cancelled) {
+          setError((caught as Error).message)
+          setActiveDocumentId(null)
+        }
+      }
+    }
+    void poll()
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+    }
+  }, [activeDocumentId])
+
+  useEffect(() => {
+    if (!crawlJobId) return
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const poll = async () => {
+      try {
+        const job = await request<CrawlJob>(`/ingest/url/${crawlJobId}/status`)
+        if (cancelled) return
+        const summary = crawlSummary(job)
+        setMessage(summary.text)
+        if (summary.terminal) setCrawlJobId(null)
+        else timer = setTimeout(() => void poll(), 1500)
+      } catch (caught) {
+        if (!cancelled) {
+          setError((caught as Error).message)
+          setCrawlJobId(null)
+        }
+      }
+    }
+    void poll()
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+    }
+  }, [crawlJobId])
 
   function chooseFile(selected: File | undefined) {
     if (!selected) return
@@ -92,9 +337,16 @@ export default function KnowledgePanel({
                 : '/documents/upload'
       } else {
         if (!text.trim()) throw new Error('Enter knowledge text or a URL first.')
+        if (mode === 'url' && readiness?.url_ingestion_enabled !== true) {
+          throw new Error(urlDisabledByConfiguration
+            ? 'Web page uploads are disabled by workspace configuration.'
+            : 'DeskMate cannot verify URL-ingestion readiness. Check the backend connection and retry.')
+        }
         path =
           mode === 'url' ? '/ingest/url' : kind === 'save' || readiness?.managed_documents ? '/documents/paste' : '/ingest/paste'
-        options = post(mode === 'url' ? { url: text } : { title: title || null, text })
+        const content = mode === 'url' ? normalizePublicUrl(text) : text
+        if (mode === 'url') setText(content)
+        options = post(mode === 'url' ? { url: content } : { title: title || null, text: content })
       }
       let result = await request<{
         id?: string
@@ -106,7 +358,14 @@ export default function KnowledgePanel({
         method?: string
         graph_nodes?: number
         graph_relationships?: number
-      }>(path, options)
+        local_index_ready?: boolean
+        graph_link_status?: 'linked' | 'pending' | 'not_configured'
+        semantic_graph_status?: string
+        failed_pages?: number
+      } & Partial<Omit<CrawlJob, 'status'>>>(path, options)
+      if (result.id && (path === '/documents/upload' || path === '/documents/paste')) {
+        setActiveDocumentId(result.id)
+      }
       if (kind === 'index' && !readiness?.managed_documents && path === '/documents/upload' && result.id) {
         result = await request(`/documents/${result.id}/index`, post())
       }
@@ -115,6 +374,10 @@ export default function KnowledgePanel({
         setMessage(autoGraph
           ? `${result.method === 'document_intelligence' ? 'Azure Document Intelligence' : 'Local text fallback'} extracted ${result.pages} page(s). Neo4j linked ${result.graph_nodes ?? 0} nodes and ${result.graph_relationships ?? 0} relationships; the original and extracted text were not saved in DeskMate.`
           : `Text preview is ready (${result.pages} page(s)).`)
+      } else if (mode === 'url' && result.job_id) {
+        // The crawl continues in the background; progress is polled below.
+        setMessage(crawlSummary(result as unknown as CrawlJob).text)
+        setCrawlJobId(result.job_id)
       } else if (result.status && result.status !== 'ready') {
         const stage: Record<string, string> = {
           queued: 'Extracting', extracting: 'Extracting', structuring: 'Structuring',
@@ -123,7 +386,7 @@ export default function KnowledgePanel({
         setMessage(
           result.status === 'graph_pending'
             ? 'Local indexing is ready, but Neo4j linking is pending. Configure the authorized ingestion connection and retry linking.'
-            : `${stage[result.status] ?? 'Processing'} → Ready`,
+            : `${stage[result.status] ?? 'Processing'}`,
         )
       } else if (kind === 'save') {
         setMessage(
@@ -135,7 +398,9 @@ export default function KnowledgePanel({
         setMessage(
           result.duplicate
             ? 'This content is already in knowledge.'
-            : 'Your document was added to knowledge.',
+            : mode === 'url'
+              ? `${result.pages ?? 0} public page(s) were added to knowledge.`
+              : 'Your document was added to knowledge.',
         )
       }
     } catch (caught) {
@@ -166,22 +431,25 @@ export default function KnowledgePanel({
     <section className="card knowledge-card">
       <h2>Documents and knowledge</h2>
       <div className="knowledge-switches" aria-label="Knowledge processing options">
-        <Switch label="Azure Document Intelligence" checked={autoGraph || azureDi}
-          disabled={autoGraph || busy || readiness?.azure_document_intelligence_available === false}
+        <Switch label="Azure Document Intelligence" checked={azureAvailable === true && (autoGraph || azureDi)}
+          available={azureAvailable}
+          disabled={autoGraph || busy || azureAvailable !== true}
           onChange={setAzureDi} />
-        <Switch label="Neo4j Read" checked={neo4jRead}
-          disabled={busy || readiness?.neo4j_read_available === false}
+        <Switch label="Neo4j Read" checked={neo4jReadAvailable === true && neo4jRead}
+          available={neo4jReadAvailable}
+          disabled={busy || neo4jReadAvailable !== true}
           onChange={setNeo4jRead} />
-        <Switch label="Local + Neo4j Hybrid" checked disabled
+        <Switch label="Local + Neo4j Hybrid" checked={hybridAvailable === true}
+          available={hybridAvailable} disabled
           onChange={() => undefined} />
         <p className="muted knowledge-switch-note">
-          {autoGraph
-            ? 'Automatic ingestion is enabled: every file upload uses Azure Document Intelligence and writes reference-only nodes and links to Neo4j. Extraction previews do not save the original locally, but their graph references persist. Azure processing may incur charges. '
-            : readiness?.azure_document_intelligence_available === false
-              ? 'Azure Document Intelligence is unavailable; local document processing remains available. '
+          {readiness?.azure_document_intelligence_available === false
+            ? `${readiness.azure_document_intelligence_blocker ?? 'Azure Document Intelligence is unavailable; local document processing remains available.'} `
+            : autoGraph
+              ? 'Automatic ingestion is enabled: every file upload uses Azure Document Intelligence and writes reference-only nodes and links to Neo4j. Extraction previews do not save the original locally, but their graph references persist. Azure processing may incur charges. '
               : 'Azure processing runs only when you upload a document. '}
           {readiness?.neo4j_read_available === false
-            ? 'Neo4j read is unavailable. '
+            ? `${readiness.neo4j_read_blocker ?? 'Neo4j read is unavailable.'} `
             : 'Neo4j access is read-only. '}
           {readiness?.structured_ingestion_available === true
             ? 'Hybrid policy is always ON: saved content is indexed locally and linked to Neo4j.'
@@ -249,7 +517,9 @@ export default function KnowledgePanel({
             {mode === 'url' ? (
               <input
                 id="knowledge"
-                type="url"
+                type="text"
+                inputMode="url"
+                placeholder="https://example.com or example.com"
                 required
                 value={text}
                 onChange={(event) => setText(event.target.value)}
@@ -267,16 +537,26 @@ export default function KnowledgePanel({
         )}
         <button
           className="secondary"
-          disabled={busy || (indexingBlocked && !readiness?.managed_documents) || (mode === 'url' && urlBlocked)}
+          disabled={busy || (indexingBlocked && !readiness?.managed_documents) || (mode === 'url' && (urlBlocked || readinessChecking))}
         >
           {busy ? 'Working…' : 'Add to knowledge'}
         </button>
         {indexingBlocked && <p className="muted">Document processing is temporarily unavailable. You can still save documents and search available knowledge.</p>}
-        {mode === 'url' && urlBlocked && (
+        {mode === 'url' && urlDisabledByConfiguration && (
           <p className="muted">
-            Web page uploads are currently unavailable. You can upload a document or paste its text.
+            {readiness?.url_ingestion_blocker ?? 'Web page uploads are disabled by workspace configuration.'} You can upload a document or paste its text.
           </p>
         )}
+        {mode === 'url' && readinessChecking && <p className="muted">Checking whether web page uploads are available…</p>}
+        {mode === 'url' && !readinessChecking && urlReadinessUnavailable && (
+          <p className="muted">{readinessError
+            ? `Readiness check failed: ${readinessError}`
+            : 'The backend is unavailable, so web page upload readiness cannot be verified.'}</p>
+        )}
+        {mode === 'url' && readiness?.url_ingestion_enabled === true && !busy && (
+          <p className="muted">Web page uploads are enabled. Public URL security and robots.txt rules still apply.</p>
+        )}
+        {mode === 'url' && busy && <p className="muted">Starting the website crawl…</p>}
         {mode !== 'url' && (
           <button
             type="button"

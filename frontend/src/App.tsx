@@ -77,6 +77,30 @@ type AskResponse = {
   case_id: string | null
   result: Omit<Case, 'case_id' | 'thread_id'>
   events: Event[]
+  activity?: ActivityEvent[]
+}
+type ResetPreview = { confirmation_token: string; expires_at: number; inventory: { records: number; vectors: number; files: number; unresolved_vectors: number } }
+type ResetResult = { status: string; stores: Record<string, { status: string; deleted?: number | boolean; unresolved?: number }> }
+type Conversation = {
+  conversation_id: string
+  title: string
+  workflow: string
+  status: string
+  updated_at: string
+  linked_case_id: string | null
+  last_message_preview: string
+}
+
+export const ACTIVE_CONVERSATION_KEY = 'deskmate.active-conversation'
+
+function validConversations(value: unknown): Conversation[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is Conversation => Boolean(
+        item && typeof item === 'object' &&
+        typeof (item as Conversation).conversation_id === 'string' &&
+        typeof (item as Conversation).title === 'string',
+      ))
+    : []
 }
 
 function AnswerText({ value }: { value: string }): JSX.Element {
@@ -123,19 +147,50 @@ function AnswerText({ value }: { value: string }): JSX.Element {
 export default function App(): JSX.Element {
   // This custom data hook accepts no effect callback.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  const { readiness, refresh, checking } = useReadiness()
+  const { readiness, refresh, checking, error: readinessError } = useReadiness()
   const blocker = reasoningBlocker(readiness)
   const [ticket, setTicket] = useState('')
   const [active, setActive] = useState<Case | null>(null)
   const [cases, setCases] = useState<Case[]>([])
+  const [conversations, setConversations] = useState<Conversation[]>([])
   const [events, setEvents] = useState<Event[]>([])
   const [answer, setAnswer] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [section, setSection] = useState('Chat')
   const [activity, setActivity] = useState<ActivityEvent[]>([])
+  const [resetPreview, setResetPreview] = useState<ResetPreview | null>(null)
+  const [resetConfirmation, setResetConfirmation] = useState('')
+  const [resetting, setResetting] = useState(false)
+  const [resetResult, setResetResult] = useState<ResetResult | null>(null)
+  const [notice, setNotice] = useState('')
+  const [knowledgeGeneration, setKnowledgeGeneration] = useState(0)
   const investigation = useRef<AbortController | null>(null)
+  const chatLog = useRef<HTMLDivElement | null>(null)
+  const keepChatAtBottom = useRef(true)
+  const [pendingMessage, setPendingMessage] = useState('')
   useEffect(() => () => investigation.current?.abort(), [])
+
+  const savedMessages = active?.chat_messages ?? []
+  const summaryFallback = active?.ticket.summary.trim() ?? ''
+  const timelineMessages = active
+    ? savedMessages.some(message => message.role === 'user' && message.content.trim() === summaryFallback)
+      ? savedMessages
+      : [...savedMessages, ...(summaryFallback ? [{ role: 'user', content: summaryFallback }] : [])]
+    : []
+  useEffect(() => {
+    keepChatAtBottom.current = true
+    requestAnimationFrame(() => {
+      if (chatLog.current) chatLog.current.scrollTop = chatLog.current.scrollHeight
+    })
+  }, [active?.thread_id])
+  useEffect(() => {
+    if (keepChatAtBottom.current) {
+      requestAnimationFrame(() => {
+        if (chatLog.current) chatLog.current.scrollTop = chatLog.current.scrollHeight
+      })
+    }
+  }, [timelineMessages.length, pendingMessage])
 
   async function investigate<T>(path: string, body?: unknown): Promise<T> {
     investigation.current?.abort()
@@ -162,8 +217,34 @@ export default function App(): JSX.Element {
 
 
   useEffect(() => {
-    request<Case[]>('/cases')
-      .then(setCases)
+    Promise.all([request<Case[]>('/cases'), request<Conversation[]>('/conversations')])
+      .then(async ([savedCases, savedConversations]) => {
+        setCases(savedCases)
+        setConversations(validConversations(savedConversations))
+        const id = localStorage.getItem(ACTIVE_CONVERSATION_KEY)
+        if (!id) return
+        try {
+          const restored = await request<AskResponse>(`/conversations/${id}`)
+          if (!restored.result || typeof restored.result.status !== 'string') {
+            localStorage.removeItem(ACTIVE_CONVERSATION_KEY)
+            return
+          }
+          setActive({
+            ...restored.result,
+            case_id: restored.case_id || restored.request_id,
+            thread_id: restored.request_id,
+            transient: !restored.case_id,
+          })
+          setEvents(restored.events)
+          setActivity(restored.activity ?? [])
+        } catch (caught) {
+          if ((caught as Error & { status?: number }).status === 404) {
+            localStorage.removeItem(ACTIVE_CONVERSATION_KEY)
+          } else {
+            setError((caught as Error).message)
+          }
+        }
+      })
       .catch((e) => setError(e.message))
   }, [])
 
@@ -184,7 +265,37 @@ export default function App(): JSX.Element {
       transient: !response.case_id,
     })
     setEvents(response.events)
-    setCases(await request<Case[]>('/cases'))
+    if (response.activity?.length) setActivity(response.activity)
+    localStorage.setItem(ACTIVE_CONVERSATION_KEY, response.request_id)
+    const [savedCases, savedConversations] = await Promise.all([
+      request<Case[]>('/cases'), request<Conversation[]>('/conversations'),
+    ])
+    setCases(savedCases)
+    setConversations(validConversations(savedConversations))
+  }
+  async function prepareReset() {
+    setError(''); setResetResult(null)
+    try { setResetPreview(await request<ResetPreview>('/admin/workspace-reset/prepare', post({}))) }
+    catch (caught) { setError((caught as Error).message) }
+  }
+  async function confirmReset() {
+    if (!resetPreview || resetConfirmation !== 'DELETE') return
+    setResetting(true); setError('')
+    try {
+      const result = await request<ResetResult>('/admin/workspace-reset/confirm', post({ confirmation: resetConfirmation, confirmation_token: resetPreview.confirmation_token }))
+      setResetResult(result)
+      if (result.status !== 'complete') {
+        setError('The reset is incomplete. Some external data remains; retry or review the server store status.')
+        return
+      }
+      investigation.current?.abort()
+      localStorage.removeItem(ACTIVE_CONVERSATION_KEY)
+      setActive(null); setCases([]); setConversations([]); setEvents([]); setActivity([]); setTicket(''); setAnswer('')
+      setKnowledgeGeneration(value => value + 1); setResetPreview(null); setResetConfirmation('')
+      setNotice('Workspace history deleted. DeskMate is ready for a new session.')
+      await refresh()
+    } catch (caught) { setError((caught as Error).message) }
+    finally { setResetting(false) }
   }
   async function start(event: FormEvent) {
     event.preventDefault()
@@ -261,6 +372,20 @@ export default function App(): JSX.Element {
       setBusy(false)
     }
   }
+  async function openConversation(id: string) {
+    setSection('Chat')
+    setBusy(true)
+    setError('')
+    setAnswer('')
+    try {
+      const restored = await request<AskResponse>(`/conversations/${id}`)
+      await displayRequest(restored)
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
   async function saveRequest() {
     if (!ticket.trim()) return
     setBusy(true)
@@ -273,13 +398,15 @@ export default function App(): JSX.Element {
   async function continueChat(event: FormEvent) {
     event.preventDefault()
     if (!active?.transient || !answer.trim()) return
+    const message = answer.trim()
+    setPendingMessage(message)
+    setAnswer('')
     setBusy(true)
     setError('')
     try {
-      await displayRequest(await investigate<AskResponse>(`/requests/${active.case_id}/message`, { summary: answer.trim() }))
-      setAnswer('')
-    } catch (caught) { setError((caught as Error).message) }
-    finally { setBusy(false) }
+      await displayRequest(await investigate<AskResponse>(`/requests/${active.case_id}/message`, { summary: message }))
+    } catch (caught) { setAnswer(current => current || message); setError((caught as Error).message) }
+    finally { setPendingMessage(''); setBusy(false) }
   }
 
   return (
@@ -293,7 +420,12 @@ export default function App(): JSX.Element {
           <p>Your support workspace</p>
         </div>
         <ProviderSelector />
-        <span className="runtime-label">{readiness?.runtime_mode==='isolated_demo' ? 'Isolated demo' : 'Your workspace'}</span>
+        <details className="workspace-menu">
+          <summary className="runtime-label">{readiness?.runtime_mode==='isolated_demo' ? 'Isolated demo' : 'Your workspace'} <span aria-hidden="true">▾</span></summary>
+          <div className="workspace-menu-popover" role="menu">
+            <button type="button" role="menuitem" className="workspace-menu-danger" disabled={busy} onClick={event => { event.currentTarget.closest('details')?.removeAttribute('open'); void prepareReset() }}>Delete history</button>
+          </div>
+        </details>
       </header>
       <nav className="workspace-nav" aria-label="Workspace">
         {([['Chat', 'chat'], ['Investigations', 'investigations'], ['Knowledge', 'knowledge-workspace'], ['Voice', 'voice']] as const).map(([name, id]) => (
@@ -306,28 +438,29 @@ export default function App(): JSX.Element {
           {error}
         </div>
       )}
-      <main className={`workspace-main ${section.toLowerCase()}`}>
+      {notice && <div className="success-banner" role="status">{notice}</div>}
+      <main className={`workspace-main ${section.toLowerCase()}${section === 'Chat' && activity.length > 0 ? ' with-activity' : ''}`}>
         <section hidden={section !== 'Chat'} className="chat-workspace" id="chat" aria-label="Chat workspace">
           <div className="workspace-heading"><div><span className="eyebrow">YOUR AI SERVICE DESK</span><h2>{active ? 'Let’s keep going' : 'How can I help?'}</h2></div>
-            <button type="button" className="button button-neutral" disabled={busy} onClick={() => { setActive(null); setEvents([]); setTicket(''); setAnswer(''); setError('') }}>New conversation</button>
+            <button type="button" className="button button-neutral" disabled={busy} onClick={() => { localStorage.removeItem(ACTIVE_CONVERSATION_KEY); setActive(null); setEvents([]); setActivity([]); setTicket(''); setAnswer(''); setError('') }}>New conversation</button>
           </div>
           {!active && <div className="chat-welcome"><span className="welcome-mark" aria-hidden="true">D</span><h3>A little help, a clearer day.</h3><p>Work through an IT issue, ask a question, or find an answer in your documents.</p><div className="suggestion-row">{['My VPN is not connecting', 'Help with multi-factor sign-in', 'Find an answer in my documents'].map(suggestion => <button type="button" key={suggestion} onClick={() => setTicket(suggestion)}>{suggestion}</button>)}</div></div>}
-          <form onSubmit={start} className="main-composer">
+          {!active && <form onSubmit={start} className="main-composer">
             <label htmlFor="ticket">Question or ticket</label>
             <textarea id="ticket" rows={3} placeholder="Message DeskMate…" value={ticket} onChange={e => setTicket(e.target.value)} required />
             <div className="composer-actions"><button type="button" className="button button-neutral" onClick={() => navigate('Voice', 'voice')} aria-label="Open voice support"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8"/></svg></button>
               <div><button type="button" className="button button-subtle" disabled={busy || !ticket.trim()} onClick={() => void saveRequest()}>Save request</button><button className="button button-primary" disabled={busy || !ticket.trim() || (readiness !== null && !readiness.text_ready)} aria-busy={busy}>{busy ? 'Investigating…' : 'Send'}</button></div>
             </div>
             {blocker && <div className="availability-note"><p role="status">{blocker}</p><button type="button" className="button button-subtle" disabled={checking || busy} onClick={() => void refresh()}>Check availability</button></div>}
-          </form>
+          </form>}
         </section>
         <section hidden={section !== 'Investigations'} className="history-workspace" id="investigations" aria-label="Investigation history">
           <InvestigationHistory cases={cases} selected={active?.case_id} busy={busy} onOpen={openCase} allowSamples={readiness?.runtime_mode === 'isolated_demo'} />
         </section>
-        <section hidden={section !== 'Knowledge'} id="knowledge-workspace" className="knowledge-workspace" aria-label="Knowledge workspace"><KnowledgePanel readiness={readiness} /></section>
+        <section hidden={section !== 'Knowledge'} id="knowledge-workspace" className="knowledge-workspace" aria-label="Knowledge workspace"><KnowledgePanel key={knowledgeGeneration} readiness={readiness} readinessChecking={checking} readinessError={readinessError} /></section>
         <section hidden={section !== 'Voice'} id="voice" className="voice-workspace">{section === 'Voice' && <VoiceSupport onCaseCreated={openCase} readiness={readiness} />}</section>
-        <div hidden={!['Chat', 'Investigations'].includes(section)}><InvestigationActivity events={activity} busy={busy && investigation.current !== null} onCancel={() => investigation.current?.abort()} /></div>
-        <div className="investigation-panel" hidden={!active || !['Chat', 'Investigations'].includes(section)}>
+        <div className={`chat-layout${section === 'Chat' && activity.length ? ' with-activity' : ''}`} hidden={!active || !['Chat', 'Investigations'].includes(section)}>
+        <div className="chat-thread"><div className="investigation-panel">
           {!active ? (
             <section className="empty-state">
               <div aria-hidden="true">◎</div>
@@ -352,7 +485,7 @@ export default function App(): JSX.Element {
                   {active.status.replace(/_/g, ' ')}
                 </span>
               </div>
-              <p className="ticket-summary">{active.ticket.summary}</p>
+              {section === 'Investigations' && <p className="ticket-summary">{active.ticket.summary}</p>}
               {!active.chat_messages?.length && (active.final_response?.answer || active.final_answer) && (
                 <section className="card knowledge-answer">
                   <h2>Final Answer</h2>
@@ -362,10 +495,11 @@ export default function App(): JSX.Element {
               {active.workflow === 'knowledge' && !active.chat_messages?.length && !active.final_response?.answer && !active.final_answer && (
                 <section className="card knowledge-answer"><h2>Answer</h2><p>{active.status === 'insufficient_information' ? 'The available evidence does not support an answer yet.' : 'Gathering and verifying supporting documents…'}</p></section>
               )}
-              {!!active.chat_messages?.length && <section className="card conversation-card" aria-label="Conversation">
+              {!!timelineMessages.length && <section className="card conversation-card" aria-label="Conversation">
                 <h2 className="sr-only">Conversation</h2>
-                <div className="chat-history" role="log" aria-live="polite">
-                  {active.chat_messages.map((message, index) => <div key={index} className={`chat-message ${message.role}`}><strong>{message.role === 'user' ? 'You' : 'DeskMate'}</strong>{message.role === 'assistant' ? <AnswerText value={message.content} /> : <p>{message.content}</p>}</div>)}
+                <div ref={chatLog} className="chat-history" role="log" aria-live="polite" onScroll={event => { const node = event.currentTarget; keepChatAtBottom.current = node.scrollHeight - node.scrollTop - node.clientHeight < 100 }}>
+                  {timelineMessages.map((message, index) => <div key={`${message.role}-${index}`} className={`chat-message ${message.role}`}><strong>{message.role === 'user' ? 'You' : 'DeskMate'}</strong>{message.role === 'assistant' ? <AnswerText value={message.content} /> : <p>{message.content}</p>}</div>)}
+                  {pendingMessage && <div className="chat-message user pending"><strong>You</strong><p>{pendingMessage}</p><small>Sending…</small></div>}
                 </div>
                 <form onSubmit={continueChat} className="chat-reply">
                   <label htmlFor="chat-reply">Reply to this conversation</label>
@@ -589,8 +723,11 @@ export default function App(): JSX.Element {
               </>}
             </>
           )}
+        </div></div>
+        <div className="chat-activity"><InvestigationActivity events={activity} busy={busy && investigation.current !== null} onCancel={() => investigation.current?.abort()} /></div>
         </div>
       </main>
+      {resetPreview && <div className="modal-backdrop" role="presentation"><section className="reset-modal" role="dialog" aria-modal="true" aria-labelledby="reset-title"><h2 id="reset-title">Delete all DeskMate history?</h2><p>This permanently removes your conversations, investigations, uploaded documents, knowledge, memories, and associated Neo4j and ChromaDB data from this workspace. This cannot be undone.</p><dl><dt>SQLite records</dt><dd>{resetPreview.inventory.records}</dd><dt>ChromaDB vectors</dt><dd>{resetPreview.inventory.vectors}</dd><dt>Uploaded files</dt><dd>{resetPreview.inventory.files}</dd></dl>{resetPreview.inventory.unresolved_vectors > 0 && <p className="error-banner">{resetPreview.inventory.unresolved_vectors} legacy vector entries have no tenant owner and will be retained.</p>}{resetResult && <div className="reset-results"><strong>Deletion result: {resetResult.status}</strong><ul>{Object.entries(resetResult.stores).map(([store, value]) => <li key={store}>{store}: {value.status}{value.unresolved ? ` (${value.unresolved} unresolved)` : ''}</li>)}</ul></div>}<label htmlFor="reset-confirmation">Type DELETE to confirm</label><input id="reset-confirmation" value={resetConfirmation} onChange={event => setResetConfirmation(event.target.value)} autoComplete="off"/><div className="modal-actions"><button className="button button-neutral" disabled={resetting} onClick={() => { setResetPreview(null); setResetConfirmation(''); setResetResult(null) }}>Cancel</button><button className="button button-danger" disabled={resetConfirmation !== 'DELETE' || resetting} onClick={() => void confirmReset()}>{resetting ? 'Deleting…' : resetResult?.status === 'incomplete' ? 'Retry deletion' : 'Permanently delete'}</button></div></section></div>}
       <footer>DeskMate · Thoughtful support, one conversation at a time.</footer>
     </div>
   )

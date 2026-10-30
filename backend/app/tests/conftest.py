@@ -1,31 +1,46 @@
 """Lifespan-aware clients using installed packages and isolated persistent stores."""
 
-import sys
 import os
+import sys
 from contextlib import ExitStack
 from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
-
-# Collection imports the application before fixtures run. Explicit isolated test mode
-# prevents local .env settings from selecting any live generation/speech/embeddings.
-for key, value in {
-    "TEST_MODE": "true",
-    "DATA_PLATFORM": "local",
-    "LOCAL_PERSISTENCE_ENABLED": "false",
-    "DEPLOYMENT_MODE": "local",
-    "ENABLE_LOCAL_FIXTURES": "true",
-    "GENERATION_PROVIDER": "stub",
-    "EMBED_PROVIDER": "stub",
-    "SPEECH_ENABLED": "false",
-    "NEO4J_URI": "",
-    "MCP_SERVERS": "[]",
-}.items():
-    os.environ[key] = value
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+from backend.app.testing.network_guard import install_offline_network_guard
+
+# Collection imports the application before fixtures run. Offline is the
+# fail-closed default even if a developer's .env contains real credentials.
+TEST_PROFILE = os.getenv("DESKMATE_TEST_PROFILE", "offline")
+if TEST_PROFILE == "live":
+    if os.getenv("DESKMATE_ALLOW_LIVE_API_TESTS", "false").casefold() != "true":
+        raise RuntimeError("Live tests require DESKMATE_ALLOW_LIVE_API_TESTS=true")
+elif TEST_PROFILE == "offline":
+    for key, value in {
+        "DESKMATE_TEST_PROFILE": "offline",
+        "DESKMATE_ALLOW_LIVE_API_TESTS": "false",
+        "TEST_MODE": "true",
+        "DATA_PLATFORM": "local",
+        "LOCAL_PERSISTENCE_ENABLED": "false",
+        "DEPLOYMENT_MODE": "local",
+        "ENABLE_LOCAL_FIXTURES": "true",
+        "GENERATION_PROVIDER": "stub",
+        "EMBED_PROVIDER": "stub",
+        "SPEECH_ENABLED": "false",
+        "NEO4J_URI": "",
+        "MCP_SERVERS": "[]",
+    }.items():
+        os.environ[key] = value
+else:
+    raise RuntimeError("DESKMATE_TEST_PROFILE must be 'offline' or 'live'")
+
+if TEST_PROFILE == "offline":
+    install_offline_network_guard()
 
 
 @pytest.fixture

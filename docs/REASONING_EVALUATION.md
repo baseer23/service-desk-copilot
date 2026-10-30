@@ -174,3 +174,90 @@ Forty-plus deterministic/MCP checks passed for numerical correctness, argument s
 Focused deterministic scenarios cover explicit name capture, restart persistence, duplicate suppression, correction/supersession, graph-unavailable queuing, tenant/owner isolation, per-request opt-out, unrelated third-person text, revocation and mocked graph delivery. Profile retrieval is an ordinary bounded MCP read selected only when applicable; ordinary calculations and unrelated questions do not automatically query semantic memory. Documents continue to use the separate source-grounded structured-reference graph and cannot silently rewrite authenticated profile facts.
 
 The focused semantic-memory/graph suite passed 14 tests, 31 related MCP/security/document-job tests passed, the Knowledge Panel suite passed four tests, and the production frontend build passed. The evaluation used temporary SQLite and an in-memory graph sink. It did not call a reasoning provider, Azure Document Intelligence or production Neo4j, and therefore does not claim live extraction quality, live Aura persistence or end-to-end model selection of the new profile tools.
+
+## Persistent conversation and general personal-memory evaluation — 2026-10-25
+
+The deterministic acceptance coverage now includes checkpoint-backed conversation listing/restoration, React active-thread restoration, explicit general facts, semantic/paraphrased recall, correction history, duplicate suppression, optional graph delivery, individual forgetting and owner isolation. Personal memories enter reasoning in a dedicated state field and remain distinct from operational case facts and retrieved document/web evidence.
+
+Focused non-billable checks completed before the final no-test instruction: 11 general-conversation checks, 15 React App checks and nine semantic-memory checks passed. No later full regression, build, browser or live integration run is claimed. Live-provider answer quality and live Aura reconciliation remain opt-in acceptance work.
+
+## Document semantic graph evaluation status — 2026-10-25
+
+The new reasoning contracts separate source-grounded document extraction from conservative graph placement. Extraction outputs retain logical object references; placement must choose reuse, creation or unresolved exactly once per entity and cannot name an existing ID outside the bounded tenant candidate set. Graph-first retrieval converts entity-linked document references back through `LocalKnowledgeStore.resolve_object_ids`, so Neo4j remains discovery context and Chroma text remains answer evidence.
+
+No evaluation command was executed because this task explicitly prohibited tests, lint and builds. No live model or Aura claim is made. A later authorized acceptance run should cover multi-section resume, duplicate-entity reuse across uploads, unresolved mentions, conflicting source claims, stale reference reporting, tenant isolation and vector-only behavior during Aura outages.
+
+## Human-readable investigation activity — 2026-10-25
+
+Existing SSE activity is now reduced into Understanding, Planning, Searching, Evaluating, Verifying and Outcome sections without an additional model call. Repeated low-level events update their stage, while the full allowlisted operational log remains expandable and is restored with the owner-scoped conversation record. Python compilation and TypeScript no-emit checking passed; no reasoning tests or live model calls were run. Natural-language fidelity against live Groq/Azure event combinations remains an opt-in acceptance check.
+
+## Chat transcript and URL-ingestion evaluation — 2026-10-26
+
+Focused React checks cover chronological multi-turn rendering, current-summary deduplication, follow-up submission and the Knowledge ingestion status contract. A live headless browser confirmed the transcript/activity desktop split, workspace reset menu and safe Cancel path, plus Knowledge and Voice tab accessibility. Four isolated backend checks exercised public-web authorization, durable local indexing, retrieval and graph-linked reporting using temporary stores.
+
+The live service reported local MCP/private stores ready and URL ingestion enabled, while direct Aura enrichment was unavailable. One bounded `example.com` request returned HTTP 400 and produced no searchable local item; it was not repeated. This revision therefore claims the repaired deterministic ingestion boundary, not a successful production crawl or live graph projection. No reasoning provider, paid Azure operation or full regression suite was invoked.
+
+## Validation and personal-memory recovery evaluation — 2026-10-26
+
+One bounded live Groq request reproduced the failure at the `plan` node: classification completed as knowledge/general, no MCP capability executed, and application validation rejected both the corrected and final plan. This rules out tool execution, MCP mutation and evidence-reference validation for the reported incident. Because the earlier error boundary erased the validator detail, the exact historical argument names cannot be reconstructed without another paid request and are not claimed.
+
+Disposable deterministic checks now cover an empty authenticated profile returning a concise unknown-name answer, a confirmed fictional name returning through the existing semantic-memory/profile path, stable general knowledge using zero tools, a schema-compliant MCP retrieval, invalid profile arguments corrected to the discovered zero-argument contract, and invented evidence IDs corrected once then downgraded safely. All focused checks passed. The live request was not repeated after implementation; provider-specific production answer wording remains unclaimed.
+
+## Live semantic document activation — 2026-10-26
+
+The enabled semantic worker successfully produced and persisted a source-grounded proposal for an existing authorized URL document. A read-only worker-identity check resolved every referenced logical object ID from tenant-scoped Chroma, ruling out missing evidence, owner scope and local-vector connectivity. Conservative graph-placement validation rejected the subsequent model result before semantic entity writes, so semantic placement remains a live blocker. The successful paid calls were not automatically retried.
+
+The focused activation regression and existing plain-text automatic-ingestion check passed (2 tests). Python compilation and whitespace validation also passed. No full suite, new Azure extraction, workspace reset or destructive operation was run.
+
+## Document GraphRAG repair evaluation — 2026-10-27
+
+Focused offline retrieval and graph checks passed 16 scenarios covering stable logical object IDs, structural references, Chroma hydration, stale/unavailable graph fallback, evidence-bound placement and graph writer effects. Saved-document routing checks confirmed structured document intent and mandatory graph participation; planned local searches cannot remain keyword-only and use `HYBRID` graph-first retrieval.
+
+Worker/job checks passed 22 focused scenarios across immediate wakeup, startup recovery, bounded unchanged-job handling, deferred structural retries and durable semantic handoff. Five Knowledge Panel checks and the production frontend build passed, including persisted status polling through structural and semantic completion. No live provider, Azure Document Intelligence request or Aura mutation was made, so live extraction quality and production semantic placement remain unverified.
+
+## NSNP live recovery — 2026-10-27
+
+After correcting Azure bounding-region serialization, the preserved NSNP job resumed through extraction, local indexing, structural linking and semantic understanding. The semantic provider produced 14 grounded entities/mentions and no supported relationship claim; zero relationships is retained rather than inventing an edge. Persisted status is `ready`/`complete`, with both graph statuses `linked` and no stale processing error.
+
+The focused SDK-shape regression passed. The live run exercised Azure Document Intelligence, local SentenceTransformers/Chroma, the dedicated Neo4j writer and the configured Groq provider once through the recovered pipeline. No unrelated document was reset or reindexed by this repair.
+
+## Mandatory saved-knowledge graph participation — 2026-10-26
+
+The LangGraph knowledge subgraph now records explicit saved-knowledge scope in durable state and executes a dedicated retrieval node. It runs local `search_knowledge` and an application-authored tenant-scoped Neo4j read concurrently, preferring the official read-only MCP tool when authorized. Empty graph matches remain valid observations; unavailable graph access is emitted as a failed activity and does not falsely claim graph evidence or suppress local Chroma results. Ordinary general questions and public-web requests do not enter this mandatory path.
+
+Offline coverage verifies classifier override, required local retrieval, official-MCP preference, fallback graph invocation, activity visibility, tenant parameterization and unchanged general routing. Conservative graph placement preserves every proposed entity as created, reused or unresolved and prevents unsupported reuse IDs. No paid reasoning evaluation or live semantic regeneration was run.
+
+## Saved-document QA reliability — 2026-10-28
+
+A 23-question reference set was built from a private 14-page scanned employer form (kept under `store/local/evaluations/`, never committed), with every expected answer and page verified against the page images rather than DeskMate's own chunks. Categories: exact fields, typos, abbreviations, incomplete document names, multi-page and multi-table answers, form check boxes, blank and unsupported fields, a struck-through date, relationship questions and follow-ups.
+
+`scripts/evaluate_document_qa.py` runs the set offline against a temporary index rebuilt from the document's saved extraction (network blocked, no Azure, no workspace stores) through the agent's own document scoping, graph object selection, hydration, local search, evidence selection and de-duplication. Baseline: 15/23 retrieval passes, 26 answer passages stored under the wrong page, 31 evidence items per question with 6 duplicates, follow-ups and incomplete names unidentified. After the fixes: 23/23, no mislabelled pages, no duplicates, 6–13 evidence items per question.
+
+Root causes fixed: chunks crossed page boundaries and kept their first page; every hydrated graph object was graded and kept, ranked by vector similarity alone; the same passage from the graph and local paths became two evidence items; follow-ups dropped the previous document; form check boxes reached the model as raw `:selected:` tokens; a title shortcut accepted every passage sharing a word with the question without grading; unconnected optional integrations were reported as failed evidence sources. Documented graph claims are now returned with their supporting passages.
+
+One live read-only Neo4j check confirmed the document's graph: 14 pages, 397 structural objects, 25 chunk/table objects identical to local Chroma (no stale references), and no semantic mentions or claims (semantic ingestion has not run). Offline suite: 460 passed; the 11 failures all predate this work. Live model answers for the set, the re-index that applies page-accurate chunks to already-stored documents, and semantic graph ingestion each need separate authorization.
+
+Follow-up: the evaluated document's saved extraction holds 14 section headings and 2 titles but an empty section list, so its graph had no Section nodes; replaying today's batch merge offline from its saved batches does produce the 16 sections, so the gap is confined to that historical artifact. Indexing now derives missing sections from heading paragraphs (saved artifacts are never modified), and heading-only Section rows are excluded from graph evidence slots because each heading also opens the chunk that follows it — without that exclusion the evaluation dropped to 22/23. With both changes the set stays 23/23 with unchanged ranks and pages; offline suite 462 passed, the same 11 pre-existing failures.
+
+## Form check boxes and follow-ups — 2026-10-29
+
+Read-only diagnosis of the evaluated scanned form: Azure Document Intelligence detected the check boxes, and their states survive as inline `:selected:` / `:unselected:` tokens in saved paragraphs and in the indexed chunks; the page image confirms them. The extractor never saved `page.selection_marks` (per-mark position, confidence and span), the PDF has no AcroForm fields, and reading order sometimes places a question's marks in the next paragraph, so text-only association can attach marks to the wrong question.
+
+Changes: selection marks and Azure's own per-page Markdown are saved; one helper renders marks as `[x]` / `[ ]` for every reader; fillable-PDF fields are read locally; each question with its options and marks becomes a `FormField` object (span association first, page geometry as a fallback, AcroForm when present) that abstains when association is tied, a mark has low confidence, or zero or several options are selected. Graph references add `Page-[:HAS_FORMFIELD]->FormField-[:HAS_SELECTIONMARK]->SelectionMark` with only IDs, page, role, state flag and confidence. Semantic understanding receives verified fields and drops field/value relationships that do not cite a matching answered field. Retrieval and grading use a classifier-resolved standalone question, and a selection answer comes only from an answered FormField with its page, otherwise an explicit abstention.
+
+Chunk text keeps Azure's tokens: embedding the `[x]` form moved mark-bearing chunks up for unrelated questions and dropped the 23-question set to 21/23; with tokens kept it remains 23/23. Offline: 14 new synthetic-form tests pass; the full offline suite has the same 11 pre-existing failures. Applying FormField objects to an already indexed document needs a local re-index, which requires authorization.
+
+## Live NSNP 200 form test — 2026-10-30
+
+The NSNP 200 form test works. NSNP 200.pdf was re-extracted live with Azure Document Intelligence and indexed, then four questions were asked in one Chat conversation with Azure OpenAI:
+
+| Question | Answer | Page |
+|---|---|---|
+| "in the nsnp 200 form, am i currently employed or no" | Yes, the applicant is currently employed | 6 |
+| "is it a no?" | No — the form marks Yes | 6 |
+| "what is the NOC code in my nsnp200" | 22221 | 10 |
+| "which page shows the job title?" | Page 1, "Position offered" | 1 |
+
+Each answer cites the form field or passage it came from, and each was checked against the saved extraction.
+
+Voice also works; the user confirmed it.

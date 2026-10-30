@@ -9,8 +9,10 @@ from pydantic import SecretStr
 from backend.app.core.principal import Principal, principal_scope
 from backend.app.services.azure_document_formats import word_segments
 from backend.app.services.document_repository import DocumentRepository
+from backend.app.services.local_documents import LocalDocumentRepository
 from backend.app.services.local_backup import RecordMigration, digest, snapshot_sqlite
 from backend.app.store.local_records import LocalRecords
+from backend.app.store.graph_repo import InMemoryGraphRepository
 from backend.app.store.records import ManagedStoreError
 from backend.app.voice.auth import Actor, VoiceError
 from backend.app.voice.record_repository import RecordVoiceConversationRepository
@@ -29,6 +31,84 @@ class Blobs:
 
     def get(self, identifier, artifact):
         return self.items[identifier, artifact]
+
+
+def test_enabling_semantic_ingestion_queues_previously_disabled_linked_document(settings):
+    class Records:
+        def __init__(self):
+            self.row = {"payload": {}}
+            self.written = None
+
+        def read(self, *_args):
+            return self.row
+
+        def write(self, _kind, _identifier, payload, **_kwargs):
+            self.written = payload
+            return {"payload": payload}
+
+    repository = object.__new__(LocalDocumentRepository)
+    repository.settings = settings.model_copy(update={"semantic_graph_ingestion_enabled": True})
+    repository.records = Records()
+    result = repository._set_graph_status(
+        "document-id",
+        {
+            "status": "ready", "phase": "complete", "chunks": 2,
+            "graph_link_status": "linked", "semantic_graph_status": "disabled",
+        },
+        "ready",
+    )
+    assert result["local_index_ready"] is True
+    assert result["graph_link_status"] == "linked"
+    assert result["semantic_graph_status"] == "pending"
+
+
+def test_graph_pending_records_bounded_durable_retry_metadata(settings, monkeypatch):
+    class Records:
+        def __init__(self):
+            self.row = {"payload": {}}
+
+        def read(self, *_args):
+            return self.row
+
+        def write(self, _kind, _identifier, payload, **_kwargs):
+            return {"payload": payload}
+
+    monkeypatch.setattr("time.time", lambda: 1000)
+    repository = object.__new__(LocalDocumentRepository)
+    repository.settings = settings
+    repository.records = Records()
+    result = repository._set_graph_status(
+        "document-id",
+        {"chunks": 2, "graph_retry_attempts": 1},
+        "graph_pending",
+        graph_error="ServiceUnavailable",
+    )
+    assert result["local_index_ready"] is True
+    assert result["graph_retry_attempts"] == 2
+    assert result["graph_retry_after"] == 1020
+    assert result["graph_last_error"] == "ServiceUnavailable"
+    assert result["graph_retry_terminal"] is False
+
+
+def test_reference_descriptions_use_titles_and_sections_without_body_text(settings):
+    repository = object.__new__(LocalDocumentRepository)
+    repository.settings = settings
+    graph = InMemoryGraphRepository()
+    extraction = {
+        "pages": [{"page": 1, "text": "Private recovery steps", "markdown": "Private recovery steps"}],
+        "sections": [{"id": "vpn", "page": 1, "title": "VPN recovery", "parent_id": None}],
+        "paragraphs": [
+            {"id": "heading", "page": 1, "position": 0, "role": "sectionHeading", "text": "VPN recovery"},
+            {"id": "body", "page": 1, "position": 1, "role": None, "text": "Private recovery steps"},
+        ],
+        "tables": [], "figures": [], "method": "document_intelligence",
+    }
+    repository._publish_reference_objects(
+        graph, "doc-1", "Operations handbook", extraction, temporary=False, version=1
+    )
+    descriptions = [item["description"] for item in graph.references.values()]
+    assert any("Operations handbook" in value and "VPN recovery" in value for value in descriptions)
+    assert all("Private recovery steps" not in value for value in descriptions)
 
 
 def test_snapshot_includes_committed_wal_and_never_changes_source(tmp_path):
@@ -367,7 +447,8 @@ def test_azure_structure_counts_actual_nodes_and_relationships_without_text(sett
     counts = repository._publish_reference_objects(
         graph, "a" * 64, "Structured", extraction, temporary=False
     )
-    assert counts == {"nodes": 7, "relationships": 7}
+    # Includes the paragraph's PART_OF link to the chunk that holds its text.
+    assert counts == {"nodes": 7, "relationships": 8}
     serialized = repr(graph.references)
     assert "Private body" not in serialized and "Private cell" not in serialized
     assert {item["object_type"] for item in graph.references.values()} == {

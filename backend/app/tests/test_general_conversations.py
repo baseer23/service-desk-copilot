@@ -1,3 +1,5 @@
+import pytest
+
 from backend.app.agent.models import (
     GeneralAnswer,
     InvestigationDecision,
@@ -6,6 +8,16 @@ from backend.app.agent.models import (
     VerificationResult,
 )
 from backend.app.models.instructions import stage_instructions
+from backend.app.models.dto import RequestResult
+
+pytestmark = pytest.mark.integration
+
+
+def test_empty_legacy_final_response_is_restored_as_absent():
+    restored = RequestResult.model_validate(
+        {"ticket": {}, "status": "assessment_ready", "final_response": {}}
+    )
+    assert restored.final_response is None
 
 
 def install_conversation_provider(client, captured):
@@ -68,12 +80,20 @@ def test_general_chat_uses_graph_without_fabricated_sources(make_client):
     assert body["case_id"] is None
     assert body["result"]["final_answer"] == "Toronto is in Ontario, Canada."
     assert body["result"]["final_response"]["sources"] == ["request_report"]
-    assert calls == ["list_available_context"]
+    assert calls == ["search_semantic_memory", "list_available_context"]
     followup = client.post(
         f'/requests/{body["request_id"]}/message', json={"summary": "Which province is that?"}
     )
     assert followup.status_code == 200
-    assert captured[-1][1]["conversation"][-1]["content"] == "Toronto is in Ontario, Canada."
+    # Reasoning stages see the previous answer; the verifier reviews only the
+    # current candidate, so it gets the user's turns alone.
+    reasoning = [call for call in captured if call[0] != "verify"]
+    assert reasoning[-1][1]["conversation"][-1]["content"] == "Toronto is in Ontario, Canada."
+    verifications = [call for call in captured if call[0] == "verify"]
+    assert verifications and all(
+        message["role"] != "assistant"
+        for call in verifications for message in call[1]["conversation"]
+    )
     assert client.get("/cases").json() == []
 
 
@@ -82,6 +102,12 @@ def test_general_conversation_survives_restart_and_missing_id_is_safe(make_clien
     install_conversation_provider(first, [])
     body = first.post("/ask", json={"summary": "Where is Toronto?"}).json()
     restored = make_client({"KNOWLEDGE_SCOPE": "broad"})
+    history = restored.get("/conversations")
+    assert history.status_code == 200
+    assert history.json()[0]["conversation_id"] == body["request_id"]
+    detail = restored.get(f'/conversations/{body["request_id"]}')
+    assert detail.status_code == 200
+    assert detail.json()["result"]["chat_messages"][0]["content"] == "Where is Toronto?"
     captured = []
     install_conversation_provider(restored, captured)
     response = restored.post(
@@ -90,6 +116,7 @@ def test_general_conversation_survives_restart_and_missing_id_is_safe(make_clien
     assert response.status_code == 200
     assert captured[-1][1]["conversation"][0]["content"] == "Where is Toronto?"
     assert restored.post("/requests/missing/message", json={"summary": "Hello"}).status_code == 404
+    assert restored.get("/conversations/missing").status_code == 404
 
 
 def test_general_conversation_followup_is_owner_scoped(make_client):
@@ -107,6 +134,22 @@ def test_general_conversation_followup_is_owner_scoped(make_client):
 
     with pytest.raises(KeyError):
         client.portal.call(other_user)
+
+
+@pytest.mark.memory
+def test_two_general_conversations_are_listed_and_reopen_independently(make_client):
+    client = make_client({"KNOWLEDGE_SCOPE": "broad"})
+    install_conversation_provider(client, [])
+    first = client.post("/ask", json={"summary": "Where is Toronto?"}).json()
+    second = client.post("/ask", json={"summary": "Where is Ottawa?"}).json()
+    history = client.get("/conversations").json()
+    assert {item["conversation_id"] for item in history} == {
+        first["request_id"], second["request_id"]
+    }
+    for response, question in ((first, "Where is Toronto?"), (second, "Where is Ottawa?")):
+        restored = client.get(f'/conversations/{response["request_id"]}').json()
+        assert restored["request_id"] == response["request_id"]
+        assert restored["result"]["chat_messages"][0]["content"] == question
 
 
 def test_support_scope_cannot_enter_general_generation(make_client):
@@ -280,8 +323,9 @@ def test_invalid_model_plan_gets_one_bounded_schema_revision_without_dispatch(ma
     before = agent.harness.invocation_count
     result = client.portal.call(agent.plan, state)
     assert len(contexts) == 2
-    assert contexts[1]["plan_validation_feedback"][0]["type"] == "literal_error"
-    assert "input" not in contexts[1]["plan_validation_feedback"][0]
+    assert contexts[1]["plan_validation_feedback"]["validation_error_code"] == "INVALID_TOOL_ARGUMENTS"
+    assert contexts[1]["plan_validation_feedback"]["tool_name"] == "search_knowledge"
+    assert contexts[1]["plan_validation_feedback"]["actual_argument_names"] == ["mode", "question"]
     assert result["plan"]["tool_calls"][0]["arguments"]["mode"] == "HYBRID"
     assert agent.harness.invocation_count == before
 

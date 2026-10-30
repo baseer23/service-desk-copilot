@@ -101,15 +101,12 @@ def fake_site(monkeypatch):
 def bind_mocked_url_capability(client, monkeypatch):
     """Explicit network unit injection; storage remains real temporary Chroma."""
     from backend.app.mcp import server
-    from backend.app.services.capabilities import knowledge_stores
-    from backend.app.services.ingest_service import IngestService
-    from backend.app.adapters.embeddings import get_embedding_provider
+    from backend.app.services.local_documents import LocalDocumentRepository
 
     settings = client.app.state.settings
-    vector, graph, driver = knowledge_stores(settings)
-    ingest = IngestService(settings, vector, graph, get_embedding_provider(settings))
+    repository = LocalDocumentRepository(settings)
     monkeypatch.setattr(server, "get_settings", lambda: settings)
-    monkeypatch.setattr(server, "environment", lambda: (vector, graph, driver, ingest, None))
+    monkeypatch.setattr(server, "documents", lambda: repository)
     original = client.app.state.mcp.call_tool
 
     async def call(name, arguments):
@@ -118,7 +115,7 @@ def bind_mocked_url_capability(client, monkeypatch):
         return await original(name, arguments)
 
     monkeypatch.setattr(client.app.state.mcp, "call_tool", call)
-    return graph
+    return repository
 
 
 def test_url_ingest_disabled(make_client, tmp_path):
@@ -128,6 +125,9 @@ def test_url_ingest_disabled(make_client, tmp_path):
             "EMBED_PROVIDER": "stub",
             "CHROMA_DIR": tmp_path / "chroma",
             "ALLOW_URL_INGEST": "0",
+            "ENABLE_PUBLIC_WEB_TOOLS": "1",
+            "LOCAL_PERSISTENCE_ENABLED": "true",
+            "DATA_PLATFORM": "local",
         }
     )
 
@@ -138,7 +138,7 @@ def test_url_ingest_disabled(make_client, tmp_path):
 
     assert response.status_code == 403
     body = response.json()
-    assert body["detail"] == "URL ingestion is disabled"
+    assert body["detail"]["code"] == "PUBLIC_WEB_DISABLED"
 
 
 def test_crawl_respects_robots_and_limits(fake_site, make_client, tmp_path, monkeypatch):
@@ -148,6 +148,9 @@ def test_crawl_respects_robots_and_limits(fake_site, make_client, tmp_path, monk
             "EMBED_PROVIDER": "stub",
             "CHROMA_DIR": tmp_path / "chroma",
             "ALLOW_URL_INGEST": "1",
+            "ENABLE_PUBLIC_WEB_TOOLS": "1",
+            "LOCAL_PERSISTENCE_ENABLED": "true",
+            "DATA_PLATFORM": "local",
             "URL_MAX_TOTAL_CHARS": "5000",
         }
     )
@@ -161,7 +164,7 @@ def test_crawl_respects_robots_and_limits(fake_site, make_client, tmp_path, monk
     finally:
         client.close()
 
-    assert response.status_code == 200
+    assert response.status_code == 200, response.json()
     body = response.json()
     assert body["pages"] == 2
     assert "https://example.com/guide" in fake_site.request_log
@@ -175,18 +178,21 @@ def test_main_content_extraction(fake_site, make_client, tmp_path, monkeypatch):
             "EMBED_PROVIDER": "stub",
             "CHROMA_DIR": tmp_path / "chroma",
             "ALLOW_URL_INGEST": "1",
+            "ENABLE_PUBLIC_WEB_TOOLS": "1",
+            "LOCAL_PERSISTENCE_ENABLED": "true",
+            "DATA_PLATFORM": "local",
             "URL_RATE_LIMIT_SEC": "0",
         }
     )
 
-    local_graph = bind_mocked_url_capability(client, monkeypatch)
+    repository = bind_mocked_url_capability(client, monkeypatch)
     try:
         response = client.post(
             "/ingest/url",
             json={"url": "https://example.com/start", "max_depth": 0, "max_pages": 1},
         )
 
-        chunks = list(local_graph.chunks.values())
+        matches = repository.search("Reset MFA", 5)
     finally:
         client.close()
 
@@ -194,7 +200,7 @@ def test_main_content_extraction(fake_site, make_client, tmp_path, monkeypatch):
     assert body["pages"] == 1
     assert body["chunks"] >= 1
     assert body["entities"] >= 0
-    combined_text = "\n".join(chunk.get("text", "") for chunk in chunks)
+    combined_text = "\n".join(match.get("text", "") for match in matches)
     assert "Reset MFA" in combined_text
     assert "Menu" not in combined_text
 
@@ -206,13 +212,15 @@ def test_url_ingest_end_to_end(fake_site, make_client, tmp_path, monkeypatch):
             "EMBED_PROVIDER": "stub",
             "CHROMA_DIR": tmp_path / "chroma",
             "ALLOW_URL_INGEST": "1",
+            "ENABLE_PUBLIC_WEB_TOOLS": "1",
             "URL_RATE_LIMIT_SEC": "0",
             "URL_MAX_TOTAL_CHARS": "10000",
+            "LOCAL_PERSISTENCE_ENABLED": "true",
+            "DATA_PLATFORM": "local",
         }
     )
 
-    graph_repo = None
-    local_graph = bind_mocked_url_capability(client, monkeypatch)
+    repository = bind_mocked_url_capability(client, monkeypatch)
     try:
         response = client.post(
             "/ingest/url",
@@ -220,15 +228,14 @@ def test_url_ingest_end_to_end(fake_site, make_client, tmp_path, monkeypatch):
         )
         body = response.json()
 
-        graph_repo = local_graph
     finally:
         client.close()
 
-    assert response.status_code == 200
+    assert response.status_code == 200, response.json()
     assert body["pages"] == 2
     assert body["chunks"] > 0
     assert body["vector_count"] == body["chunks"]
 
-    assert graph_repo is not None
-    if hasattr(graph_repo, "documents"):
-        assert len(graph_repo.documents) >= 2
+    assert body["local_index_ready"] is True
+    assert body["graph_link_status"] == "linked"
+    assert len(repository.list_documents()) >= 2

@@ -1,5 +1,7 @@
 """Bounded graph-reference planning and tenant-safe local hydration."""
 
+import re
+
 from backend.app.agent.models import GraphLookupPlan
 from backend.app.services.entities import extract_entities
 
@@ -12,7 +14,12 @@ class GraphFirstRetrieval:
 
     def plan(self, question: str) -> GraphLookupPlan:
         entities = extract_entities([{"text": question}])[:10]
-        concepts = list(dict.fromkeys([*entities, *question.split()]))[:10]
+        tokens = question.split()
+        identifier_variants = [
+            re.sub(r"(?<=\D)(?=\d)", " ", token)
+            for token in tokens if re.search(r"[A-Za-z]\d", token)
+        ]
+        concepts = list(dict.fromkeys([*entities, *identifier_variants, *tokens]))[:10]
         return GraphLookupPlan(
             entities=entities,
             concepts=concepts,
@@ -37,14 +44,35 @@ class GraphFirstRetrieval:
         if not getattr(self.graph_repo, "available", True) or lookup is None:
             return [], "unavailable"
         plan = GraphLookupPlan.model_validate(graph_plan) if graph_plan else self.plan(question)
+        if not plan.entities and not plan.concepts:
+            # A plan that only scopes document_ids still needs lookup terms;
+            # the graph query matches nothing without them.
+            derived = self.plan(question)
+            plan = plan.model_copy(
+                update={"entities": derived.entities, "concepts": derived.concepts}
+            )
         try:
             references = lookup(
                 [*plan.entities, *plan.concepts],
-                plan.limit,
+                max(plan.limit * 10, 100),
                 document_ids=plan.document_ids,
                 object_types=plan.object_types,
                 relationships=plan.relationship_types,
             )
+            # Semantic entities are discovery anchors. Only their source object
+            # references are hydrated; graph metadata itself is not answer evidence.
+            candidate_lookup = getattr(self.graph_repo, "find_entity_candidates", None)
+            document_lookup = getattr(self.graph_repo, "find_related_documents", None)
+            if candidate_lookup and document_lookup:
+                for term in [*plan.entities, *plan.concepts][:10]:
+                    for candidate in candidate_lookup(term, limit=5):
+                        for document in document_lookup(candidate["id"], limit=10):
+                            references.extend({
+                                "object_id": object_id,
+                                "object_type": "SemanticEvidence",
+                                "document_id": document.get("document_id"),
+                                "description": document.get("summary", ""),
+                            } for object_id in document.get("object_ids", []))
         except Exception:
             return [], "unavailable"
         if not references:
@@ -53,7 +81,7 @@ class GraphFirstRetrieval:
         if resolver is None:
             return [], "unavailable"
         query = self.embeddings.embed_texts([question])[0]
-        object_ids = [row["object_id"] for row in references]
+        object_ids = list(dict.fromkeys(row["object_id"] for row in references))
         try:
             hydrated = resolver(object_ids, query)
         except TypeError:

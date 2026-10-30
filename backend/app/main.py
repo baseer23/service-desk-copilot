@@ -13,6 +13,7 @@ from typing import Any
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import SecretStr
+from pydantic import BaseModel, Field
 from starlette.responses import Response
 
 from backend.app.agent.checkpoints import checkpoint_store
@@ -32,8 +33,9 @@ from backend.app.models.dto import (
     IngestPasteRequest,
     IngestPasteResponse,
     IngestPdfResponse,
+    IngestUrlJobResponse,
     IngestUrlRequest,
-    IngestUrlResponse,
+    MemorySaveRequest,
 )
 from backend.app.models.provider import LLMError
 from backend.app.models.provider_factory import get_selectable_provider as get_provider
@@ -43,12 +45,18 @@ from backend.app.services.web import FetchError, UnsafeURL
 from backend.app.store.vector_chroma import StorageError
 
 
+class WorkspaceResetConfirm(BaseModel):
+    confirmation: str = Field(min_length=6, max_length=20)
+    confirmation_token: str = Field(min_length=20, max_length=200)
+
+
 def llm_error_detail(error: LLMError) -> dict[str, Any]:
     """Return an actionable, secret-free provider diagnostic for the UI."""
     if error.category == "application_validation":
         return {
             "code": "APPLICATION_VALIDATION_FAILED",
             "message": "DeskMate rejected an invalid investigation step. Collected evidence was preserved.",
+            **error.diagnostics,
         }
     messages = {
         "authentication": "Azure OpenAI authentication failed. Sign in to Entra again and retry.",
@@ -129,7 +137,7 @@ def create_app(settings: Settings | None = None):
         mcp = MultiMCPClient(s, builtin=DeskMateMCPClient(s))
         app.state.settings, app.state.mcp = s, mcp
         provider = None
-        ingestion_task = None
+        ingestion_task = crawl_task = None
         try:
             try:
                 provider = get_provider(s)
@@ -139,8 +147,10 @@ def create_app(settings: Settings | None = None):
                 provider = None
             await mcp.start()
             from backend.app.services.local_documents import graph_writer_readiness
+            from backend.app.services.document_processing import azure_document_readiness
 
             app.state.graph_writer = await asyncio.to_thread(graph_writer_readiness, s)
+            app.state.azure_document = await asyncio.to_thread(azure_document_readiness, s)
             from backend.app.core.principal import Principal, principal_scope
 
             system_tenant = (
@@ -150,11 +160,32 @@ def create_app(settings: Settings | None = None):
                 async with checkpoint_store(s) as saver:
                     app.state.agent = ServiceDeskAgent(s, mcp, provider, saver)
                     await app.state.agent.initialize()
+                    app.state.neo4j_read = {
+                        "available": False,
+                        "blocker": "Neo4j read authorization has not been verified.",
+                    }
+                    if {"neo4j__get-schema", "neo4j__read-cypher"}.issubset(mcp.discovered):
+                        try:
+                            await mcp.call_tool("neo4j__get-schema", {})
+                            probe = await mcp.call_tool(
+                                "neo4j__read-cypher",
+                                {"query": "RETURN 1 AS authorized_read", "params": {}},
+                            )
+                            if probe.get("status") != "ok" or not probe.get("items"):
+                                raise MCPToolError("Neo4j read probe returned no result")
+                            app.state.neo4j_read = {"available": True, "blocker": None}
+                        except (MCPToolError, MCPConnectionError, ValueError):
+                            app.state.neo4j_read = {
+                                "available": False,
+                                "blocker": "Neo4j MCP schema or authorized read verification failed.",
+                            }
                     from backend.app.voice.history import VoiceHistory
                     from backend.app.conversation.sessions import ConversationSessions
+                    from backend.app.services.conversation_history import ConversationHistory
 
                     app.state.voice = VoiceHistory(s)
                     app.state.conversation_sessions = ConversationSessions()
+                    app.state.conversation_history = ConversationHistory(s)
                     app.state.provider_initialized = provider is not None
                     try:
                         local = await app.state.agent.harness.invoke("get_local_storage_status", {})
@@ -166,16 +197,38 @@ def create_app(settings: Settings | None = None):
                             "aura_connected": False,
                         }
                     if s.uses_record_store:
-                        from backend.app.services.document_worker import document_worker
+                        from backend.app.services.document_worker import (
+                            document_worker,
+                            recover_interrupted_work,
+                        )
 
+                        await recover_interrupted_work(s, app.state.agent.harness)
+                        app.state.ingestion_wakeup = asyncio.Event()
                         ingestion_task = asyncio.create_task(
-                            document_worker(s, app.state.agent.harness)
+                            document_worker(
+                                s, app.state.agent.harness, app.state.ingestion_wakeup
+                            ),
+                            name="document-worker",
+                        )
+                        app.state.ingestion_task = ingestion_task
+                        from backend.app.services.url_crawl_worker import url_crawl_worker
+
+                        app.state.url_crawl_wakeup = asyncio.Event()
+                        crawl_task = asyncio.create_task(
+                            url_crawl_worker(
+                                s, app.state.agent.harness, app.state.url_crawl_wakeup,
+                                app.state.ingestion_wakeup,
+                            ),
+                            name="url-crawl-worker",
                         )
                     yield
         finally:
-            if ingestion_task:
-                ingestion_task.cancel()
-                await asyncio.gather(ingestion_task, return_exceptions=True)
+            active_ingestion = getattr(app.state, "ingestion_task", ingestion_task)
+            background = {ingestion_task, active_ingestion, crawl_task} - {None}
+            for task in background:
+                task.cancel()
+            if background:
+                await asyncio.gather(*background, return_exceptions=True)
             await app.state.speech.close()
             await mcp.close()
             if provider and hasattr(provider, "aclose"):
@@ -254,6 +307,14 @@ def create_app(settings: Settings | None = None):
         try:
             mutation_origin(request, s)
             actor = await authenticate(request, s)
+            from backend.app.services.workspace_reset import workspace_blocked
+
+            if (
+                request.method in {"POST", "PUT", "PATCH", "DELETE"}
+                and workspace_blocked(actor.tenant_id)
+                and not request.url.path.startswith("/admin/workspace-reset/")
+            ):
+                raise HTTPException(423, "This workspace is being reset. Try again shortly.")
             selection = request.headers.get("X-DeskMate-Provider", s.generation_provider)
             if s.test_mode and s.generation_provider == "stub":
                 selection = "stub"
@@ -271,6 +332,51 @@ def create_app(settings: Settings | None = None):
         if not current_principal(s).operator:
             raise HTTPException(403, "This action requires an administrator.")
         return (await app.state.voice.store(readiness)).model_dump()
+
+    @app.post("/admin/workspace-reset/prepare")
+    async def prepare_workspace_reset():
+        actor = current_principal(s)
+        if not actor.operator:
+            raise HTTPException(403, "This action requires an administrator.")
+        from backend.app.services.workspace_reset import WorkspaceReset
+
+        return await asyncio.to_thread(WorkspaceReset(s).prepare, actor.tenant_id, actor.owner_id)
+
+    @app.post("/admin/workspace-reset/confirm")
+    async def confirm_workspace_reset(body: WorkspaceResetConfirm):
+        actor = current_principal(s)
+        if not actor.operator:
+            raise HTTPException(403, "This action requires an administrator.")
+        if body.confirmation != "DELETE":
+            raise HTTPException(422, "Type DELETE exactly to confirm the workspace reset")
+        from backend.app.agent.streaming import cancel_workspace_streams
+        from backend.app.services.workspace_reset import WorkspaceReset
+
+        await cancel_workspace_streams(actor.tenant_id)
+        ingestion = getattr(app.state, "ingestion_task", None)
+        if ingestion and not ingestion.done():
+            ingestion.cancel()
+            await asyncio.gather(ingestion, return_exceptions=True)
+        try:
+            result = await WorkspaceReset(s).confirm(
+                actor.tenant_id, actor.owner_id, body.confirmation_token
+            )
+            if result["status"] == "complete":
+                app.state.conversation_sessions.clear()
+                await asyncio.to_thread(app.state.conversation_history.records.close)
+                if s.uses_record_store:
+                    from backend.app.services.document_worker import document_worker
+
+                    app.state.ingestion_wakeup.clear()
+                    app.state.ingestion_task = asyncio.create_task(
+                        document_worker(
+                            s, app.state.agent.harness, app.state.ingestion_wakeup
+                        ),
+                        name="document-worker-after-reset",
+                    )
+            return result
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     def readiness() -> ReadinessReport:
         from backend.app.diagnostics.readiness import configuration_readiness
@@ -299,16 +405,15 @@ def create_app(settings: Settings | None = None):
             "local_ocr_available": report.local_ocr_available,
             "semantic_ingestion_ready": report.semantic_ingestion_ready,
             "url_ingestion_enabled": report.url_ingestion_enabled,
+            "url_ingestion_blocker": report.url_ingestion_blocker,
             "managed_documents": s.uses_record_store,
             "azure_document_intelligence_available": bool(
-                s.uses_record_store and s.azure_document_endpoint
+                s.uses_record_store and app.state.azure_document["available"]
             ),
-            "neo4j_read_available": bool(
-                app.state.mcp.integration_status.get("neo4j") == "connected"
-                and {"neo4j__get-schema", "neo4j__read-cypher"}.issubset(
-                    app.state.mcp.discovered
-                )
-            ),
+            "azure_document_intelligence_blocker": app.state.azure_document["blocker"],
+            "azure_document_intelligence_code": app.state.azure_document["code"],
+            "neo4j_read_available": app.state.neo4j_read["available"],
+            "neo4j_read_blocker": app.state.neo4j_read["blocker"],
             "structured_ingestion_available": bool(
                 s.uses_record_store and app.state.graph_writer["available"]
             ),
@@ -367,11 +472,14 @@ def create_app(settings: Settings | None = None):
     @app.post("/ingest/pdf", response_model=IngestPdfResponse)
     async def ingest_pdf(file: UploadFile = File(...), title: str | None = Form(None)):
         uploaded = await document_upload(file, title, "save_staged_document")
-        processed = (
-            await app.state.agent.harness.invoke(
-                "index_document", {"document_id": uploaded["id"]}
-            )
-        )["result"]
+        from backend.app.services.document_worker import document_processing_lock
+
+        async with document_processing_lock(current_principal(s).tenant_id, uploaded["id"]):
+            processed = (
+                await app.state.agent.harness.invoke(
+                    "index_document", {"document_id": uploaded["id"]}
+                )
+            )["result"]
         pages = processed.get("pages", uploaded.get("pages", 1))
         return {
             "pages": pages, "chunks": processed["chunks"],
@@ -388,6 +496,8 @@ def create_app(settings: Settings | None = None):
                 "Automatic ingestion requires a persistent local document store"
                 + (" and Azure DI endpoint." if requires_azure else "."),
             )
+        if requires_azure and not app.state.azure_document["available"]:
+            raise HTTPException(503, app.state.azure_document["blocker"])
         # Revalidate the writer BEFORE starting a potentially billable extraction.
         from backend.app.services.local_documents import graph_writer_readiness
 
@@ -462,14 +572,17 @@ def create_app(settings: Settings | None = None):
             raise HTTPException(400, "document_processing must be local or azure_di")
         if s.auto_document_graph_ingestion:
             ingestion_mode, document_processing = "structured_graph", "azure_di"
-        return await document_upload(
+        result = await document_upload(
             file, title, "save_document", ingestion_mode, document_processing
         )
+        if s.uses_record_store and result.get("id"):
+            app.state.ingestion_wakeup.set()
+        return result
 
     @app.post("/documents/paste")
     async def save_pasted_document(body: IngestPasteRequest):
         await require_auto_graph_writer(requires_azure=False)
-        return (
+        result = (
             await app.state.agent.harness.invoke(
                 "save_document",
                 {
@@ -481,6 +594,9 @@ def create_app(settings: Settings | None = None):
                 },
             )
         )["result"]
+        if s.uses_record_store and result.get("id"):
+            app.state.ingestion_wakeup.set()
+        return result
 
     @app.get("/documents")
     async def list_local_documents():
@@ -497,13 +613,18 @@ def create_app(settings: Settings | None = None):
                     "message": report.semantic_ingestion_blocker,
                 },
             )
-        return (
-            await app.state.agent.harness.invoke("index_document", {"document_id": document_id})
-        )["result"]
+        from backend.app.services.document_worker import document_processing_lock
+
+        async with document_processing_lock(current_principal(s).tenant_id, document_id):
+            return (
+                await app.state.agent.harness.invoke(
+                    "index_document", {"document_id": document_id}
+                )
+            )["result"]
 
     @app.post("/documents/{document_id}/reprocess")
     async def reprocess_local_document(document_id: str):
-        return (
+        result = (
             await app.state.agent.harness.invoke(
                 "reprocess_document",
                 {
@@ -513,6 +634,9 @@ def create_app(settings: Settings | None = None):
                 },
             )
         )["result"]
+        if s.uses_record_store:
+            app.state.ingestion_wakeup.set()
+        return result
 
     @app.post("/documents/{document_id}/enrich-graph")
     async def enrich_local_document_graph(document_id: str):
@@ -520,6 +644,14 @@ def create_app(settings: Settings | None = None):
             await app.state.agent.harness.invoke(
                 "enrich_document_graph", {"document_id": document_id}
             )
+        )["result"]
+
+    @app.post("/documents/upgrade-graph-projection")
+    async def upgrade_graph_projection(document_id: str | None = None):
+        """Operator action: rebuild structural graph meaning from saved extractions."""
+        arguments = {"document_id": document_id} if document_id else {}
+        return (
+            await app.state.agent.harness.invoke("upgrade_graph_projection", arguments)
         )["result"]
 
     @app.get("/documents/{document_id}/status")
@@ -605,13 +737,54 @@ def create_app(settings: Settings | None = None):
         )
         return {"mode": "keyword", "generated_answer": False, "items": result["items"]}
 
-    @app.post("/ingest/url", response_model=IngestUrlResponse)
+    @app.post("/ingest/url", response_model=IngestUrlJobResponse)
     async def ingest_url(body: IngestUrlRequest):
-        if not s.allow_url_ingest:
-            raise HTTPException(403, "URL ingestion is disabled")
-        return (
-            await app.state.agent.harness.invoke("ingest_url", body.model_dump(exclude_none=True))
-        )["result"]
+        if not s.allow_url_ingest or not s.enable_public_web_tools:
+            raise HTTPException(403, {
+                "code": "PUBLIC_WEB_DISABLED",
+                "message": "Website ingestion is disabled by workspace authorization.",
+            })
+        if not s.uses_record_store:
+            raise HTTPException(503, {
+                "code": "VECTOR_INDEX_FAILED",
+                "message": "Local website indexing is unavailable in this workspace.",
+            })
+        try:
+            outcome = await app.state.agent.harness.invoke(
+                "ingest_url", body.model_dump(exclude_none=True)
+            )
+        except MCPToolError as exc:
+            code = getattr(exc, "code", None) or "WEBSITE_UNAVAILABLE"
+            messages = {
+                "PUBLIC_WEB_DISABLED": "Website ingestion is disabled by workspace authorization.",
+                "URL_BLOCKED": "That address is not an allowed public website.",
+                "ROBOTS_DISALLOWED": "The website does not allow this page to be indexed.",
+                "WEBSITE_UNAVAILABLE": "The website could not be retrieved. Check its address or availability.",
+                "CRAWL_EMPTY": "The website returned no readable page content.",
+                "VECTOR_INDEX_FAILED": "The website was retrieved, but local knowledge indexing failed.",
+            }
+            raise HTTPException(
+                exc.status_code if exc.status_code in {400, 403, 422, 502, 503} else 502,
+                {"code": code, "message": messages.get(code, messages["WEBSITE_UNAVAILABLE"])},
+            ) from exc
+        if outcome.get("status") != "ok" or not isinstance(outcome.get("result"), dict):
+            raise HTTPException(502, {
+                "code": "VECTOR_INDEX_FAILED",
+                "message": "The website crawl could not be started.",
+            })
+        # The crawl runs in the background; poll /ingest/url/{job_id}/status.
+        app.state.url_crawl_wakeup.set()
+        return outcome["result"]
+
+    @app.get("/ingest/url/{job_id}/status", response_model=IngestUrlJobResponse)
+    async def ingest_url_status(job_id: str):
+        try:
+            outcome = await app.state.agent.harness.invoke("get_url_crawl_job", {"job_id": job_id})
+        except MCPToolError as exc:
+            raise HTTPException(404, {"code": "CRAWL_JOB_NOT_FOUND", "message": str(exc)}) from exc
+        if outcome.get("status") != "ok" or not isinstance(outcome.get("result"), dict):
+            raise HTTPException(404, {"code": "CRAWL_JOB_NOT_FOUND", "message": "Crawl job not found"})
+        return outcome["result"]
 
     async def load(case_id):
         state = (await app.state.agent.harness.invoke("get_case", {"case_id": case_id}))["result"]
@@ -622,13 +795,14 @@ def create_app(settings: Settings | None = None):
     async def request_result(request_id, summary=None, answer=None, message=None):
         await require_reasoning()
         try:
-            state, events = await app.state.agent.run_request(request_id, summary, answer, message)
-            assertion = summary if summary is not None else message
+            assertion = summary if summary is not None else message if message is not None else answer
             if assertion and s.uses_record_store:
                 await app.state.agent.harness.invoke(
                     "capture_semantic_memory",
                     {"text": assertion, "conversation_id": request_id},
                 )
+            state, events = await app.state.agent.run_request(request_id, summary, answer, message)
+            await asyncio.to_thread(app.state.conversation_history.save_turn, request_id, state)
             return AskResponse(
                 request_id=request_id,
                 intent="knowledge_question" if state["workflow"] == "knowledge" else "service_desk",
@@ -689,6 +863,66 @@ def create_app(settings: Settings | None = None):
     async def forget_memory_profile():
         return (await app.state.agent.harness.invoke("forget_authenticated_profile", {}))["result"]
 
+    @app.post("/memory/save")
+    async def save_memory(body: MemorySaveRequest):
+        if not s.local_persistence_enabled:
+            raise HTTPException(503, "Durable personal memory is disabled")
+        result = (await app.state.agent.harness.invoke(
+            "capture_semantic_memory",
+            {"text": body.text, "conversation_id": body.conversation_id or uuid.uuid4().hex},
+        ))["result"]
+        if not result.get("captured") and result.get("reason") != "duplicate":
+            raise HTTPException(422, "An explicit remember instruction is required")
+        return result
+
+    @app.get("/memory")
+    async def list_memory(query: str | None = None, limit: int = 10):
+        if query:
+            return (await app.state.agent.harness.invoke(
+                "search_semantic_memory", {"query": query, "limit": limit}
+            ))["result"]
+        return (await app.state.agent.harness.invoke("get_authenticated_profile", {}))["result"]
+
+    @app.delete("/memory/{fact_id}")
+    async def forget_memory(fact_id: str):
+        result = (await app.state.agent.harness.invoke(
+            "forget_semantic_memory", {"fact_id": fact_id}
+        ))["result"]
+        if not result.get("revoked"):
+            raise HTTPException(404, "Memory fact not found")
+        return result
+
+    @app.get("/conversations")
+    async def list_conversations():
+        return await asyncio.to_thread(app.state.conversation_history.list)
+
+    @app.get("/conversations/{conversation_id}", response_model=AskResponse)
+    async def get_conversation(conversation_id: str):
+        record = await asyncio.to_thread(app.state.conversation_history.get, conversation_id)
+        if record is None:
+            raise HTTPException(404, "Conversation not found")
+        snapshot = await app.state.agent.graph.aget_state(app.state.agent.config(conversation_id))
+        if not snapshot.values:
+            raise HTTPException(409, "Conversation checkpoint is unavailable; it was not replaced")
+        state = dict(snapshot.values)
+        from backend.app.core.principal import current_principal
+
+        if state.get("request_owner") and state["request_owner"] != current_principal(s).owner_id:
+            raise HTTPException(404, "Conversation not found")
+        events = []
+        if record.get("linked_case_id"):
+            events = (await app.state.agent.harness.invoke(
+                "get_case_history", {"case_id": conversation_id}
+            ))["items"]
+        return AskResponse(
+            request_id=conversation_id,
+            intent="knowledge_question" if state.get("workflow") == "knowledge" else "service_desk",
+            case_id=record.get("linked_case_id"),
+            result=state,
+            events=events,
+            activity=record.get("activity", []),
+        )
+
     @app.post("/requests/{request_id}/resume", response_model=AskResponse)
     async def resume_request(request: Request, request_id: str, body: CaseResumeRequest):
         if "text/event-stream" in request.headers.get("accept", ""):
@@ -705,8 +939,19 @@ def create_app(settings: Settings | None = None):
 
     def stream_operation(request: Request, operation):
         from backend.app.agent.streaming import investigation_stream
+        actor = current_principal(s)
 
-        return investigation_stream(request, s, operation)
+        async def persist_activity(result, activity):
+            request_id = getattr(result, "request_id", None)
+            if request_id:
+                await asyncio.to_thread(
+                    app.state.conversation_history.save_activity,
+                    request_id,
+                    activity,
+                    principal=actor,
+                )
+
+        return investigation_stream(request, s, operation, persist_activity)
 
     @app.post("/ask/stream")
     async def ask_stream(request: Request, body: CaseCreateRequest):

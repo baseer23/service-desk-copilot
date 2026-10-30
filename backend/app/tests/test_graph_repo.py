@@ -56,9 +56,55 @@ def test_structured_graph_writes_reference_metadata_without_raw_content():
     )
     serialized = repr(captured)
     assert "full private paragraph" not in serialized
-    assert all("text" not in params and "embedding" not in params for _, params in captured)
-    assert captured[0][1]["tenant_id"] == "tenant-a"
-    assert len(captured[0][1]["description"]) == 160
+    rows = [row for _, params in captured for row in params["rows"]]
+    assert all("text" not in row and "embedding" not in row for row in rows)
+    assert rows[0]["tenant_id"] == "tenant-a"
+    assert len(rows[0]["description"]) == 160
+
+
+def test_document_publication_batches_writes_and_matches_links_by_label():
+    from types import SimpleNamespace
+
+    from backend.app.services.local_documents import LocalDocumentRepository
+
+    writes = []
+
+    class Driver:
+        def execute_write(self, callback):
+            queries = []
+            writes.append(queries)
+            return callback(
+                SimpleNamespace(run=lambda query, **params: queries.append((query, params)))
+            )
+
+    repo = GraphRepository(Driver(), tenant_provider=lambda: "tenant-a")
+    paragraphs = [
+        {"id": f"p{index}", "page": 1 + index % 3, "position": index,
+         "role": "sectionHeading" if index % 10 == 0 else None,
+         "text": f"Heading {index}" if index % 10 == 0 else f"Paragraph {index}"}
+        for index in range(60)
+    ]
+    extraction = {
+        "pages": [{"page": page, "text": "fictional", "spans": []} for page in (1, 2, 3)],
+        "paragraphs": paragraphs, "tables": [], "figures": [], "sections": [],
+        "method": "document_intelligence",
+    }
+    owner = SimpleNamespace(settings=SimpleNamespace(chunk_tokens=400))
+
+    counts = LocalDocumentRepository._publish_reference_objects(
+        owner, repo, "d" * 64, "Fictional ferry manual", extraction,
+    )
+
+    # Document, pages, reference objects and links: four transactions in all,
+    # however many objects the document has.
+    assert len(writes) == 4
+    queries = [query for batch in writes for query, _ in batch]
+    assert sum(len(params.get("rows", [])) for batch in writes for _, params in batch) > 60
+    links = [query for query in queries if "MERGE (a)-[:" in query]
+    assert links and all(
+        "MATCH (a:Section" in query or "MATCH (a:Paragraph" in query for query in links
+    )
+    assert counts["nodes"] > 60
 
 
 def test_upsert_entity_and_link(mock_driver):

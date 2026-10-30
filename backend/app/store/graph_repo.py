@@ -29,6 +29,88 @@ T = TypeVar("T")
 ChunkRecord = Dict[str, object]
 
 
+# Structural labels. Long narrative text stays in local storage (Chroma); short
+# structural meaning (questions, option labels, headers, titles) and, when the
+# content policy allows, exact values are stored as node properties.
+REFERENCE_LABELS = {
+    "Chunk", "Table", "Figure", "Section", "Paragraph", "TableCell", "FormField", "SelectionMark",
+}
+REFERENCE_RELATIONSHIPS = {
+    "HAS_SECTION", "HAS_CHUNK", "HAS_TABLE", "HAS_FIGURE", "HAS_PARAGRAPH", "HAS_TABLECELL",
+    "HAS_CELL", "HAS_FORMFIELD", "HAS_SELECTIONMARK", "REFERENCES_TABLE", "REFERENCES_FIGURE",
+    "MENTIONS", "RELATED_TO", "HEADER_OF", "PART_OF",
+}
+# Meaningful properties a structural node may carry, beyond its provenance.
+MEANINGFUL_PROPERTIES = {
+    "question", "question_normalized", "field_type", "field_status", "selected_option",
+    "association_method", "ambiguity_reason", "option_count", "option_label", "selected",
+    "ordinal",
+    "form_field_id", "title", "caption", "level", "page_start", "page_end",
+    "content_references", "row_count", "column_count", "column_headers", "row_headers",
+    "table_id", "row_group", "row_span", "column_span", "kind", "column_header", "row_header",
+    "value", "data_type", "unit", "header_text", "content_policy",
+}
+WRITE_BATCH_ROWS = 500
+# Exact structural lookups. Fixed, parameterised and tenant-scoped; the agent
+# runs them through neo4j-mcp read-cypher and never composes its own Cypher.
+EXACT_FORM_FIELDS_QUERY = (
+    "MATCH (f:FormField) WHERE f.tenant_id = $tenant_id AND f.document_id IN $document_ids "
+    "OPTIONAL MATCH (f)-[:HAS_SELECTIONMARK]->(m:SelectionMark) "
+    "WITH f, m ORDER BY m.ordinal "
+    "WITH f, collect(CASE WHEN m IS NULL THEN NULL ELSE {label: m.option_label, "
+    "selected: m.state_flag = 'selected', confidence: m.confidence, ordinal: m.ordinal} END) "
+    "AS options "
+    "RETURN coalesce(f.original_id, f.id) AS object_id, f.document_id AS document_id, "
+    "f.page AS page, f.question AS question, f.question_normalized AS question_normalized, "
+    "f.field_type AS field_type, f.field_status AS status, f.selected_option AS selected_option, "
+    "f.confidence AS confidence, f.ambiguity_reason AS ambiguity_reason, "
+    "f.association_method AS association_method, options LIMIT 500"
+)
+EXACT_TABLE_CELLS_QUERY = (
+    "MATCH (c:TableCell) WHERE c.tenant_id = $tenant_id AND c.document_id IN $document_ids "
+    "AND c.kind = 'content' "
+    "RETURN coalesce(c.original_id, c.id) AS object_id, c.document_id AS document_id, "
+    "c.page AS page, c.table_id AS table_id, c.table_row AS row, c.table_column AS column, "
+    "c.row_span AS row_span, c.column_span AS column_span, c.column_header AS column_header, "
+    "c.row_header AS row_header, c.value AS value, c.data_type AS data_type, c.unit AS unit "
+    "LIMIT 5000"
+)
+
+
+VERIFIED_CLAIMS = {"observed", "derived", "documented"}
+
+
+def claim_status(item):
+    """A claim's stored status; unlabeled legacy proposals keep 'documented'."""
+    status = item.get("status")
+    return status if status in {"observed", "derived", "ambiguous", "hypothesis"} else "documented"
+
+
+def meaningful_properties(values):
+    """Allowlisted, Neo4j-storable properties (primitives or lists of primitives).
+
+    A None value is kept so ``SET n += map`` removes a property the current
+    content policy no longer allows.
+    """
+    clean = {}
+    for key, value in (values or {}).items():
+        if key not in MEANINGFUL_PROPERTIES:
+            continue
+        if isinstance(value, str):
+            value = value[:1000]
+        elif isinstance(value, list):
+            value = [str(item)[:300] for item in value[:50]]
+        elif value is not None and not isinstance(value, (bool, int, float)):
+            continue
+        clean[key] = value
+    return clean
+
+
+def _batches(rows):
+    for start in range(0, len(rows), WRITE_BATCH_ROWS):
+        yield rows[start:start + WRITE_BATCH_ROWS]
+
+
 class GraphRepository:
     """Persistence adapter for document, chunk, and entity metadata in Neo4j."""
 
@@ -60,12 +142,20 @@ class GraphRepository:
             "CREATE CONSTRAINT IF NOT EXISTS FOR (c:Chunk) REQUIRE c.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (e:Entity) REQUIRE e.id IS UNIQUE",
             "CREATE INDEX IF NOT EXISTS FOR (e:Entity) ON (e.name)",
+            "CREATE INDEX IF NOT EXISTS FOR (e:Entity) ON (e.normalized_name)",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (c:GraphClaim) REQUIRE c.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (m:GraphMention) REQUIRE m.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (s:Section) REQUIRE s.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (t:Table) REQUIRE t.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (f:Figure) REQUIRE f.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (p:Page) REQUIRE p.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (p:Paragraph) REQUIRE p.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (c:TableCell) REQUIRE c.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (f:FormField) REQUIRE f.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (m:SelectionMark) REQUIRE m.id IS UNIQUE",
+            "CREATE INDEX IF NOT EXISTS FOR (f:FormField) ON (f.document_id)",
+            "CREATE INDEX IF NOT EXISTS FOR (f:FormField) ON (f.question_normalized)",
+            "CREATE INDEX IF NOT EXISTS FOR (c:TableCell) ON (c.document_id)",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (t:Topic) REQUIRE t.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (f:SemanticFact) REQUIRE f.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (s:ConversationSource) REQUIRE s.id IS UNIQUE",
@@ -77,15 +167,19 @@ class GraphRepository:
     def upsert_document(
         self, doc_id: str, title: Optional[str] = None, source: str = "paste",
         *, version: int = 1, content_hash: str | None = None,
+        source_type: str | None = None, source_url: str | None = None,
+        canonical_url: str | None = None, projection: dict | None = None,
     ) -> None:
-        """Insert or update a document node and basic metadata."""
+        """Insert or update a document node, its metadata and source provenance."""
 
         def _tx(tx: Transaction) -> None:
             tx.run(
                 "MERGE (d:Document {id: $doc_id}) "
                 "SET d.title = $title, d.source = $source, d.version=$version, "
                 "d.content_hash=$content_hash, d.link_status='linked', "
-                "d.updated_at = timestamp(), d.original_id=$original_id, d.tenant_id=$tenant_id",
+                "d.updated_at = timestamp(), d.original_id=$original_id, d.tenant_id=$tenant_id, "
+                "d.source_type=$source_type, d.source_url=$source_url, "
+                "d.canonical_url=$canonical_url, d += $projection",
                 doc_id=self.scope(doc_id),
                 title=title,
                 source=source,
@@ -93,24 +187,59 @@ class GraphRepository:
                 tenant_id=self.tenant(),
                 version=version,
                 content_hash=content_hash or doc_id,
+                source_type=source_type,
+                source_url=source_url or None,
+                canonical_url=canonical_url or None,
+                projection={
+                    key: value for key, value in (projection or {}).items()
+                    if key in {"projection_version", "content_policy", "extraction_method",
+                               "extraction_artifact"}
+                },
             )
 
         self._execute_write(_tx)
 
+    def exact_form_fields(self, document_ids):
+        """Form fields of the given documents with their options, by index lookup."""
+        def read(tx):
+            return [dict(row) for row in tx.run(
+                EXACT_FORM_FIELDS_QUERY, tenant_id=self.tenant(), document_ids=list(document_ids),
+            )]
+        return self._execute_read(read) or []
+
+    def exact_table_cells(self, document_ids):
+        """Content cells of the given documents' tables with their headers."""
+        def read(tx):
+            return [dict(row) for row in tx.run(
+                EXACT_TABLE_CELLS_QUERY, tenant_id=self.tenant(), document_ids=list(document_ids),
+            )]
+        return self._execute_read(read) or []
+
     def upsert_page(self, doc_id: str, page: int, version: int = 1) -> None:
         """Create a tenant-scoped page anchor without storing private content."""
-        page_id = f"{doc_id}:page:{page}"
+        self.upsert_pages(doc_id, [page], version)
+
+    def upsert_pages(self, doc_id: str, pages, version: int = 1) -> None:
+        """Create many page anchors in one transaction (one round trip per batch)."""
+        rows = [
+            {"page_id": self.scope(f"{doc_id}:page:{page}"),
+             "original_id": f"{doc_id}:page:{page}", "page": page}
+            for page in pages
+        ]
+        if not rows:
+            return
 
         def _tx(tx: Transaction) -> None:
-            tx.run(
-                "MATCH (d:Document {id:$doc_id}) MERGE (p:Page {id:$page_id}) "
-                "SET p.original_id=$original_id, p.document_id=$original_doc_id, "
-                "p.page=$page, p.version=$version, p.tenant_id=$tenant "
-                "MERGE (d)-[:HAS_PAGE]->(p)",
-                doc_id=self.scope(doc_id), page_id=self.scope(page_id),
-                original_id=page_id, original_doc_id=doc_id, page=page,
-                version=version, tenant=self.tenant(),
-            )
+            for batch in _batches(rows):
+                tx.run(
+                    "MATCH (d:Document {id:$doc_id}) UNWIND $rows AS row "
+                    "MERGE (p:Page {id:row.page_id}) "
+                    "SET p.original_id=row.original_id, p.document_id=$original_doc_id, "
+                    "p.page=row.page, p.version=$version, p.tenant_id=$tenant "
+                    "MERGE (d)-[:HAS_PAGE]->(p)",
+                    rows=batch, doc_id=self.scope(doc_id), original_doc_id=doc_id,
+                    version=version, tenant=self.tenant(),
+                )
 
         self._execute_write(_tx)
 
@@ -135,53 +264,84 @@ class GraphRepository:
 
     def upsert_reference_object(self, doc_id: str, item: dict) -> None:
         """Persist bounded reference metadata only; actual content remains local."""
-        label = item.get("object_type", "Chunk")
-        if label not in {"Chunk", "Table", "Figure", "Section", "Paragraph", "TableCell"}:
-            raise ValueError("Unsupported graph object type")
-        description = re.sub(r"\s+", " ", str(item.get("description") or "")).strip()[:160]
+        self.upsert_reference_objects(doc_id, [item])
+
+    def upsert_reference_objects(self, doc_id: str, items) -> None:
+        """Persist many reference objects with one UNWIND per label and batch.
+
+        A per-object transaction costs several Aura round trips, which made
+        linking a large form take minutes.
+        """
+        grouped: dict[str, list[dict]] = {}
+        for item in items:
+            label = item.get("object_type", "Chunk")
+            if label not in REFERENCE_LABELS:
+                raise ValueError("Unsupported graph object type")
+            grouped.setdefault(label, []).append(self._reference_row(doc_id, item))
+        if not grouped:
+            return
 
         def _tx(tx: Transaction) -> None:
-            tx.run(
-                f"MERGE (n:{label} {{id: $id}}) "
-                "SET n.original_id=$original_id, n.document_id=$document_id, "
-                "n.page=$page, n.ordinal=$ordinal, n.description=$description, "
-                "n.document_hash=$document_hash, n.content_hash=$content_hash, "
-                "n.version=$version, n.source_provenance=$source_provenance, "
-                "n.link_status=$link_status, n.tenant_id=$tenant_id, "
-                "n.source_element_id=$source_element_id, n.azure_role=$azure_role, "
-                "n.span_offset=$span_offset, n.span_length=$span_length, "
-                "n.table_row=$table_row, n.table_column=$table_column, "
-                "n.bounding_regions_json=$bounding_regions_json",
-                id=self.scope(item["object_id"]),
-                original_id=item["object_id"],
-                document_id=doc_id,
-                page=item.get("page"),
-                ordinal=item.get("position"),
-                description=description,
-                document_hash=doc_id,
-                tenant_id=self.tenant(),
-                content_hash=item.get("content_hash"),
-                version=item.get("version", 1),
-                source_provenance=item.get("source_provenance"),
-                link_status=item.get("link_status", "linked"),
-                source_element_id=item.get("source_element_id"),
-                azure_role=item.get("azure_role"),
-                span_offset=item.get("span_offset"),
-                span_length=item.get("span_length"),
-                table_row=item.get("table_row"),
-                table_column=item.get("table_column"),
-                bounding_regions_json=json.dumps(
-                    item.get("bounding_regions", [])[:8], separators=(",", ":")
-                )[:4000],
-            )
-            tx.run(
-                f"MATCH (p:Page {{id:$page_id}}), (n:{label} {{id:$id}}) "
-                f"MERGE (p)-[:HAS_{label.upper()}]->(n)",
-                page_id=self.scope(f"{doc_id}:page:{item.get('page')}"),
-                id=self.scope(item["object_id"]),
-            )
+            for label, rows in grouped.items():
+                for batch in _batches(rows):
+                    tx.run(
+                        f"UNWIND $rows AS row MERGE (n:{label} {{id: row.id}}) "
+                        "SET n.original_id=row.original_id, n.document_id=row.document_id, "
+                        "n.page=row.page, n.ordinal=row.ordinal, n.description=row.description, "
+                        "n.document_hash=row.document_hash, n.content_hash=row.content_hash, "
+                        "n.version=row.version, n.source_provenance=row.source_provenance, "
+                        "n.link_status=row.link_status, n.tenant_id=row.tenant_id, "
+                        "n.source_element_id=row.source_element_id, n.azure_role=row.azure_role, "
+                        "n.span_offset=row.span_offset, n.span_length=row.span_length, "
+                        "n.table_row=row.table_row, n.table_column=row.table_column, "
+                        "n.role=row.role, n.state_flag=row.state_flag, "
+                        "n.confidence=row.confidence, "
+                        "n.bounding_regions_json=row.bounding_regions_json, "
+                        "n += row.properties",
+                        rows=batch,
+                    )
+                    if label == "SelectionMark":
+                        continue  # reached through its FormField, not directly from the Page
+                    tx.run(
+                        f"UNWIND $rows AS row MATCH (p:Page {{id:row.page_id}}) "
+                        f"MATCH (n:{label} {{id:row.id}}) MERGE (p)-[:HAS_{label.upper()}]->(n)",
+                        rows=batch,
+                    )
 
         self._execute_write(_tx)
+
+    def _reference_row(self, doc_id: str, item: dict) -> dict:
+        description = re.sub(r"\s+", " ", str(item.get("description") or "")).strip()[:160]
+        return {
+            "id": self.scope(item["object_id"]),
+            "page_id": self.scope(f"{doc_id}:page:{item.get('page')}"),
+            "original_id": item["object_id"],
+            "document_id": doc_id,
+            "page": item.get("page"),
+            "ordinal": item.get("position"),
+            "description": description,
+            "document_hash": doc_id,
+            "tenant_id": self.tenant(),
+            "content_hash": item.get("content_hash"),
+            "version": item.get("version", 1),
+            "source_provenance": item.get("source_provenance"),
+            "link_status": item.get("link_status", "linked"),
+            "source_element_id": item.get("source_element_id"),
+            "azure_role": item.get("azure_role"),
+            "span_offset": item.get("span_offset"),
+            "span_length": item.get("span_length"),
+            "table_row": item.get("table_row"),
+            "table_column": item.get("table_column"),
+            # Form references carry a role, a state flag and a confidence,
+            # never the question's answer text.
+            "role": item.get("role"),
+            "state_flag": item.get("state_flag"),
+            "confidence": item.get("confidence"),
+            "bounding_regions_json": json.dumps(
+                item.get("bounding_regions", [])[:8], separators=(",", ":")
+            )[:4000],
+            "properties": meaningful_properties(item.get("properties")),
+        }
 
     def fetch_structured_references(
         self,
@@ -203,6 +363,8 @@ class GraphRepository:
             "HAS_PARAGRAPH",
             "HAS_TABLECELL",
             "HAS_CELL",
+            "HAS_FORMFIELD",
+            "HAS_SELECTIONMARK",
             "HAS_OBJECT",
             "REFERENCES_TABLE",
             "REFERENCES_FIGURE",
@@ -216,8 +378,8 @@ class GraphRepository:
         ]
         selected_types = [
             label
-            for label in (object_types or ["Chunk", "Table", "Figure", "Section", "Paragraph", "TableCell"])
-            if label in {"Chunk", "Table", "Figure", "Section", "Paragraph", "TableCell"}
+            for label in (object_types or sorted(REFERENCE_LABELS))
+            if label in REFERENCE_LABELS
         ]
 
         def _tx(tx: Transaction):
@@ -230,45 +392,105 @@ class GraphRepository:
                 "MATCH path=(seed)-[*0..2]-(n) "
                 "WHERE n.tenant_id=$tenant AND any(label IN labels(n) WHERE label IN $object_types) "
                 "AND all(r IN relationships(path) WHERE type(r) IN $relationships) "
-                "RETURN DISTINCT coalesce(n.original_id,n.id) AS object_id, labels(n)[0] AS object_type, "
-                "n.document_id AS document_id, n.page AS page, n.description AS description "
+                "WITH DISTINCT n,d, reduce(score=0, term IN $terms | score + "
+                "CASE WHEN toLower(coalesce(n.description,'')) CONTAINS term THEN 2 ELSE 0 END + "
+                "CASE WHEN toLower(coalesce(d.title,'')) CONTAINS term THEN 1 ELSE 0 END) AS relevance "
+                "RETURN coalesce(n.original_id,n.id) AS object_id, labels(n)[0] AS object_type, "
+                "coalesce(n.document_id,d.original_id) AS document_id, n.page AS page, "
+                "n.description AS description ORDER BY relevance DESC, n.page ASC "
                 "LIMIT $limit",
                 tenant=self.tenant(),
                 terms=terms,
                 document_ids=list(document_ids or []),
                 object_types=selected_types,
                 relationships=selected_relationships,
-                limit=min(max(limit, 1), 20),
+                limit=min(max(limit, 1), 200),
             )
             return [dict(record) for record in result]
 
         return self._execute_read(_tx) or []
 
-    def link_reference_objects(self, source_id: str, target_id: str, relationship: str):
-        allowed = {
-            "HAS_SECTION",
-            "HAS_CHUNK",
-            "HAS_TABLE",
-            "HAS_FIGURE",
-            "HAS_PARAGRAPH",
-            "HAS_TABLECELL",
-            "HAS_CELL",
-            "REFERENCES_TABLE",
-            "REFERENCES_FIGURE",
-            "MENTIONS",
-            "RELATED_TO",
-        }
-        if relationship not in allowed:
-            raise ValueError("Unsupported structured relationship")
+    def link_website_document(self, doc_id: str, origin: str, canonical_url: str, outlinks):
+        """Attach a crawled page to its Website and to linked pages, in one transaction.
+
+        LINKS_TO is written in both directions against Documents already in the
+        graph (matched by canonical_url), so pages can be linked in any order: a
+        link to a page not yet saved is written when that page arrives. Counts
+        are relationships actually created.
+        """
+        outlinks = [str(url) for url in list(dict.fromkeys(outlinks or []))[:500]]
 
         def _tx(tx: Transaction):
-            tx.run(
-                "MATCH (a {id:$source}), (b {id:$target}) "
-                f"WHERE a.tenant_id=$tenant AND b.tenant_id=$tenant MERGE (a)-[:{relationship}]->(b)",
-                source=self.scope(source_id),
-                target=self.scope(target_id),
-                tenant=self.tenant(),
+            attached = tx.run(
+                "MATCH (d:Document {id:$doc}) WHERE d.tenant_id=$tenant "
+                "SET d.outlinks=$outlinks "
+                "MERGE (w:Website {id:$website}) ON CREATE SET w.created_at=timestamp() "
+                "SET w.origin=$origin, w.original_id=$origin, w.tenant_id=$tenant "
+                "MERGE (w)-[:HAS_DOCUMENT]->(d) RETURN count(d) AS attached",
+                doc=self.scope(doc_id), tenant=self.tenant(), outlinks=outlinks,
+                website=self.scope("website:" + origin), origin=origin,
+            ).single()
+            if not attached or not attached["attached"]:
+                # The page Document is not in the graph yet: nothing was written.
+                return {"outbound": 0, "inbound": 0, "document_found": False}
+            outbound = tx.run(
+                "MATCH (d:Document {id:$doc}) WHERE d.tenant_id=$tenant "
+                "UNWIND $outlinks AS url "
+                "MATCH (t:Document {canonical_url:url}) WHERE t.tenant_id=$tenant AND t <> d "
+                "MERGE (d)-[:LINKS_TO]->(t)",
+                doc=self.scope(doc_id), tenant=self.tenant(), outlinks=outlinks,
+            ).consume().counters.relationships_created
+            inbound = tx.run(
+                "MATCH (d:Document {id:$doc}) WHERE d.tenant_id=$tenant "
+                "MATCH (s:Document) WHERE s.tenant_id=$tenant AND s <> d "
+                "AND $canonical IN coalesce(s.outlinks, []) "
+                "MERGE (s)-[:LINKS_TO]->(d)",
+                doc=self.scope(doc_id), tenant=self.tenant(), canonical=canonical_url,
+            ).consume().counters.relationships_created
+            # Counters report relationships actually created, not existing ones re-matched.
+            return {"outbound": outbound, "inbound": inbound, "document_found": True}
+
+        return self._execute_write(_tx) or {"outbound": 0, "inbound": 0, "document_found": False}
+
+    def link_reference_objects(
+        self, source_id: str, target_id: str, relationship: str,
+        source_label: str | None = None, target_label: str | None = None,
+    ):
+        self.link_reference_objects_many(
+            [(source_id, target_id, relationship, source_label, target_label)]
+        )
+
+    def link_reference_objects_many(self, links) -> None:
+        """Link reference objects in batches of (source, target, relationship[, labels]).
+
+        Known labels let the match use the per-label id constraints instead
+        of scanning every node in the database for each link.
+        """
+        grouped: dict[tuple, list[dict]] = {}
+        for source_id, target_id, relationship, *labels in links:
+            source_label, target_label = [*labels, None, None][:2]
+            if relationship not in REFERENCE_RELATIONSHIPS:
+                raise ValueError("Unsupported structured relationship")
+            if {source_label, target_label} - REFERENCE_LABELS - {None}:
+                raise ValueError("Unsupported graph object type")
+            grouped.setdefault((relationship, source_label, target_label), []).append(
+                {"source": self.scope(source_id), "target": self.scope(target_id)}
             )
+        if not grouped:
+            return
+
+        def _tx(tx: Transaction):
+            for (relationship, source_label, target_label), rows in grouped.items():
+                source = f":{source_label}" if source_label else ""
+                target = f":{target_label}" if target_label else ""
+                for batch in _batches(rows):
+                    tx.run(
+                        f"UNWIND $rows AS row MATCH (a{source} {{id:row.source}}) "
+                        f"MATCH (b{target} {{id:row.target}}) "
+                        "WHERE a.tenant_id=$tenant AND b.tenant_id=$tenant "
+                        f"MERGE (a)-[:{relationship}]->(b)",
+                        rows=batch, tenant=self.tenant(),
+                    )
 
         self._execute_write(_tx)
 
@@ -416,9 +638,9 @@ class GraphRepository:
                 "MATCH path=(seed)-[*1..2]-(neighbor:Entity) "
                 "UNWIND relationships(path) AS r "
                 "WITH r WHERE ($tenant IS NULL OR (startNode(r).tenant_id=$tenant AND endNode(r).tenant_id=$tenant)) "
-                'AND type(r) IN ["WORKS_AT","HAS_SITE","USES","AFFECTS","APPLIES_TO","INVOLVES","ASSOCIATED_WITH"] '
+                'AND (type(r) IN ["WORKS_AT","HAS_SITE","USES","AFFECTS","APPLIES_TO","INVOLVES","ASSOCIATED_WITH"] OR type(r)="RELATED_TO") '
                 "AND ($allow_fixtures OR coalesce(r.source_system, '') <> 'local_fixture') "
-                "RETURN DISTINCT startNode(r).name AS subject, type(r) AS predicate, "
+                "RETURN DISTINCT startNode(r).name AS subject, coalesce(r.predicate,type(r)) AS predicate, "
                 "endNode(r).name AS object, r.source_system AS source_system, "
                 "toString(r.observed_at) AS observed_at LIMIT $limit",
                 terms=terms,
@@ -429,6 +651,152 @@ class GraphRepository:
             return [dict(row) for row in rows]
 
         return self._execute_read(read) or []
+
+    def find_entity_candidates(self, name, entity_type=None, aliases=None, identifiers=None, limit=20):
+        """Find compact candidate identities without mutating the graph."""
+        terms = list(dict.fromkeys(v.casefold() for v in [name, *(aliases or [])] if v.strip()))[:20]
+        identifier_values = [str(v).casefold() for v in (identifiers or {}).values() if str(v).strip()][:20]
+
+        def read(tx):
+            rows = tx.run(
+                "MATCH (e:Entity) WHERE e.tenant_id=$tenant AND ("
+                "toLower(coalesce(e.normalized_name,e.name,'')) IN $terms OR "
+                "any(a IN coalesce(e.aliases,[]) WHERE toLower(a) IN $terms) OR "
+                "any(v IN $identifiers WHERE toLower(coalesce(e.identifiers_json,'')) CONTAINS v)) "
+                "RETURN coalesce(e.original_id,toLower(e.name)) AS id,e.name AS name,"
+                "coalesce(e.kind,e.type) AS kind,e.aliases AS aliases,e.description AS description "
+                "ORDER BY CASE WHEN toLower(coalesce(e.normalized_name,e.name,''))=$name THEN 0 ELSE 1 END "
+                "LIMIT $limit",
+                tenant=self.tenant(), terms=terms, identifiers=identifier_values,
+                name=name.casefold(), limit=min(max(limit, 1), 20),
+            )
+            return [dict(row) for row in rows]
+        return self._execute_read(read) or []
+
+    def get_entity_neighborhood(self, entity_id, max_hops=2, limit=30):
+        hops = 1 if max_hops <= 1 else 2
+        query = (
+            f"MATCH (seed:Entity {{id:$id}}) WHERE seed.tenant_id=$tenant "
+            f"OPTIONAL MATCH path=(seed)-[*1..{hops}]-(other:Entity) "
+            "WHERE other.tenant_id=$tenant UNWIND relationships(path) AS r "
+            "RETURN DISTINCT coalesce(startNode(r).original_id,toLower(startNode(r).name)) AS source_id,"
+            "startNode(r).name AS source,coalesce(r.predicate,type(r)) AS predicate,"
+            "coalesce(endNode(r).original_id,toLower(endNode(r).name)) AS target_id,endNode(r).name AS target LIMIT $limit"
+        )
+        def read(tx):
+            return [dict(row) for row in tx.run(query, id=self.scope(entity_id), tenant=self.tenant(), limit=min(max(limit, 1), 30))]
+        return {"entity_id": entity_id, "relationships": self._execute_read(read) or []}
+
+    def find_related_documents(self, entity_id, limit=20):
+        def read(tx):
+            rows = tx.run(
+                "MATCH (e:Entity {id:$id}) WHERE e.tenant_id=$tenant "
+                "MATCH (e)<-[:REFERS_TO]-(m:GraphMention)-[:MENTIONED_IN]->(d:Document) "
+                "OPTIONAL MATCH (m)-[:SUPPORTED_BY]->(o) "
+                "RETURN coalesce(d.original_id,d.id) AS document_id,d.title AS title,"
+                "d.summary AS summary,collect(DISTINCT coalesce(o.original_id,o.id))[0..50] AS object_ids LIMIT $limit",
+                id=self.scope(entity_id), tenant=self.tenant(), limit=min(max(limit, 1), 20),
+            )
+            return [dict(row) for row in rows]
+        return self._execute_read(read) or []
+
+    def existing_entity_ids(self, entity_ids):
+        logical = list(dict.fromkeys(entity_ids))[:100]
+        def read(tx):
+            rows = tx.run("MATCH (e:Entity) WHERE e.tenant_id=$tenant AND e.id IN $ids "
+                          "RETURN coalesce(e.original_id,toLower(e.name)) AS id",
+                          tenant=self.tenant(), ids=[self.scope(value) for value in logical])
+            return [row["id"] for row in rows]
+        return set(self._execute_read(read) or [])
+
+    def update_document_semantics(self, document_id, *, document_type, summary, status):
+        def write(tx):
+            tx.run("MATCH (d:Document {id:$id}) WHERE d.tenant_id=$tenant "
+                   "SET d.document_type=$type,d.summary=$summary,d.semantic_graph_status=$status,d.semantic_updated_at=timestamp()",
+                   id=self.scope(document_id), tenant=self.tenant(), type=document_type[:160], summary=summary[:1200], status=status)
+        self._execute_write(write)
+
+    def upsert_knowledge_entities(self, entities):
+        for entity in entities:
+            def write(tx, entity=entity):
+                tx.run("MERGE (e:Entity {id:$id}) ON CREATE SET e.created_at=timestamp() "
+                       "SET e.original_id=$original_id,e.tenant_id=$tenant,e.name=$name,e.normalized_name=$normalized,"
+                       "e.kind=$kind,e.aliases=$aliases,e.identifiers_json=$identifiers,e.description=$description,e.updated_at=timestamp()",
+                       id=self.scope(entity["id"]), original_id=entity["id"], tenant=self.tenant(),
+                       name=entity["name"][:240], normalized=entity["name"].casefold()[:240], kind=entity["kind"][:100],
+                       aliases=[str(v)[:240] for v in entity.get("aliases", [])[:20]],
+                       identifiers=json.dumps(entity.get("identifiers", {}), sort_keys=True)[:4000],
+                       description=str(entity.get("description", ""))[:1200])
+            self._execute_write(write)
+        return {"upserted": len(entities)}
+
+    def upsert_knowledge_relationships(self, relationships):
+        """Write claims; the count is rows actually matched, never proposals."""
+        written = 0
+        for item in relationships:
+            evidence = list(dict.fromkeys(item.get("evidence_object_ids", [])))[:50]
+            claim_id = "claim_" + hashlib.sha256(json.dumps({
+                "s": item["source_id"], "p": item["predicate"], "o": item["target_id"],
+                "d": item["document_id"], "e": evidence}, sort_keys=True).encode()).hexdigest()[:32]
+            def write_scoped(tx, item=item, evidence=evidence, claim_id=claim_id):
+                result = tx.run("MATCH (a:Entity {id:$source}),(b:Entity {id:$target}),(d:Document {id:$document}) "
+                       "WHERE a.tenant_id=$tenant AND b.tenant_id=$tenant AND d.tenant_id=$tenant "
+                       # Only verified claims (observed/derived) become a traversable edge;
+                       # ambiguous and hypothesis claims stay GraphClaims with their status.
+                       "FOREACH (_ IN CASE WHEN $verified THEN [1] ELSE [] END | "
+                       "MERGE (a)-[r:RELATED_TO {predicate:$predicate}]->(b) "
+                       "ON CREATE SET r.created_at=timestamp() "
+                       "SET r.updated_at=timestamp(), r.status=$status) "
+                       "MERGE (c:GraphClaim {id:$claim}) SET c.original_id=$claim_original,c.tenant_id=$tenant,c.predicate=$predicate,"
+                       "c.confidence=$confidence,c.is_explicit=$explicit,c.description=$description,c.observed_at=$observed_at,c.status=$status "
+                       "MERGE (c)-[:SUBJECT]->(a) MERGE (c)-[:OBJECT]->(b) MERGE (c)-[:DOCUMENTED_IN]->(d) "
+                       "RETURN count(c) AS written",
+                       source=self.scope(item["source_id"]), target=self.scope(item["target_id"]), document=self.scope(item["document_id"]),
+                       tenant=self.tenant(), predicate=item["predicate"][:64], claim=self.scope(claim_id), claim_original=claim_id,
+                       confidence=float(item.get("confidence", 0)), explicit=bool(item.get("is_explicit", True)),
+                       description=str(item.get("description", ""))[:1200], observed_at=item.get("observed_at"),
+                       status=claim_status(item), verified=claim_status(item) in VERIFIED_CLAIMS)
+                record = result.single()
+                if evidence:
+                    tx.run("MATCH (c:GraphClaim {id:$claim}) UNWIND $evidence AS oid "
+                           "MATCH (o {id:oid}) WHERE c.tenant_id=$tenant AND o.tenant_id=$tenant "
+                           "MERGE (c)-[:SUPPORTED_BY]->(o)", claim=self.scope(claim_id),
+                           evidence=[self.scope(v) for v in evidence], tenant=self.tenant())
+                return record["written"] if record else 0
+            written += self._execute_write(write_scoped) or 0
+        return {"upserted": written, "proposed": len(relationships)}
+
+    def link_document_mentions(self, document_id, mentions):
+        """Link mentions; counts are rows actually matched, never proposals."""
+        linked = resolved = 0
+        for item in mentions:
+            mention_id = "mention_" + hashlib.sha256(f"{document_id}:{item['mention_id']}".encode()).hexdigest()[:32]
+            def write(tx, item=item, mention_id=mention_id):
+                result = tx.run("MATCH (d:Document {id:$document}) WHERE d.tenant_id=$tenant "
+                       "MERGE (m:GraphMention {id:$mention}) SET m.original_id=$mention_original,m.tenant_id=$tenant,"
+                       "m.name=$name,m.kind=$kind,m.status=$status MERGE (m)-[:MENTIONED_IN]->(d) "
+                       "RETURN count(m) AS linked",
+                       document=self.scope(document_id), tenant=self.tenant(), mention=self.scope(mention_id),
+                       mention_original=mention_id, name=item["name"][:240], kind=item["kind"][:100], status=item["status"])
+                record = result.single()
+                evidence = item.get("evidence_object_ids", [])[:50]
+                if evidence:
+                    tx.run("MATCH (m:GraphMention {id:$mention}) UNWIND $evidence AS oid "
+                           "MATCH (o {id:oid}) WHERE m.tenant_id=$tenant AND o.tenant_id=$tenant "
+                           "MERGE (m)-[:SUPPORTED_BY]->(o)", mention=self.scope(mention_id),
+                           evidence=[self.scope(v) for v in evidence], tenant=self.tenant())
+                refers = 0
+                if item.get("entity_id"):
+                    refers_record = tx.run("MATCH (m:GraphMention {id:$mention}),(e:Entity {id:$entity}) "
+                           "WHERE m.tenant_id=$tenant AND e.tenant_id=$tenant MERGE (m)-[:REFERS_TO]->(e) "
+                           "RETURN count(e) AS resolved",
+                           mention=self.scope(mention_id), entity=self.scope(item["entity_id"]), tenant=self.tenant()).single()
+                    refers = refers_record["resolved"] if refers_record else 0
+                return (record["linked"] if record else 0), refers
+            counts = self._execute_write(write) or (0, 0)
+            linked += counts[0]
+            resolved += counts[1]
+        return {"linked": linked, "resolved": resolved, "proposed": len(mentions)}
 
     def upsert_semantic_memory(self, batch) -> None:
         """Idempotently publish validated, owner-scoped facts and provenance."""
@@ -455,10 +823,10 @@ class GraphRepository:
                     "MERGE (s:ConversationSource {id:$id}) "
                     "SET s.source_type=$source_type, s.source_id=$source_id, "
                     "s.content_hash=$content_hash, s.observed_at=$observed_at, "
-                    "s.tenant_id=$tenant, s.updated_at=timestamp()",
+                    "s.tenant_id=$tenant, s.owner_id=$owner, s.updated_at=timestamp()",
                     id=self.scope(source.id), source_type=source.source_type,
                     source_id=source.source_id, content_hash=source.content_hash,
-                    observed_at=source.observed_at, tenant=tenant,
+                    observed_at=source.observed_at, tenant=tenant, owner=source.owner_id,
                 )
 
             self._execute_write(write_source)
@@ -471,14 +839,15 @@ class GraphRepository:
                     "MATCH (subject {id:$subject_id}) "
                     "WHERE subject.tenant_id=$tenant AND subject.owner_id=$owner "
                     "MERGE (f:SemanticFact {id:$fact_id}) "
-                    "SET f.predicate=$predicate, f.value=$value, f.confidence=$confidence, "
+                    "SET f.predicate=$predicate, f.category=$category, f.value=$value, f.confidence=$confidence, "
                     "f.status=$status, f.tenant_id=$tenant, f.owner_id=$owner, "
                     "f.original_id=$original_id, f.updated_at=timestamp() "
                     "MERGE (subject)-[:HAS_FACT]->(f) "
                     "WITH f MATCH (s:ConversationSource {id:$source_id}) "
                     "WHERE s.tenant_id=$tenant MERGE (f)-[:SUPPORTED_BY]->(s)",
                     subject_id=self.scope(fact.subject_id), fact_id=self.scope(fact.id),
-                    predicate=fact.predicate, value=fact.value, confidence=fact.confidence,
+                    predicate=fact.predicate, category=fact.category,
+                    value=fact.value, confidence=fact.confidence,
                     status=fact.status, tenant=fact.tenant_id, owner=fact.owner_id,
                     source_id=self.scope(fact.source_id), original_id=fact.id,
                 )
@@ -554,6 +923,34 @@ class GraphRepository:
         except Exception:  # pragma: no cover - depends on runtime connectivity
             return False
 
+    def delete_workspace_graph(self, tenant_id: str, batch_size: int = 500) -> dict:
+        """Delete only nodes carrying an exact tenant owner marker, in bounded batches."""
+        if not tenant_id or self.tenant_provider and tenant_id != self.tenant():
+            raise PermissionError("Graph reset tenant mismatch")
+
+        def count(tx):
+            return tx.run(
+                "MATCH (n) WHERE n.tenant_id=$tenant_id RETURN count(n) AS total",
+                tenant_id=tenant_id,
+            ).single()["total"]
+
+        total = int(self._execute_read(count) or 0)
+        deleted = 0
+        while True:
+            def remove(tx):
+                return tx.run(
+                    "MATCH (n) WHERE n.tenant_id=$tenant_id WITH n LIMIT $limit "
+                    "DETACH DELETE n RETURN count(*) AS deleted",
+                    tenant_id=tenant_id, limit=min(max(batch_size, 1), 1000),
+                ).single()["deleted"]
+
+            removed = int(self._execute_write(remove) or 0)
+            deleted += removed
+            if removed == 0:
+                break
+        remaining = int(self._execute_read(count) or 0)
+        return {"status": "cleared" if remaining == 0 else "incomplete", "deleted": deleted, "before": total, "remaining": remaining}
+
     def _execute_write(self, func: Callable[[Transaction], T]) -> T:
         try:
             if hasattr(self._driver, "execute_write"):
@@ -596,6 +993,9 @@ class UnavailableGraphRepository:
     def upsert_document(self, *args, **kwargs):
         pass
 
+    def link_website_document(self, *args, **kwargs):
+        return {"outbound": 0, "inbound": 0, "document_found": False}
+
     def upsert_chunk(self, *args, **kwargs):
         pass
 
@@ -629,8 +1029,32 @@ class UnavailableGraphRepository:
     def link_reference_objects(self, *args, **kwargs):
         pass
 
+    def upsert_pages(self, *args, **kwargs):
+        pass
+
+    def upsert_reference_objects(self, *args, **kwargs):
+        pass
+
+    def exact_form_fields(self, document_ids):
+        return []
+
+    def exact_table_cells(self, document_ids):
+        return []
+
+    def link_reference_objects_many(self, *args, **kwargs):
+        pass
+
     def search_relationships(self, entities, limit=12):
         return []
+
+    def find_entity_candidates(self, *args, **kwargs): return []
+    def get_entity_neighborhood(self, entity_id, **kwargs): return {"entity_id": entity_id, "relationships": []}
+    def find_related_documents(self, *args, **kwargs): return []
+    def existing_entity_ids(self, entity_ids): return set()
+    def upsert_knowledge_entities(self, entities): return {"upserted": 0}
+    def upsert_knowledge_relationships(self, relationships): return {"upserted": 0}
+    def link_document_mentions(self, document_id, mentions): return {"linked": 0}
+    def update_document_semantics(self, *args, **kwargs): return None
 
     def upsert_semantic_memory(self, *args, **kwargs):
         return None
@@ -640,6 +1064,9 @@ class UnavailableGraphRepository:
 
     def ping(self):
         return False
+
+    def delete_workspace_graph(self, tenant_id, batch_size=500):
+        return {"status": "unavailable", "deleted": 0, "remaining": None}
 
 
 class InMemoryGraphRepository:
@@ -652,16 +1079,49 @@ class InMemoryGraphRepository:
         self.entity_links: MutableMapping[str, Dict[str, Any]] = {}
         self.references: MutableMapping[str, Dict[str, Any]] = {}
         self.semantic_facts: MutableMapping[str, Dict[str, Any]] = {}
+        self.knowledge_relationships: list[dict] = []
+        self.document_mentions: list[dict] = []
+        self.websites: MutableMapping[str, set] = {}
+        self.document_links: set[tuple[str, str]] = set()
+        self.reference_links: set[tuple[str, str, str]] = set()
 
     def ensure_constraints(self) -> None:  # pragma: no cover - no-op for in-memory variant
         """In-memory store has no constraints to create."""
+
+    def delete_workspace_graph(self, tenant_id, batch_size=500):
+        deleted = sum(map(len, (self.documents, self.chunks, self.entity_links, self.references, self.semantic_facts)))
+        self.documents.clear(); self.chunks.clear(); self.entity_links.clear(); self.references.clear(); self.semantic_facts.clear()
+        self.knowledge_relationships.clear(); self.document_mentions.clear()
+        self.websites.clear(); self.document_links.clear(); self.reference_links.clear()
+        return {"status": "cleared", "deleted": deleted, "remaining": 0}
 
     def upsert_document(
         self, doc_id: str, title: Optional[str] = None, source: str = "paste", **metadata
     ) -> None:
         """Store document metadata in-memory."""
 
-        self.documents[doc_id] = {"title": title, "source": source}
+        self.documents[doc_id] = {
+            "title": title, "source": source,
+            **{key: metadata.get(key) for key in ("source_type", "source_url", "canonical_url")},
+        }
+
+    def link_website_document(self, doc_id, origin, canonical_url, outlinks):
+        if doc_id not in self.documents:
+            # Like the Neo4j MATCH: an absent page Document gets no links.
+            return {"outbound": 0, "inbound": 0, "document_found": False}
+        self.websites.setdefault(origin, set()).add(doc_id)
+        self.documents[doc_id]["outlinks"] = list(outlinks or [])
+        outbound = {
+            (doc_id, other_id) for other_id, other in self.documents.items()
+            if other_id != doc_id and other.get("canonical_url") in (outlinks or [])
+        }
+        inbound = {
+            (other_id, doc_id) for other_id, other in self.documents.items()
+            if other_id != doc_id and canonical_url in (other.get("outlinks") or [])
+        }
+        outbound, inbound = outbound - self.document_links, inbound - self.document_links
+        self.document_links |= outbound | inbound
+        return {"outbound": len(outbound), "inbound": len(inbound), "document_found": True}
 
     def upsert_page(self, doc_id: str, page: int, version: int = 1) -> None:
         """Pages are implicit in the lightweight test repository."""
@@ -679,13 +1139,77 @@ class InMemoryGraphRepository:
         }
 
     def upsert_reference_object(self, doc_id: str, item: dict) -> None:
+        current = self.references.get(item["object_id"], {})
+        properties = {
+            **current.get("properties", {}), **meaningful_properties(item.get("properties")),
+        }
         self.references[item["object_id"]] = {
             "object_id": item["object_id"],
             "object_type": item["object_type"],
             "document_id": doc_id,
             "page": item.get("page"),
+            "position": item.get("position"),
+            "source_element_id": item.get("source_element_id"),
+            "table_row": item.get("table_row"),
+            "table_column": item.get("table_column"),
             "description": str(item.get("description") or "")[:160],
+            "role": item.get("role"),
+            "state_flag": item.get("state_flag"),
+            "confidence": item.get("confidence"),
+            # Mirrors SET n += properties: a None value removes the property.
+            "properties": {key: value for key, value in properties.items() if value is not None},
         }
+
+    def exact_form_fields(self, document_ids):
+        """Same rows as EXACT_FORM_FIELDS_QUERY."""
+        rows = []
+        for object_id, item in self.references.items():
+            if item["object_type"] != "FormField" or item["document_id"] not in document_ids:
+                continue
+            props = item["properties"]
+            marks = sorted(
+                (self.references[target] for source, relationship, target in self.reference_links
+                 if source == object_id and relationship == "HAS_SELECTIONMARK"
+                 and target in self.references),
+                key=lambda mark: mark["properties"].get("ordinal", 0),
+            )
+            rows.append({
+                "object_id": object_id, "document_id": item["document_id"], "page": item["page"],
+                "question": props.get("question"),
+                "question_normalized": props.get("question_normalized"),
+                "field_type": props.get("field_type"), "status": props.get("field_status"),
+                "selected_option": props.get("selected_option"),
+                "confidence": item.get("confidence"),
+                "ambiguity_reason": props.get("ambiguity_reason"),
+                "association_method": props.get("association_method"),
+                "options": [
+                    {"label": mark["properties"].get("option_label"),
+                     "selected": mark["state_flag"] == "selected",
+                     "confidence": mark["confidence"],
+                     "ordinal": mark["properties"].get("ordinal")}
+                    for mark in marks
+                ],
+            })
+        return rows
+
+    def exact_table_cells(self, document_ids):
+        """Same rows as EXACT_TABLE_CELLS_QUERY."""
+        rows = []
+        for object_id, item in self.references.items():
+            props = item["properties"]
+            if (item["object_type"] != "TableCell" or item["document_id"] not in document_ids
+                    or props.get("kind") != "content"):
+                continue
+            rows.append({
+                "object_id": object_id, "document_id": item["document_id"], "page": item["page"],
+                "table_id": props.get("table_id"), "row": item["table_row"],
+                "column": item["table_column"], "row_span": props.get("row_span"),
+                "column_span": props.get("column_span"),
+                "column_header": props.get("column_header"),
+                "row_header": props.get("row_header"), "value": props.get("value"),
+                "data_type": props.get("data_type"), "unit": props.get("unit"),
+            })
+        return rows
 
     def fetch_structured_references(
         self,
@@ -713,9 +1237,21 @@ class InMemoryGraphRepository:
             and (not object_types or item["object_type"] in object_types)
         ][: min(max(limit, 1), 20)]
 
-    def link_reference_objects(self, source_id: str, target_id: str, relationship: str):
+    def link_reference_objects(self, source_id: str, target_id: str, relationship: str, *labels):
         if source_id not in self.references or target_id not in self.references:
             raise ValueError("Unknown reference object")
+        self.reference_links.add((source_id, relationship, target_id))
+
+    def upsert_pages(self, doc_id: str, pages, version: int = 1) -> None:
+        """Pages are implicit in the lightweight test repository."""
+
+    def upsert_reference_objects(self, doc_id: str, items) -> None:
+        for item in items:
+            self.upsert_reference_object(doc_id, item)
+
+    def link_reference_objects_many(self, links) -> None:
+        for source_id, target_id, relationship, *_labels in links:
+            self.link_reference_objects(source_id, target_id, relationship)
 
     def link_doc_chunk(self, doc_id: str, chunk_id: str) -> None:  # pragma: no cover - no-op
         """Document/chunk relationships are implicit in the in-memory structure."""
@@ -768,6 +1304,46 @@ class InMemoryGraphRepository:
                     {"id": chunk_id, "text": chunk["text"], "metadata": metadata, "score": 0.0}
                 )
         return collected[:limit]
+
+    def find_entity_candidates(self, name, entity_type=None, aliases=None, identifiers=None, limit=20):
+        terms = {name.casefold(), *(value.casefold() for value in aliases or [])}
+        return [{"id": key, "name": value["name"], "kind": value.get("kind") or value.get("type")}
+                for key, value in self.entity_links.items()
+                if value["name"].casefold() in terms][:limit]
+
+    def get_entity_neighborhood(self, entity_id, max_hops=2, limit=30):
+        return {"entity_id": entity_id, "relationships": [row for row in self.knowledge_relationships
+                if entity_id in {row.get("source_id"), row.get("target_id")}][:limit]}
+
+    def find_related_documents(self, entity_id, limit=20):
+        rows = []
+        for mention in self.document_mentions:
+            if mention.get("entity_id") == entity_id:
+                doc = self.documents.get(mention["document_id"], {})
+                rows.append({"document_id": mention["document_id"], "title": doc.get("title"),
+                             "summary": doc.get("summary"), "object_ids": mention.get("evidence_object_ids", [])})
+        return rows[:limit]
+
+    def existing_entity_ids(self, entity_ids):
+        return {value for value in entity_ids if value in self.entity_links}
+
+    def upsert_knowledge_entities(self, entities):
+        for item in entities:
+            self.entity_links[item["id"]] = {**item, "type": item["kind"], "chunks": set()}
+        return {"upserted": len(entities)}
+
+    def upsert_knowledge_relationships(self, relationships):
+        self.knowledge_relationships.extend(relationships)
+        return {"upserted": len(relationships)}
+
+    def link_document_mentions(self, document_id, mentions):
+        self.document_mentions.extend({**item, "document_id": document_id} for item in mentions)
+        return {"linked": len(mentions)}
+
+    def update_document_semantics(self, document_id, *, document_type, summary, status):
+        self.documents.setdefault(document_id, {}).update(
+            document_type=document_type, summary=summary, semantic_graph_status=status
+        )
 
     def ping(self) -> bool:
         """In-memory store is always available."""

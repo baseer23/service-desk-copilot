@@ -18,6 +18,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
+      DESKMATE_TEST_PROFILE: offline
+      DESKMATE_ALLOW_LIVE_API_TESTS: "false"
       TEST_MODE: "true"
       DATA_PLATFORM: local
       LOCAL_PERSISTENCE_ENABLED: "false"
@@ -53,23 +55,8 @@ jobs:
         run: |
           .venv/bin/python -m compileall -q backend/app
           .venv/bin/ruff check backend --select E9,F63,F7,F82
-      - name: Focused backend regressions
-        run: >-
-          .venv/bin/python -m pytest -q
-          backend/app/tests/test_semantic_memory.py
-          backend/app/tests/test_graph_repo.py
-          backend/app/tests/test_mcp.py
-          backend/app/tests/test_mcp_security.py
-          backend/app/tests/test_multi_mcp.py
-          backend/app/tests/test_general_intelligence.py
-          backend/app/tests/test_scope_source_policy.py
-          backend/app/tests/test_activity_stream.py
-          backend/app/tests/test_web_research.py
-          backend/app/tests/test_local_document_jobs.py
-      - name: Frontend type checks
-        run: npm --prefix frontend run typecheck
-      - name: Frontend tests and production build
-        run: |
-          npm --prefix frontend test
-          npm --prefix frontend run build
+      - name: Install Chromium for offline acceptance tests
+        run: npm --prefix frontend exec -- playwright install --with-deps chromium
+      - name: Complete offline regression
+        run: make test-regression
 

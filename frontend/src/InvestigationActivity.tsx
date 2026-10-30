@@ -1,59 +1,66 @@
+import { useState } from 'react'
 import type { ActivityEvent } from './investigationStream'
 
-// Display actual LangGraph decisions and tool observations, not private model reasoning.
-const STEP_LABELS: Record<string, string> = {
-  understanding_summary: 'Intent',
-  research_plan: 'Plan',
-  source_decision: 'Tool selection',
-  source_selection: 'Source evaluation',
-  evidence_evaluation: 'Evidence assessment',
-  evidence_collected: 'Evidence inventory',
-  source_assessment: 'Document grading',
-  verification_summary: 'Verification',
-  recovery: 'Recovery',
-  final_assessment: 'Outcome',
-  follow_up: 'Clarification',
-}
-function ActivityRow({ event }: { event: ActivityEvent }): JSX.Element {
-  const label = STEP_LABELS[event.stage]
-    ?? (event.stage.startsWith('tool:') ? `Tool: ${event.stage.slice(5).replace(/_/g, ' ')}` : null)
-  return <li>
-    <div>{label && <strong>{label} · </strong>}<span>{event.summary}</span>{' '}<small>{event.status}{event.duration_ms !== undefined ? ` · ${(event.duration_ms / 1000).toFixed(1)}s` : ''}</small></div>
-    {event.objective && <p className="activity-detail"><strong>Objective:</strong> {event.objective}</p>}
-    {event.query && <p className="activity-detail"><strong>Query:</strong> {event.query}</p>}
-    {event.question && <p className="activity-detail"><strong>Question:</strong> {event.question}</p>}
-    {event.rationale && <p className="activity-detail"><strong>Decision rationale:</strong> {event.rationale}</p>}
-    {event.source_strategy && <p className="activity-detail"><strong>Approach:</strong> {event.source_strategy}</p>}
-    {event.sufficient_evidence && <p className="activity-detail"><strong>Completion criterion:</strong> {event.sufficient_evidence}</p>}
-    {event.research_questions?.length ? <div className="activity-detail"><strong>Research questions</strong><ul>{event.research_questions.map(question => <li key={question}>{question}</li>)}</ul></div> : null}
-    {event.actions?.length ? <ul className="activity-detail">{event.actions.map((action, index) => <li key={`${action.tool}-${index}`}><strong>{action.tool.replace(/_/g, ' ')}</strong>{action.reason ? ` — ${action.reason}` : ''}</li>)}</ul> : null}
-    {event.skipped_sources?.length ? <div className="activity-detail"><strong>Not needed</strong><ul>{event.skipped_sources.map((item, index) => <li key={`${item.source}-${index}`}><strong>{item.source}</strong> — {item.reason}</li>)}</ul></div> : null}
-    {event.research_queries?.length ? <ul className="activity-detail">{event.research_queries.map(query => <li key={query}>{query}</li>)}</ul> : null}
-    {event.findings?.length ? <div className="activity-detail"><strong>Observed</strong><ul>{event.findings.map(finding => <li key={finding}>{finding}</li>)}</ul></div> : null}
-    {event.missing_information?.length ? <div className="activity-detail"><strong>Still needed</strong><ul>{event.missing_information.map(item => <li key={item}>{item}</li>)}</ul></div> : null}
-    {event.next_action && <p className="activity-detail"><strong>Next:</strong> {event.next_action}</p>}
-    {event.conclusion && <p className="activity-detail"><strong>Conclusion:</strong> {event.conclusion}</p>}
-    {event.sources?.length ? <ul className="activity-sources">{event.sources.map((source, index) => {
-      const linkable = !!source.url && (/^https:\/\//i.test(source.url) || /^\/documents\/[a-f0-9]{64}\/download$/.test(source.url))
-      const method = source.extraction_method === 'document_intelligence' ? 'Azure Document Intelligence layout' : source.extraction_method ? source.extraction_method.replace(/_/g, ' ') : null
-      return <li key={`${source.url ?? source.title}-${index}`}>
-        {linkable ? <a href={source.url!} target={source.url!.startsWith('http') ? '_blank' : undefined} rel={source.url!.startsWith('http') ? 'noreferrer' : undefined}>{source.title}</a> : source.title}
-        {(source.page || method) && <small> · {[source.page ? `Page ${source.page}` : null, method].filter(Boolean).join(' · ')}</small>}
-      </li>
-    })}</ul> : null}
-  </li>
+const GROUPS = [
+  { title: 'Understanding the request', match: /understand|intent|classif|follow_up/ },
+  { title: 'Planning the investigation', match: /plan|research|source_decision/ },
+  { title: 'Checking available information', match: /tool:|search|fetch|source_selection|evidence_collected/ },
+  { title: 'Evaluating what was found', match: /evaluat|assess|grading|reflection/ },
+  { title: 'Verifying the answer', match: /verif|contradiction/ },
+  { title: 'Preparing the response', match: /final|outcome|complete/ },
+]
+
+function groupFor(event: ActivityEvent): string {
+  return GROUPS.find(group => group.match.test(`${event.stage} ${event.kind}`))?.title
+    ?? 'Checking available information'
 }
 
 export default function InvestigationActivity({ events, busy, onCancel }: { events: ActivityEvent[]; busy: boolean; onCancel: () => void }): JSX.Element | null {
+  const [view, setView] = useState<'activity' | 'diagnostics'>('activity')
   if (!events.length && !busy) return null
-  const diagnostics = events.filter(event => event.kind.startsWith('llm_') || event.kind === 'context_compaction' || event.kind === 'provider_fallback' || event.stage === 'evidence_grading')
-  const investigation = events.filter(event => !diagnostics.includes(event))
-  return <details className="card investigation-activity" open={busy}>
-    <summary>Investigation Activity</summary>
-    <ol aria-label="Investigation activities" aria-live="polite">
-      {investigation.map(event => <ActivityRow key={event.sequence} event={event} />)}
+  const latest = new Map<string, ActivityEvent>()
+  const visibleEvents = events.filter(event => event.kind !== 'llm_usage' && event.kind !== 'context_compaction')
+  const diagnosticEvents = events.filter(event => event.kind === 'llm_usage' || event.kind === 'context_compaction')
+  for (const event of visibleEvents) latest.set(groupFor(event), event)
+  return <aside className="card working-panel" aria-label="How DeskMate is working">
+    <div className="working-heading"><div><span className="eyebrow">LIVE INVESTIGATION</span><h2>How DeskMate is working</h2></div>{busy && <span className="working-pulse">Working</span>}</div>
+    <ol className="working-stages" aria-live="polite">
+      {GROUPS.map(group => {
+        const event = latest.get(group.title)
+        return <li key={group.title} className={event ? `stage-${event.status}` : ''}>
+          <span className="stage-marker" aria-hidden="true">{event?.status === 'completed' ? '✓' : event ? '•' : '○'}</span>
+          <div><strong>{group.title}</strong><p>{event?.summary ?? 'Waiting for this step.'}</p></div>
+        </li>
+      })}
     </ol>
-    {!!diagnostics.length && <details><summary>Diagnostics</summary><ol>{diagnostics.map(event => <ActivityRow key={event.sequence} event={event} />)}</ol></details>}
+    <div className="activity-view-tabs" role="tablist" aria-label="Investigation detail view">
+      <button type="button" role="tab" aria-selected={view === 'activity'} onClick={() => setView('activity')}>Investigation Activity</button>
+      <button type="button" role="tab" aria-selected={view === 'diagnostics'} onClick={() => setView('diagnostics')}>Diagnostics</button>
+    </div>
+    <ol className="investigation-activity" hidden={view !== 'activity'}>
+      {visibleEvents.map(event => <li key={`${event.sequence}-${event.event_id ?? ''}`}>
+        <strong>{event.stage.replace(/^tool:/, '').replace(/_/g, ' ').replace(/^./, value => value.toUpperCase())} · {event.status}</strong>
+        {event.query && <p className="activity-detail">{event.query}</p>}
+        {event.objective && <p className="activity-detail"><span>Objective: </span><span>{event.objective}</span></p>}
+        {event.rationale && <p className="activity-detail"><span>Why: </span><span>{event.rationale}</span></p>}
+        {event.research_questions?.map(value => <p className="activity-detail" key={value}><span>Question: </span><span>{value}</span></p>)}
+        {event.actions?.map(value => <p className="activity-detail" key={`${value.tool}-${value.reason}`}><span>{value.tool}: </span><span>{value.reason}</span></p>)}
+        {event.findings?.map(value => <p className="activity-detail" key={value}><span>Found: </span><span>{value}</span></p>)}
+        {event.missing_information?.map(value => <p className="activity-detail" key={value}><span>Missing: </span><span>{value}</span></p>)}
+        {event.skipped_sources?.map(value => <p className="activity-detail" key={`${value.source}-${value.reason}`}><span>Skipped {value.source}: </span><span>{value.reason}</span></p>)}
+        {event.next_action && <p className="activity-detail"><span>Next: </span><span>{event.next_action}</span></p>}
+        {!!event.sources?.length && <ul className="activity-sources">{event.sources.map(source => <li key={`${source.url ?? source.title}-${source.page ?? ''}`}>
+          {source.url ? <a href={source.url} target="_blank" rel="noreferrer">{source.title}</a> : source.title}
+          {(source.page || source.extraction_method) && <small>{[
+            source.page ? `Page ${source.page}` : '',
+            source.extraction_method === 'document_intelligence' ? 'Azure Document Intelligence layout' : source.extraction_method ?? '',
+          ].filter(Boolean).join(' · ')}</small>}
+        </li>)}</ul>}
+      </li>)}
+    </ol>
+    {view === 'diagnostics'
+      ? <ol className="technical-activity">{events.map(event => <li key={`${event.sequence}-${event.event_id ?? ''}`}><strong>{event.stage.replace(/^tool:/, '').replace(/_/g, ' ')}</strong><span>{event.summary}</span><small>{event.status}{event.duration_ms !== undefined ? ` · ${(event.duration_ms / 1000).toFixed(1)}s` : ''}</small></li>)}</ol>
+      : <div hidden>{diagnosticEvents.map(event => <span key={`${event.sequence}-${event.event_id ?? ''}`}>{event.summary}</span>)}</div>}
     {busy && <button type="button" className="button button-subtle" onClick={onCancel}>Cancel investigation</button>}
-  </details>
+  </aside>
 }

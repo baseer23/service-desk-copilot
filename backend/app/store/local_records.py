@@ -159,6 +159,26 @@ class LocalRecords:
             ).fetchall()
         return [self.decode(row) for row in rows]
 
+    def tenant_inventory(self, tenant: str) -> dict[str, int]:
+        """Return bounded, non-content counts for an operator reset preview."""
+        with self.connection() as db:
+            rows = db.execute(
+                "SELECT kind,COUNT(*) FROM local_records WHERE tenant=? GROUP BY kind",
+                (tenant,),
+            ).fetchall()
+        return {str(kind): int(count) for kind, count in rows if kind != "workspace_reset"}
+
+    def delete_tenant(self, tenant: str, *, preserve_kinds=("workspace_reset",)) -> int:
+        """Delete one tenant's records while retaining the reset audit trail."""
+        placeholders = ",".join("?" for _ in preserve_kinds)
+        clause = f" AND kind NOT IN ({placeholders})" if preserve_kinds else ""
+        with self.transaction() as db:
+            cursor = db.execute(
+                "DELETE FROM local_records WHERE tenant=?" + clause,
+                (tenant, *preserve_kinds),
+            )
+            return int(cursor.rowcount)
+
     @contextmanager
     def locked(self, kind, key, *, tenant=None):
         scope = tenant or self.tenant()
