@@ -246,3 +246,18 @@ Read-only diagnosis of the evaluated scanned form: Azure Document Intelligence d
 Changes: selection marks and Azure's own per-page Markdown are saved; one helper renders marks as `[x]` / `[ ]` for every reader; fillable-PDF fields are read locally; each question with its options and marks becomes a `FormField` object (span association first, page geometry as a fallback, AcroForm when present) that abstains when association is tied, a mark has low confidence, or zero or several options are selected. Graph references add `Page-[:HAS_FORMFIELD]->FormField-[:HAS_SELECTIONMARK]->SelectionMark` with only IDs, page, role, state flag and confidence. Semantic understanding receives verified fields and drops field/value relationships that do not cite a matching answered field. Retrieval and grading use a classifier-resolved standalone question, and a selection answer comes only from an answered FormField with its page, otherwise an explicit abstention.
 
 Chunk text keeps Azure's tokens: embedding the `[x]` form moved mark-bearing chunks up for unrelated questions and dropped the 23-question set to 21/23; with tokens kept it remains 23/23. Offline: 14 new synthetic-form tests pass; the full offline suite has the same 11 pre-existing failures. Applying FormField objects to an already indexed document needs a local re-index, which requires authorization.
+
+## Live NSNP 200 form test — 2026-10-30
+
+The NSNP 200 form test works. NSNP 200.pdf was re-extracted live with Azure Document Intelligence and indexed, then four questions were asked in one Chat conversation with Azure OpenAI:
+
+| Question | Answer | Page |
+|---|---|---|
+| "in the nsnp 200 form, am i currently employed or no" | Yes, the applicant is currently employed | 6 |
+| "is it a no?" | No — the form marks Yes | 6 |
+| "what is the NOC code in my nsnp200" | 22221 | 10 |
+| "which page shows the job title?" | Page 1, "Position offered" | 1 |
+
+Each answer cites the form field or passage it came from, and each was checked against the saved extraction.
+
+Voice also works; the user confirmed it.
