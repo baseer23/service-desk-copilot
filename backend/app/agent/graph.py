@@ -3381,6 +3381,14 @@ class ServiceDeskAgent:
                 diagnostics={"invalid_evidence_ids": invalid},
             )
 
+    @staticmethod
+    def _verification_conversation(conversation):
+        """The user's earlier turns only: previous answers are not the candidate."""
+        return [
+            message for message in conversation or []
+            if not (isinstance(message, dict) and message.get("role") == "assistant")
+        ]
+
     async def verify(self, state):
         # Judge the current candidate independently; prior critic text and
         # preliminary analysis hypotheses can otherwise anchor the review.
@@ -3399,6 +3407,12 @@ class ServiceDeskAgent:
                 "conversation",
             )
         }
+        # Earlier assistant answers are not under review. Left in the
+        # conversation, a previous wrong answer is judged as if it were this
+        # candidate and sends a correct answer back into recovery. The user's
+        # turns and the standalone question keep a follow-up interpretable.
+        context["conversation"] = self._verification_conversation(context.get("conversation", []))
+        context["standalone_question"] = self._retrieval_question(state)
         context["direct_model_answer"] = self._direct_model_answer(state)
         clarifying = bool(state["decision"].get("question_for_human"))
         if clarifying:

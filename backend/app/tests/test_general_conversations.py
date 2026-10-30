@@ -85,7 +85,15 @@ def test_general_chat_uses_graph_without_fabricated_sources(make_client):
         f'/requests/{body["request_id"]}/message', json={"summary": "Which province is that?"}
     )
     assert followup.status_code == 200
-    assert captured[-1][1]["conversation"][-1]["content"] == "Toronto is in Ontario, Canada."
+    # Reasoning stages see the previous answer; the verifier reviews only the
+    # current candidate, so it gets the user's turns alone.
+    reasoning = [call for call in captured if call[0] != "verify"]
+    assert reasoning[-1][1]["conversation"][-1]["content"] == "Toronto is in Ontario, Canada."
+    verifications = [call for call in captured if call[0] == "verify"]
+    assert verifications and all(
+        message["role"] != "assistant"
+        for call in verifications for message in call[1]["conversation"]
+    )
     assert client.get("/cases").json() == []
 
 
