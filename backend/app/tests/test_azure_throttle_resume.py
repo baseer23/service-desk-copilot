@@ -125,3 +125,109 @@ def test_reupload_resumes_throttled_document_and_keeps_saved_batches(settings, t
     assert "processing_error_code" not in state
     assert blobs.location(identifier, "extraction-batch-0.json").read_bytes() == batch
     assert blobs.location(identifier, "original").read_bytes() == data
+
+
+# --- Timeouts, resumed polling and parsing failures ------------------------------------
+
+
+class _Poller:
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+
+    def continuation_token(self):
+        return "operation-token"
+
+    @property
+    def details(self):
+        return {"operation_id": "op-1"}
+
+    def result(self, timeout=None):
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+class _Client:
+    """Scripted Document Intelligence client; records every analyze call."""
+
+    def __init__(self, submits):
+        self.submits, self.calls = list(submits), []
+
+    def begin_analyze_document(self, model_id, body=None, *, continuation_token=None, **kwargs):
+        self.calls.append({"body": body is not None, "continuation_token": continuation_token})
+        outcome = self.submits.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+def _result(lines=("Fictional harbour permit",)):
+    page = SimpleNamespace(page_number=1, spans=[], lines=[SimpleNamespace(content=v) for v in lines],
+                           selection_marks=[], width=8.5, height=11, unit="inch")
+    return SimpleNamespace(pages=[page], content="\n".join(lines), paragraphs=[], tables=[],
+                           figures=[], sections=[])
+
+
+def _extractor(settings, client):
+    return AzureDocumentExtractor(settings, records=None, client=client)
+
+
+def test_a_timed_out_status_poll_resumes_the_same_operation_without_resubmitting(settings):
+    client = _Client([
+        _Poller([ServiceResponseTimeoutError("fictional poll timeout")]),
+        _Poller([_result()]),
+    ])
+    extracted = _extractor(settings, client).extract(b"%PDF fictional", "image/png")
+    assert extracted["pages"][0]["text"] == "Fictional harbour permit"
+    # One billable submit; the second call only resumes the operation by token.
+    assert client.calls == [{"body": True, "continuation_token": None},
+                            {"body": False, "continuation_token": "operation-token"}]
+
+
+def test_a_submit_timeout_is_reported_as_a_timeout_and_never_resent(settings):
+    from backend.app.services.document_processing import DocumentProcessingFailure
+
+    client = _Client([ServiceResponseTimeoutError("fictional submit timeout")])
+    with pytest.raises(DocumentProcessingFailure) as failure:
+        _extractor(settings, client).extract(b"%PDF fictional", "image/png")
+    assert failure.value.code == "AZURE_DOCUMENT_TIMEOUT"
+    assert failure.value.source_exception_type == "ServiceResponseTimeoutError"
+    assert len(client.calls) == 1
+
+
+def test_our_parsing_errors_are_not_reported_as_azure_failures(settings):
+    from backend.app.services.document_processing import DocumentProcessingFailure
+
+    broken = _result()
+    broken.pages[0].lines = [SimpleNamespace()]  # a line without content
+    client = _Client([_Poller([broken])])
+    with pytest.raises(DocumentProcessingFailure) as failure:
+        _extractor(settings, client).extract(b"%PDF fictional", "image/png")
+    assert failure.value.code == "DOCUMENT_PARSING_FAILED"
+    assert failure.value.source_exception_type == "AttributeError"
+    assert "document_processing.py" in failure.value.safe_traceback
+
+
+@pytest.mark.parametrize("code, resumes", [
+    ("DOCUMENT_PARSING_FAILED", True), ("AZURE_DOCUMENT_REJECTED", True),
+    ("AZURE_DOCUMENT_UNREACHABLE", True), ("AZURE_DOCUMENT_TIMEOUT", False),
+    ("AZURE_DOCUMENT_RESPONSE_LOST", False), ("AZURE_DOCUMENT_PROCESSING_FAILED", False),
+])
+def test_re_adding_resumes_only_after_a_non_ambiguous_failure(settings, tmp_path, code, resumes):
+    configured = settings.model_copy(update={"local_documents_dir": tmp_path / "documents"})
+    records = LocalRecords(configured)
+    repository = DocumentRepository(
+        configured, records, LocalDocuments(configured, records), SimpleNamespace(),
+        SimpleNamespace(), SimpleNamespace(),
+    )
+    upload = (b"%PDF-1.4 fictional " + code.encode(), "Retry.pdf", "application/pdf",
+              "structured_graph", "azure_di")
+    identifier = repository.upload(*upload)["id"]
+    row = records.read("document", identifier)
+    records.write("document", identifier, {
+        **row["payload"], "status": "error", "phase": "extract_inflight",
+        "processing_error_code": code, "failed_stage": "azure_extraction",
+    }, previous=row)
+    again = repository.upload(*upload)
+    assert (again["status"] == "queued") is resumes

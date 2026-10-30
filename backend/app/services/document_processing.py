@@ -56,8 +56,24 @@ def _azure_failure(exc: Exception) -> DocumentProcessingFailure:
         code, reason = "AZURE_DOCUMENT_AUTHORIZATION_FAILED", "Azure Document Intelligence rejected the configured identity."
     elif status == 429:
         code, reason = "AZURE_DOCUMENT_CAPACITY", "Azure Document Intelligence is temporarily at capacity."
-    elif kind in {"ServiceRequestError", "ServiceResponseError"}:
+    elif kind == "ServiceResponseTimeoutError":
+        # The request may already have been accepted (and billed): never retried
+        # automatically; an operator reprocess resumes from the saved batches.
+        code, reason = (
+            "AZURE_DOCUMENT_TIMEOUT",
+            "Azure Document Intelligence did not respond in time; the request may still have "
+            "been processed.",
+        )
+    elif kind == "ServiceRequestError":
+        # The request never reached Azure.
         code, reason = "AZURE_DOCUMENT_UNREACHABLE", "Azure Document Intelligence could not be reached."
+    elif kind == "ServiceResponseError":
+        # Sent, but the response was lost: ambiguous, like a timeout.
+        code, reason = (
+            "AZURE_DOCUMENT_RESPONSE_LOST",
+            "Azure Document Intelligence's response was lost; the request may still have been "
+            "processed.",
+        )
     elif status == 400:
         code, reason = "AZURE_DOCUMENT_REJECTED", "Azure Document Intelligence rejected this document."
     else:
@@ -126,9 +142,47 @@ class AzureDocumentExtractor:
                     retry_backoff_factor=2, retry_backoff_max=60,
                 ),
                 connection_timeout=5,
-                read_timeout=15,
+                # The analyze POST carries the whole segment (up to 4 MB on the free
+                # tier) and can take well over 15 s to be accepted under load.
+                read_timeout=60,
             )
         self.client = client
+
+    def _failure(self, exc):
+        failure = _azure_failure(exc)
+        logger.error(
+            "Azure document extraction failed type=%s code=%s traceback=%s",
+            failure.source_exception_type, failure.code, failure.safe_traceback,
+        )
+        return failure
+
+    def _analysis_result(self, poller):
+        """Wait for an accepted analysis; a failed status poll resumes the same operation.
+
+        Polling is a free GET of an operation Azure already accepted, so it is
+        safe to repeat; the billable analyze POST is never re-sent here.
+        """
+        from azure.core.exceptions import ServiceRequestError, ServiceResponseError
+
+        try:
+            token = poller.continuation_token()
+        except Exception:  # noqa: BLE001 - a poller without a token cannot be resumed
+            token = None
+        for attempt in range(3):
+            try:
+                return poller.result(timeout=600)
+            except (ServiceRequestError, ServiceResponseError) as exc:
+                if token is None or attempt == 2:
+                    raise self._failure(exc) from None
+                logger.warning(
+                    "Azure analysis status poll failed type=%s; resuming the same operation",
+                    type(exc).__name__,
+                )
+                poller = self.client.begin_analyze_document(
+                    "prebuilt-layout", None, continuation_token=token
+                )
+            except Exception as exc:  # noqa: BLE001 - mapped to a sanitized failure
+                raise self._failure(exc) from None
 
     def extract(self, data: bytes, media_type: str, enhanced: bool = False):
         segments = [(data, 0)]
@@ -184,8 +238,11 @@ class AzureDocumentExtractor:
                         arguments["output"] = [AnalyzeOutputOption.FIGURES]
                     except (ImportError, AttributeError):
                         pass
-                poller = self.client.begin_analyze_document("prebuilt-layout", **arguments)
-                result = poller.result(timeout=600)
+                try:
+                    poller = self.client.begin_analyze_document("prebuilt-layout", **arguments)
+                except Exception as exc:  # noqa: BLE001 - the submit itself failed
+                    raise self._failure(exc) from None
+                result = self._analysis_result(poller)
                 for page in result.pages or []:
                     page_number = page.page_number + offset
                     # Azure's own Markdown for the page (tables, headings and ☒/☐
@@ -302,13 +359,18 @@ class AzureDocumentExtractor:
                     figures.append(record)
                 if not result.pages and result.content:
                     pages.append({"page": offset + 1, "text": result.content})
-            except Exception as exc:  # noqa: BLE001 - persist only sanitized diagnostics.
-                failure = _azure_failure(exc)
-                logger.error(
-                    "Azure document extraction failed type=%s code=%s traceback=%s",
-                    failure.source_exception_type, failure.code, failure.safe_traceback,
-                )
-                raise failure from None
+            except DocumentProcessingFailure:
+                raise
+            except Exception as exc:  # noqa: BLE001 - our parsing of a successful result
+                # Not an Azure failure: report the real exception, not "Azure could not".
+                trace = _safe_traceback(exc)
+                logger.error("Document parsing failed type=%s traceback=%s",
+                             type(exc).__name__, trace)
+                raise DocumentProcessingFailure(
+                    "DOCUMENT_PARSING_FAILED",
+                    "DeskMate could not read Azure Document Intelligence's result for this "
+                    "document.", type(exc).__name__, trace,
+                ) from None
         if not any(page["text"].strip() for page in pages):
             raise ValueError("The document contains no readable text")
         return {
