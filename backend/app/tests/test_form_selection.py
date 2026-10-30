@@ -924,3 +924,19 @@ def test_the_verifier_does_not_review_previous_answers():
     kept = ServiceDeskAgent._verification_conversation(conversation)
     assert [message["role"] for message in kept] == ["user", "user"]
     assert all("not listed" not in message["content"] for message in kept)
+
+
+def test_the_most_similar_passage_survives_fusion_without_sharing_a_word():
+    rows = [{"id": "c-position", "text": "Name of worker: A. Person. Position offered: Technician",
+             "score": 0.48, "score_type": "cosine_similarity",
+             "metadata": {"object_id": "c-position", "object_type": "Chunk", "page": 1}}]
+    rows += [
+        {"id": f"c{index}", "text": f"The job offer page lists the title of signing officer {index}.",
+         "score": 0.45 - index / 100, "score_type": "cosine_similarity",
+         "metadata": {"object_id": f"c{index}", "object_type": "Chunk", "page": 2 + index % 9}}
+        for index in range(30)
+    ]
+    chosen = ServiceDeskAgent._select_graph_evidence(
+        rows, "In Employer form.pdf, which page shows the job title?", 8,
+    )
+    assert "c-position" in [row["id"] for row in chosen]
