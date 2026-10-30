@@ -14,7 +14,14 @@ from backend.app.services.document_processing import with_heading_sections
 from backend.app.store.records import ManagedStoreError
 
 logger = logging.getLogger(__name__)
-RESUMABLE_EXTRACTION_ERRORS = {"AZURE_DOCUMENT_CAPACITY", "AZURE_DOCUMENT_INTERRUPTED"}
+# Failures whose request was rejected, never sent, or whose result we failed to
+# read: re-adding the document resumes from the saved batches. Timeouts and
+# unknown processing failures are ambiguous (possibly billed) and need an
+# explicit reprocess.
+RESUMABLE_EXTRACTION_ERRORS = {
+    "AZURE_DOCUMENT_CAPACITY", "AZURE_DOCUMENT_INTERRUPTED", "AZURE_DOCUMENT_UNREACHABLE",
+    "AZURE_DOCUMENT_REJECTED", "DOCUMENT_PARSING_FAILED",
+}
 # Statuses written only while a process is actively working on the document.
 ACTIVE_STATUSES = {"extracting", "structuring", "embedding"}
 
