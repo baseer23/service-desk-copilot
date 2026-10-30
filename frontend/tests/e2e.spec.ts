@@ -3,6 +3,15 @@ import { test, expect, type Response } from '@playwright/test'
 // Chromium does not retain SSE bodies for Network.getResponseBody. Clone the
 // browser's original fetch response for assertions; never send a second POST.
 test.beforeEach(async ({ page }) => {
+  await page.route('**/*', async route => {
+    const url = new URL(route.request().url())
+    if (['127.0.0.1', 'localhost', '::1'].includes(url.hostname) || ['data:', 'blob:'].includes(url.protocol)) {
+      await route.continue()
+      return
+    }
+    await route.abort('blockedbyclient')
+    throw new Error(`Offline browser test blocked outbound request to ${url.hostname}`)
+  })
   await page.addInitScript(() => {
     const nativeFetch = window.fetch.bind(window)
     const responses = new Map<string, Promise<unknown>>()
@@ -31,27 +40,20 @@ async function readWorkflowResponse(response: Response) {
 import { resumePDF } from './pdf'
 const ticket = 'Jake Peralta from B99 cannot connect to the VPN. Authentication failed.'
 
-for (const summary of [
-  'Fictional test: Microsoft 365 MFA fails for Amy Santiago from B99.',
-  'Fictional test: VPN authentication fails for Charles Boyle from B99.',
-  'Fictional test: printer installation fails for Rosa Diaz from B99.',
-  'Fictional test: Outlook email synchronization fails for Terry Jeffords from B99.',
-  'Fictional test: Noah Fictional from B99 has lost network connectivity.',
-  'Fictional test: Emma Fictional from B99 reports a Microsoft 365 account lockout.',
-  'Fictional test: Oliver Fictional from B99 cannot establish a remote desktop connection.',
-]) {
-  test(`simulated reasoning through real browser and MCP: ${summary}`, async ({ page }) => {
-    const errors: string[] = []
-    page.on('pageerror', error => errors.push(error.name))
-    await page.goto('/')
-    await page.getByLabel('Question or ticket').fill(summary)
-    await page.getByRole('button', { name: 'Send' }).click()
-    await expect(page.locator('.case-heading .status-pill')).toHaveText(/needs input|assessment ready|insufficient information/)
-    await expect(page.getByRole('alert')).toHaveCount(0)
-    await expect(page.getByText('ISOLATED DEMO', { exact: true }).first()).toBeVisible()
-    expect(errors).toEqual([])
-  })
-}
+// Generic MFA, VPN and printer browser paths are covered below with stronger
+// tool-selection, interruption and persistence assertions. Seven variants that
+// exercised only this same submit/status path were removed from browser scope.
+
+test('ordinary conversation restores the same thread after refresh', async ({ page }) => {
+  await page.goto('/')
+  await page.getByLabel('Question or ticket').fill('Where is Toronto?')
+  await page.getByRole('button', { name: 'Send', exact: true }).click()
+  const conversationID = await page.getByTestId('case-id').textContent()
+  await expect(page.getByLabel('Conversation')).toBeVisible()
+  await page.reload()
+  await expect(page.getByTestId('case-id')).toHaveText(conversationID!)
+  await expect(page.getByLabel('Conversation')).toContainText('Where is Toronto?')
+})
 
 test('local PDF extraction, staging, dedup and cited keyword search use real HTTP/MCP', async ({ page }) => {
   const errors: string[] = []

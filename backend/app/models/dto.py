@@ -1,6 +1,6 @@
 from backend.app.agent.models import Hypothesis, FinalResponse, EvidenceItem
 from typing import Any, Literal
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, Field, computed_field, model_validator
 from backend.app.agent.models import MemoryFact
 
 
@@ -44,13 +44,55 @@ class IngestPdfResponse(IngestPasteResponse):
 
 class IngestUrlRequest(BaseModel):
     url: str
-    max_depth: int | None = Field(default=None, ge=0, le=3)
-    max_pages: int | None = Field(default=None, ge=1, le=10)
+    max_depth: int | None = Field(default=None, ge=0, le=10)
+    max_pages: int | None = Field(default=None, ge=1, le=2000)
+
+
+class IngestUrlJobResponse(BaseModel):
+    """A website crawl job: progress grows as the background crawler saves pages."""
+
+    job_id: str
+    url: str
+    status: Literal["queued", "running", "complete", "failed", "blocked_by_site"]
+    max_depth: int
+    max_pages: int
+    created_at: str | None = None
+    updated_at: str | None = None
+    pages_found: int = 0
+    pages_saved: int = 0
+    pages_duplicate: int = 0
+    pages_skipped: int = 0
+    skipped_reasons: dict[str, int] = Field(default_factory=dict)
+    skipped: list[dict[str, str]] = Field(default_factory=list)
+    sitemap_seeds: int = 0
+    document_ids: list[str] = Field(default_factory=list)
+    # Crawl stages, from the crawl state.
+    pages_fetched: int = 0
+    pages_blocked: dict[str, int] = Field(default_factory=dict)
+    blocked_by_site: dict[str, str] | None = None
+    crawl_delay: float = 0.0
+    resume_after: float | None = None
+    azure_analysis: Literal["enabled", "disabled", "not_configured"] = "disabled"
+    # Ingestion stages, from each saved page's document state.
+    pages_azure_analysed: int | None = None
+    pages_indexed: int | None = None
+    pages_linked: int | None = None
+    pages_semantic: dict[str, int] | None = None
+    pages_failed: int | None = None
+    failed_reasons: dict[str, int] | None = None
+    error_code: str | None = None
+    error_message: str | None = None
 
 
 class IngestUrlResponse(IngestPasteResponse):
     pages: int
     skipped_urls: list[str] = Field(default_factory=list)
+    document_ids: list[str] = Field(default_factory=list)
+    local_index_ready: bool = False
+    graph_link_status: Literal["linked", "pending", "not_configured"] = "pending"
+    semantic_graph_status: str = "pending"
+    status: Literal["ready", "graph_pending", "partial"] = "ready"
+    failed_pages: int = Field(default=0, ge=0)
 
 
 class CaseCreateRequest(BaseModel):
@@ -59,6 +101,11 @@ class CaseCreateRequest(BaseModel):
 
 class CaseResumeRequest(BaseModel):
     answer: str = Field(min_length=1, max_length=2000)
+
+
+class MemorySaveRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=2000)
+    conversation_id: str | None = Field(default=None, min_length=1, max_length=240)
 
 
 class LegacyEvidence(BaseModel):
@@ -97,6 +144,18 @@ class RequestResult(BaseModel):
     final_answer: str | None = None
     chat_messages: list[dict[str, str]] = Field(default_factory=list)
     research_iteration: int = 0
+    explicit_saved_knowledge: bool = False
+    # available | empty | stale | unavailable | error; None when no graph read ran.
+    graph_status: str | None = None
+    executed_tool_calls: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_empty_legacy_final_response(cls, value):
+        """Treat old empty response placeholders as absent without rewriting history."""
+        if isinstance(value, dict) and value.get("final_response") == {}:
+            value = {**value, "final_response": None}
+        return value
 
 
 class CaseResponse(RequestResult):
@@ -122,6 +181,7 @@ class AskResponse(BaseModel):
     case_id: str | None
     result: RequestResult
     events: list[CaseEvent]
+    activity: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class EmailTurnRequest(BaseModel):

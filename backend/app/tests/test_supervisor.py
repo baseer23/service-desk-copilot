@@ -57,6 +57,7 @@ def test_document_questions_use_real_knowledge_subgraph(make_client, question):
     agent = c.app.state.agent
     assert "knowledge_subgraph" in agent.graph.get_graph().nodes
     assert "formulate_retrieval_plan" in agent.knowledge_subgraph.get_graph().nodes
+    assert "knowledge_retrieval" in agent.knowledge_subgraph.get_graph().nodes
 
 
 @pytest.mark.parametrize(

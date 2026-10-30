@@ -2,13 +2,127 @@
 
 import base64
 import hashlib
+import logging
+import traceback
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
+from azure.core.pipeline.policies import RetryPolicy
+
 from backend.app.core.config import Settings
+from backend.app.services.form_marks import readable_marks
 from backend.app.core.azure_identity import azure_credential
 from backend.app.store.records import ManagedStoreError
+
+logger = logging.getLogger(__name__)
+
+
+class ThrottleOnlyRetryPolicy(RetryPolicy):
+    """Retry only HTTP 429 (rejected before analysis/billing), honouring Retry-After up to 60s."""
+
+    def is_retry(self, settings, response):
+        if response.http_response.status_code != 429 or settings["total"] <= 0:
+            return False
+        wait = self.get_retry_after(response)
+        return wait is None or wait <= 60
+
+
+class DocumentProcessingFailure(ManagedStoreError):
+    """Sanitized external-processing failure safe for durable document state."""
+
+    def __init__(self, code: str, reason: str, source_exception_type: str, safe_traceback: str):
+        super().__init__(reason)
+        self.code = code
+        self.reason = reason
+        self.source_exception_type = source_exception_type
+        self.safe_traceback = safe_traceback
+
+
+def _safe_traceback(exc: Exception) -> str:
+    return " <- ".join(
+        f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}"
+        for frame in traceback.extract_tb(exc.__traceback__)[-8:]
+    )
+
+
+def _azure_failure(exc: Exception) -> DocumentProcessingFailure:
+    kind = type(exc).__name__
+    status = getattr(exc, "status_code", None)
+    if kind in {"ClientAuthenticationError", "CredentialUnavailableError"}:
+        code, reason = "AZURE_DOCUMENT_AUTHENTICATION_FAILED", "Azure Document Intelligence authentication failed."
+    elif status in {401, 403}:
+        code, reason = "AZURE_DOCUMENT_AUTHORIZATION_FAILED", "Azure Document Intelligence rejected the configured identity."
+    elif status == 429:
+        code, reason = "AZURE_DOCUMENT_CAPACITY", "Azure Document Intelligence is temporarily at capacity."
+    elif kind == "ServiceResponseTimeoutError":
+        # The request may already have been accepted (and billed): never retried
+        # automatically; an operator reprocess resumes from the saved batches.
+        code, reason = (
+            "AZURE_DOCUMENT_TIMEOUT",
+            "Azure Document Intelligence did not respond in time; the request may still have "
+            "been processed.",
+        )
+    elif kind == "ServiceRequestError":
+        # The request never reached Azure.
+        code, reason = "AZURE_DOCUMENT_UNREACHABLE", "Azure Document Intelligence could not be reached."
+    elif kind == "ServiceResponseError":
+        # Sent, but the response was lost: ambiguous, like a timeout.
+        code, reason = (
+            "AZURE_DOCUMENT_RESPONSE_LOST",
+            "Azure Document Intelligence's response was lost; the request may still have been "
+            "processed.",
+        )
+    elif status == 400:
+        code, reason = "AZURE_DOCUMENT_REJECTED", "Azure Document Intelligence rejected this document."
+    else:
+        code, reason = "AZURE_DOCUMENT_PROCESSING_FAILED", "Azure Document Intelligence could not process this document."
+    return DocumentProcessingFailure(code, reason, kind, _safe_traceback(exc))
+
+
+def azure_document_readiness(settings: Settings) -> dict[str, object]:
+    """Perform a read-only authenticated resource probe without analyzing content."""
+    if not settings.azure_document_endpoint:
+        return {
+            "available": False,
+            "code": "AZURE_DOCUMENT_ENDPOINT_MISSING",
+            "blocker": "AZURE_DOCUMENT_ENDPOINT is required.",
+        }
+    client = credential = None
+    try:
+        from azure.ai.documentintelligence import DocumentIntelligenceClient
+        from azure.core.rest import HttpRequest
+
+        credential = azure_credential(settings)
+        client = DocumentIntelligenceClient(
+            settings.azure_document_endpoint,
+            credential,
+            api_version=settings.azure_document_api_version,
+            retry_total=0,
+            connection_timeout=5,
+            read_timeout=10,
+        )
+        endpoint = settings.azure_document_endpoint.rstrip("/")
+        response = client.send_request(HttpRequest(
+            "GET",
+            f"{endpoint}/documentintelligence/info?api-version={settings.azure_document_api_version}",
+        ))
+        if response.status_code >= 400:
+            response.raise_for_status()
+        return {"available": True, "code": None, "blocker": None}
+    except Exception as exc:
+        failure = _azure_failure(exc)
+        logger.warning(
+            "Azure Document Intelligence readiness failed type=%s code=%s traceback=%s",
+            failure.source_exception_type, failure.code, failure.safe_traceback,
+        )
+        return {"available": False, "code": failure.code, "blocker": failure.reason}
+    finally:
+        if client:
+            client.close()
+        if credential:
+            credential.close()
 
 
 class AzureDocumentExtractor:
@@ -23,11 +137,52 @@ class AzureDocumentExtractor:
                 settings.azure_document_endpoint,
                 self.credential,
                 api_version=settings.azure_document_api_version,
-                retry_total=0,
+                retry_policy=ThrottleOnlyRetryPolicy(
+                    retry_total=4, retry_status=4, retry_connect=0, retry_read=0,
+                    retry_backoff_factor=2, retry_backoff_max=60,
+                ),
                 connection_timeout=5,
-                read_timeout=15,
+                # The analyze POST carries the whole segment (up to 4 MB on the free
+                # tier) and can take well over 15 s to be accepted under load.
+                read_timeout=60,
             )
         self.client = client
+
+    def _failure(self, exc):
+        failure = _azure_failure(exc)
+        logger.error(
+            "Azure document extraction failed type=%s code=%s traceback=%s",
+            failure.source_exception_type, failure.code, failure.safe_traceback,
+        )
+        return failure
+
+    def _analysis_result(self, poller):
+        """Wait for an accepted analysis; a failed status poll resumes the same operation.
+
+        Polling is a free GET of an operation Azure already accepted, so it is
+        safe to repeat; the billable analyze POST is never re-sent here.
+        """
+        from azure.core.exceptions import ServiceRequestError, ServiceResponseError
+
+        try:
+            token = poller.continuation_token()
+        except Exception:  # noqa: BLE001 - a poller without a token cannot be resumed
+            token = None
+        for attempt in range(3):
+            try:
+                return poller.result(timeout=600)
+            except (ServiceRequestError, ServiceResponseError) as exc:
+                if token is None or attempt == 2:
+                    raise self._failure(exc) from None
+                logger.warning(
+                    "Azure analysis status poll failed type=%s; resuming the same operation",
+                    type(exc).__name__,
+                )
+                poller = self.client.begin_analyze_document(
+                    "prebuilt-layout", None, continuation_token=token
+                )
+            except Exception as exc:  # noqa: BLE001 - mapped to a sanitized failure
+                raise self._failure(exc) from None
 
     def extract(self, data: bytes, media_type: str, enhanced: bool = False):
         segments = [(data, 0)]
@@ -70,33 +225,47 @@ class AzureDocumentExtractor:
             try:
                 arguments = {
                     "body": BytesIO(segment),
-                    "content_type": "application/octet-stream",
+                    # Layout v4.0 analyses HTML as text (billed per 3,000 characters).
+                    "content_type": (
+                        "text/html" if media_type == "text/html" else "application/octet-stream"
+                    ),
                     "output_content_format": "markdown",
                 }
-                if enhanced:
+                if enhanced and media_type != "text/html":
                     try:
                         from azure.ai.documentintelligence.models import AnalyzeOutputOption
 
                         arguments["output"] = [AnalyzeOutputOption.FIGURES]
                     except (ImportError, AttributeError):
                         pass
-                poller = self.client.begin_analyze_document("prebuilt-layout", **arguments)
-                result = poller.result(timeout=600)
+                try:
+                    poller = self.client.begin_analyze_document("prebuilt-layout", **arguments)
+                except Exception as exc:  # noqa: BLE001 - the submit itself failed
+                    raise self._failure(exc) from None
+                result = self._analysis_result(poller)
                 for page in result.pages or []:
-                    text = "\n".join(line.content for line in page.lines or [])
-                    if not text and result.content:
-                        text = "\n".join(
-                            result.content[span.offset : span.offset + span.length]
-                            for span in page.spans or []
-                        )
+                    page_number = page.page_number + offset
+                    # Azure's own Markdown for the page (tables, headings and ☒/☐
+                    # marks), sliced from the result content by the page's spans.
+                    markdown = "".join(
+                        result.content[span.offset : span.offset + span.length]
+                        for span in page.spans or []
+                    ) if result.content else ""
+                    text = "\n".join(line.content for line in page.lines or []) or markdown
                     pages.append(
                         {
-                            "page": page.page_number + offset,
+                            "page": page_number,
                             "text": text,
-                            "markdown": text,
+                            "markdown": readable_marks(markdown or text),
                             "spans": [
                                 {"offset": span.offset, "length": span.length}
                                 for span in page.spans or []
+                            ],
+                            "selection_marks": [
+                                _selection_mark(mark, page_number, ordinal, offset)
+                                for ordinal, mark in enumerate(
+                                    getattr(page, "selection_marks", None) or []
+                                )
                             ],
                         }
                     )
@@ -124,7 +293,11 @@ class AzureDocumentExtractor:
                             "column": cell.column_index,
                             "row_span": getattr(cell, "row_span", 1) or 1,
                             "column_span": getattr(cell, "column_span", 1) or 1,
-                            "kind": str(getattr(cell, "kind", "content") or "content"),
+                            # The enum's value ("columnHeader"), not its Python name.
+                            "kind": str(
+                                getattr(getattr(cell, "kind", None), "value", None)
+                                or getattr(cell, "kind", None) or "content"
+                            ),
                             "text": cell.content,
                             "spans": [
                                 {"offset": span.offset, "length": span.length}
@@ -145,6 +318,9 @@ class AzureDocumentExtractor:
                             "page": table_page,
                             "row_count": getattr(table, "row_count", 0),
                             "column_count": getattr(table, "column_count", 0),
+                            "caption": getattr(
+                                getattr(table, "caption", None), "content", None
+                            ),
                             "cells": cells,
                             "bounding_regions": _regions(table.bounding_regions or [], offset),
                         }
@@ -183,8 +359,18 @@ class AzureDocumentExtractor:
                     figures.append(record)
                 if not result.pages and result.content:
                     pages.append({"page": offset + 1, "text": result.content})
-            except Exception:  # noqa: BLE001 - Sanitize SDK/auth failures without disclosing response bodies.
-                raise ManagedStoreError("Document text and layout could not be processed") from None
+            except DocumentProcessingFailure:
+                raise
+            except Exception as exc:  # noqa: BLE001 - our parsing of a successful result
+                # Not an Azure failure: report the real exception, not "Azure could not".
+                trace = _safe_traceback(exc)
+                logger.error("Document parsing failed type=%s traceback=%s",
+                             type(exc).__name__, trace)
+                raise DocumentProcessingFailure(
+                    "DOCUMENT_PARSING_FAILED",
+                    "DeskMate could not read Azure Document Intelligence's result for this "
+                    "document.", type(exc).__name__, trace,
+                ) from None
         if not any(page["text"].strip() for page in pages):
             raise ValueError("The document contains no readable text")
         return {
@@ -301,7 +487,39 @@ def _sections(paragraphs):
     return sections
 
 
+def _selection_mark(mark, page_number, ordinal, offset=0):
+    """A saved selection mark: state, confidence, polygon and span, with a stable ID."""
+    span = getattr(mark, "span", None)
+    return {
+        "id": f"selectionmark-{page_number}-{ordinal}",
+        "page": page_number,
+        "state": str(getattr(mark, "state", "") or "").lower(),
+        "confidence": getattr(mark, "confidence", None),
+        "bounding_regions": _regions(
+            [SimpleNamespace(
+                page_number=page_number - offset, polygon=getattr(mark, "polygon", None)
+            )],
+            offset,
+        ),
+        "span": {"offset": span.offset, "length": span.length} if span else None,
+    }
+
+
+def with_heading_sections(extraction):
+    """Derive sections a saved extraction's heading paragraphs define but it lacks."""
+    if extraction.get("sections") or not extraction.get("paragraphs"):
+        return extraction
+    return {**extraction, "sections": _sections(extraction["paragraphs"])}
+
+
 def _offset_batch(batch, offset, batch_index):
+    for page in batch.get("pages", []):
+        # Marks are numbered per document page, so their IDs stay stable.
+        for ordinal, mark in enumerate(page.get("selection_marks") or []):
+            mark["page"] = mark.get("page", 1) + offset
+            mark["id"] = f"selectionmark-{mark['page']}-{ordinal}"
+            for region in mark.get("bounding_regions", []):
+                region["page"] = region.get("page", 1) + offset
     for collection in ("pages", "paragraphs", "tables", "figures"):
         for ordinal, item in enumerate(batch.get(collection, [])):
             item["page"] = item.get("page", 1) + offset
@@ -331,12 +549,25 @@ def _compressed_page_image(page, byte_limit):
 
 
 def _regions(regions, offset=0):
+    def polygon_points(polygon):
+        values = list(polygon or [])
+        if values and all(isinstance(value, (int, float)) for value in values):
+            return [
+                {"x": float(values[index]), "y": float(values[index + 1])}
+                for index in range(0, len(values) - 1, 2)
+            ]
+        points = []
+        for point in values:
+            if isinstance(point, dict) and "x" in point and "y" in point:
+                points.append({"x": float(point["x"]), "y": float(point["y"])})
+            elif hasattr(point, "x") and hasattr(point, "y"):
+                points.append({"x": float(point.x), "y": float(point.y)})
+        return points
+
     return [
         {
             "page": region.page_number + offset,
-            "polygon": [
-                {"x": point.x, "y": point.y} for point in getattr(region, "polygon", None) or []
-            ],
+            "polygon": polygon_points(getattr(region, "polygon", None)),
         }
         for region in regions
     ]

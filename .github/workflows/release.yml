@@ -58,7 +58,7 @@ jobs:
           .venv/bin/python -m pip check
           npm --prefix frontend ci
           .venv/bin/python -m compileall -q backend/app
-          .venv/bin/python -m pytest -q backend/app/tests/test_semantic_memory.py backend/app/tests/test_mcp_security.py backend/app/tests/test_provider_selection.py backend/app/tests/test_storage_safety.py
+          .venv/bin/python -m pytest -q -m "not live" backend/app/tests/test_semantic_memory.py backend/app/tests/test_mcp_security.py backend/app/tests/test_provider_selection.py backend/app/tests/test_storage_safety.py
           npm --prefix frontend test
           npm --prefix frontend run build
       - name: Deployment status

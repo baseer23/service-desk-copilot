@@ -1,7 +1,7 @@
 import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, expect, test, vi } from 'vitest'
-import App, { type Case } from './App'
+import App, { ACTIVE_CONVERSATION_KEY, type Case } from './App'
 
 const initial: Case = {
   case_id: 'case-unit',
@@ -22,7 +22,23 @@ const initial: Case = {
 }
 afterEach(() => {
   cleanup()
+  localStorage.clear()
   vi.unstubAllGlobals()
+})
+
+test('restores the active conversation after a refresh', async () => {
+  const current = { ...initial, workflow: 'knowledge', status: 'assessment_ready', final_answer: 'Azure.', chat_messages: [{ role: 'user', content: 'Which cloud?' }, { role: 'assistant', content: 'Azure.' }] }
+  localStorage.setItem(ACTIVE_CONVERSATION_KEY, 'chat-restored')
+  const fetch = vi.fn(async (url: string) => {
+    if (url === '/cases' || url === '/conversations') return Response.json([])
+    if (url === '/conversations/chat-restored') return Response.json({ request_id: 'chat-restored', case_id: null, result: current, events: [] })
+    return Response.json({})
+  })
+  vi.stubGlobal('fetch', fetch)
+  render(<App />)
+  expect(await screen.findByText('Which cloud?')).toBeInTheDocument()
+  expect(screen.getByText('Azure.')).toBeInTheDocument()
+  expect(localStorage.getItem(ACTIVE_CONVERSATION_KEY)).toBe('chat-restored')
 })
 
 test('workspace navigation switches focused views without breaking knowledge inputs', async () => {
@@ -52,6 +68,27 @@ test('general conversation sends follow-ups to the existing request', async () =
   await user.type(await screen.findByLabelText('Reply to this conversation'), 'Which country?')
   await user.click(within(screen.getByLabelText('Conversation')).getByRole('button', { name: 'Send message' }))
   await waitFor(() => expect(fetch.mock.calls.some(([url]) => url === '/requests/chat-one/message')).toBe(true))
+})
+
+test('restores a failed follow-up in the composer without duplicating prior messages', async () => {
+  const current = { ...initial, workflow: 'knowledge', status: 'assessment_ready', final_answer: 'First answer.', chat_messages: [{ role: 'user', content: 'First question' }, { role: 'assistant', content: 'First answer.' }] }
+  localStorage.setItem(ACTIVE_CONVERSATION_KEY, 'chat-failure')
+  const fetch = vi.fn(async (url: string) => {
+    if (url === '/cases' || url === '/conversations') return Response.json([])
+    if (url === '/conversations/chat-failure') return Response.json({ request_id: 'chat-failure', case_id: null, result: current, events: [] })
+    if (url.endsWith('/message')) return Response.json({ detail: { message: 'The plan was rejected.' } }, { status: 502 })
+    return Response.json({})
+  })
+  vi.stubGlobal('fetch', fetch)
+  const user = userEvent.setup()
+  render(<App />)
+  const composer = await screen.findByLabelText('Reply to this conversation')
+  await user.type(composer, 'Please try this follow-up')
+  await user.click(within(screen.getByLabelText('Conversation')).getByRole('button', { name: 'Send message' }))
+  expect(await screen.findByRole('alert')).toHaveTextContent('The plan was rejected.')
+  expect(composer).toHaveValue('Please try this follow-up')
+  expect(within(screen.getByLabelText('Conversation')).getAllByText('First answer.')).toHaveLength(1)
+  expect(within(screen.getByLabelText('Conversation')).getByRole('button', { name: 'Send message' })).toBeEnabled()
 })
 
 test('creates a case, shows real event data, resumes human input and renders assessment', async () => {
@@ -183,7 +220,7 @@ test('can submit again after an empty proxy response', async () => {
   vi.stubGlobal(
     'fetch',
     vi.fn(async (url: string) => {
-      if (url === '/cases') return Response.json([])
+      if (url === '/cases' || url === '/conversations') return Response.json([])
       if (url === '/readiness') return Response.json({})
       if (url === '/documents') return Response.json([])
       if (url === '/speech/readiness') return Response.json({ ready: false })

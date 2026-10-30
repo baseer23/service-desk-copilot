@@ -32,6 +32,7 @@ def build_neo4j_stdio_env(settings, parent_env: Mapping[str, str]) -> dict[str, 
         raise MCPConnectionError("Neo4j MCP credentials are missing or incomplete")
 
     child = {key: value for key, value in parent_env.items() if key in _PASSTHROUGH}
+    # neo4j-mcp 1.x reads only the NEO4J_MCP_* names (see `neo4j-mcp --help`).
     child.update(
         {
             "NEO4J_MCP_URI": uri,

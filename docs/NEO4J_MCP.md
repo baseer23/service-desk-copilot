@@ -6,7 +6,7 @@ DeskMate uses the [official Neo4j MCP server](https://github.com/neo4j/mcp) as a
 
 Install with `brew install neo4j-mcp`. Where Homebrew is unavailable, the upstream project's supported distribution for the relevant platform may be used; configure `MCP_SERVERS` with its absolute executable and arguments. Verify the selected build with `neo4j-mcp -v` and consult the [current installation guide](https://neo4j.com/docs/mcp/current/installation/).
 
-Keep the Aura URI, username, password, and database in the private `.env` as `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, and `NEO4J_DATABASE`. DeskMate maps these validated settings only into the child process as `NEO4J_MCP_URI`, `NEO4J_MCP_USERNAME`, `NEO4J_MCP_PASSWORD`, and `NEO4J_MCP_DATABASE`. It forces `NEO4J_MCP_READ_ONLY=true` and `NEO4J_MCP_TELEMETRY=false`. Never place credentials in `MCP_SERVERS`.
+Keep the Aura URI, username, password, and database in the private `.env` as `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, and `NEO4J_DATABASE`. DeskMate maps these validated settings only into the child process as `NEO4J_MCP_URI`, `NEO4J_MCP_USERNAME`, `NEO4J_MCP_PASSWORD`, and `NEO4J_MCP_DATABASE`. It forces `NEO4J_MCP_READ_ONLY=true` and `NEO4J_MCP_TELEMETRY=false`. Never place credentials in `MCP_SERVERS`. neo4j-mcp 1.6.x reads only the `NEO4J_MCP_*` names (see `neo4j-mcp --help`); plain `NEO4J_*` names are deprecated aliases and are never set for the child process.
 
 Example registration:
 

@@ -33,6 +33,7 @@ class ReadinessReport(BaseModel):
     semantic_ingestion_ready: bool = False
     semantic_ingestion_blocker: str | None = None
     url_ingestion_enabled: bool = False
+    url_ingestion_blocker: str | None = None
     selected_provider: str = "groq"
 
 
@@ -73,4 +74,19 @@ def configuration_readiness(settings: Settings, *, reasoning_initialized=False, 
         local_documents_ready=local_mcp=="READY", local_ocr_available=ocr_available(),
         semantic_ingestion_ready=stores and not embedding_missing,
         semantic_ingestion_blocker=None if stores and not embedding_missing else "Local knowledge indexing is unavailable.",
-        url_ingestion_enabled=settings.allow_url_ingest)
+        url_ingestion_enabled=bool(
+            settings.allow_url_ingest
+            and settings.enable_public_web_tools
+            and settings.uses_record_store
+            and local_mcp == "READY"
+            and private_stores == "READY"
+        ),
+        url_ingestion_blocker=(
+            None
+            if settings.allow_url_ingest
+            and settings.enable_public_web_tools
+            and settings.uses_record_store
+            and local_mcp == "READY"
+            and private_stores == "READY"
+            else "Public website ingestion requires workspace authorization and available local storage."
+        ))

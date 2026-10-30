@@ -68,10 +68,18 @@ class Retriever:
             self.graph_repo, self.vector_store, self.embedding_provider
         ).search(question, top_k, graph_plan)
         if structured:
-            supplement = self.vector_search(question, top_k)
+            if hasattr(self.vector_store, "hybrid"):
+                embedding = self.embedding_provider.embed_texts([question])[0]
+                supplement = self.vector_store.hybrid(question, embedding, top_k)
+            else:
+                supplement = self.vector_search(question, top_k)
             seen = set()
             combined = []
-            for row in structured + supplement:
+            # Graph-first: hydrated graph objects are already ranked against the
+            # question, so they lead the local supplement. An exact local
+            # identifier match still comes first because it names the passage.
+            exact = [row for row in supplement if row.get("match_type") == "exact_identifier"]
+            for row in exact + structured + supplement:
                 if row["id"] not in seen:
                     combined.append(row)
                     seen.add(row["id"])

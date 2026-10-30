@@ -22,9 +22,11 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   try {
     body = await response.json()
   } catch {
+    const contentType = response.headers.get('content-type')?.split(';', 1)[0] || 'unknown content type'
+    const endpoint = path.split('?', 1)[0]
     throw new Error(
       response.ok
-        ? 'DeskMate received an empty or invalid server response. Reload the page and try again.'
+        ? `DeskMate received ${contentType} instead of JSON from ${endpoint}. Check that the backend and development proxy are running, then retry.`
         : response.status >= 500
           ? `The DeskMate server is temporarily unavailable (HTTP ${response.status}). Please try again.`
           : `Request failed (HTTP ${response.status}). The server returned an empty or invalid response.`,

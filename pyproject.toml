@@ -19,6 +19,7 @@ fixable = ["ALL"]
 
 [tool.ruff.lint.per-file-ignores]
 "backend/app/tests/*" = ["S101", "PLR2004", "A003"]
+"scripts/select_tests.py" = ["S603", "S607"]
 
 [tool.mypy]
 python_version = "3.11"
@@ -39,3 +40,12 @@ check_untyped_defs = false
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = ["backend/app/tests"]
+markers = [
+    "unit: fast isolated unit tests",
+    "integration: local SQLite, Chroma, HTTP, or MCP integration tests",
+    "memory: persistent conversation and semantic-memory acceptance tests",
+    "mcp: MCP contract and transport tests",
+    "security: authorization, isolation, and data-safety tests",
+    "slow: deterministic tests unsuitable for the normal fast loop",
+    "live: explicitly authorized external-service tests excluded from offline profiles",
+]

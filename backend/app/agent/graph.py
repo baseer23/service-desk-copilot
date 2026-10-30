@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import re
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -16,6 +17,7 @@ from backend.app.agent.models import (
     EvidenceGradeResult,
     EvidenceItem,
     FinalResponse,
+    Hypothesis,
     InvestigationDecision,
     InvestigationPlan,
     MemoryFact,
@@ -26,11 +28,57 @@ from backend.app.agent.models import (
 )
 from backend.app.agent.scope import SCOPE_MESSAGE
 from backend.app.agent.state import InvestigationState
-from backend.app.agent.tools import AgentToolHarness
-from backend.app.mcp.client import MCPToolError
+from backend.app.agent.tools import AgentToolHarness, PlanValidationError
+from backend.app.mcp.client import MCPConnectionError, MCPToolError
 from backend.app.models.provider import LLMError
+from backend.app.services.entities import extract_entities
 from backend.app.services.source_policy import permits, quality, rank_sources
 from backend.app.services.web import relevant_excerpt
+
+DOCUMENT_EXTENSION = re.compile(r"\.(?:pdf|docx?|txt|md|html?|pptx?|xlsx?|csv|rtf)$", re.IGNORECASE)
+# GraphLookupPlan.document_ids accepts at most ten saved documents.
+MAX_DOCUMENT_CHOICES = 10
+OPENING_QUOTES = "\u201c\u2018"
+CLOSING_QUOTES = "\u201d\u2019"
+MAX_GRAPH_OBJECT_REFERENCES = 500
+# Graph-scoped passages handed to grading and reasoning per request.
+GRAPH_EVIDENCE_LIMIT = 8
+GRADE_BATCH = 8  # candidates per evidence-grading call
+MAX_GRAPH_RELATIONSHIPS = 20
+# Reciprocal-rank-fusion constant (Cormack et al.); larger flattens rank gaps.
+RRF_K = 60
+RARE_TERM_CANDIDATES = 2  # a query term in at most this many candidates is rare
+LEXICAL_ANCHORS = 2  # best lexical matches on a rare term always kept
+VECTOR_ANCHORS = 3  # most similar passages always kept
+FUZZY_TERM_SCORE = 83
+# Same-page passages added after the best-matching pages (graph neighbourhood).
+GRAPH_NEIGHBOUR_PAGES = 2
+GRAPH_NEIGHBOUR_LIMIT = 4
+# A FormField whose question matches the request this well is the field asked about.
+FORM_FIELD_MATCH = 85
+SELECTION_QUESTION = re.compile(
+    r"\b(?:checked|ticked|check-?box(?:es)?|tick-?box(?:es)?|selected option|which option"
+    r"|marked(?:\s+as)?\s+(?:yes|no)|yes or no|is it (?:a |an )?(?:yes|no))\b",
+    re.IGNORECASE,
+)
+# A yes/no question about a form ("... employed or no", "'yes' ... or 'no'"): used
+# only to retrieve form fields, never to override an answer.
+YES_NO_CHOICE = re.compile(
+    r"\b(?:or\s+(?:no|not)\s*\W*$|yes\W{0,3}(?:\s*\([^)]{0,60}\))?\s+or\s+\W{0,3}no\b)",
+    re.IGNORECASE,
+)
+SEARCH_STOPWORDS = frozenset(
+    "a an and are as at be by can could did do does for from has have how i in is it its my "
+    "of on or our please so tell than that the their them there these this those to was what "
+    "whats when where which who whom why will with would you your".split()
+)
+GRAPH_STATUS_SUMMARIES = {
+    "available": "Graph references resolved to local document passages",
+    "empty": "Graph returned no references for this request",
+    "stale": "Graph references had no matching local passages",
+    "unavailable": "Graph is not connected; local retrieval continues",
+    "error": "Graph read failed; local retrieval continues",
+}
 
 LABELS = {
     "search_memory": "Memory searched",
@@ -46,6 +94,10 @@ LABELS = {
     "get_recent_changes": "Recent changes checked",
     "search_knowledge": "Knowledge searched",
     "search_graph": "Relationships searched",
+    "search_knowledge_entities": "Knowledge entities searched",
+    "get_knowledge_entity_context": "Entity relationships inspected",
+    "get_entity_document_references": "Entity documents located",
+    "neo4j__read-cypher": "Neo4j knowledge graph queried",
     "search_web": "Public sources searched",
     "search_news": "Current news searched",
     "fetch_web_page": "Public page fetched",
@@ -60,6 +112,8 @@ LABELS = {
     "convert_currency": "Exchange rate checked",
     "get_holidays": "Holidays checked",
 }
+
+logger = logging.getLogger(__name__)
 
 
 def now():
@@ -96,7 +150,10 @@ class ServiceDeskAgent:
             "remember",
             "finalize",
         ):
-            builder.add_node(name, instrument(name, getattr(self, name)))
+            function = (
+                self.execute_planned_tools if name == "execute_tools" else getattr(self, name)
+            )
+            builder.add_node(name, instrument(name, function))
         builder.add_node("reject_scope", instrument("reject_scope", self.reject_scope))
         builder.add_edge("reject_scope", END)
         builder.add_node("knowledge_subgraph", self.knowledge_subgraph)
@@ -125,16 +182,20 @@ class ServiceDeskAgent:
 
     def _subgraph(self, workflow):
         graph = StateGraph(InvestigationState)
-        graph.add_node("execute_tools", instrument("execute_tools", self.execute_tools))
         if workflow == "knowledge":
+            graph.add_node(
+                "knowledge_retrieval",
+                instrument("knowledge_retrieval", self.retrieve_knowledge),
+            )
             graph.add_node("understand_question", instrument("understand_question", self.understand_question))
             graph.add_node("retrieval_context", instrument("retrieval_context", self.retrieval_context))
             graph.add_node("formulate_retrieval_plan", instrument("plan", self.plan))
             graph.add_edge(START, "understand_question")
             graph.add_edge("understand_question", "retrieval_context")
             graph.add_edge("retrieval_context", "formulate_retrieval_plan")
-            graph.add_edge("formulate_retrieval_plan", "execute_tools")
+            graph.add_edge("formulate_retrieval_plan", "knowledge_retrieval")
         else:
+            graph.add_node("execute_tools", instrument("execute_tools", self.execute_tools))
             for name in (
                 "analyze_ticket",
                 "identify_entities",
@@ -151,7 +212,10 @@ class ServiceDeskAgent:
             graph.add_edge("load_memory", "formulate_investigation_plan")
             graph.add_edge("formulate_investigation_plan", "execute_tools")
         graph.add_node("observe", instrument("observe", self.observe))
-        graph.add_edge("execute_tools", "observe")
+        graph.add_edge(
+            "knowledge_retrieval" if workflow == "knowledge" else "execute_tools",
+            "observe",
+        )
         graph.add_edge("observe", END)
         return graph.compile()
 
@@ -212,6 +276,9 @@ class ServiceDeskAgent:
         summaries = {
             "search_knowledge": knowledge_summary,
             "search_graph": "Querying knowledge relationships",
+            "search_knowledge_entities": "Searching linked knowledge entities",
+            "get_knowledge_entity_context": "Inspecting linked entity context",
+            "get_entity_document_references": "Locating documents linked to the entity",
             "search_news": "Searching current news",
             "search_web": "Searching the public web",
             "fetch_web_page": "Reading a public source",
@@ -271,9 +338,14 @@ class ServiceDeskAgent:
             if name == "search_knowledge"
             else summary
         )
+        completed_status = (
+            "failed"
+            if isinstance(result, dict) and result.get("status") in {"error", "unavailable"}
+            else "completed"
+        )
         await emit(
             "tool:" + name,
-            "completed",
+            completed_status,
             completed_summary,
             **details,
             result_count=result_count,
@@ -336,6 +408,17 @@ class ServiceDeskAgent:
                     "result": value,
                 }
         elif isinstance(value, dict):
+            if value.get("available") is False:
+                return {
+                    **value,
+                    "tool": value.get("tool") or name,
+                    "source_system": value.get("source_system", "tool_error"),
+                    "timestamp": value.get("timestamp") or now(),
+                    "reliability": 0,
+                    "status": "unavailable",
+                    "error": value.get("reason") or "Graph integration is unavailable",
+                    "items": [],
+                }
             if value.get("status") in {"error", "unavailable"}:
                 return {
                     **value,
@@ -406,6 +489,8 @@ class ServiceDeskAgent:
                     "contradictions": [],
                     "actions_already_taken": [],
                     "research_iteration": 0,
+                    "enforced_abstention": False, "abstention_reconsidered": False,
+                    "document_evidence_seen": -1, "recovery_stalled": False,
                     "research_rounds": 0,
                 }
             try:
@@ -478,6 +563,8 @@ class ServiceDeskAgent:
                 "verification": {},
                 "research_rounds": 0,
                 "research_iteration": 0,
+                "enforced_abstention": False, "abstention_reconsidered": False,
+                "document_evidence_seen": -1, "recovery_stalled": False,
                 "web_pages_fetched": 0,
                 "executed_tool_calls": [],
                 "final_answer": None,
@@ -488,6 +575,9 @@ class ServiceDeskAgent:
                     "previous_request": previous.get("ticket", {}).get("summary"),
                     "resolved_goal": previous.get("intent", {}).get("goal"),
                     "document_references": references[-12:],
+                    # The objects the previous answer cited, so a follow-up such as
+                    # "is it a no?" is checked against the same form field.
+                    "cited_object_ids": self._cited_object_ids(previous),
                 },
             }
             self._request_events[request_id] = []
@@ -514,9 +604,12 @@ class ServiceDeskAgent:
                 "retrieval_candidates": [],
                 "confirmed_facts": [],
                 "remembered_facts": [],
+                "personal_memory": [],
                 "human_answers": [],
                 "contradictions": [],
                 "research_iteration": 0,
+                "enforced_abstention": False, "abstention_reconsidered": False,
+                "document_evidence_seen": -1, "recovery_stalled": False,
                 "research_rounds": 0,
                 "web_pages_fetched": 0,
                 "executed_tool_calls": [],
@@ -535,6 +628,22 @@ class ServiceDeskAgent:
             if not snapshot.next or snapshot.values.get("status") != "needs_input":
                 raise ValueError("This request is not awaiting human input")
             graph_input = Command(resume=answer)
+        memory_query = message if message is not None else summary if summary is not None else answer
+        personal_memory = []
+        if memory_query:
+            try:
+                memory_result = await self.harness.invoke(
+                    "search_semantic_memory", {"query": memory_query, "limit": 5}
+                )
+                personal_memory = (memory_result.get("result") or {}).get("facts", [])
+            except Exception:
+                personal_memory = []
+        if isinstance(graph_input, dict):
+            graph_input["personal_memory"] = personal_memory
+        elif personal_memory:
+            await self.graph.aupdate_state(
+                self.config(request_id), {"personal_memory": personal_memory}
+            )
         try:
             await self.graph.ainvoke(graph_input, self.config(request_id))
             state = dict((await self.graph.aget_state(self.config(request_id))).values)
@@ -580,9 +689,16 @@ class ServiceDeskAgent:
                 }
             }
             if "text" in body:
-                body["text"] = relevant_excerpt(str(body["text"]), state["ticket"]["summary"], 1600)
+                body["text"] = relevant_excerpt(
+                    self._readable_marks(body["text"]), self._retrieval_question(state), 1600
+                )
                 body["title"] = meta.get("title") or body.get("title")
                 body["url"] = row.get("url")
+                # Where the passage is: without its page the model can quote a
+                # passage yet not say which page it is on.
+                for key in ("page", "object_type"):
+                    if meta.get(key) is not None:
+                        body[key] = meta[key]
             evidence.append(
                 {
                     k: row[k]
@@ -603,8 +719,13 @@ class ServiceDeskAgent:
                 "ticket",
                 "workflow",
                 "intent",
+                "explicit_saved_knowledge",
+                "resolved_document_ids",
+                "document_alias_matches",
+                "graph_status",
                 "analysis",
                 "remembered_facts",
+                "personal_memory",
                 "confirmed_facts",
                 "human_answers",
                 "contradictions",
@@ -651,17 +772,26 @@ class ServiceDeskAgent:
         request_text = state["ticket"]["summary"]
         explicit_local = bool(re.search(
             r"(?:\b(?:from|check|search|use)\s+(?:(?:my|our|the|saved|uploaded|internal)\s+){0,3}(?:knowledge|kb)\b"
-            r"|\baccording\s+to\s+(?:(?:my|our|the)\s+)?(?:uploaded|saved|local)\s+(?:pdf|document|file|newspaper)\b)",
+            r"|\baccording\s+to\s+(?:(?:my|our|the)\s+)?(?:uploaded|saved|local)\s+(?:pdf|document|file|newspaper)\b"
+            r"|\b(?:in|from)\s+my\s+(?=[A-Za-z0-9_.-]*\d)[A-Za-z0-9_.-]+\b)",
             request_text, flags=re.IGNORECASE,
         ))
+        # Structured classification is authoritative for natural requests such
+        # as a document title or a follow-up about an uploaded PDF. Regexes only
+        # enforce source scope when the model misses an explicit phrase.
+        explicit_local = explicit_local or (
+            intent.workflow == "knowledge" and intent.knowledge_source == "documents"
+        )
         explicit_public = bool(re.search(
             r"\b(?:search|check|look\s+up)\s+(?:online|the\s+(?:web|internet))\b"
             r"|\blatest\s+official\s+(?:requirements|rules|regulations|guidance)\b",
             request_text, flags=re.IGNORECASE,
         ))
-        if explicit_local and intent.workflow == "knowledge" and intent.knowledge_source != "documents":
+        if explicit_local and (
+            intent.workflow != "knowledge" or intent.knowledge_source != "documents"
+        ):
             intent = intent.model_copy(update={
-                "knowledge_source": "documents", "public_topic": "none",
+                "workflow": "knowledge", "knowledge_source": "documents", "public_topic": "none",
                 "justification": (
                     "The user explicitly requested local knowledge. "
                     "Select authorized local evidence before answering."
@@ -698,8 +828,116 @@ class ServiceDeskAgent:
         )
         return {
             "intent": intent.model_dump(), "workflow": intent.workflow,
+            "explicit_saved_knowledge": explicit_local,
             "chat_messages": state.get("chat_messages", []),
         }
+
+    @staticmethod
+    def _title_tokens(title):
+        stem = DOCUMENT_EXTENSION.sub("", str(title or "").strip())
+        return re.findall(r"[a-z0-9]+", stem.casefold())
+
+    @staticmethod
+    def _contains_token_sequence(tokens, alias):
+        """True when consecutive whole tokens join to exactly ``alias``."""
+        for start in range(len(tokens)):
+            joined = ""
+            for token in tokens[start:]:
+                joined += token
+                if joined == alias:
+                    return True
+                if not alias.startswith(joined):
+                    break
+        return False
+
+    @classmethod
+    def _document_alias_matches(cls, question, inventory, *, require_distinctive=True):
+        """Resolve saved-document titles named in ``question`` to unique document IDs.
+
+        The full normalized title stem must appear on token boundaries, so
+        "nsnp200", "nsnp 200" and "NSNP-200" all name "NSNP 200.pdf" while
+        "latest" never names "test.pdf". A single plain word ("network.pdf")
+        is too common to imply a document unless the question refers to it as
+        a file. Versions of one document family resolve to the newest version.
+        """
+        text = str(question or "").casefold()
+        tokens = re.findall(r"[a-z0-9]+", text)
+        best = {}
+        for document in inventory if isinstance(inventory, list) else []:
+            if not isinstance(document, dict):
+                continue
+            identifier = str(document.get("id") or "")
+            title = str(document.get("title") or "")
+            title_tokens = cls._title_tokens(title)
+            alias = "".join(title_tokens)
+            if not identifier or len(alias) < 3 or not cls._contains_token_sequence(tokens, alias):
+                continue
+            distinctive = len(title_tokens) > 1 or any(c.isdigit() for c in alias)
+            if require_distinctive and not distinctive and not re.search(
+                rf"(?<![a-z0-9]){re.escape(alias)}\.[a-z0-9]{{2,5}}\b"
+                rf"|[\"'{OPENING_QUOTES}]{re.escape(alias)}[\"'{CLOSING_QUOTES}]"
+                rf"|(?<![a-z0-9]){re.escape(alias)}\s+(?:pdf|docx?|document|file)\b",
+                text,
+            ):
+                continue
+            try:
+                version = int(document.get("version") or 1)
+            except (TypeError, ValueError):
+                version = 1
+            candidate = {"id": identifier, "title": title, "alias": alias, "version": version}
+            key = str(document.get("family") or identifier)
+            if key not in best or version > best[key]["version"]:
+                best[key] = candidate
+        return list(best.values())
+
+    @staticmethod
+    def _document_choice_question(matches):
+        titles = [match["title"] for match in matches]
+        choices = [
+            f"{number}) {match['title']}"
+            + (f" [{match['id'][:8]}]" if titles.count(match["title"]) > 1 else "")
+            for number, match in enumerate(matches[:MAX_DOCUMENT_CHOICES], 1)
+        ]
+        return "Which saved document did you mean: " + "; ".join(choices) + "?"
+
+    @classmethod
+    def _choose_document(cls, answer, matches):
+        """Pick one candidate from a clarification answer, or None if still ambiguous."""
+        matches = matches[:MAX_DOCUMENT_CHOICES]
+        tokens = re.findall(r"[a-z0-9]+", str(answer or "").casefold())
+        named = cls._document_alias_matches(answer, matches, require_distinctive=False)
+        if named:
+            longest = max(len(match["alias"]) for match in named)
+            named = [match for match in named if len(match["alias"]) == longest]
+            if len(named) == 1:
+                return next(match for match in matches if match["id"] == named[0]["id"])
+        title_tokens = [set(cls._title_tokens(match["title"])) for match in matches]
+        distinguishing = [
+            match for match, own in zip(matches, title_tokens, strict=True)
+            if any(
+                token in own and sum(token in other for other in title_tokens) == 1
+                for token in tokens
+            )
+        ]
+        if len(distinguishing) == 1:
+            return distinguishing[0]
+        by_id = [
+            match for match in matches
+            if any(len(token) >= 6 and match["id"].casefold().startswith(token) for token in tokens)
+        ]
+        if len(by_id) == 1:
+            return by_id[0]
+        ordinals = {
+            "first": 1, "1st": 1, "second": 2, "2nd": 2, "third": 3, "3rd": 3,
+            "fourth": 4, "4th": 4, "fifth": 5, "5th": 5,
+        }
+        positions = {ordinals[token] for token in tokens if token in ordinals}
+        if len(tokens) <= 3:
+            positions |= {int(token) for token in tokens if token.isdigit()}
+        positions = {position for position in positions if 1 <= position <= len(matches)}
+        if len(positions) == 1:
+            return matches[positions.pop() - 1]
+        return None
 
     def intent_route(self, state):
         intent = state["intent"]
@@ -721,8 +959,75 @@ class ServiceDeskAgent:
             "pending_question": None,
         }
 
+    async def _load_saved_documents(self, state):
+        """Read tenant document metadata once per request, after scope acceptance.
+
+        A listing failure leaves alias resolution disabled; it never fails the
+        request, and retrieval context is then discovered as before. Values
+        from an earlier request on the same thread are always replaced.
+        """
+        unresolved = {
+            "available_context": None,
+            "document_alias_matches": [],
+            "resolved_document_ids": [],
+            "graph_status": None,
+        }
+        try:
+            result = await self.harness.invoke(
+                "list_available_context", {"question": state["ticket"]["summary"]}
+            )
+        except (MCPToolError, MCPConnectionError, ValueError):
+            return unresolved
+        context = result.get("result") if isinstance(result, dict) else None
+        if not isinstance(context, dict) or result.get("status") != "ok":
+            return unresolved
+        context = dict(context)
+        inventory = context.pop("document_inventory", None) or []
+        intent = state.get("intent") or {}
+        matches, resolved, kind = self._scope_documents(
+            self._retrieval_question(state), inventory, state.get("conversation_context"),
+            documents_intent=(
+                intent.get("workflow") == "knowledge"
+                and intent.get("knowledge_source") == "documents"
+            ),
+        )
+        if matches and kind != "title":
+            await emit(
+                "document_resolution", "completed",
+                f"Saved document scope from the {kind}: "
+                + ", ".join(str(match["title"]) for match in matches[:3]),
+                document_count=len(matches),
+            )
+        return {
+            **unresolved,
+            "available_context": context,
+            "document_alias_matches": matches,
+            "resolved_document_ids": resolved,
+        }
+
     async def understand_request(self, state):
-        update = {"status": "investigating"}
+        update = {"status": "investigating", **await self._load_saved_documents(state)}
+        if update.get("document_alias_matches"):
+            # A request naming a saved document is answered from that document.
+            intent = dict(state["intent"])
+            if (
+                intent.get("workflow") != "knowledge"
+                or intent.get("knowledge_source") != "documents"
+            ):
+                intent.update(
+                    workflow="knowledge", knowledge_source="documents", public_topic="none",
+                    justification=(
+                        "The request names a saved document. "
+                        "Select authorized local evidence before answering."
+                    ),
+                )
+                await emit(
+                    "source_scope", "completed",
+                    "Source scope constrained to the user's saved knowledge",
+                    rationale="The request names a saved document in this workspace.",
+                )
+            update.update(intent=intent, workflow="knowledge", explicit_saved_knowledge=True)
+            state = {**state, **update}
         if state.get("route_request") and state["workflow"] == "service_desk":
             evidence = [{**row, "case_id": state["case_id"]} for row in state.get("evidence", [])]
             state = {**state, "persist_case": True, "evidence": evidence}
@@ -749,10 +1054,23 @@ class ServiceDeskAgent:
         return {"analysis": {"symptoms": state["ticket"]["summary"], "entities": []}}
 
     async def retrieval_context(self, state):
-        result = await self.harness.invoke(
-            "list_available_context", {"question": state["ticket"]["summary"]}
-        )
-        return {"available_context": result["result"]}
+        # understand_request already discovered context for this request.
+        available = state.get("available_context")
+        if not isinstance(available, dict):
+            result = await self.harness.invoke(
+                "list_available_context", {"question": state["ticket"]["summary"]}
+            )
+            available = dict(result["result"])
+            available.pop("document_inventory", None)
+        matches = state.get("document_alias_matches", [])
+        return {
+            "available_context": {
+                **available,
+                "saved_document_matches": [
+                    {"id": match["id"], "title": match["title"]} for match in matches
+                ],
+            },
+        }
 
     async def analyze_ticket(self, state):
         analysis = await self.provider.generate_structured(
@@ -787,13 +1105,72 @@ class ServiceDeskAgent:
             await self.harness.initialize()
             await emit("discover_tools", "completed", "MCP tool schemas validated",
                        tool_count=len(self.harness.tools))
+        alias_matches = state.get("document_alias_matches", [])
+        resolution = {}
+        if len(alias_matches) > 1 and not state.get("resolved_document_ids"):
+            question = self._document_choice_question(alias_matches)
+            answers = [
+                item.get("answer") for item in state.get("human_answers", [])
+                if str(item.get("question") or "").strip().casefold() == question.casefold()
+            ]
+            if not answers:
+                plan = InvestigationPlan(
+                    goal="Resolve the saved document before retrieval",
+                    additional_evidence_useful=False,
+                    source_strategy="Use only the tenant-owned saved-document inventory.",
+                    clarification_needed=True,
+                    clarification_question=question,
+                    clarification_reason=(
+                        "More than one tenant-owned filename matches the supplied alias."
+                    ),
+                    stop_condition="Stop after the user identifies one saved document.",
+                )
+                await self.note(state, "plan", f"Plan: {plan.goal}.", "application")
+                return {
+                    "plan": plan.model_dump(),
+                    "research_questions": [],
+                    "plan_executed": False,
+                    "tools_discovered": True,
+                }
+            # The question is asked once. An answer that still names no single
+            # candidate scopes retrieval to all candidates instead of re-asking.
+            chosen = self._choose_document(answers[-1], alias_matches)
+            selected = [chosen] if chosen else alias_matches[:MAX_DOCUMENT_CHOICES]
+            resolution = {
+                "document_alias_matches": selected,
+                "resolved_document_ids": [match["id"] for match in selected],
+            }
+            state = {**state, **resolution}
+            await emit(
+                "document_resolution", "completed",
+                f"Saved document selected: {chosen['title']}" if chosen
+                else "Answer matched no single document; searching all candidates",
+                document_count=len(selected),
+            )
         context = self.context(state, True)
         for attempt in range(2):
             plan = await self.provider.generate_structured("plan", context, InvestigationPlan)
+            # A plan that contains retrieval actions necessarily considers
+            # additional evidence useful. Normalize this redundant model flag;
+            # tool schemas and source-scope validation remain authoritative.
+            if plan.tool_calls and not plan.additional_evidence_useful:
+                plan.additional_evidence_useful = True
+            if state.get("explicit_saved_knowledge"):
+                for call in plan.tool_calls:
+                    if call.name == "search_knowledge":
+                        graph_plan = dict(call.arguments.get("graph_plan") or {})
+                        graph_plan["document_ids"] = list(state.get("resolved_document_ids", []))
+                        call.arguments = {
+                            **call.arguments,
+                            "question": self._retrieval_question(state),
+                            "mode": "HYBRID",
+                            "graph_plan": graph_plan,
+                        }
             try:
                 self.harness.validate_plan(plan, state["workflow"])
                 if not plan.tool_calls and plan.additional_evidence_useful and not plan.clarification_needed:
-                    raise ValueError(
+                    raise PlanValidationError(
+                        "EVIDENCE_FLAG_WITHOUT_ACTION",
                         "The plan says more evidence is required but requests no tool. "
                         "Choose an authorized retrieval tool, ask one justified clarification, "
                         "or, for stable general knowledge only, explicitly set "
@@ -805,12 +1182,33 @@ class ServiceDeskAgent:
                     and not plan.tool_calls
                     and not plan.clarification_needed
                 ):
-                    raise ValueError(
+                    raise PlanValidationError(
+                        "REQUIRED_SOURCE_NOT_SELECTED",
                         "This question needs the selected source scope. Plan a real "
                         "document/web retrieval or request one material clarification."
                     )
+                if (
+                    state.get("workflow") == "knowledge"
+                    and state.get("explicit_saved_knowledge")
+                    and not plan.clarification_needed
+                    and not any(call.name == "search_knowledge" for call in plan.tool_calls)
+                ):
+                    raise PlanValidationError(
+                        "LOCAL_KNOWLEDGE_RETRIEVAL_REQUIRED",
+                        "An explicit saved-knowledge request requires local Chroma retrieval. "
+                        "Use search_knowledge; graph participation is enforced separately.",
+                    )
+                if state.get("explicit_saved_knowledge") and any(
+                    call.name in {"search_web", "search_news", "fetch_web_page"}
+                    for call in plan.tool_calls
+                ):
+                    raise PlanValidationError(
+                        "SAVED_KNOWLEDGE_PUBLIC_SOURCE_FORBIDDEN",
+                        "This request is explicitly scoped to saved documents. Do not use public web tools.",
+                    )
                 if plan.tool_calls and not plan.additional_evidence_useful:
-                    raise ValueError(
+                    raise PlanValidationError(
+                        "TOOL_CALLS_WITH_EVIDENCE_DISABLED",
                         "Tool calls contradict additional_evidence_useful=false. "
                         "Set it true when collecting observations."
                     )
@@ -824,18 +1222,71 @@ class ServiceDeskAgent:
                     and plan.clarification_question
                     and plan.clarification_question.strip().casefold() in answered_questions
                 ):
-                    raise ValueError(
+                    raise PlanValidationError(
+                        "REPEATED_CLARIFICATION",
                         "The proposed clarification was already answered. Build a new plan using "
                         "the confirmed human answer."
                     )
                 break
-            except ValueError as exc:
+            except (ValueError, PlanValidationError) as exc:
+                diagnostics = self._plan_validation_diagnostics(
+                    state, exc, attempt + 1
+                )
+                await self._emit_validation_failure(diagnostics)
                 if attempt:
+                    if state.get("explicit_saved_knowledge"):
+                        plan = InvestigationPlan(
+                            goal="Answer from the user's saved document evidence",
+                            additional_evidence_useful=True,
+                            source_strategy="Use tenant-scoped local hybrid retrieval only.",
+                            unknowns=["The answer-bearing passage in the named saved document"],
+                            tool_calls=[{
+                                "name": "search_knowledge",
+                                "arguments": {
+                                    "question": self._retrieval_question(state),
+                                    "top_k": 5,
+                                    "mode": "HYBRID",
+                                    "graph_plan": {
+                                        "document_ids": list(
+                                            state.get("resolved_document_ids", [])
+                                        ),
+                                    },
+                                },
+                                "reason": "The request explicitly names the user's saved document.",
+                            }],
+                            stop_condition="Stop after grounded saved-document evidence is retrieved.",
+                        )
+                        self.harness.validate_plan(plan, state["workflow"])
+                        break
+                    if self._asks_authenticated_identity(state):
+                        plan = InvestigationPlan(
+                            goal="Check the authenticated user's confirmed profile",
+                            additional_evidence_useful=True,
+                            source_strategy=(
+                                "Use the tenant- and owner-scoped authenticated profile capability."
+                            ),
+                            unknowns=["Whether a confirmed profile name is available"],
+                            tool_calls=[{
+                                "name": "get_authenticated_profile",
+                                "arguments": {},
+                                "reason": "The answer must come from confirmed personal memory.",
+                            }],
+                            stop_condition=(
+                                "Stop after the authenticated profile returns a confirmed name or no name."
+                            ),
+                        )
+                        self.harness.validate_plan(plan, state["workflow"])
+                        break
                     raise LLMError(
                         "Model plan failed tool permission or argument validation",
                         category="application_validation",
+                        request_id=state.get("case_id"),
+                        diagnostics=diagnostics,
                     ) from exc
                 context["plan_validation_feedback"] = (
+                    exc.feedback()
+                    if isinstance(exc, PlanValidationError)
+                    else
                     exc.errors(include_input=False, include_url=False)
                     if isinstance(exc, ValidationError)
                     else str(exc)
@@ -891,20 +1342,70 @@ class ServiceDeskAgent:
             additional_evidence_useful=plan.additional_evidence_useful,
         )
         return {
+            **resolution,
             "plan": plan.model_dump(),
             "research_questions": plan.unknowns,
             "plan_executed": False,
             "tools_discovered": True,
         }
 
+    @staticmethod
+    def _asks_authenticated_identity(state):
+        text = " ".join(
+            str(item.get("content", ""))
+            for item in [*state.get("chat_messages", [])[-4:], {
+                "content": state.get("ticket", {}).get("summary", "")
+            }]
+        ).casefold()
+        return bool(
+            re.search(r"\b(?:what(?:'s|s|\s+is)|tell\s+me)\s+my\s+(?:name|profile|identity)\b", text)
+            or re.search(r"\bwho\s+am\s+i\b", text)
+        )
+
+    def _plan_validation_diagnostics(self, state, error, attempt):
+        details = error.feedback() if isinstance(error, PlanValidationError) else {
+            "validation_error_code": "PLAN_CONTRACT_INVALID",
+            "expected_argument_names": [],
+            "actual_argument_names": [],
+        }
+        details.pop("message", None)
+        return {
+            "request_id": state.get("case_id"),
+            "provider": self.provider.name(),
+            "stage": "plan",
+            "attempt_number": attempt,
+            **details,
+        }
+
+    async def _emit_validation_failure(self, diagnostics):
+        logger.warning(
+            "Investigation validation rejected provider=%s stage=%s code=%s "
+            "tool=%s expected_arguments=%s actual_arguments=%s attempt=%s request_id=%s",
+            diagnostics.get("provider"), diagnostics.get("stage"),
+            diagnostics.get("validation_error_code"), diagnostics.get("tool_name"),
+            diagnostics.get("expected_argument_names", []),
+            diagnostics.get("actual_argument_names", []),
+            diagnostics.get("attempt_number"), diagnostics.get("request_id"),
+        )
+        event_details = {key: value for key, value in diagnostics.items() if key != "stage"}
+        await emit(
+            diagnostics.get("stage", "application_validation"), "failed",
+            "The proposed investigation step did not match its validated contract",
+            **event_details,
+        )
+
     async def execute_tools(self, state):
         plan = InvestigationPlan.model_validate(state["plan"])
         try:
             self.harness.validate_plan(plan, state["workflow"])
         except ValueError as exc:
+            diagnostics = self._plan_validation_diagnostics(state, exc, 1)
+            await self._emit_validation_failure(diagnostics)
             raise LLMError(
                 "Model plan failed tool permission or argument validation",
                 category="application_validation",
+                request_id=state.get("case_id"),
+                diagnostics=diagnostics,
             ) from exc
         results = [None] * len(plan.tool_calls)
         attempted_signatures = []
@@ -1043,6 +1544,650 @@ class ServiceDeskAgent:
             "research_rounds": state.get("research_rounds", 0) + int(web_round),
         }
 
+    async def execute_planned_tools(self, state):
+        """Replanned knowledge retrieval stays graph-first like the knowledge subgraph."""
+        if state.get("workflow") == "knowledge":
+            return await self.retrieve_knowledge(state)
+        return await self.execute_tools(state)
+
+    async def retrieve_knowledge(self, state):
+        """Graph-first saved-document retrieval: graph references, then local search.
+
+        The Neo4j read and local hydration complete before the planned local
+        search runs as a supplement or fallback; graph evidence is listed first.
+        """
+        if not state.get("explicit_saved_knowledge"):
+            return await self.execute_tools(state)
+        exact = await self._exact_structured_lookup(state)
+        if exact is not None:
+            # An exact form or table question is answered by indexed graph
+            # lookup; no broad graph read and no semantic search are needed.
+            await emit(
+                "graph_retrieval", "completed",
+                "Answered from an exact structured lookup in the knowledge graph",
+                graph_status="available", hydrated_count=len(exact["output"]["items"]),
+            )
+            return {
+                "graph_status": "available",
+                "tool_results": [exact],
+                "plan_executed": True,
+                "executed_tool_calls": list(dict.fromkeys([
+                    *state.get("executed_tool_calls", []), *exact["signatures"],
+                ])),
+            }
+        graph_result = await self._mandatory_saved_knowledge_graph_read(state)
+        planned = await self.execute_tools(state)
+        if graph_result is None:
+            # The identical graph read already ran for this request.
+            return planned
+        status = graph_result["graph_status"]
+        await emit(
+            "graph_retrieval",
+            "completed" if status in {"available", "empty"} else "failed",
+            GRAPH_STATUS_SUMMARIES[status],
+            graph_status=status,
+            hydrated_count=len((graph_result.get("hydrated_output") or {}).get("items", [])),
+        )
+        graph_outputs = [graph_result]
+        graph_rows = []
+        if graph_result.get("hydrated_output"):
+            graph_rows = graph_result["hydrated_output"]["items"]
+            graph_outputs.append({
+                "name": "search_knowledge",
+                "output": graph_result["hydrated_output"],
+            })
+        # Local search is a supplement: passages the graph path already supplied
+        # are not graded or cited a second time.
+        supplements = []
+        for item in planned.get("tool_results", []):
+            output = item.get("output")
+            if item.get("name") == "search_knowledge" and isinstance(output, dict) and graph_rows:
+                rows = output.get("items") or []
+                unique = self._unique_document_rows([*graph_rows, *rows])[len(graph_rows):]
+                item = {**item, "output": {**output, "items": unique}}
+            supplements.append(item)
+        return {
+            **planned,
+            "graph_status": status,
+            "tool_results": [*graph_outputs, *supplements],
+            "executed_tool_calls": list(dict.fromkeys([
+                *planned.get("executed_tool_calls", []),
+                self._tool_signature(graph_result["name"], graph_result["arguments"]),
+            ])),
+        }
+
+    async def _exact_structured_lookup(self, state):
+        """Answer an exact form-field or table-cell question by indexed graph lookup.
+
+        Runs the fixed EXACT_* queries through neo4j-mcp read-cypher for the
+        resolved documents. A matching field or cell is returned as evidence
+        directly when the graph holds its verified value (content policy
+        structured_values); otherwise that one element is resolved by ID from
+        the local index or saved extraction. Returns None when the question is
+        not an exact structural question or nothing matches, so the normal
+        graph-first retrieval runs instead.
+        """
+        from rapidfuzz import fuzz, utils
+
+        from backend.app.core.principal import current_principal
+        from backend.app.services.graph_projection import normalize_question
+        from backend.app.store.graph_repo import EXACT_FORM_FIELDS_QUERY, EXACT_TABLE_CELLS_QUERY
+
+        document_ids = list(state.get("resolved_document_ids", []))[:MAX_DOCUMENT_CHOICES]
+        if not document_ids or "neo4j__read-cypher" not in self.harness.allowed_names("knowledge"):
+            return None
+        question = self._retrieval_question(state)
+        titles = {match.get("id"): match.get("title")
+                  for match in state.get("document_alias_matches", [])}
+        params = {"tenant_id": current_principal(self.settings).tenant_id,
+                  "document_ids": document_ids}
+        signatures = []
+
+        async def read(query):
+            arguments = {"query": query, "params": params}
+            signatures.append(self._tool_signature("neo4j__read-cypher", arguments))
+            try:
+                output = await self._call(state, "neo4j__read-cypher", arguments)
+            except (MCPToolError, ValueError):
+                return []
+            if output.get("status") != "ok":
+                return []
+            return [row for row in output.get("items", []) if isinstance(row, dict)]
+
+        def exact(item, source_system):
+            return {
+                "name": "search_knowledge",
+                "arguments": {"question": question, "mode": "EXACT"},
+                "signatures": signatures,
+                "output": {
+                    "tool": "search_knowledge", "status": "ok", "items": [item],
+                    "timestamp": now(), "source_system": source_system, "reliability": 0.95,
+                },
+            }
+
+        fields = sorted(
+            (
+                (fuzz.token_set_ratio(normalize_question(row["question"]), question,
+                                      processor=utils.default_process), row)
+                for row in await read(EXACT_FORM_FIELDS_QUERY) if row.get("question")
+            ),
+            key=lambda pair: -pair[0],
+        )
+        if fields and fields[0][0] >= FORM_FIELD_MATCH:
+            row = fields[0][1]
+            options = [o for o in row.get("options") or [] if isinstance(o, dict)]
+            metadata = {
+                "doc_id": row.get("document_id"), "title": titles.get(row.get("document_id")),
+                "page": row.get("page"), "object_id": row.get("object_id"),
+                "object_type": "FormField", "ingestion_mode": "structured_graph",
+                "form_field_question": row.get("question"),
+                "form_field_status": row.get("status"),
+                "form_field_selected": row.get("selected_option"),
+                "form_ambiguity_reason": row.get("ambiguity_reason"),
+                "form_association_method": row.get("association_method"),
+                "match_type": "exact_graph_lookup",
+            }
+            verified = row.get("status") != "answered" or (
+                row.get("selected_option") and all(o.get("label") for o in options)
+            )
+            if verified:
+                text = " ".join([str(row["question"]), *(
+                    f"[{'x' if o.get('selected') else ' '}] {o['label']}" for o in options
+                    if o.get("label")
+                )])
+                return exact({"id": f"graph-{row.get('object_id')}", "text": text,
+                              "metadata": metadata, "score": 1.0, "storage": "neo4j",
+                              "match_type": "exact_graph_lookup"}, "neo4j_aura")
+            # The graph does not hold this field's value (content policy): resolve
+            # exactly this element by ID, never by similarity search.
+            try:
+                hydrated = await self._call(
+                    state, "resolve_graph_references",
+                    {"question": question, "object_ids": [row["object_id"]]},
+                )
+            except (MCPToolError, ValueError):
+                return None  # normal graph-first retrieval still runs
+            signatures.append(self._tool_signature(
+                "resolve_graph_references", {"question": question, "object_ids": [row["object_id"]]}
+            ))
+            rows = [r for r in hydrated.get("items", []) if isinstance(r, dict)]
+            if rows:
+                item = {**rows[0], "match_type": "exact_graph_lookup"}
+                item["metadata"] = {**item.get("metadata", {}), "match_type": "exact_graph_lookup"}
+                return exact(item, "chroma")
+
+        def leaves(header):
+            return [part.split(" / ")[-1].strip() for part in str(header or "").split(" | ")
+                    if part.strip()]
+
+        def named(header):
+            return any(
+                fuzz.partial_ratio(leaf.casefold(), question.casefold()) >= FORM_FIELD_MATCH
+                for leaf in leaves(header) if len(leaf) >= 3
+            )
+
+        cells = [
+            cell for cell in await read(EXACT_TABLE_CELLS_QUERY)
+            if cell.get("object_id") and cell.get("table_id") is not None
+            and cell.get("row") is not None
+        ]
+        column_hits = [cell for cell in cells if named(cell.get("column_header"))]
+        if not column_hits and any(cell.get("column_header") is None for cell in cells):
+            # The content policy keeps table text local: the graph says which
+            # tables exist, the saved extraction says what they hold.
+            column_hits = [cell for cell in cells if cell.get("column_header") is None]
+        if not column_hits:
+            return None
+        matches = [cell for cell in column_hits
+                   if cell.get("row_header") and cell.get("value") is not None
+                   and named(cell.get("row_header"))]
+        source_system = "neo4j_aura"
+        if not matches:
+            # Values are not in the graph (content policy): read exactly these
+            # tables' cells from the saved extraction.
+            tables = {}
+            for cell in column_hits:
+                tables.setdefault(cell["document_id"], set()).add(cell.get("table_id"))
+            local = []
+            for document_id, table_ids in tables.items():
+                arguments = {"document_id": document_id, "table_ids": sorted(map(str, table_ids))}
+                signatures.append(self._tool_signature("resolve_table_cells", arguments))
+                try:
+                    result = await self._call(state, "resolve_table_cells", arguments)
+                except (MCPToolError, ValueError):
+                    return None  # normal graph-first retrieval still runs
+                local.extend(r for r in result.get("items", []) if isinstance(r, dict))
+            matches = [cell for cell in local
+                       if named(cell.get("column_header")) and named(cell.get("row_header"))]
+            source_system = "local_document"
+        if len(matches) != 1:
+            return None
+        cell = matches[0]
+        text = (f"{cell.get('row_header')} | {cell.get('column_header')}: {cell.get('value')}"
+                + (f" ({cell['unit']})" if cell.get("unit") else ""))
+        return exact({
+            "id": f"graph-{cell.get('object_id')}", "text": text, "score": 1.0,
+            "storage": "neo4j" if source_system == "neo4j_aura" else "extraction",
+            "match_type": "exact_graph_lookup",
+            "metadata": {
+                "doc_id": cell.get("document_id"), "title": titles.get(cell.get("document_id")),
+                "page": cell.get("page"), "object_id": cell.get("object_id"),
+                "object_type": "TableCell", "ingestion_mode": "structured_graph",
+                "table_id": cell.get("table_id"), "table_row": cell.get("row"),
+                "table_column": cell.get("column"), "row_header": cell.get("row_header"),
+                "column_header": cell.get("column_header"), "cell_value": cell.get("value"),
+                "unit": cell.get("unit"), "match_type": "exact_graph_lookup",
+            },
+        }, source_system)
+
+    async def _mandatory_saved_knowledge_graph_read(self, state):
+        """Issue one bounded tenant-scoped graph read; never accept model-written Cypher.
+
+        Returns None when this exact read already ran for the request. The
+        result's graph_status is available, empty, stale (references without
+        local passages), unavailable (no graph connection) or error. An MCP
+        failure is always an error, never an empty graph.
+        """
+        from backend.app.core.principal import current_principal
+
+        question = self._retrieval_question(state)
+        concepts = extract_entities([{"text": question}])
+        if not concepts:
+            concepts = re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]{2,}", question)
+        identifiers = re.findall(r"\b[A-Za-z]+\d+[A-Za-z0-9_-]*\b", question)
+        variants = [re.sub(r"(?<=\D)(?=\d)", " ", value) for value in identifiers]
+        terms = list(dict.fromkeys(
+            value.casefold()[:120] for value in [*variants, *identifiers, *concepts]
+        ))[:10]
+        document_ids = list(state.get("resolved_document_ids", []))[:MAX_DOCUMENT_CHOICES]
+        allowed = self.harness.allowed_names("knowledge")
+        name = "neo4j__read-cypher" if "neo4j__read-cypher" in allowed else "search_graph"
+        if name == "neo4j__read-cypher":
+            # A resolved document scopes the read by ID; only unresolved requests
+            # fall back to title/summary terms. Pattern comprehensions collect
+            # each branch independently, so branches never multiply rows.
+            query = (
+                "MATCH (d:Document) WHERE d.tenant_id = $tenant_id "
+                "AND ((size($document_ids) > 0 AND coalesce(d.original_id, d.id) IN $document_ids) "
+                "OR (size($document_ids) = 0 AND any(term IN $terms "
+                "WHERE toLower(coalesce(d.title, '')) CONTAINS term "
+                "OR toLower(coalesce(d.summary, '')) CONTAINS term))) "
+                "WITH d ORDER BY coalesce(d.original_id, d.id) LIMIT 20 "
+                "RETURN coalesce(d.original_id, d.id) AS document_id, d.title AS title, "
+                "d.summary AS summary, "
+                "[(d)<-[:MENTIONED_IN]-(m:GraphMention)-[:REFERS_TO]->(e:Entity) "
+                "WHERE m.tenant_id = $tenant_id | e.name][..50] AS entities, "
+                "[(d)<-[:MENTIONED_IN]-(m:GraphMention)-[:SUPPORTED_BY]->(o) "
+                "WHERE m.tenant_id = $tenant_id | coalesce(o.original_id, o.id)][..500] "
+                "AS mention_object_ids, "
+                "[(d)<-[:DOCUMENTED_IN]-(c:GraphClaim)-[:SUPPORTED_BY]->(o) "
+                "WHERE c.tenant_id = $tenant_id AND coalesce(c.status, 'documented') "
+                "IN ['observed', 'derived', 'documented'] | coalesce(o.original_id, o.id)][..500] "
+                "AS claim_object_ids, "
+                "[(d)<-[:DOCUMENTED_IN]-(c:GraphClaim)-[:SUBJECT]->(s) "
+                "WHERE c.tenant_id = $tenant_id AND coalesce(c.status, 'documented') "
+                "IN ['observed', 'derived', 'documented'] | "
+                "{subject: s.name, predicate: c.predicate, "
+                "object: head([(c)-[:OBJECT]->(t) | t.name]), "
+                "evidence_object_ids: [(c)-[:SUPPORTED_BY]->(x) | coalesce(x.original_id, x.id)][..10]}"
+                "][..50] AS claims, "
+                "[(d)-[:HAS_PAGE]->(p:Page)-[:HAS_CHUNK|HAS_TABLE|HAS_FIGURE|HAS_SECTION"
+                "|HAS_PARAGRAPH|HAS_TABLECELL|HAS_FORMFIELD]->(o) WHERE p.tenant_id = $tenant_id "
+                "| {object_id: coalesce(o.original_id, o.id), page: p.page}][..2000] "
+                "AS page_objects"
+            )
+            arguments = {
+                "query": query,
+                "params": {
+                    "tenant_id": current_principal(self.settings).tenant_id,
+                    "terms": terms,
+                    "document_ids": document_ids,
+                },
+            }
+        else:
+            arguments = {"entities": terms, "limit": 20}
+        if self._tool_signature(name, arguments) in state.get("executed_tool_calls", []):
+            return None
+        try:
+            output = await self._call(state, name, arguments)
+        except (MCPToolError, ValueError) as exc:
+            output = {
+                "tool": name,
+                "source_system": "tool_error",
+                "timestamp": now(),
+                "reliability": 0,
+                "status": "error",
+                "error": str(exc),
+                "items": [],
+            }
+        if output.get("status") == "error":
+            graph_status = "error"
+        elif output.get("status") != "ok":
+            graph_status = "unavailable"
+        else:
+            graph_status = "available" if output.get("items") else "empty"
+        hydrated_output = None
+        if name == "neo4j__read-cypher" and output.get("status") == "ok":
+            rows = [row for row in output.get("items", []) if isinstance(row, dict)]
+            object_ids = self._graph_object_ids(rows)
+            # Reference lists are hydration inputs, not evidence for the model.
+            summaries = [
+                {
+                    "document_id": row.get("document_id"),
+                    "title": row.get("title"),
+                    "summary": row.get("summary"),
+                    "entities": list(dict.fromkeys(
+                        str(value) for value in row.get("entities") or [] if value
+                    ))[:10],
+                    "relationships": [
+                        {
+                            "subject": claim.get("subject"), "predicate": claim.get("predicate"),
+                            "object": claim.get("object"),
+                            "supporting_object_ids": list(claim.get("evidence_object_ids") or []),
+                        }
+                        for claim in row.get("claims") or [] if isinstance(claim, dict)
+                    ][:MAX_GRAPH_RELATIONSHIPS],
+                    "referenced_objects": len(self._graph_object_ids([row])),
+                }
+                for row in rows
+            ]
+            # Passages that support semantic mentions or documented claims are
+            # graph evidence in their own right; they are always kept.
+            supporting = {
+                str(value) for row in rows
+                for value in [*(row.get("mention_object_ids") or []), *(row.get("claim_object_ids") or [])]
+                if value
+            }
+            output = {**output, "items": summaries, "result": summaries}
+            graph_status = "empty"
+            if object_ids:
+                try:
+                    hydration = await self._call(
+                        state, "resolve_graph_references",
+                        {"question": question, "object_ids": object_ids},
+                    )
+                except (MCPToolError, ValueError) as exc:
+                    hydration = {"status": "error", "error": str(exc), "items": []}
+                if hydration.get("status") == "ok" and hydration.get("items"):
+                    hydrated = self._select_graph_evidence(
+                        [dict(item) for item in hydration["items"] if isinstance(item, dict)],
+                        question, GRAPH_EVIDENCE_LIMIT, priority_ids=supporting,
+                        raw_question=state["ticket"]["summary"],
+                        selection=self._asks_selection(state),
+                        inherited_ids=self._inherited_object_ids(state),
+                    )
+                    for item in hydrated:
+                        item["graph_enrichment"] = "available"
+                        item["match_type"] = item.get("match_type", "graph_reference")
+                    hydrated_output = {
+                        "tool": "search_knowledge",
+                        "status": "ok",
+                        "items": hydrated,
+                        "timestamp": now(),
+                        "source_system": "chroma",
+                        "reliability": 0.9,
+                    }
+                    graph_status = "available"
+                elif hydration.get("status") == "ok":
+                    graph_status = "stale"
+                else:
+                    graph_status = "error"
+        return {
+            "name": name,
+            "arguments": arguments,
+            "output": output,
+            "hydrated_output": hydrated_output,
+            "graph_status": graph_status,
+        }
+
+    @staticmethod
+    def _search_terms(text):
+        return [
+            token for token in re.findall(r"[a-z0-9]+", str(text or "").casefold())
+            if token not in SEARCH_STOPWORDS and (len(token) > 1 or token.isdigit())
+        ]
+
+    @classmethod
+    def _select_graph_evidence(cls, rows, question, limit, priority_ids=(), raw_question=None,
+                               selection=False, inherited_ids=()):
+        """Rank graph-scoped passages by fused vector and keyword relevance, then bound them.
+
+        Rows arrive ordered by vector similarity. Keyword relevance is IDF-weighted
+        over the candidates themselves, so words repeated on every page (titles,
+        footers) count for little, and tolerates typos at reduced weight. Reciprocal
+        rank fusion combines both, as hybrid graph retrievers do. The graph's page
+        structure then adds passages on the same page as the best matches, the
+        Document -> Page -> object neighbourhood a field's label and value share.
+        Passages supporting semantic graph claims or mentions are always kept.
+        Section headings are navigation, not evidence: each heading also opens the
+        chunk that follows it, so heading-only rows would only displace content.
+        A FormField repeats its chunk's question and marks; it is added (outside
+        the limit) only when its question matches the one asked.
+        """
+        import math
+
+        from rapidfuzz import fuzz
+
+        rows = [row for row in rows if isinstance(row, dict)]
+
+        asked = {"ticket": {"summary": raw_question or question},
+                 "intent": {"standalone_question": question}}
+
+        def field_score(row):
+            return cls._form_field_score(asked, {"content": {"metadata": row.get("metadata", {})}})
+
+        def cosine(row):
+            if row.get("score_type") != "cosine_similarity":
+                return 0
+            return float(row.get("score") or 0)
+
+        inherited = {str(value) for value in inherited_ids}
+
+        def object_id(row):
+            return str(row.get("metadata", {}).get("object_id"))
+
+        fields = sorted(
+            (row for row in rows
+             if row.get("metadata", {}).get("object_type") == "FormField"
+             and (object_id(row) in inherited or field_score(row) >= FORM_FIELD_MATCH)),
+            key=lambda row: (object_id(row) not in inherited, -field_score(row), -cosine(row)),
+        )
+        if selection:
+            # A paraphrased selection question ("currently employed" for "currently
+            # working for you") rarely matches lexically; keep the form fields the
+            # resolver ranked closest to the question so the model can read them.
+            ranked = sorted(
+                (row for row in rows
+                 if row.get("metadata", {}).get("object_type") == "FormField"
+                 and row not in fields),
+                key=lambda row: -cosine(row),
+            )
+            fields = [*fields, *ranked[:3]]
+        rows = [
+            row for row in rows
+            if row.get("metadata", {}).get("object_type") not in {"Section", "FormField"}
+        ]
+        if not rows:
+            return fields[:5]
+        query_terms = set(cls._search_terms(question))
+        documents = [set(cls._search_terms(row.get("text"))) for row in rows]
+
+        def presence(term, terms):
+            if term in terms:
+                return 1.0
+            if len(term) >= 4 and not term.isdigit() and any(
+                len(other) >= 4 and fuzz.ratio(term, other) >= FUZZY_TERM_SCORE for other in terms
+            ):
+                return 0.5
+            return 0.0
+
+        matrix = [{term: presence(term, terms) for term in query_terms} for terms in documents]
+        frequency = {term: sum(row[term] > 0 for row in matrix) for term in query_terms}
+        weight = {
+            term: math.log((len(rows) + 1) / (count + 1)) + 1
+            for term, count in frequency.items() if count
+        }
+        lexical = [sum(weight.get(term, 0) * value for term, value in row.items()) for row in matrix]
+        lexical_rank = {
+            index: position for position, index in enumerate(
+                sorted((i for i, score in enumerate(lexical) if score > 0),
+                       key=lambda i: (-lexical[i], i))
+            )
+        }
+        fused = sorted(
+            range(len(rows)),
+            key=lambda i: -(
+                1 / (RRF_K + i + 1)
+                + (1 / (RRF_K + lexical_rank[i] + 1) if i in lexical_rank else 0)
+            ),
+        )
+        priority = {str(value) for value in priority_ids}
+        supported = [i for i in fused if str(rows[i].get("metadata", {}).get("object_id")) in priority]
+        # Lexical anchors: a passage holding a rare query term exactly (one that
+        # occurs in at most two candidates, such as a code or acronym) is kept even
+        # when its embedding ranks it low; fusion alone lets passages that are
+        # middling on both rankings displace the only exact match.
+        rare = {term for term, count in frequency.items() if 0 < count <= RARE_TERM_CANDIDATES}
+        anchors = [
+            i for i in sorted(lexical_rank, key=lexical_rank.get)[:LEXICAL_ANCHORS]
+            if any(matrix[i][term] == 1.0 for term in rare)
+        ]
+        # Vector anchors, the mirror case: the passages most similar in meaning
+        # (rows arrive in similarity order) are kept even with no word in common,
+        # e.g. "job title" for "Position offered"; otherwise passages sharing a
+        # common word ("job", "page") collect two partial fusion scores and win.
+        anchors += [i for i in range(min(VECTOR_ANCHORS, len(rows))) if i not in anchors]
+        chosen = [*supported[:MAX_GRAPH_RELATIONSHIPS]]
+        # Anchors take slots within the limit; they never enlarge the selection.
+        chosen += [i for i in anchors if i not in chosen][:max(limit - len(chosen), 0)]
+        for i in fused:
+            if len(chosen) >= limit:
+                break
+            if i not in chosen:
+                chosen.append(i)
+        best_pages = []
+        for i in fused:
+            page = rows[i].get("metadata", {}).get("page")
+            if page is not None and page not in best_pages:
+                best_pages.append(page)
+            if len(best_pages) >= GRAPH_NEIGHBOUR_PAGES:
+                break
+        neighbours = [
+            i for i in fused
+            if i not in chosen and rows[i].get("metadata", {}).get("page") in best_pages
+        ][:GRAPH_NEIGHBOUR_LIMIT]
+        return [*fields[:5], *(rows[i] for i in [*chosen, *neighbours])]
+
+    @staticmethod
+    def _unique_document_rows(rows):
+        """Drop repeats of a passage already returned by an earlier retrieval path."""
+        seen, unique = set(), []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            key = (row.get("metadata", {}).get("doc_id"), row.get("id"))
+            if key[1] is not None and key in seen:
+                continue
+            seen.add(key)
+            unique.append(row)
+        return unique
+
+    @classmethod
+    def _scope_documents(cls, question, inventory, conversation_context=None, documents_intent=False):
+        """Which saved documents a question is about: (matches, resolved_ids, kind).
+
+        A full title always wins. Weaker evidence is used only when the classifier
+        already chose saved documents: first the documents the previous answer
+        cited (a follow-up), then title acronyms named as whole words. Inherited
+        documents are all in scope; several acronym candidates are asked about.
+        """
+        matches = cls._document_alias_matches(question, inventory)
+        if matches or not documents_intent:
+            return matches, ([matches[0]["id"]] if len(matches) == 1 else []), "title"
+        titles = {str(item.get("id")): item.get("title") for item in inventory or []}
+        ids = [item for item in cls._inherited_document_ids(conversation_context) if item in titles]
+        kind = "previous answer"
+        if not ids:
+            ids, _ = cls._resolve_named_documents(question, inventory)
+            kind = "title acronym"
+        matches = [
+            {"id": item, "title": titles.get(item) or item, "alias": "", "version": 1,
+             "matched_by": kind}
+            for item in ids
+        ]
+        resolved = ids if kind == "previous answer" or len(ids) == 1 else []
+        return matches, resolved, (kind if ids else "none")
+
+    @staticmethod
+    def _inherited_document_ids(conversation_context):
+        """Documents the previous answer cited, for a follow-up naming none."""
+        references = (conversation_context or {}).get("document_references") or []
+        return list(dict.fromkeys(
+            str(item["document_id"]) for item in references
+            if isinstance(item, dict) and item.get("document_id")
+        ))[:MAX_DOCUMENT_CHOICES]
+
+    @classmethod
+    def _resolve_named_documents(cls, question, inventory):
+        """Document IDs a question names: full titles first, then title acronyms.
+
+        Returns (ids, kind). An acronym such as "NSNP" in a title only names a
+        document when written as a whole word; several candidates stay several,
+        so the caller asks which one was meant.
+        """
+        matches = cls._document_alias_matches(question, inventory)
+        if matches:
+            return [match["id"] for match in matches], "title"
+        words = set(re.findall(r"[a-z0-9]+", str(question or "").casefold()))
+        named = []
+        for document in inventory if isinstance(inventory, list) else []:
+            title = DOCUMENT_EXTENSION.sub("", str(document.get("title") or ""))
+            acronyms = {
+                token.casefold() for token in re.findall(r"\b[A-Z]{3,}\b", title)
+            }
+            if document.get("id") and acronyms & words:
+                named.append(str(document["id"]))
+        return named[:MAX_DOCUMENT_CHOICES], ("acronym" if named else "none")
+
+    @staticmethod
+    def _readable_marks(text):
+        """Form check boxes as [x] / [ ], from Azure tokens or ☒ / ☐ alike."""
+        from backend.app.services.form_marks import readable_marks
+
+        return readable_marks(text)
+
+    @staticmethod
+    def _retrieval_question(state):
+        """The self-contained question for retrieval and grading.
+
+        A follow-up such as "is it a no?" is resolved by the classifier from the
+        conversation; the user's own words remain the displayed request.
+        """
+        intent = state.get("intent") or {}
+        return str(intent.get("standalone_question") or "").strip() or state["ticket"]["summary"]
+
+    @staticmethod
+    def _graph_object_ids(rows):
+        """Semantic support first, then page objects in page order; bounded and unique."""
+        semantic, located = [], []
+        for row in rows:
+            semantic += [
+                *(row.get("mention_object_ids") or []),
+                *(row.get("claim_object_ids") or []),
+            ]
+            located += [
+                item for item in row.get("page_objects") or []
+                if isinstance(item, dict) and item.get("object_id")
+            ]
+        located.sort(key=lambda item: (
+            item["page"] if isinstance(item.get("page"), int) else float("inf"),
+            str(item["object_id"]),
+        ))
+        ordered = [*semantic, *(item["object_id"] for item in located)]
+        return list(dict.fromkeys(str(value) for value in ordered if value))[
+            :MAX_GRAPH_OBJECT_REFERENCES
+        ]
+
     @staticmethod
     def _tool_signature(name, arguments):
         return json.dumps(
@@ -1084,7 +2229,17 @@ class ServiceDeskAgent:
             }
         failed = result.get("status") in {"error", "unavailable"}
         if failed:
-            rows = [{"error": result.get("error") or "Capability returned no usable response"}]
+            detail = result.get("result") if isinstance(result.get("result"), dict) else {}
+            if result.get("status") == "unavailable":
+                # An unconnected optional integration is reported with its own
+                # reason; it is not a failed evidence source.
+                rows = [{
+                    "error": result.get("error") or detail.get("reason")
+                    or "This integration is not connected.",
+                    "available": False,
+                }]
+            else:
+                rows = [{"error": result.get("error") or "Capability returned no usable response"}]
         items = []
         for row in rows:
             meta = row.get("metadata", {})
@@ -1151,6 +2306,14 @@ class ServiceDeskAgent:
     async def _grade_document_evidence(self, state, candidates):
         if not candidates:
             return {"accepted": [], "rejected": [], "unverified": []}
+        if all(
+            (item.get("content") or {}).get("metadata", {}).get("match_type")
+            == "exact_graph_lookup" for item in candidates
+        ):
+            # Indexed structural lookups matched the question deterministically.
+            return {"accepted": list(candidates), "rejected": [], "unverified": []}
+        # Every candidate is graded. A title named in the question says which
+        # document to search, not which of its passages answer the question.
         candidate_ids = [
             str(item["content"].get("id")
                 or item["content"].get("metadata", {}).get("chunk_id")
@@ -1164,69 +2327,91 @@ class ServiceDeskAgent:
                 f"{len(candidates)} retrieved documents as unverified candidates",
             )
             return {"accepted": [], "rejected": [], "unverified": candidates}
-        bounded = [
-            {
-                "id": candidate_ids[index],
-                "chunk_id": candidate_ids[index],
-                "title": item["content"].get("title")
-                or item["content"].get("metadata", {}).get("title"),
-                "excerpt": relevant_excerpt(
-                    str(item["content"].get("text", "")), state["ticket"]["summary"], 900
-                ),
-            }
-            for index, item in enumerate(candidates)
-        ]
-        try:
-            grade = await self.provider.generate_structured(
-                "grade_evidence",
-                {"question": state["ticket"]["summary"], "candidates": bounded},
-                EvidenceGradeResult,
+        # A form field the question (or the previous answer) points at is the
+        # evidence a selection answer must come from, whatever the grader says.
+        inherited = self._inherited_object_ids(state)
+        fields = {
+            candidate_id for candidate_id, item in zip(candidate_ids, candidates, strict=True)
+            if self._form_field_score(state, item) >= FORM_FIELD_MATCH
+            or (
+                (item.get("content") or {}).get("metadata", {}).get("object_type") == "FormField"
+                and (item.get("content") or {}).get("metadata", {}).get("object_id") in inherited
             )
-            actual = set(candidate_ids)
-            accepted = set(grade.accepted_ids)
-            rejected = {item.id for item in grade.rejected}
-            if (
-                len(grade.accepted_ids) != len(accepted)
-                or len(grade.rejected) != len(rejected)
-                or not accepted <= actual
-                or not rejected <= actual
-                or accepted & rejected
-                or accepted | rejected != actual
-            ):
-                raise ValueError("Evidence grader returned invalid candidate identifiers")
+        }
+        question = self._retrieval_question(state)
+
+        async def grade(batch):
+            """Grade one bounded batch; (accepted ids, {rejected id: reason}, failed)."""
+            bounded = [
+                {
+                    "id": candidate_id,
+                    "chunk_id": candidate_id,
+                    "title": item["content"].get("title")
+                    or item["content"].get("metadata", {}).get("title"),
+                    "excerpt": relevant_excerpt(
+                        self._readable_marks(item["content"].get("text", "")), question, 900,
+                    ),
+                }
+                for candidate_id, item in batch
+            ]
+            actual = {candidate_id for candidate_id, _item in batch}
+            try:
+                result = await self.provider.generate_structured(
+                    "grade_evidence", {"question": question, "candidates": bounded},
+                    EvidenceGradeResult,
+                )
+                accepted = set(result.accepted_ids)
+                rejected = {item.id: item.reason for item in result.rejected}
+                if (
+                    len(result.accepted_ids) != len(accepted)
+                    or len(result.rejected) != len(rejected)
+                    or not accepted <= actual
+                    or not set(rejected) <= actual
+                    or accepted & set(rejected)
+                    or accepted | set(rejected) != actual
+                ):
+                    raise ValueError("Evidence grader returned invalid candidate identifiers")
+                return accepted, rejected, False
+            except Exception as exc:  # noqa: BLE001 - this batch stays unverified
+                logger.warning(
+                    "Evidence grading failed for %d candidates type=%s",
+                    len(batch), type(exc).__name__,
+                )
+                return set(), {}, True
+
+        # Bounded batches graded concurrently: one call over every candidate
+        # can outlast the model timeout and would leave all of them unverified.
+        pairs = list(zip(candidate_ids, candidates, strict=True))
+        batches = [pairs[start:start + GRADE_BATCH] for start in range(0, len(pairs), GRADE_BATCH)]
+        outcomes = await asyncio.gather(*(grade(batch) for batch in batches))
+        accepted, rejected, unverified = set(fields), {}, set()
+        for batch, (batch_accepted, batch_rejected, failed) in zip(batches, outcomes, strict=True):
+            if failed:
+                unverified |= {candidate_id for candidate_id, _item in batch} - fields
+            accepted |= batch_accepted
+            rejected.update(
+                (key, reason) for key, reason in batch_rejected.items() if key not in fields
+            )
+        if unverified:
             await emit(
-                "evidence_grading",
-                "completed",
-                f"Document relevance checked: {len(accepted)} accepted; {len(rejected)} rejected",
-                findings=[f"Rejected {item.id}: {item.reason}" for item in grade.rejected[:6]],
+                "evidence_grading", "failed",
+                "Model grading unavailable for some candidates; retaining "
+                f"{len(unverified)} retrieved documents as unverified candidates",
             )
-            return {
-                "accepted": [
-                    item for candidate_id, item in zip(candidate_ids, candidates)
-                    if candidate_id in accepted
-                ],
-                "rejected": [
-                    {
-                        "evidence": item,
-                        "reason": next(
-                            rejected_item.reason
-                            for rejected_item in grade.rejected
-                            if rejected_item.id == candidate_id
-                        ),
-                    }
-                    for candidate_id, item in zip(candidate_ids, candidates)
-                    if candidate_id in rejected
-                ],
-                "unverified": [],
-            }
-        except Exception:
-            await emit(
-                "evidence_grading",
-                "failed",
-                "Model grading unavailable; retaining "
-                f"{len(candidates)} retrieved documents as unverified candidates",
-            )
-            return {"accepted": [], "rejected": [], "unverified": candidates}
+        await emit(
+            "evidence_grading",
+            "completed",
+            f"Document relevance checked: {len(accepted)} accepted; {len(rejected)} rejected",
+            findings=[f"Rejected {key}: {reason}" for key, reason in list(rejected.items())[:6]],
+        )
+        return {
+            "accepted": [item for candidate_id, item in pairs if candidate_id in accepted],
+            "rejected": [
+                {"evidence": item, "reason": rejected[candidate_id]}
+                for candidate_id, item in pairs if candidate_id in rejected
+            ],
+            "unverified": [item for candidate_id, item in pairs if candidate_id in unverified],
+        }
 
     async def observe(self, state):
         evidence = list(state.get("evidence", []))
@@ -1266,10 +2451,22 @@ class ServiceDeskAgent:
                 rows = errors + assessment["accepted"]
             converted.extend(rows)
         retrieval_candidates = list(candidate_map.values())[-24:]
+
+        def passage(row):
+            # One stored passage keeps one evidence ID, whichever path found it.
+            if row.get("source_type") != "document":
+                return None
+            content = row.get("content", {})
+            return (row.get("doc_id") or content.get("metadata", {}).get("doc_id"), content.get("id"))
+
+        passages = {passage(row) for row in evidence} - {None}
         for row in converted:
-            if row["id"] not in seen:
+            key = passage(row)
+            if row["id"] not in seen and (key is None or key[1] is None or key not in passages):
                 evidence.append(row)
                 seen.add(row["id"])
+                if key is not None:
+                    passages.add(key)
         contradictions = list(state.get("contradictions", []))
         by_predicate = {}
         trusted_facts = []
@@ -1354,13 +2551,130 @@ class ServiceDeskAgent:
                 self._validate_evidence_refs(
                     state, [identifier for item in decision.hypotheses for identifier in item.evidence_ids]
                 )
+                clarification = str(decision.question_for_human or "")
+                page_match = re.search(r"\bpage\s+(\d+)\b", clarification, re.IGNORECASE)
+                location_request = bool(re.search(
+                    r"\b(?:which|what)\s+(?:section|page)|\bsurrounding\s+text\b|\bexact\s+location\b",
+                    clarification, re.IGNORECASE,
+                ))
+                value_request = bool(re.search(
+                    r"\b(?:what|which)\b.{0,100}\b(?:code|number|identifier|date|amount|value)\b",
+                    clarification, re.IGNORECASE,
+                ))
+                if state.get("workflow") == "knowledge" and (
+                    page_match or location_request or value_request
+                ):
+                    requested_page = int(page_match.group(1)) if page_match else None
+                    present = [
+                        item for item in self.usable_evidence(state)
+                        if item.get("source_type") == "document"
+                        and (
+                            requested_page is None
+                            or item.get("content", {}).get("metadata", {}).get("page") == requested_page
+                        )
+                        and item.get("content", {}).get("metadata", {}).get("page") is not None
+                        and str(item.get("content", {}).get("text") or "").strip()
+                    ]
+                    if present:
+                        clarification_terms = {
+                            token.casefold()
+                            for token in re.findall(r"[A-Za-z0-9]+", clarification)
+                            if len(token) >= 3
+                            and token.casefold() not in {
+                                "what", "which", "the", "for", "from", "listed",
+                                "document", "program", "referring", "provide",
+                            }
+                        }
+                        present.sort(
+                            key=lambda item: sum(
+                                term in str(item["content"].get("text") or "").casefold()
+                                for term in clarification_terms
+                            ),
+                            reverse=True,
+                        )
+                        matching = present
+                        if value_request:
+                            matching = [
+                                item for item in present
+                                if sum(
+                                    term in str(item["content"].get("text") or "").casefold()
+                                    for term in clarification_terms
+                                ) >= min(2, len(clarification_terms))
+                                and re.search(
+                                    r"(?:\b\d[\w.-]*\b|:\s*\S+)",
+                                    str(item["content"].get("text") or ""),
+                                )
+                            ]
+                        if matching and attempt == 0:
+                            available_pages = sorted({
+                                item["content"]["metadata"]["page"] for item in matching
+                            })
+                            context["decision_validation_feedback"] = {
+                                "message": (
+                                    "Do not ask the user for a document value, text, or location that is "
+                                    "already present in accepted evidence. The text and page "
+                                    f"provenance are already available on page(s) {available_pages}. "
+                                    "Answer from this evidence or identify a different genuine gap."
+                                ),
+                                "matching_evidence": [
+                                    {
+                                        "id": item["id"],
+                                        "title": item["content"].get("title")
+                                        or item["content"].get("metadata", {}).get("title"),
+                                        "page": item["content"]["metadata"]["page"],
+                                        "excerpt": relevant_excerpt(
+                                            self._readable_marks(item["content"].get("text") or ""),
+                                            self._retrieval_question(state), 1600,
+                                        ),
+                                    }
+                                    for item in matching[:3]
+                                ],
+                            }
+                            continue
+                        if matching:
+                            raise LLMError(
+                                "Reasoning repeatedly requested document evidence that is already present"
+                            )
                 break
-            except LLMError:
+            except LLMError as exc:
                 if attempt:
-                    raise
+                    permitted = {e["id"] for e in state.get("evidence", [])}
+                    decision = decision.model_copy(update={
+                        "outcome": "cannot_verify",
+                        "hypotheses": [
+                            item.model_copy(update={
+                                "evidence_ids": [identifier for identifier in item.evidence_ids if identifier in permitted],
+                                "status": "plausible",
+                            })
+                            for item in decision.hypotheses
+                        ],
+                        "answer": None,
+                        "enough_information": False,
+                        "confidence": 0,
+                        "uncertainty": list(dict.fromkeys([
+                            *decision.uncertainty,
+                            "The proposed answer could not be tied to available evidence.",
+                        ])),
+                    })
+                    await self._emit_validation_failure({
+                        "request_id": state.get("case_id"),
+                        "provider": self.provider.name(),
+                        "stage": "reason",
+                        "validation_error_code": "UNKNOWN_EVIDENCE_REFERENCE",
+                        "expected_argument_names": sorted(
+                            e["id"] for e in state.get("evidence", [])
+                        ),
+                        "actual_argument_names": sorted(exc.diagnostics.get("invalid_evidence_ids", [])),
+                        "attempt_number": attempt + 1,
+                    })
+                    break
+                permitted = sorted(e["id"] for e in state.get("evidence", []))
                 context["reason_validation_feedback"] = (
-                    "The prior decision cited evidence identifiers that do not exist. Cite only "
-                    "exact IDs supplied in evidence, or leave evidence_ids empty."
+                    "Remove these invalid evidence IDs: "
+                    + ", ".join(exc.diagnostics.get("invalid_evidence_ids", []))
+                    + ". Permitted evidence IDs are: "
+                    + (", ".join(permitted) if permitted else "none")
+                    + ". Cite only exact permitted IDs or leave evidence_ids empty."
                 )
         # Carry forward the planner's grounded clarification decision. A
         # retrieval-free clarification must not become an unsupported answer or
@@ -1390,6 +2704,25 @@ class ServiceDeskAgent:
             decision.needs_web_research = False
             decision.requested_tools = []
             decision.confidence = 0
+        reconsidering = bool(
+            state.get("enforced_abstention")
+            and (state.get("verification") or {}).get("contradictions")
+        )
+        document_evidence = sum(
+            1 for item in self.usable_evidence(state) if item.get("source_type") == "document"
+        )
+        # A recovery pass that found no more usable document evidence than the
+        # previous one has stalled; replanning again only repeats rejected lookups.
+        recovery_stalled = bool(
+            state.get("research_iteration", 0) >= 1
+            and document_evidence <= int(state.get("document_evidence_seen", -1))
+        )
+        enforced_abstention = False
+        if state.get("workflow") == "knowledge":
+            proposed = decision.outcome
+            self._enforce_form_selection(state, decision)
+            self._enforce_table_cell(state, decision)
+            enforced_abstention = proposed == "answer" and decision.outcome == "cannot_verify"
         summary = state["ticket"]["summary"].casefold()
         terse_diagnostic_request = (
             len(summary.split()) <= 8
@@ -1450,8 +2783,6 @@ class ServiceDeskAgent:
             issues.append("A ticket-specific question is not permitted for this knowledge request.")
         if decision.human_field == "current_site":
             product = (state.get("analysis", {}).get("product") or "").casefold()
-            import re
-
             product_terms = set(re.findall(r"\w+", product))
             relevant_sites = [
                 e
@@ -1479,6 +2810,13 @@ class ServiceDeskAgent:
             for call in decision.requested_tools
             if self._tool_signature(call.name, call.arguments) not in executed
         ]
+        if state.get("explicit_saved_knowledge"):
+            requested_tools = [
+                call for call in requested_tools
+                if call.name not in {"search_web", "search_news", "fetch_web_page"}
+            ]
+            decision.needs_web_research = False
+            decision.research_queries = []
         next_plan = None
         if requested_tools:
             next_plan = InvestigationPlan(
@@ -1523,6 +2861,10 @@ class ServiceDeskAgent:
             "decision": decision.model_dump(),
             "decision_issues": issues,
             "research_iteration": iteration,
+            "enforced_abstention": enforced_abstention,
+            "abstention_reconsidered": bool(state.get("abstention_reconsidered") or reconsidering),
+            "document_evidence_seen": document_evidence,
+            "recovery_stalled": recovery_stalled,
             "hypotheses": [h.model_dump() for h in decision.hypotheses],
             "inferences": decision.inferences,
             "missing_information": [m.model_dump() for m in decision.missing_information],
@@ -1537,6 +2879,236 @@ class ServiceDeskAgent:
         if next_plan is not None:
             result.update(plan=next_plan.model_dump(), plan_executed=False)
         return result
+
+    @classmethod
+    def _form_field_score(cls, state, item):
+        """How well a FormField item's question matches the request (0 when not a field)."""
+        from rapidfuzz import fuzz, utils
+
+        metadata = (item.get("content") or {}).get("metadata") or {}
+        question = str(metadata.get("form_field_question") or "")
+        if metadata.get("object_type") != "FormField" or not question.strip():
+            return 0
+        normalize = lambda text: re.sub(r"^\W*\d{1,3}[.)]\s*", "", text).casefold()  # noqa: E731
+        asked = {cls._retrieval_question(state), str(state.get("ticket", {}).get("summary") or "")}
+        return max(
+            fuzz.token_set_ratio(normalize(question), value, processor=utils.default_process)
+            for value in asked if value.strip()
+        )
+
+    @staticmethod
+    def _cited_object_ids(state):
+        """Object IDs of the document evidence the state's answer cited (plus earlier turns')."""
+        cited = {value for hypothesis in state.get("hypotheses", []) or []
+                 for value in hypothesis.get("evidence_ids", []) or []}
+        objects = [
+            ((item.get("content") or {}).get("metadata") or {}).get("object_id")
+            for item in state.get("evidence", []) or [] if item.get("id") in cited
+        ]
+        inherited = (state.get("conversation_context") or {}).get("cited_object_ids", [])
+        return list(dict.fromkeys(value for value in [*objects, *inherited] if value))[:20]
+
+    @classmethod
+    def _inherited_object_ids(cls, state):
+        """Objects the previous answer cited, for a follow-up about a selection only.
+
+        "is it a no?" is about the field just discussed; "what is the NOC code"
+        is a new question and must not inherit it.
+        """
+        if not cls._asks_selection(state):
+            return set()
+        return set((state.get("conversation_context") or {}).get("cited_object_ids", []))
+
+    @classmethod
+    def _asks_selection(cls, state):
+        """Whether the request asks which option a form marks (raw or standalone)."""
+        asked = [cls._retrieval_question(state), str(state.get("ticket", {}).get("summary") or "")]
+        return any(SELECTION_QUESTION.search(value) or YES_NO_CHOICE.search(value)
+                   for value in asked if value)
+
+    def _enforce_form_selection(self, state, decision):
+        """Keep a form answer only where extracted selections support it.
+
+        Applies when the request asks which option a form marks, or when a
+        FormField for the question is in evidence (cited by the model, or
+        matching the raw or standalone question). Evidence, strongest first:
+
+        1. a cited or matching FormField: its verified selection is the answer;
+        2. otherwise, the check boxes in the passages the model cited: kept
+           when exactly one cited question matches and has one selected option
+           that the answer states.
+
+        It never replaces a grounded answer with an abstention. It abstains,
+        naming the question and the reason, only when that evidence has no
+        usable selection or contradicts the answer.
+        """
+        evidence = [item for item in self.usable_evidence(state)
+                    if item.get("source_type") == "document"]
+        cited = {value for item in decision.hypotheses for value in item.evidence_ids}
+        inherited = self._inherited_object_ids(state)
+
+        def metadata(item):
+            return (item.get("content") or {}).get("metadata") or {}
+
+        # A follow-up ("is it a no?") is about the field the previous answer cited.
+        cited |= {item["id"] for item in evidence
+                  if metadata(item).get("object_type") == "FormField"
+                  and metadata(item).get("object_id") in inherited}
+
+        def cosine(item):
+            content = item.get("content") or {}
+            if content.get("score_type") != "cosine_similarity":
+                return 0.0
+            return float(content.get("score") or 0)
+
+        ranked = sorted(
+            ((item["id"] in cited, self._form_field_score(state, item), cosine(item), item)
+             for item in evidence if metadata(item).get("object_type") == "FormField"),
+            key=lambda row: (not row[0], -row[1], -row[2]),
+        )
+        fields = [item for is_cited, score, _cosine, item in ranked
+                  if is_cited or score >= FORM_FIELD_MATCH]
+        asked = [self._retrieval_question(state), str(state["ticket"]["summary"])]
+        if not fields and not any(SELECTION_QUESTION.search(value) for value in asked):
+            return
+        if fields:
+            item = fields[0]
+            question, page = metadata(item)["form_field_question"], metadata(item).get("page")
+            if metadata(item).get("form_field_status") == "answered":
+                self._state_selection(decision, item, metadata(item)["form_field_selected"],
+                                      question, page)
+                return
+            reason = str(metadata(item).get("form_ambiguity_reason") or "uncertain")
+            self._abstain_selection(
+                decision, question, f"its check boxes are ambiguous ({reason.replace('_', ' ')})"
+            )
+            return
+        outcome = self._cited_selection(
+            state, decision, [item for item in evidence if item["id"] in cited]
+        )
+        if outcome == "kept":
+            return
+        if outcome is None:
+            self._abstain_selection(
+                decision, str(state["ticket"]["summary"]).strip(),
+                "no check-box selection was extracted for it from the document",
+            )
+            return
+        question, why = outcome
+        self._abstain_selection(decision, question, why)
+
+    @classmethod
+    def _cited_selection(cls, state, decision, cited_items):
+        """Check an answer against the check boxes in the passages the model cited.
+
+        Returns "kept" when exactly one cited question matches the request and
+        has one selected option that the answer states; (question, reason) when
+        the marks are ambiguous or contradict the answer; None when the cited
+        passages hold no matching marked question.
+        """
+        from rapidfuzz import fuzz, utils
+
+        from backend.app.services.form_marks import parse_marks
+
+        # The request, the standalone question and the model's own wording of the
+        # answer (which usually quotes the form's question).
+        asked = [cls._retrieval_question(state), str(state["ticket"]["summary"]),
+                 str(decision.answer or ""), *(item.claim for item in decision.hypotheses)]
+
+        def matches(prompt):
+            prompt = re.sub(r"^\W*\d{1,3}[.)]\s*", "", prompt).casefold()
+            return len(prompt.split()) >= 2 and any(
+                fuzz.token_set_ratio(prompt, value, processor=utils.default_process)
+                >= FORM_FIELD_MATCH for value in asked if value.strip()
+            )
+
+        found = []
+        for item in cited_items:
+            text = str((item.get("content") or {}).get("text") or "")
+            # Readable marks back to tokens: "[x] Yes [ ] No" -> "☒ Yes ☐ No".
+            text = re.sub(r"\[[xX]\]", "☒", text).replace("[ ]", "☐")
+            for block in re.split(r"\n+", text):
+                parsed = parse_marks(block)
+                if parsed and parsed[0] and matches(parsed[0]):
+                    found.append((item, parsed[0], parsed[1]))
+        if not found:
+            return None
+        if len(found) > 1:
+            return (found[0][1], "several marked questions in the cited passages match it")
+        item, prompt, options = found[0]
+        selected = [label for is_selected, label in options if is_selected]
+        if len(selected) != 1:
+            return (prompt, "its check boxes are ambiguous ("
+                    + ("none selected" if not selected else "multiple selected") + ")")
+        label = selected[0]
+        answer = str(decision.answer or "")
+        if decision.outcome == "answer" and re.search(
+            rf"\b{re.escape(label)}\b", answer, re.IGNORECASE
+        ):
+            page = (item.get("content") or {}).get("metadata", {}).get("page")
+            if page is not None and f"page {page}" not in answer.casefold():
+                decision.answer = f"{answer.rstrip()} (page {page})"
+            decision.hypotheses = [Hypothesis(
+                claim=decision.answer, evidence_ids=[item["id"]], confidence=0.85,
+                status="supported",
+            )]
+            return "kept"
+        if decision.outcome == "answer":
+            return (prompt, f"the cited passage marks “{label}”, which the answer does not state")
+        return None
+
+    @staticmethod
+    def _state_selection(decision, item, selected, question, page):
+        stated = re.search(rf"\b{re.escape(selected)}\b", str(decision.answer or ""), re.IGNORECASE)
+        if decision.outcome != "answer" or not stated:
+            decision.answer = f"The form marks “{selected}” for “{question}” (page {page})."
+        elif page is not None and f"page {page}" not in str(decision.answer).casefold():
+            decision.answer = f"{str(decision.answer).rstrip()} (page {page})"
+        decision.outcome, decision.enough_information = "answer", True
+        decision.hypotheses = [Hypothesis(
+            claim=decision.answer, evidence_ids=[item["id"]], confidence=0.9, status="supported",
+        )]
+        decision.confidence = max(decision.confidence, 0.8)
+        decision.question_for_human = decision.human_field = None
+        decision.needs_web_research = False
+
+    @staticmethod
+    def _abstain_selection(decision, question, why):
+        decision.outcome, decision.enough_information = "cannot_verify", False
+        decision.answer = (
+            f"I can't establish which option is selected for “{question}” "
+            f"from the document: {why}."
+        )
+        decision.hypotheses, decision.confidence = [], 0
+        decision.question_for_human = decision.human_field = None
+        decision.needs_web_research = False
+
+    def _enforce_table_cell(self, state, decision):
+        """State an exactly matched table cell's value and headers as the answer."""
+        cells = [
+            item for item in self.usable_evidence(state)
+            if (item.get("content") or {}).get("metadata", {}).get("object_type") == "TableCell"
+            and item["content"]["metadata"].get("match_type") == "exact_graph_lookup"
+        ]
+        if not cells:
+            return
+        item = cells[0]
+        metadata = item["content"]["metadata"]
+        value = str(metadata.get("cell_value") or "")
+        if decision.outcome == "answer" and value and value in str(decision.answer or ""):
+            return
+        unit = f" {metadata['unit']}" if metadata.get("unit") else ""
+        decision.answer = (
+            f"The table on page {metadata.get('page')} lists {value}{unit} for "
+            f"“{metadata.get('row_header')}” under “{metadata.get('column_header')}”."
+        )
+        decision.outcome, decision.enough_information = "answer", True
+        decision.hypotheses = [Hypothesis(
+            claim=decision.answer, evidence_ids=[item["id"]], confidence=0.9, status="supported",
+        )]
+        decision.confidence = max(decision.confidence, 0.8)
+        decision.question_for_human = decision.human_field = None
+        decision.needs_web_research = False
 
     @staticmethod
     def usable_evidence(state):
@@ -1654,6 +3226,8 @@ class ServiceDeskAgent:
             "pending_field": None,
             "plan_executed": True,
             "research_iteration": 0,
+            "enforced_abstention": False, "abstention_reconsidered": False,
+            "document_evidence_seen": -1, "recovery_stalled": False,
             "decision_issues": [],
             "verification": {},
         }
@@ -1817,11 +3391,22 @@ class ServiceDeskAgent:
                 "web_pages_fetched": state.get("web_pages_fetched", 0)}
 
     def _validate_evidence_refs(self, state, ids):
-        if set(ids) - {e["id"] for e in state.get("evidence", [])}:
+        invalid = sorted(set(ids) - {e["id"] for e in state.get("evidence", [])})
+        if invalid:
             raise LLMError(
                 "Structured reasoning cited unknown evidence identifiers",
                 category="application_validation",
+                request_id=state.get("case_id"),
+                diagnostics={"invalid_evidence_ids": invalid},
             )
+
+    @staticmethod
+    def _verification_conversation(conversation):
+        """The user's earlier turns only: previous answers are not the candidate."""
+        return [
+            message for message in conversation or []
+            if not (isinstance(message, dict) and message.get("role") == "assistant")
+        ]
 
     async def verify(self, state):
         # Judge the current candidate independently; prior critic text and
@@ -1841,6 +3426,12 @@ class ServiceDeskAgent:
                 "conversation",
             )
         }
+        # Earlier assistant answers are not under review. Left in the
+        # conversation, a previous wrong answer is judged as if it were this
+        # candidate and sends a correct answer back into recovery. The user's
+        # turns and the standalone question keep a follow-up interpretable.
+        context["conversation"] = self._verification_conversation(context.get("conversation", []))
+        context["standalone_question"] = self._retrieval_question(state)
         context["direct_model_answer"] = self._direct_model_answer(state)
         clarifying = bool(state["decision"].get("question_for_human"))
         if clarifying:
@@ -1962,8 +3553,23 @@ class ServiceDeskAgent:
             if state.get("research_iteration", 0) < 2:
                 return "reason"
         if (
+            decision.get("outcome") == "cannot_verify"
+            and state.get("enforced_abstention")
+            and not state.get("abstention_reconsidered")
+            and v.get("contradictions")
+            and any(item.get("source_type") == "document" for item in self.usable_evidence(state))
+            and state.get("research_iteration", 0) < self.settings.max_investigation_cycles
+        ):
+            # The form-selection rule turned the model's answer into an abstention
+            # and the verifier says the evidence already collected contradicts it.
+            # Reconsider that evidence once; planning the same lookup again only
+            # repeats the retrieval (and the plan validator rightly rejects a plan
+            # that asks for nothing new).
+            return "reason"
+        if (
             not decision.get("question_for_human")
             and v.get("should_continue_research")
+            and not state.get("recovery_stalled")
             and state.get("research_iteration", 0) < self.settings.max_investigation_cycles
         ):
             # Verification identified a material gap. Ask the model to PLAN
@@ -2055,6 +3661,7 @@ class ServiceDeskAgent:
         if not supported:
             errors = [
                 e["content"].get("error") for e in state.get("evidence", [])
+                if e["content"].get("available") is not False
                 if e["source_type"] == "tool_error" and e["content"].get("error")
             ]
             observed_tools = {
@@ -2087,6 +3694,46 @@ class ServiceDeskAgent:
             if missing:
                 limitation += " I still need: " + missing[0].rstrip(".") + "."
         answer_value = (d.answer or d.recommended_next_action) if supported else limitation
+        if (
+            supported
+            and state.get("workflow") == "knowledge"
+            and answer_value
+            and not re.search(r"\bpage\s+\d+\b", answer_value, re.IGNORECASE)
+        ):
+            # Cite only document evidence the model referenced by validated ID;
+            # without such a reference no page citation is added.
+            referenced = list(dict.fromkeys([
+                *(
+                    identifier for item in d.hypotheses if item.status != "rejected"
+                    for identifier in item.evidence_ids
+                ),
+                *v.get("evidence_ids", []),
+            ]))
+            usable = {item["id"]: item for item in self.usable_evidence(state)}
+            locations = {}
+            for identifier in referenced:
+                item = usable.get(identifier)
+                if not item or item.get("source_type") != "document":
+                    continue
+                metadata = item.get("content", {}).get("metadata", {})
+                title = item["content"].get("title") or metadata.get("title") or "saved document"
+                web_page = metadata.get("canonical_url") or metadata.get("url")
+                if metadata.get("source_type") == "url" and web_page:
+                    # A web page has no page numbers; cite its title and address.
+                    locations.setdefault(f"{title} — {web_page}", [])
+                    continue
+                if metadata.get("page") is None:
+                    continue
+                pages = locations.setdefault(title, [])
+                if metadata["page"] not in pages:
+                    pages.append(metadata["page"])
+            if locations:
+                citation = "; ".join(
+                    label if not pages else f"{label}, page{'s' if len(pages) > 1 else ''} "
+                    + ", ".join(str(page) for page in pages[:5])
+                    for label, pages in list(locations.items())[:3]
+                )
+                answer_value = f"{answer_value.rstrip().rstrip('.')} ({citation})."
         response = FinalResponse(
             issue_summary=state["ticket"]["summary"],
             answer=answer_value,

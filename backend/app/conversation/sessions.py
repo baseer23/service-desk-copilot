@@ -28,3 +28,9 @@ class ConversationSessions:
                 return value
             self._items.pop(session_id, None)
             return None
+
+    def clear(self):
+        with self._lock:
+            count = len(self._items)
+            self._items.clear()
+            return count

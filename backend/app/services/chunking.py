@@ -73,7 +73,16 @@ def split_structured(
     chunk_tokens: int = DEFAULT_CHUNK_TOKENS,
     extraction_version: int = 1,
 ):
-    """Create stable, structure-aware searchable objects from a preserved extraction."""
+    """Create stable, structure-aware searchable objects from a preserved extraction.
+
+    Each form question with its options and marks is also one FormField
+    object (rendered with [x] / [ ]), so a question is never separated from its
+    options. Other objects keep Azure's mark tokens as extracted: embeddings of
+    the original text rank more stably, and every reader sees them through
+    form_marks.readable_marks.
+    """
+    from backend.app.services.form_marks import form_fields, render_field
+
     objects = []
 
     def add(kind, page, position, text, **references):
@@ -131,7 +140,11 @@ def split_structured(
                     None,
                 )
             candidate = "\n\n".join([*buffer, paragraph.get("text", "")])
-            if buffer and approx_tokens(candidate) > chunk_tokens:
+            # A chunk never spans pages: its page is its citation, so text from
+            # the next page must start a new chunk even mid-section.
+            if buffer and (
+                approx_tokens(candidate) > chunk_tokens or paragraph.get("page") != start_page
+            ):
                 add("Chunk", start_page, start_position, "\n\n".join(buffer), section_id=section_id)
                 buffer = []
             if not buffer:
@@ -183,6 +196,29 @@ def split_structured(
             image_artifact=figure.get("image_artifact"),
             image_status=figure.get("image_status", "unsupported"),
             bounding_regions=figure.get("bounding_regions", []),
+        )
+
+    for field in form_fields(extraction):
+        add(
+            "FormField",
+            field["page"],
+            f"field-{field['id']}",
+            render_field(field),
+            form_field_id=field["id"],
+            question=field["question"],
+            options=[option["label"] for option in field["options"]],
+            selected_option=field["selected_option"],
+            field_status=field["status"],
+            ambiguity_reason=field["ambiguity_reason"],
+            association_method=field["association_method"],
+            field_confidence=field["confidence"],
+            mark_ids=field["mark_ids"],
+            marks=[
+                {"mark_id": option["mark_id"], "selected": option["selected"],
+                 "confidence": option.get("confidence")}
+                for option in field["options"]
+            ],
+            source_id=field["source_id"],
         )
     return objects
 

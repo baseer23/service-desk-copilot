@@ -12,6 +12,10 @@ class InvestigationState(TypedDict, total=False):
     status: str
     workflow: str
     intent: dict[str, Any]
+    explicit_saved_knowledge: bool
+    resolved_document_ids: list[str]
+    document_alias_matches: list[dict[str, Any]]
+    graph_status: str | None
     analysis: dict[str, Any]
     plan: dict[str, Any]
     research_questions: list[str]
@@ -27,6 +31,7 @@ class InvestigationState(TypedDict, total=False):
     executed_tool_calls: list[str]
     available_context: dict[str, Any]
     remembered_facts: list[dict[str, Any]]
+    personal_memory: list[dict[str, Any]]
     confirmed_facts: list[dict[str, Any]]
     human_answers: list[dict[str, Any]]
     hypotheses: list[dict[str, Any]]
@@ -36,6 +41,10 @@ class InvestigationState(TypedDict, total=False):
     pending_question: str | None
     pending_field: str | None
     research_iteration: int
+    enforced_abstention: bool
+    abstention_reconsidered: bool
+    document_evidence_seen: int
+    recovery_stalled: bool
     research_rounds: int
     web_pages_fetched: int
     actions_already_taken: list[str]

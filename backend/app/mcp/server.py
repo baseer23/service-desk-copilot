@@ -2,6 +2,10 @@
 
 import asyncio
 import base64
+import inspect
+import logging
+import time
+import uuid
 from datetime import datetime, timezone
 from functools import lru_cache, wraps
 from typing import Any, Literal
@@ -14,6 +18,17 @@ from mcp.server.fastmcp import Context, FastMCP
 
 server = FastMCP("deskmate")
 fixtures = FixtureRepository()
+
+
+# One bounded crawl step stays well inside the MCP request timeout.
+CRAWL_STEP_SECONDS = 20
+
+
+class URLIngestError(ValueError):
+    def __init__(self, code: str, message: str, status_code: int):
+        super().__init__(message)
+        self.code = code
+        self.status_code = status_code
 
 
 def capability(source_system, reliability=0.9):
@@ -32,7 +47,7 @@ def capability(source_system, reliability=0.9):
                 if (
                     (settings.deployment_mode == "production" or not settings.test_mode)
                     and fn.__name__ in {
-                        "search_web", "search_news", "fetch_web_page", "ingest_url",
+                        "search_web", "search_news", "fetch_web_page", "ingest_url", "advance_url_crawl",
                         "get_weather", "geocode_location", "search_places", "get_route",
                         "convert_currency", "get_holidays",
                     }
@@ -52,7 +67,11 @@ def capability(source_system, reliability=0.9):
                             "reason": "This organizational data source is not connected.",
                         }
                     else:
-                        result = await asyncio.to_thread(fn, *args, **kwargs)
+                        result = (
+                            await fn(*args, **kwargs)
+                            if inspect.iscoroutinefunction(fn)
+                            else await asyncio.to_thread(fn, *args, **kwargs)
+                        )
                 rows = result if isinstance(result, list) else [result] if result else []
                 status = (
                     "unavailable"
@@ -88,7 +107,12 @@ def capability(source_system, reliability=0.9):
                     status="error",
                     error=message,
                     result=(
-                        {"http_status": exc.status_code} if hasattr(exc, "status_code") else None
+                        {
+                            **({"http_status": exc.status_code} if hasattr(exc, "status_code") else {}),
+                            **({"code": exc.code} if hasattr(exc, "code") else {}),
+                        }
+                        if hasattr(exc, "status_code") or hasattr(exc, "code")
+                        else None
                     ),
                 )
 
@@ -255,6 +279,35 @@ def search_graph(entities: list[str], limit: int = 12):
     return graph.search_relationships(entities, limit)
 
 
+@capability("neo4j_aura")
+def search_knowledge_entities(query: str, limit: int = 20):
+    """Find tenant-scoped semantic entities and compact candidate metadata."""
+    _, graph, driver, _, _ = environment()
+    if not driver:
+        return {"available": False, "reason": "Aura is not connected; local retrieval remains available."}
+    if not 1 <= limit <= 20:
+        raise ValueError("limit must be between 1 and 20")
+    return graph.find_entity_candidates(query, limit=limit)
+
+
+@capability("neo4j_aura")
+def get_knowledge_entity_context(entity_id: str):
+    """Return a bounded tenant-scoped semantic neighborhood for one known entity ID."""
+    _, graph, driver, _, _ = environment()
+    if not driver:
+        return {"available": False, "reason": "Aura is not connected; local retrieval remains available."}
+    return graph.get_entity_neighborhood(entity_id, max_hops=2, limit=30)
+
+
+@capability("neo4j_aura")
+def get_entity_document_references(entity_id: str):
+    """Return linked document and logical Chroma object references for an entity."""
+    _, graph, driver, _, _ = environment()
+    if not driver:
+        return {"available": False, "reason": "Aura is not connected; local retrieval remains available."}
+    return graph.find_related_documents(entity_id, limit=20)
+
+
 @capability("semantic_memory", 1.0)
 def get_authenticated_profile():
     """Return confirmed profile facts for the authenticated tenant and owner only."""
@@ -282,6 +335,12 @@ def capture_semantic_memory(text: str, conversation_id: str, allow_personal_memo
 def forget_authenticated_profile():
     """Application-controlled revocation of the authenticated owner's personal memory."""
     return {"revoked": semantic_memory().forget_profile()}
+
+
+@capability("semantic_memory", 1.0)
+def forget_semantic_memory(fact_id: str):
+    """Application-controlled revocation of one authenticated owner's fact."""
+    return {"revoked": semantic_memory().forget(fact_id)}
 
 
 @capability("local_fixture")
@@ -661,6 +720,31 @@ def list_documents():
     return documents().list_documents()
 
 
+@capability("local_document")
+def resolve_table_cells(document_id: str, table_ids: list[str]):
+    """Application-controlled: exact table cells with headers from the saved extraction."""
+    cells = getattr(documents(), "table_cells", None)
+    if cells is None:
+        raise ValueError("Exact table cells require the local document store")
+    return {"items": cells(document_id, table_ids[:20]), "status": "ok"}
+
+
+@capability("local_document")
+def upgrade_graph_projection(document_id: str | None = None):
+    """Operator action: re-project saved extractions into the structural graph (no Azure)."""
+    upgrade = getattr(documents(), "upgrade_graph_projection", None)
+    if upgrade is None:
+        raise ValueError("Graph projection upgrade requires the local document store")
+    return upgrade(document_id)
+
+
+@capability("local_document")
+def recover_interrupted_documents():
+    """Settle document jobs an earlier application process left mid-operation."""
+    recover = getattr(documents(), "recover_interrupted", None)
+    return recover() if recover else []
+
+
 @capability("chroma")
 def index_document(document_id: str):
     """Explicit operator write: embed a staged document into the configured verified collection."""
@@ -701,6 +785,41 @@ def enrich_document_graph(document_id: str):
     return enrich(document_id)
 
 
+@capability("document_semantic_graph")
+async def enrich_document_semantic_graph(document_id: str):
+    """Authorized ingestion-stage semantic linking; never exposed to the chat planner."""
+    settings = get_settings()
+    if not settings.semantic_graph_ingestion_enabled:
+        raise ValueError("Semantic graph ingestion is not enabled")
+    if not (settings.neo4j_ingestion_enabled and settings.neo4j_uri
+            and settings.neo4j_ingestion_user and settings.neo4j_ingestion_password.get_secret_value()):
+        raise ValueError("The authorized Neo4j ingestion writer is not configured")
+    from neo4j import GraphDatabase
+    from backend.app.core.principal import current_principal
+    from backend.app.models.provider_factory import get_selectable_provider
+    from backend.app.services.capabilities import knowledge_stores
+    from backend.app.services.document_semantic_graph import DocumentSemanticGraphService
+    from backend.app.store.graph_repo import GraphRepository
+
+    driver = GraphDatabase.driver(settings.neo4j_uri, auth=(settings.neo4j_ingestion_user,
+        settings.neo4j_ingestion_password.get_secret_value()), connection_timeout=5,
+        max_transaction_retry_time=0, connection_acquisition_timeout=5)
+    provider = get_selectable_provider(settings)
+    try:
+        driver.verify_connectivity()
+        graph = GraphRepository(driver,
+            tenant_provider=lambda: current_principal(settings).tenant_id,
+            optional=False, allow_fixtures=False, database=settings.neo4j_database)
+        graph.ensure_constraints()
+        vector, _, _ = knowledge_stores(settings, connect_graph=False, records=managed_records())
+        return await DocumentSemanticGraphService(
+            settings, documents(), managed_records(), provider, graph, vector
+        ).enrich(document_id)
+    finally:
+        await provider.aclose()
+        driver.close()
+
+
 @capability("document_store")
 def get_document(document_id: str):
     """Read an authorized document's processing status."""
@@ -723,27 +842,229 @@ def get_document_original(document_id: str):
 
 @capability("chroma")
 def ingest_url(url: str, max_depth: int | None = None, max_pages: int | None = None):
-    """Safely crawl bounded public pages and ingest extracted documents with URL provenance."""
-    from backend.app.services.url_crawler import CrawlLimits, UrlCrawler
+    """Start a durable background crawl of a public website; returns its job ID at once."""
+    from backend.app.services.web import validate_public_url
 
     s = get_settings()
-    if not s.allow_url_ingest:
-        raise ValueError("URL ingestion is disabled")
+    if not s.allow_url_ingest or not s.enable_public_web_tools:
+        raise URLIngestError(
+            "PUBLIC_WEB_DISABLED",
+            "Website ingestion is disabled by workspace authorization.",
+            403,
+        )
+    if not s.uses_record_store:
+        raise URLIngestError(
+            "VECTOR_INDEX_FAILED", "Local website indexing is unavailable.", 503
+        )
     depth = s.url_max_depth if max_depth is None else max_depth
     pages = s.url_max_pages if max_pages is None else max_pages
-    if not 0 <= depth <= 3 or not 1 <= pages <= 10:
+    if not 0 <= depth <= 10 or not 1 <= pages <= 2000:
         raise ValueError("Invalid crawl limits")
-    result = UrlCrawler(s).crawl(
-        url, CrawlLimits(depth, pages, s.url_max_total_chars, s.url_rate_limit_sec)
+    try:
+        validate_public_url(url)
+    except ValueError as exc:
+        raise URLIngestError("URL_BLOCKED", str(exc), 400) from exc
+    job_id = uuid.uuid4().hex
+    now = datetime.now(timezone.utc).isoformat()
+    job = {
+        "job_id": job_id, "url": url, "status": "queued",
+        "max_depth": depth, "max_pages": pages,
+        "created_at": now, "updated_at": now,
+        "pages_saved": 0, "pages_duplicate": 0, "document_ids": [], "url_documents": {},
+        "save_failures": [], "crawl_state": None, "error_code": None, "error_message": None,
+    }
+    documents().records.write(
+        "url_crawl_job", job_id, job, create_only=True, fields={"status": "queued"}
     )
-    totals = {"chunks": 0, "entities": 0, "vector_count": 0, "ms": 0}
-    for page in result.pages:
-        item = environment()[3].ingest_text(
-            page.title, page.content, source=page.url, source_type="url", url=page.url
+    return _crawl_job_summary(job)
+
+
+# Skip reasons meaning the website itself refused the crawler.
+SITE_REFUSAL_REASONS = {"bot_challenge", "http_401", "http_403", "http_451", "robots_disallowed"}
+
+
+def _crawl_job_summary(job, documents_by_id=None):
+    """Public job progress without the resumable crawl internals.
+
+    Crawl counts come from the crawl state; ingestion counts come from each
+    saved page's own document state, so a finished crawl never reads as
+    finished ingestion.
+    """
+    state = job.get("crawl_state") or {}
+    skipped = [*state.get("skipped", []), *job.get("save_failures", [])]
+    reasons, blocked = {}, {}
+    for item in skipped:
+        reasons[item["reason"]] = reasons.get(item["reason"], 0) + 1
+        if item["reason"] in SITE_REFUSAL_REASONS:
+            blocked[item["reason"]] = blocked.get(item["reason"], 0) + 1
+    found = set(state.get("seen_urls", [])) | {item[0] for item in state.get("queue", [])}
+    summary = {
+        key: job.get(key)
+        for key in (
+            "job_id", "url", "status", "max_depth", "max_pages", "created_at", "updated_at",
+            "pages_saved", "pages_duplicate", "document_ids", "error_code", "error_message",
         )
-        for key in totals:
-            totals[key] += getattr(item, key)
-    return {**totals, "pages": len(result.pages), "skipped_urls": result.skipped_urls}
+    }
+    summary.update(
+        pages_found=len(found), pages_skipped=len(skipped), skipped_reasons=reasons,
+        skipped=skipped[-50:], sitemap_seeds=state.get("sitemap_seeds", 0),
+        pages_fetched=state.get("pages_accepted", 0), pages_blocked=blocked,
+        blocked_by_site=state.get("blocked_by_site"),
+        crawl_delay=state.get("crawl_delay", 0.0), resume_after=state.get("resume_after") or None,
+        azure_analysis=job.get("azure_analysis", "disabled"),
+    )
+    if documents_by_id is not None:
+        rows = [documents_by_id[item] for item in job.get("document_ids", []) if item in documents_by_id]
+        semantic, failures = {}, {}
+        for row in rows:
+            status = row.get("semantic_graph_status") or "pending"
+            semantic[status] = semantic.get(status, 0) + 1
+            if row.get("status") == "error":
+                reason = row.get("processing_error_code") or row.get("failed_stage") or "unknown"
+                failures[reason] = failures.get(reason, 0) + 1
+        summary.update(
+            pages_azure_analysed=sum(
+                row.get("extraction_method") == "document_intelligence" for row in rows
+            ),
+            pages_indexed=sum(bool(row.get("local_index_ready")) for row in rows),
+            pages_linked=sum(row.get("graph_link_status") == "linked" for row in rows),
+            pages_semantic=semantic,
+            pages_failed=sum(failures.values()),
+            failed_reasons=failures,
+        )
+    return summary
+
+
+def _blocked_message(state):
+    """Plain-language explanation of a crawl the website refused."""
+    blocked = state.get("blocked_by_site") or {}
+    refused = sum(
+        item["reason"] in {"http_401", "http_403", "http_451"} for item in state.get("skipped", [])
+    )
+    if blocked.get("reason") == "bot_challenge":
+        return (
+            "The website answered with a bot-protection challenge, so the crawl stopped. "
+            "DeskMate doesn't bypass site protections."
+        )
+    return (
+        f"The website refused automated access to {refused} "
+        f"page{'s' if refused != 1 else ''} (HTTP 403), so the crawl stopped. "
+        "DeskMate doesn't bypass site protections."
+    )
+
+
+@capability("public_web")
+def advance_url_crawl(job_id: str):
+    """Application-controlled: crawl the next bounded batch of a website job and save pages."""
+    from backend.app.services.url_crawler import CrawlError, CrawlLimits, UrlCrawler
+
+    s = get_settings()
+    repository = documents()
+    row = repository.records.read("url_crawl_job", job_id)
+    if not row:
+        raise ValueError("Crawl job not found")
+    job = dict(row["payload"])
+    if job["status"] not in {"queued", "running"}:
+        return {**_crawl_job_summary(job), "saved_now": 0}
+
+    def persist(status=None):
+        nonlocal row
+        job["status"] = status or job["status"]
+        job["updated_at"] = datetime.now(timezone.utc).isoformat()
+        row = repository.records.write(
+            "url_crawl_job", job_id, job, previous=row, fields={"status": job["status"]}
+        )
+
+    crawler = UrlCrawler(s)
+    # Paid Azure layout analysis of saved pages only when enabled and configured.
+    processing = "azure_di" if s.url_azure_analysis and s.azure_document_endpoint else "local"
+    job["azure_analysis"] = (
+        "enabled" if processing == "azure_di"
+        else "not_configured" if s.url_azure_analysis else "disabled"
+    )
+    if job["crawl_state"] is None:
+        limits = CrawlLimits(
+            job["max_depth"], job["max_pages"], s.url_max_total_chars,
+            s.url_rate_limit_sec, s.url_max_page_chars,
+        )
+        try:
+            job["crawl_state"] = crawler.start(job["url"], limits)
+        except CrawlError as exc:
+            job.update(error_code=exc.code, error_message=str(exc))
+            persist("failed")
+            return {**_crawl_job_summary(job), "saved_now": 0}
+        persist("running")
+    state = job["crawl_state"]
+    saved_now = 0
+    deadline = time.monotonic() + CRAWL_STEP_SECONDS
+    while not state["done"]:
+        # Each step saves at least one page, then stops at its time budget.
+        pages = crawler.advance(state, max_pages=1)
+        for page in pages:
+            try:
+                saved = repository.upload(
+                    page.html.encode("utf-8"), page.title, "text/html",
+                    "structured_graph", processing, source_type="url",
+                    source_url=page.url, canonical_url=page.canonical_url or page.url,
+                    retrieved_at=datetime.now(timezone.utc).isoformat(),
+                )
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "URL page save failed safely (%s)", type(exc).__name__
+                )
+                job["save_failures"].append({"url": page.url, "reason": "save_failed"})
+                continue
+            job["url_documents"][page.canonical_url or page.url] = saved["id"]
+            if saved["id"] not in job["document_ids"]:
+                job["document_ids"].append(saved["id"])
+            if saved.get("duplicate"):
+                job["pages_duplicate"] += 1
+            else:
+                job["pages_saved"] += 1
+                saved_now += 1
+        # Persist after every page so a restart resumes without refetching it.
+        persist()
+        if not pages or time.monotonic() >= deadline:
+            break
+    if state["done"]:
+        if state.get("blocked_by_site"):
+            # Stop instead of retrying; every page saved so far is kept.
+            job.update(error_code="BLOCKED_BY_SITE", error_message=_blocked_message(state))
+            persist("blocked_by_site")
+        elif job["document_ids"]:
+            persist("complete")
+        else:
+            error = UrlCrawler.empty_error(state)
+            job.update(error_code=error.code, error_message=str(error))
+            persist("failed")
+    return {**_crawl_job_summary(job), "saved_now": saved_now}
+
+
+@capability("sqlite_memory", 1)
+def list_url_crawl_jobs():
+    """Application-controlled: crawl jobs that still have work to do."""
+    records = documents().records
+    rows = [
+        *records.query("url_crawl_job", fields={"status": "queued"}, limit=100),
+        *records.query("url_crawl_job", fields={"status": "running"}, limit=100),
+    ]
+    return [{"job_id": row["payload"]["job_id"], "status": row["payload"]["status"]} for row in rows]
+
+
+@capability("sqlite_memory", 1)
+def get_url_crawl_job(job_id: str):
+    """Crawl job progress including how many saved pages are indexed and linked."""
+    repository = documents()
+    row = repository.records.read("url_crawl_job", job_id)
+    if not row:
+        raise ValueError("Crawl job not found")
+    documents_by_id = {item["id"]: item for item in repository.list_documents()}
+    for document_id in row["payload"].get("document_ids", []):
+        if document_id not in documents_by_id:
+            stored = repository.records.read("document", document_id)
+            if stored:
+                documents_by_id[document_id] = stored["payload"]
+    return _crawl_job_summary(row["payload"], documents_by_id)
 
 
 @capability("sqlite_memory", 1)
@@ -860,6 +1181,17 @@ def list_available_context(question: str | None = None):
         "local_documents_available": bool(catalog),
         "document_catalog": catalog,
         "document_catalog_bounded": len(catalog) < len(rows) if get_settings().uses_record_store else False,
+        # Complete tenant-owned title inventory for application-side document
+        # resolution; the agent removes it before building model context.
+        "document_inventory": [
+            {
+                "id": row.get("id"),
+                "title": row.get("title"),
+                "family": row.get("family"),
+                "version": row.get("version", 1),
+            }
+            for row in rows
+        ],
         "chroma": vector.ping(),
         "aura_connected": driver is not None,
         **(fixtures.inventory() if get_settings().enable_local_fixtures else {}),
@@ -867,6 +1199,25 @@ def list_available_context(question: str | None = None):
         "memory": "sqlite_memory",
         "web": "public_web" if get_settings().enable_public_web_tools else "unavailable",
     }
+
+
+@capability("chroma")
+def resolve_graph_references(question: str, object_ids: list[str]):
+    """Application-controlled: hydrate graph object references into local passages.
+
+    Only tenant-owned passages are returned, ranked against ``question``.
+    """
+    if not 1 <= len(object_ids) <= 500:
+        raise ValueError("object_ids must contain between 1 and 500 references")
+    repository = documents()
+    resolve = getattr(getattr(repository, "search_store", None), "resolve_object_ids", None)
+    if resolve is None:
+        return {
+            "available": False,
+            "reason": "Graph-reference hydration requires local document persistence.",
+        }
+    embedding = repository.embeddings.embed_texts([question])[0]
+    return resolve(object_ids, embedding)
 
 
 @capability("local_storage", 1)

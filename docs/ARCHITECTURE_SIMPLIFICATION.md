@@ -204,3 +204,189 @@ Saved document ingestion now enforces `structured_graph` at the HTTP and MCP bou
 Authenticated conversation memory recognizes only explicit first-person name assertions, records a bounded source excerpt and SHA-256 provenance in tenant/owner-scoped SQLite, and queues an idempotent semantic graph batch. Corrections retain and supersede the previous fact. Neo4j receives scoped `User`, `SemanticFact` and `ConversationSource` nodes with `HAS_FACT`, `SUPPORTED_BY` and `SUPERSEDES` links through separately configured ingestion credentials. Graph delivery has zero driver retries and at most three application attempts; local confirmed memory remains available with an honest pending status. Profile read/search and revocation capabilities derive identity from signed request authority, never model arguments. Unrelated document text cannot alter a personal profile.
 
 Executed non-billable checks: 14 focused semantic-memory/graph tests, 31 related MCP/security/document-job tests and four Knowledge Panel tests passed; the production frontend build passed. No live Aura write, Azure Document Intelligence request, provider inference, public-web request, store deletion, allowance change or Voice change was performed. Live authenticated cross-conversation recall through a configured Aura writer remains an acceptance blocker.
+
+## Persistent chat registry and personal-memory index — 2026-10-25
+
+Ordinary chat threads now have a tenant/owner-scoped SQLite registry whose identifier is the existing LangGraph `thread_id`. The registry stores only discovery metadata; transcripts and continuation state remain in durable checkpoints. React stores only that active identifier, restores the checkpoint through `/conversations/{id}`, lists ordinary chats independently from Cases, and clears only the pointer when starting a new chat.
+
+Explicit remember commands now produce validated identity, preference, project, employment, technology or generic-note facts without a model call. SQLite remains authoritative for confirmed, superseded and revoked facts and for source, vector and graph delivery jobs. A model-specific `personal_memory_local_*` Chroma collection embeds only normalized facts, checks tenant/owner authority against SQLite on every result and removes superseded/revoked vectors. Neo4j remains an optional idempotent projection with minimal provenance; an outage leaves local recall available and its graph job pending. Relevant facts are loaded into the separate LangGraph `personal_memory` field before reasoning.
+
+Before the instruction to stop executing tests, focused checks passed for the 11 general-conversation scenarios, 15 React App scenarios and nine semantic-memory scenarios. The final backfill and graph-metadata edits were inspected but were not followed by another test run. No live model, public web, Azure service or Neo4j write was executed.
+
+## Offline test profiles and change-aware selection — 2026-10-25
+
+Default pytest, CI and Playwright configuration now declares the offline profile, forces local stubs and installs a fail-closed socket guard. Loopback and Unix sockets remain available for FastAPI, Vite and real MCP stdio; named or non-loopback destinations fail before a provider SDK can connect, even if local credentials exist. Live tests are separately marked and require two explicit authorization settings.
+
+`make test-fast` maps the merge-base, staged, unstaged and untracked paths to conservative backend/UI checks and expands unknown backend contracts to the complete offline suite. `make test-regression` is the full offline PR gate. Seven generic browser status variants were consolidated into stronger retained VPN, MFA and printer scenarios, while a real-browser conversation-refresh check was added. The inventory and profile matrix are recorded in `docs/TEST_INVENTORY.md` and `docs/TESTING.md`.
+
+Per user instruction, this testing refactor was not executed. No before/after duration is claimed; the next authorized regression should record pytest durations and Playwright reporting before further consolidation.
+
+## Source-grounded document semantic graph — 2026-10-25
+
+Structured uploads now retain the existing extraction, Chroma indexing and reference-only Neo4j projection, then optionally enter a separately configured semantic stage. Bounded page/section batches are interpreted through the selected structured-reasoning provider; cursors, section proposals, candidate snapshots and placement plans persist in tenant-scoped SQLite under a versioned pipeline key. Provider context redacts common secret assignments and treats all document text as untrusted data. The stage never repeats extraction or embeddings.
+
+The writer uses flexible `Entity.kind` values and generic `RELATED_TO.predicate` relationships. Conservative model placement may reuse only tenant-scoped candidate IDs returned by discovery; trusted Python validates decisions and logical evidence IDs before parameterized writes. `GraphMention` and `GraphClaim` records connect entities and relationships to the canonical `Document` plus existing structured object IDs, while full text remains local and in Chroma. Personal conversation memory remains a separate graph domain. Semantic ingestion is disabled by default and requires both its explicit setting and the dedicated Neo4j writer.
+
+Per user instruction, no tests, lint, build, paid provider call, Azure extraction, or live Neo4j write was executed for this change. Live provider extraction quality, Aura permissions, and end-to-end placement remain acceptance blockers until explicitly authorized.
+
+## Workspace reset and visible investigation activity — 2026-10-25
+
+The API now provides operator-only prepare/confirm reset routes with an expiring principal-bound token, exact `DELETE` confirmation, tenant write blocking, active-stream and ingestion cancellation, per-store reporting, and a retained content-free reset audit. SQLite records/checkpoints, tenant-owned Chroma rows, verified tenant document paths, and tenant-owned Neo4j nodes are deleted independently; uncertain legacy vectors are retained and reported rather than erased. Neo4j deletion uses the dedicated writer and bounded tenant-scoped batches. A successful reset clears in-process sessions and starts a fresh ingestion worker.
+
+The chat UI adds the guarded reset modal and a responsive 60/40 conversation/activity layout. Live activity is grouped into six user-readable stages, retains the complete event log under Technical activity, and persists only allowlisted visible event fields for conversation restoration.
+
+Executed non-billable checks: Python bytecode compilation, TypeScript no-emit type checking, and Git whitespace validation passed. No reset, test suite, live provider request, Chroma deletion, file deletion, or Aura operation was executed. Legacy vectors without reliable tenant ownership and workspace-owned backups/staged files without ownership metadata remain retained and must be reported rather than deleted.
+
+## Continuous chat and durable URL ingestion — 2026-10-26
+
+Chat now renders the checkpoint-backed message list as one chronological transcript, appending the current summary only when it is absent from saved messages. Follow-up submission appears immediately as a pending user turn, transcript scrolling follows new content only while the reader remains near the bottom, and desktop activity uses a stable 65/35 transcript/activity grid that stacks on mobile. The redundant Recent conversations panel was removed without changing conversation persistence or case architecture.
+
+URL ingestion now requires the same public-web, local-MCP and private-store conditions reported by readiness. Crawled pages enter `LocalDocumentRepository`, preserving immutable local source/provenance, compatible Chroma vectors and reference-only Neo4j delivery; graph failure returns `graph_pending` without rolling back local knowledge. Crawler and MCP failures expose bounded safe error codes rather than internal exceptions.
+
+Focused checks passed: four URL-ingestion backend tests, 19 App/Knowledge frontend tests, Python compilation, TypeScript no-emit checking, Git whitespace validation and a live headless browser layout/menu check. A single bounded live `example.com` ingestion returned HTTP 400 and a read-only search confirmed no item was persisted; it was not retried because the mutation result must not be assumed safe to repeat. Runtime health and frontend returned HTTP 200. Aura enrichment was unavailable, and no graph write, reset, paid model call or full test suite was performed.
+
+## Existing document-ingestion activation — 2026-10-26
+
+The private local profile now enables the existing persistence, URL/public-web, structural Neo4j and semantic document-graph switches. Previously linked documents whose semantic status was durably recorded as `disabled` are moved to `pending` when structural linking next succeeds under an enabled semantic configuration, allowing the existing worker to discover them without changing the ingestion architecture. The private `.env` remains ignored and no credential values are committed.
+
+A minimal authorized check confirmed local Chroma retrieval, MCP readiness, Azure Document Intelligence readiness, Neo4j read connectivity and the dedicated structured writer preflight. Re-linking one existing authorized URL document completed with four structural nodes and three relationships. Its semantic proposal completed with 14 entities and one relationship, but graph placement was rejected by application validation and remains failed for operator review; the paid model call was not retried. Two older Azure extraction jobs remain `extract_inflight` and were not repeated because their billing outcome is ambiguous.
+
+## Complete integration recovery — 2026-10-26
+
+Explicit saved-knowledge scope is now an application-enforced LangGraph route even when the classifier proposes the service-desk workflow. The knowledge subgraph owns a dedicated retrieval node that runs the validated local Chroma search and one bounded graph read concurrently. When the authorized official Neo4j MCP read tool is discovered, the application supplies fixed parameterized tenant-scoped Cypher; otherwise the built-in tenant-scoped graph capability reports its real unavailable/empty result. The model never writes Cypher and cannot skip local retrieval for this scope.
+
+The document worker now resumes local indexing, idempotent structural linking and already-safe semantic placement states independently. Structural graph failures persist bounded exponential backoff and a terminal marker after five attempts; ambiguous Azure extraction and embedding dispatch states are never automatically repeated. Reference descriptions use document/section/caption metadata without storing body or cell text in Aura. Malformed graph-placement decisions are conservatively converted to unresolved mentions rather than unsafe entity reuse or an additional model call.
+
+Verification used temporary offline stores and mocked providers: 97 document, URL, graph, MCP-security and LangGraph tests passed; all 57 frontend tests and the production frontend build passed. The official Neo4j MCP adapter also passed a bounded read-only live discovery/schema/`RETURN 1`/node-count check. No Azure Document Intelligence request, LLM request, graph write, document reprocessing, workspace reset or destructive operation was performed.
+
+## Event-driven document pipeline repair — 2026-10-27
+
+Durable document ingestion now uses one application-lifetime event instead of a fixed ten-second scan. Upload and paste routes signal only after the original and metadata are saved; startup still recovers eligible jobs, each signal drains successive indexing, structural-link and semantic stages, and persisted graph deadlines wake the worker without repeating Azure extraction. Worker and manual indexing share a tenant/document-scoped in-process lock. This protects the supported single-process profile; a multi-process deployment would still require a distributed lease or job coordinator.
+
+Saved-document classification now accepts the structured intent result for uploaded PDFs, titles and follow-ups. Its local retrieval is forced through the existing graph-first `HYBRID` path, with local Chroma fallback and no graph metadata promoted to factual evidence. Semantic failures are automatically resumable only when the selected provider explicitly marks them recoverable; model-call budget exhaustion is terminal `partial` and ambiguous graph/model operations are not retried.
+
+Focused offline checks passed for worker recovery/wakeup/backoff, local document job transitions, logical graph-to-Chroma reference hydration, conservative semantic placement, graph repository writes, saved-knowledge routing, the five Knowledge Panel scenarios and the production frontend build. No Azure extraction, paid reasoning request or live Neo4j write was executed; those remain the live boundary.
+
+## Live document failure recovery — 2026-10-27
+
+The live `NSNP 200.pdf` failure was an `AttributeError` in `AzureDocumentExtractor._regions`: the installed Azure SDK returned a flat numeric polygon while the serializer expected point objects. Azure had completed analysis, but the local exception occurred before the first immutable batch was saved. The serializer now accepts numeric, mapping and point-object polygon forms. Processing failures persist a safe stage, code, reason and source exception type, while logs include document ID and stack-frame-only traceback without SDK response bodies or document text.
+
+Azure readiness now uses an authenticated read-only resource-info request; Neo4j writer readiness distinguishes missing settings, connectivity, authorization and schema/transaction validation. Reprocess signals the event-driven worker, resumable semantic states are eligible after restart, successful recovery clears stale failure fields, and the UI renders the persisted safe reason.
+
+One focused polygon regression passed. One live operator-reviewed recovery completed: 14 Azure-extracted pages in seven immutable batches, 25 Chroma chunks, four tables, 412 structural graph nodes, 485 structural relationships and a linked semantic result with 14 entities/mentions and zero source-supported semantic relationships. Both Azure and Neo4j live readiness probes passed.
+
+## Investigation validation recovery — 2026-10-26
+
+Plan rejection now retains a safe structured diagnostic containing request ID, selected provider, stage, validation code, capability name, expected and actual argument names, and attempt number. Discovered MCP schemas remain authoritative. A rejected plan receives one bounded correction with exact schema feedback; authenticated identity questions that still fail correction use the existing owner-scoped `get_authenticated_profile` capability with its exact zero-argument schema rather than failing or inventing identity. Other invalid plans remain rejected.
+
+Reasoning still rejects nonexistent evidence IDs. Its one correction now names the invalid and permitted IDs; a second failure strips unsupported references and terminates as an explicit cannot-verify result. Failed chat follow-ups restore the unsent text, prior messages and normal submit state.
+
+The single live Groq reproduction classified `whats my name` as knowledge/general, reached `plan`, performed provider structured recovery, and then failed application plan validation twice before any MCP tool executed. The prior code discarded the validator exception, so historical logs cannot recover the exact rejected argument set. New deterministic coverage reproduced the likely profile-contract failure (`query` supplied to zero-argument `get_authenticated_profile`) and verifies its safe correction. Focused results: 25 general-conversation/memory/validation checks, five dedicated validation checks, one MCP execution check and 16 App checks passed; compilation, TypeScript checking and live health checks passed. No workspace reset, database mutation outside disposable test stores, or second live-provider request was performed.
+
+## Graph-first saved-document retrieval — 2026-10-27
+
+Saved-document titles now resolve on whole-token boundaries against the tenant's complete title inventory, which `list_available_context` returns once per request after the scope check and the agent keeps out of model context. A single plain-word title needs an explicit file reference, document families resolve to their newest version, and an ambiguous title is asked about once; an answer that still names no single document searches all candidates rather than asking again. Listing failure continues without title resolution.
+
+Saved-knowledge retrieval is graph-first: one application-written, tenant- and document-scoped `read-cypher` call (independent pattern comprehensions, no `OPTIONAL MATCH` row multiplication), hydration of its object references through the application-only `resolve_graph_references` MCP tool, then local search as supplement or fallback. `graph_status` records `available`, `empty`, `stale`, `unavailable` or `error`; an MCP failure is never reported as an empty graph. Answer page citations come only from evidence IDs the model referenced. neo4j-mcp 1.6.x reads `NEO4J_MCP_*`; plain `NEO4J_*` names are deprecated aliases and are not set for the child process. The document-graph e2e acceptance test is now `live`-marked and skips unless both live flags are set; `pytest.ini` was removed so `pyproject.toml` registers every marker.
+
+Executed offline checks: 28 new graph-first tests (mocked neo4j-mcp text/JSON results, a real stdio server for row, empty-list and error results, temporary Chroma/SQLite) and the focused MCP, retrieval, general-conversation, supervisor and scope suites: 88 passed, 6 failed. All six failures predate this change: `search_semantic_memory` runs before the scope check (four scope cases), and two supervisor cases are covered in the branch report. No running application, Azure, Groq or Neo4j Aura request was made. Remaining live blockers: a real chat answer over an existing saved document through the configured Aura instance, and the exact live `read-cypher` response envelope from neo4j-mcp 1.6.0.
+
+## Whole-site URL ingestion — 2026-10-28
+
+"Add from URL" now starts a durable crawl job instead of crawling, indexing and linking inside one MCP call. `ingest_url` stores a `url_crawl_job` record and returns its ID; a FastAPI `url-crawl-worker` drives the application-only `advance_url_crawl` MCP tool in bounded steps (at least one page, at most 20 seconds), persisting queue, seen URLs and robots rules after each page so jobs resume after restart. Seeds come from robots `Sitemap:` lines and `/sitemap.xml` (defusedxml, same-origin, robots-allowed). Limits are per page (`url_max_page_chars`) plus an overall safety cap; robots, same-origin, rate limiting and public-URL validation are unchanged. Pages are saved as `text/html` originals with URL provenance and a canonical-URL document family, and the existing document worker indexes and links them; `html_extraction` gives them the same Section/Paragraph/Table/TableCell/Chunk structure as PDFs and never reaches Azure. Neo4j Documents carry `source_type`, `source_url` and `canonical_url`; `(:Website)-[:HAS_DOCUMENT]->(:Document)` and `(:Document)-[:LINKS_TO]->(:Document)` are written once per page. Answers cite web pages by title and URL. `GET /ingest/url/{job_id}/status` drives the URL tab's progress display.
+
+Executed offline checks: 7 new crawl-job tests and 2 frontend crawl-summary tests; with `test_ingest_url`, `test_local_document_jobs`, `test_document_worker` and `test_graph_first_documents`, 54 passed and 3 failed — the three `test_ingest_url` tests that assert the former synchronous response (`pages`, `chunks`, immediate linking) and were deliberately left unchanged. Local documents, web research, MCP, MCP security, graph repository and multi-MCP suites: 73 passed. Frontend: 58 passed, 3 pre-existing `ProviderSelector` failures; production build passed. Remaining live blockers: a real crawl, the Website/LINKS_TO Cypher against Aura, and semantic ingestion of URL documents (disabled).
+
+## Website ingestion hardening — 2026-10-29
+
+A read-only diagnostic (4 GETs with the crawler's own session) showed the crawler was sending `python-requests/2.32.3`: `session.headers.setdefault("User-Agent", ...)` never applied because `requests.Session` already has one. The site's own nginx answered 403 (no `cf-mitigated` challenge header), its robots.txt asked for `Crawl-delay: 10`, and its sitemap index (on the apex) listed only www URLs while the crawl origin was the apex.
+
+The crawler now identifies itself as `DeskMateBot/1.0 (+URL_CRAWLER_CONTACT)` with standard Accept headers, honours robots Crawl-delay, resolves the apex/www origin from one root fetch before reading robots and sitemaps, rewrites same-site alias URLs to the canonical host, never keeps bot-protection cookies, stops a job as `blocked_by_site` on a challenge or three consecutive 403s (keeping saved pages), and waits out a bounded Retry-After on 429. Saved pages are content-addressed after removing scripts, comments and nonces. Optional Azure Document Intelligence layout analysis of saved pages (`URL_AZURE_ANALYSIS=false` by default) is merged with the local parse's links, canonical URL and tables. The document worker no longer lets a document whose pass changes nothing starve later queued pages, LINKS_TO counts report relationships actually created, and the crawl status reports crawl stages and per-page ingestion stages separately.
+
+Offline: 13 new mocked tests and the existing crawl, worker, local job and graph-first suites pass; the full offline suite has the same 11 pre-existing failures. Not yet verified live: a crawl with the new identity, Azure page-unit cost, Aura Website/HAS_DOCUMENT/LINKS_TO counts and a chat answer from crawled pages.
+
+## Upload speed and interrupted jobs — 2026-10-29
+
+A 14-page structured upload (NSNP 200, free-tier Azure DI, seven 2-page batches) showed two problems. Azure was not slow: each batch took about 6 s, with no 429s, and local post-processing of the saved batches took 0.05 s. Instead:
+
+- **Linking was the slow stage.** `_publish_reference_objects` wrote every page, chunk, paragraph, table cell, form field and selection mark in its own transaction. `link_reference_objects` matched `(a {id:...})` without a label, so every link scanned the whole database. That came to about 640 sequential Aura round trips, taking 3 min 11 s. The form fields and selection marks added in fix/form-selection-accuracy added about 200 of them. Publication now collects its writes and sends them with `UNWIND` in four transactions (document, pages, reference objects, links). Links carry their node labels, and FormField and SelectionMark have uniqueness constraints like the other reference labels. The single-item repository methods delegate to the batched ones.
+- **A restart stranded the job.** Stopping the app while batch 6 was in flight left the document in `extract_inflight` with status `extracting`, which no worker pass resumes. The upload showed as processing forever, and re-uploads returned the same stuck job. At startup the lifespan now calls the `recover_interrupted_documents` MCP tool for each tenant:
+  - An interrupted extraction becomes an explicit `AZURE_DOCUMENT_INTERRUPTED` error. The in-flight batch is never re-sent automatically.
+  - Interrupted local stages (structuring, embedding) are re-queued.
+  - Re-uploading the same file resumes from the saved batches, as it already did for `AZURE_DOCUMENT_CAPACITY`.
+
+Executed checks:
+- **Offline tests:** 4 new recovery tests, including one that a resumed PDF sends only its unsaved pages, and a batching test that publishes a document in 4 write transactions with labelled link matches. The full offline suite has the same 11 pre-existing failures (`test_ingest_url`, `test_scope_source_policy` and `test_service_desk_scenarios`, confirmed on dev without these changes).
+- **Live recovery:** on restart, the stuck NSNP 200 job became `AZURE_DOCUMENT_INTERRUPTED` with 6 batches saved. One re-upload sent only batch 6 (pages 13–14, one free-tier request) and the document reached `ready`.
+- **Live link timing:** re-linking it through `/documents/{id}/enrich-graph` (no Azure, saved vectors reused) took about 6 s instead of 3 min 11 s. A read-only Aura check found all 547 reference nodes plus the Document: 30 FormField, 87 SelectionMark, 87 HAS_SELECTIONMARK, 275 HAS_PARAGRAPH. Both new constraints exist.
+
+## Probabilistic knowledge-graph experiment (dev_exp) — 2026-10-29
+
+An isolated experiment compares dev's semantic graph pipeline (A) with probabilistic reasoning plus deterministic validation, written through the Python driver (B) or through a separate write-enabled neo4j-mcp connection (C). It is not wired into the application. The conversational agent's neo4j-mcp stays read-only. See [PROBABILISTIC_KG_EXPERIMENT.md](PROBABILISTIC_KG_EXPERIMENT.md).
+
+Executed checks:
+- **Offline tests:** 10 new tests. They cover an end-to-end A/B/C comparison on six invented documents with recorded model output, the validator's guarantees, the template allowlist, read-only and production-URI refusal, and retrieval bounds.
+- **Transport:** C ran over real MCP stdio to a stand-in for neo4j-mcp.
+- **Full offline suite:** the same 11 pre-existing failures as dev.
+
+No Azure, Groq or Neo4j Aura request was made. Remaining live blockers: real model proposals, real Cypher on Neo4j, and the real neo4j-mcp `write-cypher` against an isolated database.
+
+## Meaningful structural graph (dev_exp) — 2026-10-29
+
+**What was wrong.** The structural writer works:
+- `_link_structured` writes through the Python Neo4j driver with the separate ingestion login, in batched `UNWIND` transactions.
+- The official neo4j-mcp stays read-only.
+- NSNP 200's 548 nodes were confirmed in Aura by a read-only count.
+
+What it wrote was mostly location, not meaning:
+- **Form fields:** the question lived only inside `description`. There was no field type, selected option, ambiguity reason or association method.
+- **Selection marks:** a state with no option label.
+- **Tables:** "table reference on page N". There was no shape and no headers.
+- **Cells:** coordinates and a hash. There was no text, kind, span, header link or data type.
+- **Sections:** no page range or content count.
+
+Two problems were in the extraction itself:
+- **Cell kinds:** every saved extraction stored the SDK enum's text (`DocumentTableCellKind.COLUMN_HEADER`) instead of `columnHeader`, so header cells were invisible.
+- **Captions:** table captions were never saved.
+
+**Semantic enrichment** runs automatically after structural linking only when `SEMANTIC_GRAPH_INGESTION_ENABLED=true`. `.env` sets it, but the app was started this session with the override `false`. Structural linking never depends on it: a semantic failure sets only `semantic_graph_status`.
+
+**What changed:**
+- **Projection** (`graph_projection.py`, `_publish_reference_objects`):
+  - **FormField:** question, `question_normalized`, `field_type`, `field_status`, `ambiguity_reason`, `association_method`, `option_count`, and `selected_option` (answered fields only).
+  - **SelectionMark:** `ordinal`, `selected`, `form_field_id`, and the `option_label` Azure associated with that mark.
+  - **Table:** shape, `table_id`, `row_group`, caption, column/row headers.
+  - **TableCell:** kind, row/column spans, column/row header (merged cells included), value, data type and unit (from the value or the header's "(CAD)").
+  - **Section:** title, `page_start`/`page_end`, `content_references`.
+  - **Figure:** caption.
+  - **New links:** `(header cell)-[:HEADER_OF]->(cell)`, `(Section)-[:HAS_TABLE|HAS_FORMFIELD]->`, `(Paragraph)-[:PART_OF]->(Chunk)`.
+  - **Document node:** projection version, content policy and extraction method.
+  - Descriptions now state what a node is.
+- **Content policy** (`GRAPH_CONTENT_POLICY`):
+  - `references` is the default and matches the previous privacy boundary. Selected options, option labels and all table text, headers included, stay local and are explicitly cleared from Neo4j. Azure marked NSNP's filled-in address row as a header row, so header text is not safe to treat as a label.
+  - `structured_values` stores those values and must be authorized for Aura.
+- **Retrieval:** `_exact_structured_lookup` runs the fixed `EXACT_FORM_FIELDS_QUERY` / `EXACT_TABLE_CELLS_QUERY` through neo4j-mcp `read-cypher`. Both are indexed on `document_id`.
+  - A matching field or cell is answered from the graph, or from that one element resolved by ID: `resolve_graph_references` for fields, `resolve_table_cells` against the saved extraction for tables.
+  - It never runs a similarity search, and it does not grade with a model.
+  - Anything unmatched falls back to the existing graph-first path.
+- **Semantic layer** (the existing `DocumentGraphUnderstanding`, not a new system):
+  - Relationships carry `status`: observed, derived, ambiguous or hypothesis, never raised by validation.
+  - Entities must be named in the objects they cite.
+  - Rejected proposals are kept in the job record.
+  - Only observed and derived claims get `RELATED_TO`, and the agent's graph read returns only those.
+- **Migration:** `upgrade_graph_projection` (MCP tool and `POST /documents/upgrade-graph-projection`) re-projects saved extractions in place. It reuses the same stable node IDs, makes no Azure call, does not re-embed, deletes nothing, and skips documents already current.
+
+Executed checks:
+- **Offline end-to-end test** (`test_meaningful_graph.py`), under both policies: Azure DI fixture → `LocalDocumentRepository` → graph → `read-cypher` harness → answer.
+  - Covers a Yes, a No, an ambiguous check-box, a table and a long section passage.
+  - Asserts no similarity search for exact answers, and that the Cypher rows carry the policy's values.
+- **Related suites:** 91 passed. The full offline suite run before the last fixes showed the 11 pre-existing failures plus 3 that are now fixed.
+- **NSNP 200, projected locally from its saved extraction** (no Aura write, no Azure):
+  - 30 form fields: 21 answered, 9 explicitly ambiguous.
+  - "Is the applicant currently working for you?" → page 6, `answered`, selected **Yes**. The Yes mark is ordinal 0, confidence 0.991, associated by text position, and No is unselected.
+  - 47 of 57 table cells regained their column headers once kinds were normalised.
+
+Not done, and needs approval:
+- running the upgrade against Aura, under the chosen content policy;
+- semantic enrichment (paid model calls);
+- real-Neo4j execution of the new Cypher. The writes and lookups were exercised against the in-memory graph and captured driver rows, not a Neo4j server.
