@@ -895,3 +895,21 @@ def test_evidence_is_graded_in_bounded_batches_and_a_failed_batch_keeps_matching
     assert [item["id"] for item in result["accepted"]] == ["c-0", "c-14"]
     assert {item["id"] for item in result["unverified"]} == {f"c-{index}" for index in range(8, 14)}
     assert len(result["rejected"]) == 7
+
+
+def test_a_rare_exact_term_survives_rank_fusion_even_when_its_embedding_ranks_last():
+    rows = [
+        {"id": f"c{index}", "text": f"Employer contact details and postal code for office {index}.",
+         "score": 0.5 - index / 100, "score_type": "cosine_similarity",
+         "metadata": {"object_id": f"c{index}", "object_type": "Chunk", "page": 1 + index % 9}}
+        for index in range(30)
+    ]
+    rows.append({"id": "c-noc", "text": "Position NOC 2021 Code 11111", "score": 0.05,
+                 "score_type": "cosine_similarity",
+                 "metadata": {"object_id": "c-noc", "object_type": "Chunk", "page": 10}})
+    question = "In Employer form.pdf, what is the NOC code listed?"
+    chosen = ServiceDeskAgent._select_graph_evidence(rows, question, 8)
+    assert "c-noc" in [row["id"] for row in chosen]
+    # A term every candidate shares is not rare and anchors nothing.
+    common = ServiceDeskAgent._select_graph_evidence(rows[:30], "what is the postal code?", 8)
+    assert len(common) <= 8 + 4
