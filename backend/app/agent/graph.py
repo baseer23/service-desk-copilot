@@ -49,6 +49,7 @@ MAX_GRAPH_RELATIONSHIPS = 20
 RRF_K = 60
 RARE_TERM_CANDIDATES = 2  # a query term in at most this many candidates is rare
 LEXICAL_ANCHORS = 2  # best lexical matches on a rare term always kept
+VECTOR_ANCHORS = 3  # most similar passages always kept
 FUZZY_TERM_SCORE = 83
 # Same-page passages added after the best-matching pages (graph neighbourhood).
 GRAPH_NEIGHBOUR_PAGES = 2
@@ -2046,8 +2047,14 @@ class ServiceDeskAgent:
             i for i in sorted(lexical_rank, key=lexical_rank.get)[:LEXICAL_ANCHORS]
             if any(matrix[i][term] == 1.0 for term in rare)
         ]
-        chosen = [*supported[:MAX_GRAPH_RELATIONSHIPS],
-                  *(i for i in anchors if i not in supported)]
+        # Vector anchors, the mirror case: the passages most similar in meaning
+        # (rows arrive in similarity order) are kept even with no word in common,
+        # e.g. "job title" for "Position offered"; otherwise passages sharing a
+        # common word ("job", "page") collect two partial fusion scores and win.
+        anchors += [i for i in range(min(VECTOR_ANCHORS, len(rows))) if i not in anchors]
+        chosen = [*supported[:MAX_GRAPH_RELATIONSHIPS]]
+        # Anchors take slots within the limit; they never enlarge the selection.
+        chosen += [i for i in anchors if i not in chosen][:max(limit - len(chosen), 0)]
         for i in fused:
             if len(chosen) >= limit:
                 break
