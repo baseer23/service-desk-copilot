@@ -694,6 +694,11 @@ class ServiceDeskAgent:
                 )
                 body["title"] = meta.get("title") or body.get("title")
                 body["url"] = row.get("url")
+                # Where the passage is: without its page the model can quote a
+                # passage yet not say which page it is on.
+                for key in ("page", "object_type"):
+                    if meta.get(key) is not None:
+                        body[key] = meta[key]
             evidence.append(
                 {
                     k: row[k]
