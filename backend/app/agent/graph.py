@@ -47,6 +47,8 @@ GRADE_BATCH = 8  # candidates per evidence-grading call
 MAX_GRAPH_RELATIONSHIPS = 20
 # Reciprocal-rank-fusion constant (Cormack et al.); larger flattens rank gaps.
 RRF_K = 60
+RARE_TERM_CANDIDATES = 2  # a query term in at most this many candidates is rare
+LEXICAL_ANCHORS = 2  # best lexical matches on a rare term always kept
 FUZZY_TERM_SCORE = 83
 # Same-page passages added after the best-matching pages (graph neighbourhood).
 GRAPH_NEIGHBOUR_PAGES = 2
@@ -2035,7 +2037,17 @@ class ServiceDeskAgent:
         )
         priority = {str(value) for value in priority_ids}
         supported = [i for i in fused if str(rows[i].get("metadata", {}).get("object_id")) in priority]
-        chosen = [*supported[:MAX_GRAPH_RELATIONSHIPS]]
+        # Lexical anchors: a passage holding a rare query term exactly (one that
+        # occurs in at most two candidates, such as a code or acronym) is kept even
+        # when its embedding ranks it low; fusion alone lets passages that are
+        # middling on both rankings displace the only exact match.
+        rare = {term for term, count in frequency.items() if 0 < count <= RARE_TERM_CANDIDATES}
+        anchors = [
+            i for i in sorted(lexical_rank, key=lexical_rank.get)[:LEXICAL_ANCHORS]
+            if any(matrix[i][term] == 1.0 for term in rare)
+        ]
+        chosen = [*supported[:MAX_GRAPH_RELATIONSHIPS],
+                  *(i for i in anchors if i not in supported)]
         for i in fused:
             if len(chosen) >= limit:
                 break
