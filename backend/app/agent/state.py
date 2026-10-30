@@ -43,6 +43,8 @@ class InvestigationState(TypedDict, total=False):
     research_iteration: int
     enforced_abstention: bool
     abstention_reconsidered: bool
+    document_evidence_seen: int
+    recovery_stalled: bool
     research_rounds: int
     web_pages_fetched: int
     actions_already_taken: list[str]

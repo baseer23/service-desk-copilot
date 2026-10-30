@@ -793,3 +793,67 @@ def test_form_fields_are_retrieved_for_a_paraphrased_selection_question():
     assert ids.index("f-working") < ids.index("f-union")
     plain = ServiceDeskAgent._select_graph_evidence(rows, standalone, 8, raw_question=raw)
     assert "f-working" not in [item["id"] for item in plain]
+
+
+def test_a_follow_up_is_answered_from_the_field_the_previous_answer_cited():
+    field = field_evidence("f-working", "1. Is the applicant currently working for you?",
+                           "answered", "Yes", page=6)
+    field["content"]["metadata"]["object_id"] = "F-working"
+    state = agent_state(
+        "is it a no?",
+        "In the employer form, is the answer to the current employment status question 'no'?",
+        [field],
+    )
+    state["conversation_context"] = {"cited_object_ids": ["F-working"]}
+    # The model abstains: the follow-up's words match no field.
+    result = InvestigationDecision(outcome="cannot_verify", evidence_summary="",
+                                   enough_information=False, confidence=0)
+    ServiceDeskAgent._enforce_form_selection(ServiceDeskAgent, state, result)
+    assert result.outcome == "answer"
+    assert result.answer == (
+        "The form marks “Yes” for “1. Is the applicant currently working for you?” (page 6)."
+    )
+    # The model answers correctly in its own words: kept, with the page.
+    kept = cited_decision("No — the form marks Yes for that question.", [])
+    ServiceDeskAgent._enforce_form_selection(ServiceDeskAgent, state, kept)
+    assert kept.outcome == "answer" and kept.answer.startswith("No — the form marks Yes")
+    assert "(page 6)" in kept.answer and kept.hypotheses[0].evidence_ids == ["f-working"]
+
+
+def test_cited_objects_carry_into_the_next_turn_and_are_kept_by_graph_selection():
+    previous = {
+        "hypotheses": [{"evidence_ids": ["e-field"]}],
+        "evidence": [{"id": "e-field", "content": {"metadata": {"object_id": "F-working"}}},
+                     {"id": "e-other", "content": {"metadata": {"object_id": "C-other"}}}],
+        "conversation_context": {"cited_object_ids": ["F-earlier"]},
+    }
+    assert ServiceDeskAgent._cited_object_ids(previous) == ["F-working", "F-earlier"]
+    rows = [
+        {"id": "c1", "text": "Section E", "score": 0.5, "score_type": "cosine_similarity",
+         "metadata": {"object_id": "c1", "object_type": "Chunk", "page": 6}},
+        {"id": "F-working", "text": "1. Is the applicant currently working for you? [x] Yes",
+         "score": 0.2, "score_type": "cosine_similarity",
+         "metadata": {"object_id": "F-working", "object_type": "FormField", "page": 6,
+                      "form_field_question": "1. Is the applicant currently working for you?"}},
+    ]
+    chosen = ServiceDeskAgent._select_graph_evidence(
+        rows, "is it a no?", 8, raw_question="is it a no?", inherited_ids={"F-working"},
+    )
+    assert "F-working" in [row["id"] for row in chosen]
+
+
+def test_a_stalled_recovery_finalizes_instead_of_replanning():
+    from types import SimpleNamespace
+
+    agent = SimpleNamespace(settings=SimpleNamespace(max_investigation_cycles=8),
+                            usable_evidence=ServiceDeskAgent.usable_evidence)
+    state = {
+        "evidence": [], "decision": {"outcome": "cannot_verify", "question_for_human": None},
+        "verification": {"contradictions": ["The previous answer said yes."],
+                         "unsupported_claims": [], "should_continue_research": True},
+        "research_iteration": 2, "decision_issues": [],
+    }
+    assert ServiceDeskAgent.verification_route(agent, state) == "plan"
+    assert ServiceDeskAgent.verification_route(agent, {**state, "recovery_stalled": True}) == (
+        "finalize"
+    )

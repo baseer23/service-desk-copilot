@@ -486,6 +486,7 @@ class ServiceDeskAgent:
                     "actions_already_taken": [],
                     "research_iteration": 0,
                     "enforced_abstention": False, "abstention_reconsidered": False,
+                    "document_evidence_seen": -1, "recovery_stalled": False,
                     "research_rounds": 0,
                 }
             try:
@@ -559,6 +560,7 @@ class ServiceDeskAgent:
                 "research_rounds": 0,
                 "research_iteration": 0,
                 "enforced_abstention": False, "abstention_reconsidered": False,
+                "document_evidence_seen": -1, "recovery_stalled": False,
                 "web_pages_fetched": 0,
                 "executed_tool_calls": [],
                 "final_answer": None,
@@ -569,6 +571,9 @@ class ServiceDeskAgent:
                     "previous_request": previous.get("ticket", {}).get("summary"),
                     "resolved_goal": previous.get("intent", {}).get("goal"),
                     "document_references": references[-12:],
+                    # The objects the previous answer cited, so a follow-up such as
+                    # "is it a no?" is checked against the same form field.
+                    "cited_object_ids": self._cited_object_ids(previous),
                 },
             }
             self._request_events[request_id] = []
@@ -600,6 +605,7 @@ class ServiceDeskAgent:
                 "contradictions": [],
                 "research_iteration": 0,
                 "enforced_abstention": False, "abstention_reconsidered": False,
+                "document_evidence_seen": -1, "recovery_stalled": False,
                 "research_rounds": 0,
                 "web_pages_fetched": 0,
                 "executed_tool_calls": [],
@@ -1899,6 +1905,7 @@ class ServiceDeskAgent:
                         question, GRAPH_EVIDENCE_LIMIT, priority_ids=supporting,
                         raw_question=state["ticket"]["summary"],
                         selection=self._asks_selection(state),
+                        inherited_ids=self._inherited_object_ids(state),
                     )
                     for item in hydrated:
                         item["graph_enrichment"] = "available"
@@ -1933,7 +1940,7 @@ class ServiceDeskAgent:
 
     @classmethod
     def _select_graph_evidence(cls, rows, question, limit, priority_ids=(), raw_question=None,
-                               selection=False):
+                               selection=False, inherited_ids=()):
         """Rank graph-scoped passages by fused vector and keyword relevance, then bound them.
 
         Rows arrive ordered by vector similarity. Keyword relevance is IDF-weighted
@@ -1965,9 +1972,16 @@ class ServiceDeskAgent:
                 return 0
             return float(row.get("score") or 0)
 
+        inherited = {str(value) for value in inherited_ids}
+
+        def object_id(row):
+            return str(row.get("metadata", {}).get("object_id"))
+
         fields = sorted(
-            (row for row in rows if field_score(row) >= FORM_FIELD_MATCH),
-            key=lambda row: (-field_score(row), -cosine(row)),
+            (row for row in rows
+             if row.get("metadata", {}).get("object_type") == "FormField"
+             and (object_id(row) in inherited or field_score(row) >= FORM_FIELD_MATCH)),
+            key=lambda row: (object_id(row) not in inherited, -field_score(row), -cosine(row)),
         )
         if selection:
             # A paraphrased selection question ("currently employed" for "currently
@@ -2321,9 +2335,16 @@ class ServiceDeskAgent:
                 raise ValueError("Evidence grader returned invalid candidate identifiers")
             # A verified form field for the question asked is the evidence a
             # selection answer must come from, whatever the grader thought of it.
+            inherited = self._inherited_object_ids(state)
             fields = {
                 candidate_id for candidate_id, item in zip(candidate_ids, candidates, strict=True)
                 if self._form_field_score(state, item) >= FORM_FIELD_MATCH
+                or (
+                    (item.get("content") or {}).get("metadata", {}).get("object_type")
+                    == "FormField"
+                    and (item.get("content") or {}).get("metadata", {}).get("object_id")
+                    in inherited
+                )
             }
             accepted, rejected = accepted | fields, rejected - fields
             grade.rejected = [item for item in grade.rejected if item.id not in fields]
@@ -2656,6 +2677,15 @@ class ServiceDeskAgent:
             state.get("enforced_abstention")
             and (state.get("verification") or {}).get("contradictions")
         )
+        document_evidence = sum(
+            1 for item in self.usable_evidence(state) if item.get("source_type") == "document"
+        )
+        # A recovery pass that found no more usable document evidence than the
+        # previous one has stalled; replanning again only repeats rejected lookups.
+        recovery_stalled = bool(
+            state.get("research_iteration", 0) >= 1
+            and document_evidence <= int(state.get("document_evidence_seen", -1))
+        )
         enforced_abstention = False
         if state.get("workflow") == "knowledge":
             proposed = decision.outcome
@@ -2802,6 +2832,8 @@ class ServiceDeskAgent:
             "research_iteration": iteration,
             "enforced_abstention": enforced_abstention,
             "abstention_reconsidered": bool(state.get("abstention_reconsidered") or reconsidering),
+            "document_evidence_seen": document_evidence,
+            "recovery_stalled": recovery_stalled,
             "hypotheses": [h.model_dump() for h in decision.hypotheses],
             "inferences": decision.inferences,
             "missing_information": [m.model_dump() for m in decision.missing_information],
@@ -2833,6 +2865,22 @@ class ServiceDeskAgent:
             for value in asked if value.strip()
         )
 
+    @staticmethod
+    def _cited_object_ids(state):
+        """Object IDs of the document evidence the state's answer cited (plus earlier turns')."""
+        cited = {value for hypothesis in state.get("hypotheses", []) or []
+                 for value in hypothesis.get("evidence_ids", []) or []}
+        objects = [
+            ((item.get("content") or {}).get("metadata") or {}).get("object_id")
+            for item in state.get("evidence", []) or [] if item.get("id") in cited
+        ]
+        inherited = (state.get("conversation_context") or {}).get("cited_object_ids", [])
+        return list(dict.fromkeys(value for value in [*objects, *inherited] if value))[:20]
+
+    @staticmethod
+    def _inherited_object_ids(state):
+        return set((state.get("conversation_context") or {}).get("cited_object_ids", []))
+
     @classmethod
     def _asks_selection(cls, state):
         """Whether the request asks which option a form marks (raw or standalone)."""
@@ -2859,9 +2907,15 @@ class ServiceDeskAgent:
         evidence = [item for item in self.usable_evidence(state)
                     if item.get("source_type") == "document"]
         cited = {value for item in decision.hypotheses for value in item.evidence_ids}
+        inherited = (state.get("conversation_context") or {}).get("cited_object_ids", [])
 
         def metadata(item):
             return (item.get("content") or {}).get("metadata") or {}
+
+        # A follow-up ("is it a no?") is about the field the previous answer cited.
+        cited |= {item["id"] for item in evidence
+                  if metadata(item).get("object_type") == "FormField"
+                  and metadata(item).get("object_id") in inherited}
 
         def cosine(item):
             content = item.get("content") or {}
@@ -3135,6 +3189,7 @@ class ServiceDeskAgent:
             "plan_executed": True,
             "research_iteration": 0,
             "enforced_abstention": False, "abstention_reconsidered": False,
+            "document_evidence_seen": -1, "recovery_stalled": False,
             "decision_issues": [],
             "verification": {},
         }
@@ -3462,6 +3517,7 @@ class ServiceDeskAgent:
         if (
             not decision.get("question_for_human")
             and v.get("should_continue_research")
+            and not state.get("recovery_stalled")
             and state.get("research_iteration", 0) < self.settings.max_investigation_cycles
         ):
             # Verification identified a material gap. Ask the model to PLAN
