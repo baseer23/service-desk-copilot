@@ -645,3 +645,151 @@ def test_grader_keeps_the_field_asked_about_even_if_the_model_rejects_it(make_cl
     graded = client.portal.call(agent._grade_document_evidence, state, candidates)
     assert [item["id"] for item in graded["accepted"]] == ["f-insured"]
     assert [item["evidence"]["id"] for item in graded["rejected"]] == ["f-pets"]
+
+
+# --- Grounded answers are never replaced by an abstention ------------------------------
+
+
+def chunk_evidence(identifier, text, page=6, score=0.4):
+    return {
+        "id": identifier, "source_type": "document", "tool": "search_knowledge",
+        "source_system": "chroma", "timestamp": "2026-10-29T00:00:00Z", "reliability": 0.9,
+        "content": {"id": identifier, "title": "Employer form.pdf", "text": text,
+                    "score": score, "score_type": "cosine_similarity",
+                    "metadata": {"doc_id": "doc-1", "page": page, "object_type": "Chunk"}},
+    }
+
+
+def cited_decision(answer, evidence_ids, outcome="answer"):
+    from backend.app.agent.models import Hypothesis
+
+    return InvestigationDecision(
+        outcome=outcome, evidence_summary="", enough_information=outcome == "answer",
+        answer=answer, confidence=0.7,
+        hypotheses=[Hypothesis(claim=answer, evidence_ids=evidence_ids, confidence=0.7)],
+    )
+
+
+def test_a_paraphrased_question_is_answered_from_the_field_the_model_cited():
+    field = field_evidence("f-working", "1. Is the applicant currently working for you?",
+                           "answered", "Yes", page=6)
+    state = agent_state(
+        "am I currently employed?",
+        "In Employer form.pdf, is the applicant currently employed?",
+        [field],
+    )
+    result = cited_decision("Yes, you are currently employed.", ["f-working"])
+    ServiceDeskAgent._enforce_form_selection(ServiceDeskAgent, state, result)
+    assert result.outcome == "answer" and result.answer.startswith("Yes, you are currently")
+    assert "(page 6)" in result.answer
+    assert result.hypotheses[0].evidence_ids == ["f-working"]
+
+
+def test_without_a_form_field_a_cited_passage_with_one_mark_keeps_the_answer():
+    passage = chunk_evidence(
+        "c-6", "Section E\n\n1. Is the applicant currently working for you? [x] Yes [ ] No"
+        "\n\n2. Is the position exempt? [ ] Yes [x] No",
+    )
+    state = agent_state(
+        "in the form, is it marked yes or no that the applicant works for you?",
+        "In Employer form.pdf, is 'Is the applicant currently working for you?' yes or no?",
+        [passage],
+    )
+    answer = "Yes — the form marks Yes for “Is the applicant currently working for you?”."
+    result = cited_decision(answer, ["c-6"])
+    ServiceDeskAgent._enforce_form_selection(ServiceDeskAgent, state, result)
+    assert result.outcome == "answer" and result.answer.startswith(answer)
+    assert "(page 6)" in result.answer and result.hypotheses[0].evidence_ids == ["c-6"]
+
+
+def test_a_cited_passage_with_both_boxes_checked_abstains_with_the_reason():
+    passage = chunk_evidence(
+        "c-7", "1. Is the applicant currently working for you? :selected: Yes :selected: No",
+    )
+    state = agent_state(
+        "is it marked yes or no that the applicant works for you?",
+        "In Employer form.pdf, is 'Is the applicant currently working for you?' yes or no?",
+        [passage],
+    )
+    result = cited_decision("Yes, the applicant currently working for you is marked Yes.",
+                            ["c-7"])
+    ServiceDeskAgent._enforce_form_selection(ServiceDeskAgent, state, result)
+    assert result.outcome == "cannot_verify"
+    assert "ambiguous (multiple selected)" in result.answer
+    assert "Is the applicant currently working for you?" in result.answer
+
+
+def test_with_no_marks_anywhere_it_abstains_naming_the_question_asked():
+    passage = chunk_evidence("c-8", "The employer operates three warehouses in Halifax.")
+    asked = "is the forklift licence box checked?"
+    state = agent_state(asked, "In Employer form.pdf, is the forklift licence box checked?",
+                        [passage])
+    result = cited_decision("Yes, it is checked.", ["c-8"])
+    ServiceDeskAgent._enforce_form_selection(ServiceDeskAgent, state, result)
+    assert result.outcome == "cannot_verify"
+    assert f"“{asked}”" in result.answer and "this question" not in result.answer
+
+
+def test_an_ordinary_question_mentioning_an_answer_does_not_trigger_the_rule():
+    passage = chunk_evidence("c-9", "5. Describe the duties of the position: stocking shelves.")
+    asked = "what is the answer to question 5"
+    state = agent_state(asked, "In Employer form.pdf, what is the answer to question 5?",
+                        [passage])
+    result = cited_decision("Question 5 lists stocking shelves as the duties.", ["c-9"])
+    ServiceDeskAgent._enforce_form_selection(ServiceDeskAgent, state, result)
+    assert result.outcome == "answer"
+    assert result.answer == "Question 5 lists stocking shelves as the duties."
+    assert not ServiceDeskAgent._asks_selection(state)
+
+
+def test_a_contradicted_abstention_is_reconsidered_instead_of_replanned():
+    from types import SimpleNamespace
+
+    agent = SimpleNamespace(settings=SimpleNamespace(max_investigation_cycles=3),
+                            usable_evidence=ServiceDeskAgent.usable_evidence)
+    state = {
+        "evidence": [chunk_evidence("c-6", "1. Is the applicant working? [x] Yes [ ] No")],
+        "decision": {"outcome": "cannot_verify", "question_for_human": None},
+        "verification": {"contradictions": ["The evidence shows [x] Yes is selected."],
+                         "unsupported_claims": [], "should_continue_research": True},
+        "research_iteration": 1, "decision_issues": [], "enforced_abstention": True,
+    }
+    # The rule overrode the model and the verifier disagrees: reconsider the evidence.
+    assert ServiceDeskAgent.verification_route(agent, state) == "reason"
+    # Only once per turn; afterwards the normal recovery applies.
+    assert ServiceDeskAgent.verification_route(
+        agent, {**state, "abstention_reconsidered": True}) == "plan"
+    # The model's own abstention keeps the normal recovery path.
+    assert ServiceDeskAgent.verification_route(
+        agent, {**state, "enforced_abstention": False}) == "plan"
+    assert ServiceDeskAgent.verification_route(
+        agent, {**state, "research_iteration": 3}) == "finalize"  # still bounded
+
+
+def test_form_fields_are_retrieved_for_a_paraphrased_selection_question():
+    def row(object_id, object_type, text, score, question=None):
+        metadata = {"doc_id": "doc-1", "page": 6, "object_id": object_id,
+                    "object_type": object_type}
+        if question:
+            metadata.update(form_field_question=question, form_field_status="answered",
+                            form_field_selected="Yes")
+        return {"id": object_id, "text": text, "score": score,
+                "score_type": "cosine_similarity", "metadata": metadata}
+
+    rows = [
+        row("c1", "Chunk", "Section E employment of the applicant", 0.45),
+        row("f-working", "FormField", "1. Is the applicant currently working for you? [x] Yes",
+            0.62, "1. Is the applicant currently working for you?"),
+        row("f-union", "FormField", "6. Is this a unionized position? [x] No", 0.21,
+            "6. Is this a unionized position?"),
+    ]
+    raw = "in the employer form, am i currently employed or no"
+    standalone = "In the employer form, is the applicant currently employed, yes or no?"
+    state = {"ticket": {"summary": raw}, "intent": {"standalone_question": standalone}}
+    assert ServiceDeskAgent._asks_selection(state)
+    chosen = ServiceDeskAgent._select_graph_evidence(rows, standalone, 8, raw_question=raw,
+                                                    selection=True)
+    ids = [item["id"] for item in chosen]
+    assert ids.index("f-working") < ids.index("f-union")
+    plain = ServiceDeskAgent._select_graph_evidence(rows, standalone, 8, raw_question=raw)
+    assert "f-working" not in [item["id"] for item in plain]

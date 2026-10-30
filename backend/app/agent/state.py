@@ -41,6 +41,8 @@ class InvestigationState(TypedDict, total=False):
     pending_question: str | None
     pending_field: str | None
     research_iteration: int
+    enforced_abstention: bool
+    abstention_reconsidered: bool
     research_rounds: int
     web_pages_fetched: int
     actions_already_taken: list[str]

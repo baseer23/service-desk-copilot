@@ -54,7 +54,13 @@ GRAPH_NEIGHBOUR_LIMIT = 4
 FORM_FIELD_MATCH = 85
 SELECTION_QUESTION = re.compile(
     r"\b(?:checked|ticked|check-?box(?:es)?|tick-?box(?:es)?|selected option|which option"
-    r"|marked(?:\s+as)?\s+(?:yes|no)|yes or no|is it (?:a |an )?(?:yes|no)|answer(?:ed)? to)\b",
+    r"|marked(?:\s+as)?\s+(?:yes|no)|yes or no|is it (?:a |an )?(?:yes|no))\b",
+    re.IGNORECASE,
+)
+# A yes/no question about a form ("... employed or no", "'yes' ... or 'no'"): used
+# only to retrieve form fields, never to override an answer.
+YES_NO_CHOICE = re.compile(
+    r"\b(?:or\s+(?:no|not)\s*\W*$|yes\W{0,3}(?:\s*\([^)]{0,60}\))?\s+or\s+\W{0,3}no\b)",
     re.IGNORECASE,
 )
 SEARCH_STOPWORDS = frozenset(
@@ -479,6 +485,7 @@ class ServiceDeskAgent:
                     "contradictions": [],
                     "actions_already_taken": [],
                     "research_iteration": 0,
+                    "enforced_abstention": False, "abstention_reconsidered": False,
                     "research_rounds": 0,
                 }
             try:
@@ -551,6 +558,7 @@ class ServiceDeskAgent:
                 "verification": {},
                 "research_rounds": 0,
                 "research_iteration": 0,
+                "enforced_abstention": False, "abstention_reconsidered": False,
                 "web_pages_fetched": 0,
                 "executed_tool_calls": [],
                 "final_answer": None,
@@ -591,6 +599,7 @@ class ServiceDeskAgent:
                 "human_answers": [],
                 "contradictions": [],
                 "research_iteration": 0,
+                "enforced_abstention": False, "abstention_reconsidered": False,
                 "research_rounds": 0,
                 "web_pages_fetched": 0,
                 "executed_tool_calls": [],
@@ -1888,6 +1897,8 @@ class ServiceDeskAgent:
                     hydrated = self._select_graph_evidence(
                         [dict(item) for item in hydration["items"] if isinstance(item, dict)],
                         question, GRAPH_EVIDENCE_LIMIT, priority_ids=supporting,
+                        raw_question=state["ticket"]["summary"],
+                        selection=self._asks_selection(state),
                     )
                     for item in hydrated:
                         item["graph_enrichment"] = "available"
@@ -1921,7 +1932,8 @@ class ServiceDeskAgent:
         ]
 
     @classmethod
-    def _select_graph_evidence(cls, rows, question, limit, priority_ids=()):
+    def _select_graph_evidence(cls, rows, question, limit, priority_ids=(), raw_question=None,
+                               selection=False):
         """Rank graph-scoped passages by fused vector and keyword relevance, then bound them.
 
         Rows arrive ordered by vector similarity. Keyword relevance is IDF-weighted
@@ -1942,24 +1954,38 @@ class ServiceDeskAgent:
 
         rows = [row for row in rows if isinstance(row, dict)]
 
+        asked = {"ticket": {"summary": raw_question or question},
+                 "intent": {"standalone_question": question}}
+
         def field_score(row):
-            return cls._form_field_score(
-                {"ticket": {"summary": question}},
-                {"content": {"metadata": row.get("metadata", {})}},
-            )
+            return cls._form_field_score(asked, {"content": {"metadata": row.get("metadata", {})}})
+
+        def cosine(row):
+            if row.get("score_type") != "cosine_similarity":
+                return 0
+            return float(row.get("score") or 0)
 
         fields = sorted(
             (row for row in rows if field_score(row) >= FORM_FIELD_MATCH),
-            key=lambda row: -field_score(row),
+            key=lambda row: (-field_score(row), -cosine(row)),
         )
+        if selection:
+            # A paraphrased selection question ("currently employed" for "currently
+            # working for you") rarely matches lexically; keep the form fields the
+            # resolver ranked closest to the question so the model can read them.
+            ranked = sorted(
+                (row for row in rows
+                 if row.get("metadata", {}).get("object_type") == "FormField"
+                 and row not in fields),
+                key=lambda row: -cosine(row),
+            )
+            fields = [*fields, *ranked[:3]]
         rows = [
             row for row in rows
             if row.get("metadata", {}).get("object_type") not in {"Section", "FormField"}
         ]
         if not rows:
-            return fields[:2]
-        if not rows:
-            return []
+            return fields[:5]
         query_terms = set(cls._search_terms(question))
         documents = [set(cls._search_terms(row.get("text"))) for row in rows]
 
@@ -2011,7 +2037,7 @@ class ServiceDeskAgent:
             i for i in fused
             if i not in chosen and rows[i].get("metadata", {}).get("page") in best_pages
         ][:GRAPH_NEIGHBOUR_LIMIT]
-        return [*fields[:2], *(rows[i] for i in [*chosen, *neighbours])]
+        return [*fields[:5], *(rows[i] for i in [*chosen, *neighbours])]
 
     @staticmethod
     def _unique_document_rows(rows):
@@ -2626,9 +2652,16 @@ class ServiceDeskAgent:
             decision.needs_web_research = False
             decision.requested_tools = []
             decision.confidence = 0
+        reconsidering = bool(
+            state.get("enforced_abstention")
+            and (state.get("verification") or {}).get("contradictions")
+        )
+        enforced_abstention = False
         if state.get("workflow") == "knowledge":
+            proposed = decision.outcome
             self._enforce_form_selection(state, decision)
             self._enforce_table_cell(state, decision)
+            enforced_abstention = proposed == "answer" and decision.outcome == "cannot_verify"
         summary = state["ticket"]["summary"].casefold()
         terse_diagnostic_request = (
             len(summary.split()) <= 8
@@ -2767,6 +2800,8 @@ class ServiceDeskAgent:
             "decision": decision.model_dump(),
             "decision_issues": issues,
             "research_iteration": iteration,
+            "enforced_abstention": enforced_abstention,
+            "abstention_reconsidered": bool(state.get("abstention_reconsidered") or reconsidering),
             "hypotheses": [h.model_dump() for h in decision.hypotheses],
             "inferences": decision.inferences,
             "missing_information": [m.model_dump() for m in decision.missing_information],
@@ -2792,59 +2827,161 @@ class ServiceDeskAgent:
         if metadata.get("object_type") != "FormField" or not question.strip():
             return 0
         normalize = lambda text: re.sub(r"^\W*\d{1,3}[.)]\s*", "", text).casefold()  # noqa: E731
-        return fuzz.token_set_ratio(
-            normalize(question), cls._retrieval_question(state), processor=utils.default_process
+        asked = {cls._retrieval_question(state), str(state.get("ticket", {}).get("summary") or "")}
+        return max(
+            fuzz.token_set_ratio(normalize(question), value, processor=utils.default_process)
+            for value in asked if value.strip()
         )
+
+    @classmethod
+    def _asks_selection(cls, state):
+        """Whether the request asks which option a form marks (raw or standalone)."""
+        asked = [cls._retrieval_question(state), str(state.get("ticket", {}).get("summary") or "")]
+        return any(SELECTION_QUESTION.search(value) or YES_NO_CHOICE.search(value)
+                   for value in asked if value)
 
     def _enforce_form_selection(self, state, decision):
-        """Answer which option is selected only from a verified, unambiguous FormField.
+        """Keep a form answer only where extracted selections support it.
 
-        Applies when the request asks about a check-box selection, or when a
-        FormField for the asked question is in evidence. Otherwise the answer
-        says the selection cannot be established and why; it never explains what
-        an option would mean instead of answering.
+        Applies when the request asks which option a form marks, or when a
+        FormField for the question is in evidence (cited by the model, or
+        matching the raw or standalone question). Evidence, strongest first:
+
+        1. a cited or matching FormField: its verified selection is the answer;
+        2. otherwise, the check boxes in the passages the model cited: kept
+           when exactly one cited question matches and has one selected option
+           that the answer states.
+
+        It never replaces a grounded answer with an abstention. It abstains,
+        naming the question and the reason, only when that evidence has no
+        usable selection or contradicts the answer.
         """
-        fields = sorted(
-            (
-                (self._form_field_score(state, item), item)
-                for item in self.usable_evidence(state)
-                if item.get("source_type") == "document"
-            ),
-            key=lambda pair: -pair[0],
+        evidence = [item for item in self.usable_evidence(state)
+                    if item.get("source_type") == "document"]
+        cited = {value for item in decision.hypotheses for value in item.evidence_ids}
+
+        def metadata(item):
+            return (item.get("content") or {}).get("metadata") or {}
+
+        def cosine(item):
+            content = item.get("content") or {}
+            if content.get("score_type") != "cosine_similarity":
+                return 0.0
+            return float(content.get("score") or 0)
+
+        ranked = sorted(
+            ((item["id"] in cited, self._form_field_score(state, item), cosine(item), item)
+             for item in evidence if metadata(item).get("object_type") == "FormField"),
+            key=lambda row: (not row[0], -row[1], -row[2]),
         )
-        relevant = [item for score, item in fields if score >= FORM_FIELD_MATCH]
-        if not relevant and not SELECTION_QUESTION.search(self._retrieval_question(state)):
+        fields = [item for is_cited, score, _cosine, item in ranked
+                  if is_cited or score >= FORM_FIELD_MATCH]
+        asked = [self._retrieval_question(state), str(state["ticket"]["summary"])]
+        if not fields and not any(SELECTION_QUESTION.search(value) for value in asked):
             return
-        if relevant:
-            item = relevant[0]
-            metadata = item["content"]["metadata"]
-            question, page = metadata["form_field_question"], metadata.get("page")
-            if metadata.get("form_field_status") == "answered":
-                selected = metadata["form_field_selected"]
-                stated = re.search(
-                    rf"\b{re.escape(selected)}\b", str(decision.answer or ""), re.IGNORECASE
-                )
-                if decision.outcome != "answer" or not stated:
-                    decision.answer = (
-                        f"The form marks “{selected}” for “{question}” (page {page})."
-                    )
-                decision.outcome, decision.enough_information = "answer", True
-                decision.hypotheses = [Hypothesis(
-                    claim=decision.answer, evidence_ids=[item["id"]], confidence=0.9,
-                    status="supported",
-                )]
-                decision.confidence = max(decision.confidence, 0.8)
-                decision.question_for_human = decision.human_field = None
-                decision.needs_web_research = False
+        if fields:
+            item = fields[0]
+            question, page = metadata(item)["form_field_question"], metadata(item).get("page")
+            if metadata(item).get("form_field_status") == "answered":
+                self._state_selection(decision, item, metadata(item)["form_field_selected"],
+                                      question, page)
                 return
-            why = (
-                "its check boxes are ambiguous ("
-                + str(metadata.get("form_ambiguity_reason") or "uncertain").replace("_", " ")
-                + ")"
+            reason = str(metadata(item).get("form_ambiguity_reason") or "uncertain")
+            self._abstain_selection(
+                decision, question, f"its check boxes are ambiguous ({reason.replace('_', ' ')})"
             )
-        else:
-            question = "this question"
-            why = "no check-box selection was extracted for it from the document"
+            return
+        outcome = self._cited_selection(
+            state, decision, [item for item in evidence if item["id"] in cited]
+        )
+        if outcome == "kept":
+            return
+        if outcome is None:
+            self._abstain_selection(
+                decision, str(state["ticket"]["summary"]).strip(),
+                "no check-box selection was extracted for it from the document",
+            )
+            return
+        question, why = outcome
+        self._abstain_selection(decision, question, why)
+
+    @classmethod
+    def _cited_selection(cls, state, decision, cited_items):
+        """Check an answer against the check boxes in the passages the model cited.
+
+        Returns "kept" when exactly one cited question matches the request and
+        has one selected option that the answer states; (question, reason) when
+        the marks are ambiguous or contradict the answer; None when the cited
+        passages hold no matching marked question.
+        """
+        from rapidfuzz import fuzz, utils
+
+        from backend.app.services.form_marks import parse_marks
+
+        # The request, the standalone question and the model's own wording of the
+        # answer (which usually quotes the form's question).
+        asked = [cls._retrieval_question(state), str(state["ticket"]["summary"]),
+                 str(decision.answer or ""), *(item.claim for item in decision.hypotheses)]
+
+        def matches(prompt):
+            prompt = re.sub(r"^\W*\d{1,3}[.)]\s*", "", prompt).casefold()
+            return len(prompt.split()) >= 2 and any(
+                fuzz.token_set_ratio(prompt, value, processor=utils.default_process)
+                >= FORM_FIELD_MATCH for value in asked if value.strip()
+            )
+
+        found = []
+        for item in cited_items:
+            text = str((item.get("content") or {}).get("text") or "")
+            # Readable marks back to tokens: "[x] Yes [ ] No" -> "☒ Yes ☐ No".
+            text = re.sub(r"\[[xX]\]", "☒", text).replace("[ ]", "☐")
+            for block in re.split(r"\n+", text):
+                parsed = parse_marks(block)
+                if parsed and parsed[0] and matches(parsed[0]):
+                    found.append((item, parsed[0], parsed[1]))
+        if not found:
+            return None
+        if len(found) > 1:
+            return (found[0][1], "several marked questions in the cited passages match it")
+        item, prompt, options = found[0]
+        selected = [label for is_selected, label in options if is_selected]
+        if len(selected) != 1:
+            return (prompt, "its check boxes are ambiguous ("
+                    + ("none selected" if not selected else "multiple selected") + ")")
+        label = selected[0]
+        answer = str(decision.answer or "")
+        if decision.outcome == "answer" and re.search(
+            rf"\b{re.escape(label)}\b", answer, re.IGNORECASE
+        ):
+            page = (item.get("content") or {}).get("metadata", {}).get("page")
+            if page is not None and f"page {page}" not in answer.casefold():
+                decision.answer = f"{answer.rstrip()} (page {page})"
+            decision.hypotheses = [Hypothesis(
+                claim=decision.answer, evidence_ids=[item["id"]], confidence=0.85,
+                status="supported",
+            )]
+            return "kept"
+        if decision.outcome == "answer":
+            return (prompt, f"the cited passage marks “{label}”, which the answer does not state")
+        return None
+
+    @staticmethod
+    def _state_selection(decision, item, selected, question, page):
+        stated = re.search(rf"\b{re.escape(selected)}\b", str(decision.answer or ""), re.IGNORECASE)
+        if decision.outcome != "answer" or not stated:
+            decision.answer = f"The form marks “{selected}” for “{question}” (page {page})."
+        elif page is not None and f"page {page}" not in str(decision.answer).casefold():
+            decision.answer = f"{str(decision.answer).rstrip()} (page {page})"
+        decision.outcome, decision.enough_information = "answer", True
+        decision.hypotheses = [Hypothesis(
+            claim=decision.answer, evidence_ids=[item["id"]], confidence=0.9, status="supported",
+        )]
+        decision.confidence = max(decision.confidence, 0.8)
+        decision.question_for_human = decision.human_field = None
+        decision.needs_web_research = False
+
+    @staticmethod
+    def _abstain_selection(decision, question, why):
         decision.outcome, decision.enough_information = "cannot_verify", False
         decision.answer = (
             f"I can't establish which option is selected for “{question}” "
@@ -2997,6 +3134,7 @@ class ServiceDeskAgent:
             "pending_field": None,
             "plan_executed": True,
             "research_iteration": 0,
+            "enforced_abstention": False, "abstention_reconsidered": False,
             "decision_issues": [],
             "verification": {},
         }
@@ -3307,6 +3445,20 @@ class ServiceDeskAgent:
                     return "ask_human"
             if state.get("research_iteration", 0) < 2:
                 return "reason"
+        if (
+            decision.get("outcome") == "cannot_verify"
+            and state.get("enforced_abstention")
+            and not state.get("abstention_reconsidered")
+            and v.get("contradictions")
+            and any(item.get("source_type") == "document" for item in self.usable_evidence(state))
+            and state.get("research_iteration", 0) < self.settings.max_investigation_cycles
+        ):
+            # The form-selection rule turned the model's answer into an abstention
+            # and the verifier says the evidence already collected contradicts it.
+            # Reconsider that evidence once; planning the same lookup again only
+            # repeats the retrieval (and the plan validator rightly rejects a plan
+            # that asks for nothing new).
+            return "reason"
         if (
             not decision.get("question_for_human")
             and v.get("should_continue_research")
