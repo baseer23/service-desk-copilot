@@ -2908,8 +2908,15 @@ class ServiceDeskAgent:
         inherited = (state.get("conversation_context") or {}).get("cited_object_ids", [])
         return list(dict.fromkeys(value for value in [*objects, *inherited] if value))[:20]
 
-    @staticmethod
-    def _inherited_object_ids(state):
+    @classmethod
+    def _inherited_object_ids(cls, state):
+        """Objects the previous answer cited, for a follow-up about a selection only.
+
+        "is it a no?" is about the field just discussed; "what is the NOC code"
+        is a new question and must not inherit it.
+        """
+        if not cls._asks_selection(state):
+            return set()
         return set((state.get("conversation_context") or {}).get("cited_object_ids", []))
 
     @classmethod
@@ -2938,7 +2945,7 @@ class ServiceDeskAgent:
         evidence = [item for item in self.usable_evidence(state)
                     if item.get("source_type") == "document"]
         cited = {value for item in decision.hypotheses for value in item.evidence_ids}
-        inherited = (state.get("conversation_context") or {}).get("cited_object_ids", [])
+        inherited = self._inherited_object_ids(state)
 
         def metadata(item):
             return (item.get("content") or {}).get("metadata") or {}

@@ -955,3 +955,18 @@ def test_the_model_context_shows_each_passage_page():
     context = ServiceDeskAgent.context(agent, state)
     content = context["evidence"][0]["content"]
     assert content["page"] == 1 and content["object_type"] == "Chunk"
+
+
+def test_a_new_question_does_not_inherit_the_previous_answer_field():
+    field = field_evidence("f-working", "1. Is the applicant currently working for you?",
+                           "answered", "Yes", page=6)
+    field["content"]["metadata"]["object_id"] = "F-working"
+    passage = chunk_evidence("c-10", "Position NOC 2021 Code 11111", page=10)
+    state = agent_state("what is the NOC code in my form",
+                        "In the employer form, what is the NOC code listed?", [field, passage])
+    state["conversation_context"] = {"cited_object_ids": ["F-working"]}
+    assert ServiceDeskAgent._inherited_object_ids(state) == set()
+    result = cited_decision("The NOC code is 11111 (page 10).", ["c-10"])
+    ServiceDeskAgent._enforce_form_selection(ServiceDeskAgent, state, result)
+    assert result.answer == "The NOC code is 11111 (page 10)."
+    assert result.hypotheses[0].evidence_ids == ["c-10"]
